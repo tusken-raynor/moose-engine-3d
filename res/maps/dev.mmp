@@ -1,0 +1,18 @@
+# Moose Dev Map for testing shit
+
+TITLE: Dev Map
+
+SECTORS:
+
+STATICS:
+
+ENTITIES:
+
+  #archetype              sector  posx posy posz  yaw pitch roll  scalex scaley scalez
+  "Test Envoronment"  0       0.0  0.0  0.0   0.0 0.0   0.0   0.0    0.0    0.0
+
+DLIGHTS:
+
+PLIGHTS:
+
+SLIGHTS:

@@ -1,0 +1,27 @@
+Map Definition Structure:
+
+TITLE: the name
+
+SECTORS:
+
+  ???
+
+STATICS:
+
+  model  sector  posx posy posz  yaw pitch roll  scalex scaley scalez
+
+ENTITIES:
+
+  archetype  sector  posx posy posz  yaw pitch roll  scalex scaley scalez
+
+DLIGHTS:
+
+  dirx diry dirz  r g b
+
+PLIGHTS:
+
+  posx posy posz  r g b  range  sector
+
+SLIGHTS:
+
+  posx posy posz  dirx diry dirz  r g b  fov  range  sector

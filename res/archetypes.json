@@ -1,0 +1,34 @@
+[
+  {
+    "name": "Test Envoronment",
+    "model": "env3.obj"
+  },
+  {
+    "name": "Learning Object",
+    "model": "bearilla2.obj"
+  },
+  {
+    "name": "Cube",
+    "model": "cube.obj"
+  },
+  {
+    "name": "Crate",
+    "model": "crt4-3.3do"
+  },
+  {
+    "name": "Clip Face",
+    "model": "face3.obj"
+  },
+  {
+    "name": "Triangle",
+    "model": "face2.obj"
+  },
+  {
+    "name": "Square",
+    "model": "face4.obj"
+  },
+  {
+    "name": "Train",
+    "model": "train.obj"
+  }
+]

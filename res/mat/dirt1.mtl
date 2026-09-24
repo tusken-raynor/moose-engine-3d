@@ -1,0 +1,20 @@
+# comment
+
+TEXTURES:
+
+# list of image files
+
+A soft_dirt.jpg
+
+OUTPUT:
+
+# OPTIONALLY LIST STATIC FORMATS INSTEAD OF DEFINING OUTPUT:
+# RGB, RGB, INDEXED: palette_name, RGB565, ARGB1555
+
+# colors
+
+R A -> r
+G A -> g
+B A -> b
+
+

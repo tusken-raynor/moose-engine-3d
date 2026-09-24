@@ -1,0 +1,18 @@
+# Crate material
+
+TEXTURES:
+# list of image files
+A star_wars.jpg
+# A wood_crate_og2.jpg, wood_crate.jpg, wood_crate-lod1.jpg, wood_crate-lod2.jpg, wood_crate-lod3.jpg, wood_crate-lod4.jpg, wood_crate-lod5.jpg, wood_crate-lod6.jpg
+# B stormtrooper_helmet.mat
+
+OUTPUT:
+# colors
+ R A -> r
+ G A -> g
+ B A -> b
+
+PROPERTIES:
+opacity -> 1.0                   # default is 1.0
+emissive_strength -> 1.0         # default is 1.0
+specular_strength -> 1.0         # default is 1.0
