@@ -1,0 +1,18 @@
+[package]
+name = "moose-app"
+description = "The Moose engine test app: fly through a level"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "moose"
+path = "src/main.rs"
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+moose-scene = { path = "../moose-scene" }
+moose-view = { path = "../moose-view" }
+moose-raster = { path = "../moose-raster" }
+moose-present = { path = "../moose-present" }
+glam.workspace = true
+png = "0.18"

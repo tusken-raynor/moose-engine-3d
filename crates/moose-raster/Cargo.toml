@@ -1,0 +1,13 @@
+[package]
+name = "moose-raster"
+description = "Span buffer rasterizer for the Moose engine: polygon setup, binning, span resolution and shading"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+moose-view = { path = "../moose-view" }
+moose-scene = { path = "../moose-scene" }
+glam.workspace = true
+rayon.workspace = true
+

@@ -1,21 +1,11 @@
-[package]
-name = "moose"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "3"
+members = ["crates/*"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
 
-[dependencies]
-minifb = "0.23.0"
-tobj = "3.2.3"
-rand = "0.8"
-json = "0.12.4"
-image = "0.24.5"
-lazy_static = "1.4.0"
-regex = "1.5"
-
-[dev-dependencies]
-criterion = "0.4.0"
-
-[profile.release]
-debug = true
+[workspace.dependencies]
+glam = "0.33"
+rayon = "1"

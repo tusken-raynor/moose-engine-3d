@@ -1,0 +1,10 @@
+[package]
+name = "moose-view"
+description = "Per-frame view processing for the Moose engine: portal traversal, transform, culling and clipping"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+moose-scene = { path = "../moose-scene" }
+glam.workspace = true

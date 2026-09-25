@@ -1,0 +1,1067 @@
+use std::ops::Range;
+
+use glam::{Affine3A, Mat3A, Vec3, Vec3A};
+use moose_assets::{Assets, EntityKind, Mesh, MeshId, Plane, PolyFlags, Polygon, Portal};
+use moose_scene::{View, World};
+
+use crate::clip::{ClipPlane, Clipper, Edge};
+
+/// Tolerance for treating the eye as lying exactly on a portal's plane, in meters. Camera
+/// moves keep 1 mm clear of portals (`moose_scene::PORTAL_CLEARANCE`), so this only
+/// catches cameras placed there directly.
+const ON_PORTAL: f32 = 1e-5;
+/// Limits on portal traversal, against pathological levels.
+const MAX_PORTAL_DEPTH: u16 = 64;
+const MAX_VISITS: usize = 4096;
+/// Portal edges subtending less than this many radians (about 0.01 px at 1280 wide) seen
+/// from the eye give no reliable plane; windows smaller than this in every direction are
+/// treated as invisible.
+const MIN_EDGE_ANGLE: f32 = 1e-5;
+/// Clipped vertices may land past the viewport edge by at most this many pixels before
+/// snapping (float rounding only; checked in debug builds).
+const MAX_OVERSHOOT: f32 = 1e-3;
+/// Points this close to a mirror's plane, in meters, are its fixed points: reflected to
+/// themselves exactly, so the mirror's own corners (and the edges walls share with it)
+/// have bit-identical clip coordinates on both sides of the mirror.
+const ON_MIRROR: f32 = 1e-5;
+/// Most reflections [`ViewConfig::max_reflections`] allows.
+pub const MAX_REFLECTIONS: u8 = 16;
+
+/// A projected vertex: exact (unrounded) framebuffer position, y down, within the
+/// viewport, and `w = 1 / depth`, larger is closer.
+///
+/// Positions are rounded only when a polygon's rows are turned into spans, using
+/// [`pixel_edge`]:
+///
+/// - An edge covers rows `pixel_edge(top)..pixel_edge(bottom)` of its two endpoints, and
+///   its x on a row is taken at the row's center ([`EdgeLine::x_at_row`], using its
+///   carried line from `ViewGeometry::edge_lines` if it has one).
+/// - Every polygon faces the camera, so on screen (y down) its edges heading down form its
+///   left boundary and its edges heading up form its right one. A row covers pixels
+///   `pixel_edge(left)..pixel_edge(right)`, and nothing if that is empty (an edge-on
+///   sliver) or if only one side crosses the row.
+///
+/// Rounding once, at the end, never changes the order of two boundaries, and polygons
+/// sharing a boundary compute the bit-identical number for it (the clipper puts shared
+/// clip points at bit-identical positions), so neighbors meet with no gap and no overlap.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenVertex {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+}
+
+/// The pixel boundary a coordinate rounds to: pixel `i` (covering `i..i + 1`) belongs to a
+/// span when its center `i + 0.5` lies in `[start, end)`, so a span covers pixels
+/// `pixel_edge(start)..pixel_edge(end)`. The same rule applies to rows. Rounds to nearest,
+/// with exact halves going down.
+pub fn pixel_edge(v: f32) -> i32 {
+    (v - 0.5).ceil() as i32
+}
+
+/// The line an edge is walked along, by its exact endpoints.
+///
+/// Normally an edge is walked between its own two vertices. An edge of a sector seen
+/// through a portal that lies on one of the portal's edges (clipped in 3D to the plane
+/// through that edge) is walked along the portal edge instead: the same line, but given by
+/// the same endpoints as the wall on the other side of the portal (the jamb, the lintel),
+/// which share that edge. Both sides then compute bit-identical x on every row. Edges on
+/// the viewport border carry the border.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeLine {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+impl EdgeLine {
+    pub fn between(a: (f32, f32), b: (f32, f32)) -> Self {
+        Self {
+            x0: a.0,
+            y0: a.1,
+            x1: b.0,
+            y1: b.1,
+        }
+    }
+
+    /// The line's exact x at the center of `row` (y = row + 0.5). Always computed from its
+    /// top endpoint, whichever order the endpoints are given in, so every polygon walking
+    /// this line gets the bit-identical result. Not defined for horizontal lines, which
+    /// cover no rows.
+    pub fn x_at_row(&self, row: i32) -> f32 {
+        let ((tx, ty), (bx, by)) = if (self.y0, self.x0) <= (self.y1, self.x1) {
+            ((self.x0, self.y0), (self.x1, self.y1))
+        } else {
+            ((self.x1, self.y1), (self.x0, self.y0))
+        };
+        tx + (bx - tx) * ((row as f32 + 0.5 - ty) / (by - ty))
+    }
+}
+
+/// Where a polygon goes in the span module; the spec's `MeshKind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolygonKind {
+    /// Level geometry, clipped to its portal window. Never overlaps other world polygons.
+    World,
+    Prop,
+    Actor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolygonSource {
+    World { sector: u32, polygon: u32 },
+    Entity { entity: u32, polygon: u32 },
+}
+
+/// A clipped, projected convex polygon, counter-clockwise from the front before projection.
+///
+/// Consecutive vertices can snap to the same pixel, so consumers must tolerate zero-length
+/// edges (a horizontal or zero-length edge covers no rows).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewPolygon {
+    pub first_vertex: u32,
+    pub vertex_count: u16,
+    /// Start of this polygon's values in `ViewGeometry::attributes`: `attrib_stride` floats
+    /// per vertex, in the order of the source mesh's `attribs`.
+    pub first_attrib: u32,
+    pub attrib_stride: u16,
+    /// Source mesh, for its attribute names and layout.
+    pub mesh: MeshId,
+    pub kind: PolygonKind,
+    pub source: PolygonSource,
+    /// The source polygon's flags.
+    pub flags: PolyFlags,
+    /// The mirror this polygon is seen in (index in `ViewGeometry::mirrors`), or `None` if
+    /// it is seen directly.
+    pub mirror: Option<u32>,
+    /// For a reflective polygon, the mirror seen through it, if its reflection was drawn:
+    /// then its reflection fills its outline behind it, and it must be drawn in the
+    /// translucent pass. `None` for every other polygon, which is drawn opaque.
+    pub reflection: Option<u32>,
+}
+
+impl ViewPolygon {
+    pub fn vertices(&self) -> Range<usize> {
+        self.first_vertex as usize..self.first_vertex as usize + self.vertex_count as usize
+    }
+
+    pub fn attributes(&self) -> Range<usize> {
+        let len = self.vertex_count as usize * self.attrib_stride as usize;
+        self.first_attrib as usize..self.first_attrib as usize + len
+    }
+}
+
+/// One sector reached this frame through one window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SectorVisit {
+    pub sector: u32,
+    /// Portals crossed to get here; 0 for the camera's sector.
+    pub depth: u16,
+    /// True if the window reaches closer than the near plane, so geometry was near-clipped.
+    pub near_clipped: bool,
+    /// The window's planes through the eye; see `ViewGeometry::window_normals`.
+    pub window: Range<u32>,
+    /// The mirror the sector is seen in, or `None` if it is seen directly.
+    pub mirror: Option<u32>,
+}
+
+/// A reflective polygon's plane seen this frame, directly or in another mirror. What is
+/// seen in it is the level reflected across its plane, then across each mirror it is seen
+/// in, out to the one seen directly. Reflective polygons on the same plane seen in the
+/// same mirror share one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mirror {
+    /// The reflective polygon's plane (in the level, unreflected), facing into its sector.
+    pub plane: Plane,
+    /// The mirror this one is seen in, or `None` if it is seen directly.
+    pub parent: Option<u32>,
+    /// Reflections between what is seen in this mirror and the level: 1 for a mirror seen
+    /// directly.
+    pub depth: u8,
+    /// The eye for what is seen in this mirror: the camera reflected back through the
+    /// mirrors, in level coordinates. Facing tests, and view vectors for shading surfaces
+    /// seen in this mirror, use it.
+    pub eye: Vec3,
+}
+
+/// View processing settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewConfig {
+    /// How many reflections deep mirrors are followed: 0 draws reflective polygons as plain
+    /// surfaces, 1 shows the level in them, 2 also shows mirrors seen in mirrors, and so
+    /// on, up to [`MAX_REFLECTIONS`]. Reflective polygons at the deepest level are drawn
+    /// plain.
+    pub max_reflections: u8,
+}
+
+impl Default for ViewConfig {
+    fn default() -> Self {
+        Self { max_reflections: 1 }
+    }
+}
+
+/// Reflects a point across a plane. Points on the plane (within `ON_MIRROR`) stay exactly
+/// where they are.
+fn reflect(plane: &Plane, p: Vec3) -> Vec3 {
+    let d = plane.distance(p);
+    if d.abs() <= ON_MIRROR {
+        p
+    } else {
+        p - 2.0 * d * plane.normal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewStats {
+    pub world_backfacing: u32,
+    pub world_outside: u32,
+    pub world_drawn: u32,
+    pub entities_culled: u32,
+    pub entities_drawn: u32,
+    pub entity_polygons_backfacing: u32,
+    pub entity_polygons_outside: u32,
+}
+
+/// Everything one view sees in one frame: clipped screen-space polygons for the span
+/// module. Reuse one per camera; buffers keep their capacity between frames.
+#[derive(Default)]
+pub struct ViewGeometry {
+    pub vertices: Vec<ScreenVertex>,
+    /// Per vertex, the line of the edge leaving it; see [`EdgeLine`].
+    pub edge_lines: Vec<Option<EdgeLine>>,
+    /// Per vertex, the world position the vertex shows: the real point on the surface, not
+    /// its reflection, for polygons seen in a mirror.
+    pub world_positions: Vec<Vec3>,
+    pub attributes: Vec<f32>,
+    pub polygons: Vec<ViewPolygon>,
+    pub visits: Vec<SectorVisit>,
+    /// Mirrors seen this frame, parents before children. Visits and polygons seen in a
+    /// mirror refer to it by index.
+    pub mirrors: Vec<Mirror>,
+    pub stats: ViewStats,
+    pub config: ViewConfig,
+    /// Window planes through the eye for every visit; see [`window_normals`](Self::window_normals).
+    window_planes: Vec<ClipPlane>,
+    /// The whole-pixel line of each window plane, parallel to `window_planes`.
+    window_lines: Vec<EdgeLine>,
+    scratch: Scratch,
+}
+
+#[derive(Default)]
+struct Scratch {
+    level: LevelCache,
+    entity_view: Vec<Vec3>,
+    entity_world: Vec<Vec3>,
+    record: Vec<f32>,
+    planes: Vec<ClipPlane>,
+    clipper: Clipper,
+    pending: Vec<Pending>,
+    /// Visits into mirrors, waiting for the traversal they were found in to finish.
+    reflected: Vec<Pending>,
+    /// Reflective polygons drawn in the current visit: source index, output index.
+    mirror_polygons: Vec<(u32, usize)>,
+    window: WindowScratch,
+}
+
+/// Level positions in clip space, each transformed at most once per space.
+#[derive(Default)]
+struct LevelCache {
+    clip: Vec<Vec3>,
+    stamp: Vec<u32>,
+    current: u32,
+}
+
+impl LevelCache {
+    /// Invalidates every cached position, for a new frame or a new space.
+    fn begin(&mut self, len: usize) {
+        self.current = self.current.wrapping_add(1);
+        if self.current == 0 {
+            self.stamp.iter_mut().for_each(|t| *t = 0);
+            self.current = 1;
+        }
+        self.clip.resize(len, Vec3::ZERO);
+        self.stamp.resize(len, 0);
+    }
+
+    fn get(&mut self, i: u32, space: &Space, positions: &[Vec3]) -> Vec3 {
+        let i = i as usize;
+        if self.stamp[i] != self.current {
+            self.clip[i] = space.to_clip(positions[i]);
+            self.stamp[i] = self.current;
+        }
+        self.clip[i]
+    }
+}
+
+#[derive(Default)]
+struct WindowScratch {
+    /// The outline of the portal or mirror being opened, in clip space.
+    points: Vec<Vec3>,
+    record: Vec<f32>,
+    planes: Vec<ClipPlane>,
+    lines: Vec<Option<EdgeLine>>,
+    clipper: Clipper,
+    window_points: Vec<Vec3>,
+    window_edges: Vec<Edge>,
+}
+
+struct Pending {
+    sector: u32,
+    window: Range<u32>,
+    near: bool,
+    depth: u16,
+    mirror: Option<u32>,
+}
+
+/// How the level is seen: directly, or in a mirror (possibly seen in other mirrors).
+/// World to clip coordinates is `M (T(p) - camera)`, where `T` reflects across the chain of
+/// mirror planes, the innermost first. Reflections are applied one plane at a time in world
+/// space, where points on each mirror stay exactly where they are, so a mirror's corners
+/// have bit-identical clip coordinates in the space it is seen in and the space seen
+/// through it. Then the eye is subtracted first as usual.
+#[derive(Clone, Copy)]
+struct Space {
+    /// M: world directions to clip coordinates.
+    matrix: Mat3A,
+    camera: Vec3,
+    /// Mirror planes, outermost (seen directly) first.
+    chain: [Plane; MAX_REFLECTIONS as usize],
+    len: usize,
+    /// The eye for facing tests: the camera, or the virtual eye `T^-1(camera)`, which sees
+    /// the level as the camera sees its reflection.
+    eye: Vec3,
+}
+
+impl Space {
+    fn direct(matrix: Mat3A, camera: Vec3) -> Self {
+        Self {
+            matrix,
+            camera,
+            chain: [Plane {
+                normal: Vec3::Y,
+                d: 0.0,
+            }; MAX_REFLECTIONS as usize],
+            len: 0,
+            eye: camera,
+        }
+    }
+
+    /// The space seen in `mirror` (`None`: the direct one).
+    fn of(direct: Space, mirrors: &[Mirror], mirror: Option<u32>) -> Self {
+        let mut space = direct;
+        let mut next = mirror;
+        while let Some(m) = next {
+            let m = &mirrors[m as usize];
+            space.chain[m.depth as usize - 1] = m.plane;
+            space.len = space.len.max(m.depth as usize);
+            next = m.parent;
+        }
+        space.eye = mirror.map_or(direct.camera, |m| mirrors[m as usize].eye);
+        space
+    }
+
+    fn to_clip(self, p: Vec3) -> Vec3 {
+        let p = self.chain[..self.len]
+            .iter()
+            .rev()
+            .fold(p, |p, plane| reflect(plane, p));
+        self.matrix * (p - self.camera)
+    }
+
+    /// The linear part of `to_clip`: M times each reflection's.
+    fn linear(&self) -> Mat3A {
+        self.chain[..self.len].iter().fold(self.matrix, |m, plane| {
+            let n = Vec3A::from(plane.normal);
+            m * Mat3A::from_cols(
+                Vec3A::X - 2.0 * n.x * n,
+                Vec3A::Y - 2.0 * n.y * n,
+                Vec3A::Z - 2.0 * n.z * n,
+            )
+        })
+    }
+
+    /// Each reflection turns clockwise into counter-clockwise, so outlines seen through an
+    /// odd number of mirrors are walked backwards to keep front faces winding the same way
+    /// on screen.
+    fn reversed(&self) -> bool {
+        self.len % 2 == 1
+    }
+}
+
+/// Output buffers, borrowed separately from the scratch space.
+struct Out<'a> {
+    vertices: &'a mut Vec<ScreenVertex>,
+    edge_lines: &'a mut Vec<Option<EdgeLine>>,
+    world_positions: &'a mut Vec<Vec3>,
+    attributes: &'a mut Vec<f32>,
+    polygons: &'a mut Vec<ViewPolygon>,
+}
+
+impl ViewGeometry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Normals of a visit's window planes, all through the eye, in homogeneous clip
+    /// coordinates `(x, y, w)` (the viewport spans -w..w on both axes, w is depth). A point
+    /// `p` is inside the window when `normal · p >= 0` for every one.
+    pub fn window_normals(&self, visit: &SectorVisit) -> impl Iterator<Item = Vec3> + '_ {
+        self.window_planes[range(&visit.window)]
+            .iter()
+            .map(|p| p.normal)
+    }
+
+    /// Where a level point seen in `mirror` appears: reflected across the mirror's plane,
+    /// then across each mirror it is seen in, out to the one seen directly.
+    pub fn reflect(&self, mirror: Option<u32>, p: Vec3) -> Vec3 {
+        let mut p = p;
+        let mut next = mirror;
+        while let Some(m) = next {
+            let m = &self.mirrors[m as usize];
+            p = reflect(&m.plane, p);
+            next = m.parent;
+        }
+        p
+    }
+
+    /// Processes one view: walks portals out from the view's sector, then transforms,
+    /// culls, clips and projects everything visible.
+    ///
+    /// - Level geometry in the camera's sector is clipped to the frustum, near plane included.
+    /// - Level geometry in later sectors is clipped only to its portal window, plus the near
+    ///   plane when that window comes closer than it. Since sectors are convex, nothing
+    ///   beyond a portal can be closer than the portal itself.
+    /// - A reflective polygon is drawn, and also opens a window like a portal: into its own
+    ///   sector reflected across its plane. The reflected level is walked like the direct
+    ///   one, seen from the virtual eye behind the mirror, with outlines reversed so they
+    ///   still wind counter-clockwise on screen. It lies entirely beyond the mirror, so the
+    ///   mirror's window bounds it like a portal's. Its polygons tile the mirror's window; the
+    ///   mirror polygon itself is left on top of them, for the translucent pass. Reflective
+    ///   polygons seen in a mirror open mirrors of their own the same way, up to
+    ///   `config.max_reflections` deep.
+    /// - Entities are culled unless some window into a sector they touch sees their bounds,
+    ///   then drawn once with a frustum clip on only the planes their bounds cross. The same
+    ///   again for each mirror, with the entity reflected. Stats count all of them.
+    pub fn build(&mut self, world: &World, assets: &Assets, view: &View) {
+        self.vertices.clear();
+        self.edge_lines.clear();
+        self.world_positions.clear();
+        self.attributes.clear();
+        self.polygons.clear();
+        self.visits.clear();
+        self.mirrors.clear();
+        self.window_planes.clear();
+        self.window_lines.clear();
+        self.stats = ViewStats::default();
+
+        let s = &mut self.scratch;
+        let mut out = Out {
+            vertices: &mut self.vertices,
+            edge_lines: &mut self.edge_lines,
+            world_positions: &mut self.world_positions,
+            attributes: &mut self.attributes,
+            polygons: &mut self.polygons,
+        };
+        let geometry = assets.mesh(world.geometry);
+        let eye = view.position;
+        // World to homogeneous clip coordinates (x, y, w), where the viewport spans
+        // -w <= x <= w and -w <= y <= w, and w is the depth. Computed as M (p - eye) rather than
+        // as an affine M p + t: subtracting the eye first is exact for nearby points, while the
+        // affine form cancels two large terms.
+        let vp = view.viewport;
+        let (half_w, half_h) = (vp.width as f32 / 2.0, vp.height as f32 / 2.0);
+        let to_clip_matrix =
+            Mat3A::from_diagonal(Vec3::new(view.focal / half_w, view.focal / half_h, -1.0))
+                * Mat3A::from_quat(view.rotation.conjugate());
+        let direct = Space::direct(to_clip_matrix, eye);
+
+        // Start in the sector the eye is really in: a camera placed directly (not moved
+        // through the world) can sit just behind a portal of its recorded sector.
+        let mut start = view.sector;
+        for _ in 0..4 {
+            let behind = world.sectors[start as usize]
+                .portals
+                .clone()
+                .map(|p| &world.portals[p as usize])
+                .find(|portal| {
+                    portal.plane.distance(eye) < -ON_PORTAL
+                        && inside_outline(outline(geometry, portal), portal.plane.normal, eye)
+                });
+            match behind {
+                Some(portal) => start = portal.target,
+                None => break,
+            }
+        }
+
+        let frustum = frustum_planes();
+        self.window_planes.extend_from_slice(&frustum);
+        self.window_lines.extend_from_slice(&border_lines(view));
+        let full = 0..4;
+        s.pending.push(Pending {
+            sector: start,
+            window: full.clone(),
+            near: true,
+            depth: 0,
+            mirror: None,
+        });
+        // Eye exactly on a portal's plane: the portal is edge-on and yields no window, but the
+        // sector behind it fills half the view. Treat it like the camera's sector; the doorway
+        // wall's faces are edge-on too, so the two sides cannot overlap.
+        for p in world.sectors[start as usize].portals.clone() {
+            let portal = &world.portals[p as usize];
+            if portal.flags.render_through()
+                && portal.plane.distance(eye).abs() <= ON_PORTAL
+                && inside_outline(outline(geometry, portal), portal.plane.normal, eye)
+            {
+                s.pending.push(Pending {
+                    sector: portal.target,
+                    window: full.clone(),
+                    near: true,
+                    depth: 1,
+                    mirror: None,
+                });
+            }
+        }
+
+        // The direct traversal, then one traversal per mirror, each after the traversal it
+        // was found in (mirrors are numbered in the order found, so the lowest waiting one
+        // always has all of its visits).
+        let max_reflections = self.config.max_reflections.min(MAX_REFLECTIONS);
+        let mut group: Option<u32> = None;
+        loop {
+            let space = Space::of(direct, &self.mirrors, group);
+            let depth = group.map_or(0, |m| self.mirrors[m as usize].depth);
+            s.level.begin(geometry.positions.len());
+            let level = &mut s.level;
+            let mut level_pos = |i: u32| level.get(i, &space, &geometry.positions);
+
+            while let Some(visit) = s.pending.pop() {
+                if self.visits.len() >= MAX_VISITS {
+                    s.pending.clear();
+                    s.reflected.clear();
+                    break;
+                }
+                let sector = &world.sectors[visit.sector as usize];
+
+                // Level geometry of this sector, clipped to the window (and near plane if needed).
+                s.planes.clear();
+                s.planes
+                    .extend_from_slice(&self.window_planes[range(&visit.window)]);
+                if visit.near {
+                    s.planes.push(ClipPlane::near(view.near));
+                }
+                s.mirror_polygons.clear();
+                for pi in sector.polygons.clone() {
+                    let polygon = &geometry.polygons[pi as usize];
+                    if polygon.plane.distance(space.eye) <= 0.0 {
+                        self.stats.world_backfacing += 1;
+                        continue;
+                    }
+                    build_record(
+                        &mut s.record,
+                        geometry,
+                        polygon,
+                        space.reversed(),
+                        &mut |i| (level_pos(i), geometry.positions[i as usize]),
+                    );
+                    let (clipped, edges) =
+                        s.clipper
+                            .clip(&s.record, RECORD + attrib_stride(geometry), &s.planes);
+                    if clipped.is_empty() {
+                        self.stats.world_outside += 1;
+                        continue;
+                    }
+                    emit(
+                        &mut out,
+                        view,
+                        clipped,
+                        edges,
+                        &self.window_lines[range(&visit.window)],
+                        geometry,
+                        world.geometry,
+                        PolygonKind::World,
+                        PolygonSource::World {
+                            sector: visit.sector,
+                            polygon: pi,
+                        },
+                        polygon.flags,
+                        group,
+                    );
+                    self.stats.world_drawn += 1;
+                    if polygon.flags.reflective() && depth < max_reflections {
+                        s.mirror_polygons.push((pi, out.polygons.len() - 1));
+                    }
+                }
+
+                if visit.depth < MAX_PORTAL_DEPTH {
+                    // Mirrors: each opens a window into this sector, reflected. Seen from here
+                    // they are front-facing convex outlines, just like portals.
+                    for &(pi, drawn) in &s.mirror_polygons {
+                        let polygon = &geometry.polygons[pi as usize];
+                        let w = &mut s.window;
+                        w.points.clear();
+                        w.points.extend(
+                            polygon
+                                .vertices()
+                                .map(|v| level_pos(geometry.vertex_positions[v])),
+                        );
+                        if space.reversed() {
+                            w.points.reverse();
+                        }
+                        let Some((window, nearest)) = open_window(
+                            &mut self.window_planes,
+                            &mut self.window_lines,
+                            w,
+                            view,
+                            &visit,
+                        ) else {
+                            continue;
+                        };
+                        let m = match self
+                            .mirrors
+                            .iter()
+                            .position(|m| m.plane == polygon.plane && m.parent == group)
+                        {
+                            Some(m) => m,
+                            None => {
+                                self.mirrors.push(Mirror {
+                                    plane: polygon.plane,
+                                    parent: group,
+                                    depth: depth + 1,
+                                    eye: reflect(&polygon.plane, space.eye),
+                                });
+                                self.mirrors.len() - 1
+                            }
+                        };
+                        out.polygons[drawn].reflection = Some(m as u32);
+                        s.reflected.push(Pending {
+                            sector: visit.sector,
+                            window,
+                            near: nearest < view.near,
+                            depth: visit.depth + 1,
+                            mirror: Some(m as u32),
+                        });
+                    }
+
+                    // Portals out of this sector, each clipped to the window to form a child
+                    // window.
+                    for p in sector.portals.clone() {
+                        let portal = &world.portals[p as usize];
+                        if !portal.flags.render_through()
+                            || portal.plane.distance(space.eye) <= ON_PORTAL
+                        {
+                            continue; // closed, facing away, or edge-on
+                        }
+                        let w = &mut s.window;
+                        w.points.clear();
+                        w.points
+                            .extend(portal.positions.iter().map(|&i| level_pos(i)));
+                        if space.reversed() {
+                            w.points.reverse();
+                        }
+                        let Some((window, nearest)) = open_window(
+                            &mut self.window_planes,
+                            &mut self.window_lines,
+                            w,
+                            view,
+                            &visit,
+                        ) else {
+                            continue;
+                        };
+                        s.pending.push(Pending {
+                            sector: portal.target,
+                            window,
+                            near: nearest < view.near,
+                            depth: visit.depth + 1,
+                            mirror: group,
+                        });
+                    }
+                }
+                self.visits.push(SectorVisit {
+                    sector: visit.sector,
+                    depth: visit.depth,
+                    near_clipped: visit.near,
+                    window: visit.window,
+                    mirror: visit.mirror,
+                });
+            }
+
+            // Next, every visit into the next mirror.
+            let Some(next) = s.reflected.iter().map(|p| p.mirror).min() else {
+                break;
+            };
+            let mut i = 0;
+            while i < s.reflected.len() {
+                if s.reflected[i].mirror == next {
+                    s.pending.push(s.reflected.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            group = next;
+        }
+
+        // Entities: cull by windows into any sector they touch, then clip to the frustum only.
+        // Once seen directly, and once in each mirror.
+        let near = ClipPlane::near(view.near);
+        for group in std::iter::once(None).chain((0..self.mirrors.len() as u32).map(Some)) {
+            let space = Space::of(direct, &self.mirrors, group);
+            for (ei, entity) in world.entities.iter().enumerate() {
+                let corners =
+                    box_corners(entity.bounds.min, entity.bounds.max).map(|c| space.to_clip(c));
+                let seen = entity.sectors.iter().any(|&sector| {
+                    self.visits
+                        .iter()
+                        .filter(|v| v.sector == sector && v.mirror == group)
+                        .any(|v| {
+                            self.window_planes[range(&v.window)]
+                                .iter()
+                                .all(|p| corners.iter().any(|&c| p.distance(c) >= 0.0))
+                        })
+                });
+                let frustum_all = frustum.iter().chain(std::iter::once(&near));
+                if !seen
+                    || frustum_all
+                        .clone()
+                        .any(|p| corners.iter().all(|&c| p.distance(c) < 0.0))
+                {
+                    self.stats.entities_culled += 1;
+                    continue;
+                }
+                s.planes.clear();
+                s.planes
+                    .extend(frustum_all.filter(|p| corners.iter().any(|&c| p.distance(c) < 0.0)));
+
+                let mesh = assets.mesh(entity.mesh);
+                let model = entity.transform();
+                // Model to clip with the eye offset folded in, for the same precision reason.
+                let model_to_view = Affine3A::from_mat3_translation(
+                    (space.linear() * Mat3A::from_quat(entity.rotation) * entity.scale).into(),
+                    space.to_clip(entity.position),
+                );
+                s.entity_view.clear();
+                s.entity_view.extend(
+                    mesh.positions
+                        .iter()
+                        .map(|&p| model_to_view.transform_point3(p)),
+                );
+                s.entity_world.clear();
+                s.entity_world
+                    .extend(mesh.positions.iter().map(|&p| model.transform_point3(p)));
+                let eye_model = model.inverse().transform_point3(space.eye);
+                let kind = if entity.kind == EntityKind::Actor {
+                    PolygonKind::Actor
+                } else {
+                    PolygonKind::Prop
+                };
+                for (pi, polygon) in mesh.polygons.iter().enumerate() {
+                    if polygon.plane.distance(eye_model) <= 0.0 {
+                        self.stats.entity_polygons_backfacing += 1;
+                        continue;
+                    }
+                    let (entity_view, entity_world) = (&s.entity_view, &s.entity_world);
+                    build_record(&mut s.record, mesh, polygon, space.reversed(), &mut |i| {
+                        (entity_view[i as usize], entity_world[i as usize])
+                    });
+                    let (clipped, edges) =
+                        s.clipper
+                            .clip(&s.record, RECORD + attrib_stride(mesh), &s.planes);
+                    if clipped.is_empty() {
+                        self.stats.entity_polygons_outside += 1;
+                        continue;
+                    }
+                    emit(
+                        &mut out,
+                        view,
+                        clipped,
+                        edges,
+                        &[], // entities are not clipped to portals: every edge between its endpoints
+                        mesh,
+                        entity.mesh,
+                        kind,
+                        PolygonSource::Entity {
+                            entity: ei as u32,
+                            polygon: pi as u32,
+                        },
+                        polygon.flags,
+                        group,
+                    );
+                }
+                self.stats.entities_drawn += 1;
+            }
+        }
+    }
+}
+
+/// Clips a portal's or mirror's outline (in `w.points`, clip space, counter-clockwise on
+/// screen) to the parent visit's window and appends the child window's planes and lines.
+/// Returns the child window and its nearest depth, or `None` if nothing is seen through it.
+fn open_window(
+    window_planes: &mut Vec<ClipPlane>,
+    window_lines: &mut Vec<EdgeLine>,
+    w: &mut WindowScratch,
+    view: &View,
+    parent: &Pending,
+) -> Option<(Range<u32>, f32)> {
+    w.record.clear();
+    w.record.extend(w.points.iter().flat_map(|p| p.to_array()));
+    w.planes.clear();
+    w.planes
+        .extend_from_slice(&window_planes[range(&parent.window)]);
+    // First, the line of each outline edge: the edge clipped exactly as the parent sector's
+    // walls are (window planes, then the near plane if the sector is near-clipped), so the
+    // wall sharing that edge ends on the same endpoints.
+    if parent.near {
+        w.planes.push(ClipPlane::near(view.near));
+    }
+    w.lines.clear();
+    w.lines.resize(w.points.len(), None);
+    let (clipped, edges) = w.clipper.clip(&w.record, 3, &w.planes);
+    for (i, edge) in edges.iter().enumerate() {
+        if let Edge::Input(e) = *edge {
+            let j = (i + 1) % edges.len();
+            let (a, b) = (
+                Vec3::from_slice(&clipped[i * 3..]),
+                Vec3::from_slice(&clipped[j * 3..]),
+            );
+            w.lines[e as usize] = Some(line_between(view, a, b));
+        }
+    }
+    if parent.near {
+        w.planes.pop();
+    }
+    // Then the window itself: the same clip without the near plane (the window must reach
+    // all the way to the eye).
+    let (clipped, edges) = w.clipper.clip(&w.record, 3, &w.planes);
+    if clipped.is_empty() {
+        return None;
+    }
+    w.window_points.clear();
+    w.window_points
+        .extend(clipped.chunks_exact(3).map(Vec3::from_slice));
+    w.window_edges.clear();
+    w.window_edges.extend_from_slice(edges);
+    if window_too_small(&w.window_points) {
+        return None;
+    }
+    // Window planes (and their lines) come from the edge sources: a parent plane is reused
+    // exactly, an outline edge's plane comes from its original corners. Never rebuilt from
+    // clipped points.
+    let first = window_planes.len() as u32;
+    let n = w.window_edges.len();
+    for i in 0..n {
+        let edge = w.window_edges[i];
+        if n > 1 && edge == w.window_edges[(i + n - 1) % n] {
+            continue; // consecutive edges on the same line
+        }
+        match edge {
+            Edge::Plane(k) => {
+                let k = parent.window.start as usize + k as usize;
+                window_planes.push(window_planes[k]);
+                window_lines.push(window_lines[k]);
+            }
+            Edge::Input(e) => {
+                let e = e as usize;
+                let (a, b) = (w.points[e], w.points[(e + 1) % w.points.len()]);
+                let normal = a.cross(b);
+                if normal.length() <= MIN_EDGE_ANGLE * a.length() * b.length() {
+                    continue; // seen edge-on: no reliable plane
+                }
+                let line = w.lines[e].unwrap_or_else(|| {
+                    line_between(view, w.window_points[i], w.window_points[(i + 1) % n])
+                });
+                window_planes.push(ClipPlane::through_eye(normal.normalize()));
+                window_lines.push(line);
+            }
+        }
+    }
+    let window = first..window_planes.len() as u32;
+    if window.len() < 3 {
+        window_planes.truncate(first as usize);
+        window_lines.truncate(first as usize);
+        return None;
+    }
+    // Everything beyond the outline is at least as deep as the outline itself.
+    let nearest = w
+        .window_points
+        .iter()
+        .map(|p| p.z)
+        .fold(f32::INFINITY, f32::min); // w = depth
+    Some((window, nearest))
+}
+
+fn range(r: &Range<u32>) -> Range<usize> {
+    r.start as usize..r.end as usize
+}
+
+fn attrib_stride(mesh: &Mesh) -> usize {
+    mesh.attribs.iter().map(|a| a.count as usize).sum()
+}
+
+/// Floats in a clip record before the attributes: clip-space x, y, w, then world x, y, z.
+const RECORD: usize = 6;
+
+/// Writes a polygon as interleaved records: clip-space x, y, w, world position, then
+/// attributes as f32. `position` gives a position index's clip and world coordinates.
+/// `reversed` walks the outline backwards (for polygons seen in a mirror).
+fn build_record(
+    record: &mut Vec<f32>,
+    mesh: &Mesh,
+    polygon: &Polygon,
+    reversed: bool,
+    position: &mut impl FnMut(u32) -> (Vec3, Vec3),
+) {
+    record.clear();
+    let vertices = polygon.vertices();
+    for k in 0..vertices.len() {
+        let v = if reversed {
+            vertices.end - 1 - k
+        } else {
+            vertices.start + k
+        };
+        let (clip, world) = position(mesh.vertex_positions[v]);
+        record.extend_from_slice(&clip.to_array());
+        record.extend_from_slice(&world.to_array());
+        for a in &mesh.attribs {
+            let n = a.count as usize;
+            record.extend((v * n..(v + 1) * n).map(|i| a.data.get_f32(i)));
+        }
+    }
+}
+
+/// Divides a clip-space point by w: its exact framebuffer position. The one place positions
+/// are projected, so a point shared by several polygons (or a portal line and a wall)
+/// projects to the bit-identical position everywhere.
+fn to_screen(view: &View, p: Vec3) -> (f32, f32) {
+    let vp = view.viewport;
+    let (half_w, half_h) = (vp.width as f32 / 2.0, vp.height as f32 / 2.0);
+    let (x, y) = (
+        view.center.x + (p.x / p.z) * half_w,
+        view.center.y - (p.y / p.z) * half_h,
+    );
+    let (left, top) = (vp.x as f32, vp.y as f32);
+    let (right, bottom) = (left + vp.width as f32, top + vp.height as f32);
+    debug_assert!(
+        x >= left - MAX_OVERSHOOT
+            && x <= right + MAX_OVERSHOOT
+            && y >= top - MAX_OVERSHOOT
+            && y <= bottom + MAX_OVERSHOOT,
+        "clipped vertex ({x}, {y}) is outside the viewport by more than rounding"
+    );
+    // Clipping leaves points inside the viewport up to float rounding; the clamp removes
+    // that, so rows and spans derived from these positions are always in bounds.
+    (x.clamp(left, right), y.clamp(top, bottom))
+}
+
+/// The screen line through two clip-space points.
+fn line_between(view: &View, a: Vec3, b: Vec3) -> EdgeLine {
+    let ((x0, y0), (x1, y1)) = (to_screen(view, a), to_screen(view, b));
+    EdgeLine { x0, y0, x1, y1 }
+}
+
+/// The viewport border lines, matching `frustum_planes` in order.
+fn border_lines(view: &View) -> [EdgeLine; 4] {
+    let vp = view.viewport;
+    let (l, t) = (vp.x as f32, vp.y as f32);
+    let (r, b) = (l + vp.width as f32, t + vp.height as f32);
+    [
+        EdgeLine::between((l, t), (l, b)), // x = -w: left
+        EdgeLine::between((r, t), (r, b)), // x = w: right
+        EdgeLine::between((l, b), (r, b)), // y = -w: bottom
+        EdgeLine::between((l, t), (r, t)), // y = w: top
+    ]
+}
+
+/// Projects clipped records (exactly, no rounding) and appends them as one output polygon.
+/// An edge that lies on one of the clip planes with a line in `plane_lines` (portal edges
+/// and viewport borders, indexed like the planes) carries that line; see [`EdgeLine`].
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    out: &mut Out,
+    view: &View,
+    records: &[f32],
+    edges: &[Edge],
+    plane_lines: &[EdgeLine],
+    mesh: &Mesh,
+    id: MeshId,
+    kind: PolygonKind,
+    source: PolygonSource,
+    flags: PolyFlags,
+    mirror: Option<u32>,
+) {
+    let stride = RECORD + attrib_stride(mesh);
+    let first_vertex = out.vertices.len() as u32;
+    let first_attrib = out.attributes.len() as u32;
+    for (r, edge) in records.chunks_exact(stride).zip(edges) {
+        let (x, y) = to_screen(view, Vec3::from_slice(r));
+        out.vertices.push(ScreenVertex {
+            x,
+            y,
+            w: 1.0 / r[2],
+        });
+        out.edge_lines.push(match *edge {
+            Edge::Plane(k) => plane_lines.get(k as usize).copied(),
+            Edge::Input(_) => None,
+        });
+        out.world_positions.push(Vec3::from_slice(&r[3..6]));
+        out.attributes.extend_from_slice(&r[RECORD..]);
+    }
+    out.polygons.push(ViewPolygon {
+        first_vertex,
+        vertex_count: (out.vertices.len() as u32 - first_vertex) as u16,
+        first_attrib,
+        attrib_stride: (stride - RECORD) as u16,
+        mesh: id,
+        kind,
+        source,
+        flags,
+        mirror,
+        reflection: None,
+    });
+}
+
+/// The four side planes of the view frustum in clip space: x = -w, x = w, y = -w, y = w.
+fn frustum_planes() -> [ClipPlane; 4] {
+    [
+        ClipPlane::frustum_x(-1.0),
+        ClipPlane::frustum_x(1.0),
+        ClipPlane::frustum_y(-1.0),
+        ClipPlane::frustum_y(1.0),
+    ]
+}
+
+/// True if a clipped window subtends less than `MIN_EDGE_ANGLE` in every direction: too
+/// small to see anything through.
+fn window_too_small(points: &[Vec3]) -> bool {
+    (0..points.len()).all(|i| {
+        let (a, b) = (points[i], points[(i + 1) % points.len()]);
+        a.cross(b).length() < MIN_EDGE_ANGLE * a.length() * b.length()
+    })
+}
+
+fn outline<'a>(geometry: &'a Mesh, portal: &'a Portal) -> impl Iterator<Item = Vec3> + Clone + 'a {
+    portal
+        .positions
+        .iter()
+        .map(|&i| geometry.positions[i as usize])
+}
+
+fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {
+    std::array::from_fn(|i| {
+        Vec3::new(
+            if i & 1 == 0 { min.x } else { max.x },
+            if i & 2 == 0 { min.y } else { max.y },
+            if i & 4 == 0 { min.z } else { max.z },
+        )
+    })
+}
+
+/// True if `p`, on the plane of a convex polygon, lies inside its outline or on its edge.
+fn inside_outline(points: impl Iterator<Item = Vec3> + Clone, normal: Vec3, p: Vec3) -> bool {
+    let pts: Vec<Vec3> = points.collect();
+    (0..pts.len()).all(|i| {
+        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+        (b - a).cross(p - a).dot(normal) >= -ON_PORTAL * (b - a).length()
+    })
+}

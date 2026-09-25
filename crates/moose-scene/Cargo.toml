@@ -1,0 +1,9 @@
+[package]
+name = "moose-scene"
+description = "Runtime world state and cameras for the Moose engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+glam.workspace = true

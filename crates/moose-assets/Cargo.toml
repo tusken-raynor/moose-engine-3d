@@ -1,0 +1,8 @@
+[package]
+name = "moose-assets"
+description = "Asset formats and in-memory mesh/level types for the Moose engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam.workspace = true

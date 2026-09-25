@@ -1,0 +1,8 @@
+[package]
+name = "moose-present"
+description = "Presentation for the Moose engine: a window showing the framebuffer, frame pacing and input"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+minifb = "0.28"

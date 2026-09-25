@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="960"><rect width="100%" height="100%" fill="#fff"/>
+<polygon points="60.0,60.0 60.0,300.0 300.0,300.0 300.0,210.0 300.0,150.0 300.0,60.0" fill="#f3dcc4" stroke="#888"/>
+<polygon points="300.0,150.0 300.0,210.0 660.0,210.0 660.0,150.0" fill="#dfe8df" stroke="#888"/>
+<polygon points="660.0,60.0 660.0,150.0 660.0,210.0 660.0,300.0 900.0,300.0 900.0,60.0" fill="#d4def0" stroke="#888"/>
+<line x1="300.0" y1="150.0" x2="300.0" y2="210.0" stroke="#d00" stroke-width="5" stroke-dasharray="6,4"/>
+<line x1="300.0" y1="150.0" x2="300.0" y2="210.0" stroke="#d00" stroke-width="5" stroke-dasharray="6,4"/>
+<line x1="660.0" y1="150.0" x2="660.0" y2="210.0" stroke="#d00" stroke-width="5" stroke-dasharray="6,4"/>
+<line x1="660.0" y1="150.0" x2="660.0" y2="210.0" stroke="#d00" stroke-width="5" stroke-dasharray="6,4"/>
+<circle cx="120.0" cy="180.0" r="7" fill="#2a2"/><line x1="120.0" y1="180.0" x2="150.0" y2="180.0" stroke="#2a2" stroke-width="3"/>
+<text x="90.0" y="204.0" font-size="13" font-family="Helvetica">spawn</text>
+<polygon points="255.0,90.0 255.0,120.0 225.0,120.0 225.0,90.0" fill="#8a5a2b" fill-opacity="0.8" stroke="#000"/>
+<text x="210.0" y="139.0" font-size="13" font-family="Helvetica">crate_a1</text>
+<polygon points="250.6,86.6 258.4,115.6 229.4,123.4 221.6,94.4" fill="#d09050" fill-opacity="0.8" stroke="#000"/>
+<text x="210.0" y="81.0" font-size="13" font-family="Helvetica">crate_a2_stacked</text>
+<polygon points="155.5,234.5 170.5,260.5 144.5,275.5 129.5,249.5" fill="#8a5a2b" fill-opacity="0.8" stroke="#000"/>
+<text x="120.0" y="289.0" font-size="13" font-family="Helvetica">crate_a3</text>
+<polygon points="492.2,171.6 497.4,201.2 467.8,206.4 462.6,176.8" fill="#8a5a2b" fill-opacity="0.8" stroke="#000"/>
+<text x="450.0" y="223.0" font-size="13" font-family="Helvetica">crate_hall</text>
+<polygon points="780.0,158.8 801.2,180.0 780.0,201.2 758.8,180.0" fill="#8a5a2b" fill-opacity="0.8" stroke="#000"/>
+<text x="750.0" y="214.0" font-size="13" font-family="Helvetica">crate_b1</text>
+<polygon points="855.0,255.0 855.0,285.0 825.0,285.0 825.0,255.0" fill="#8a5a2b" fill-opacity="0.8" stroke="#000"/>
+<text x="810.0" y="304.0" font-size="13" font-family="Helvetica">crate_b2</text>
+<text x="75.0" y="81.0" font-size="17" font-family="Helvetica" fill="#555">room_a</text>
+<text x="390.0" y="81.0" font-size="17" font-family="Helvetica" fill="#555">hallway</text>
+<text x="675.0" y="81.0" font-size="17" font-family="Helvetica" fill="#555">room_b</text>
+<text x="20" y="450" font-size="14" font-family="Helvetica">top-down view: -Z to the right, +X down; red dashes = portals; light crate = stacked</text></svg>
