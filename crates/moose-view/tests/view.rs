@@ -151,7 +151,8 @@ fn assert_invariants(out: &ViewGeometry, cam: &Camera, what: &str) {
                 view.center.x + view.focal * q.x / -q.z,
                 view.center.y - view.focal * q.y / -q.z,
             );
-            let tol = 1e-3 * (1.0 + x.abs().max(y.abs()));
+            // Float error of clipping, reflecting and projecting: a hundredth of a pixel.
+            let tol = 1e-2 + 1e-5 * x.abs().max(y.abs());
             assert!(
                 (x - v.x).abs() < tol
                     && (y - v.y).abs() < tol
@@ -182,12 +183,15 @@ fn assert_invariants(out: &ViewGeometry, cam: &Camera, what: &str) {
     }
     for p in &out.polygons {
         assert!(p.vertex_count >= 3, "{what}: degenerate polygon");
-        assert_eq!(p.attrib_stride, 3, "{what}: color only");
+        // Color first (the test levels' meshes, the crate and the ball), maybe followed by uv
+        // (levels) or a normal (the ball).
+        let stride = p.attrib_stride as usize;
+        assert!(matches!(stride, 3 | 5 | 6), "{what}: stride {stride}");
         // Colors are u8 values carried as f32; clipping only interpolates, so they stay in range.
         assert!(
             out.attributes[p.attributes()]
-                .iter()
-                .all(|&c| (-1e-3..=255.001).contains(&c)),
+                .chunks_exact(stride)
+                .all(|v| v[..3].iter().all(|&c| (-1e-3..=255.001).contains(&c))),
             "{what}: color out of range"
         );
     }

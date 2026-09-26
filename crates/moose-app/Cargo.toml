@@ -15,4 +15,4 @@ moose-view = { path = "../moose-view" }
 moose-raster = { path = "../moose-raster" }
 moose-present = { path = "../moose-present" }
 glam.workspace = true
-png = "0.18"
+png.workspace = true

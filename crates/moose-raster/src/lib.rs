@@ -12,4 +12,9 @@ pub mod shaders;
 mod render;
 
 pub use render::{LayoutError, RasterConfig, RasterPath, RenderStats, Renderer, Surface, Target};
-pub use shader::{AttribDesc, Format, Shader, ShaderId, Uniforms};
+pub use shader::{
+    AttribDesc, F32s, Fill, Format, I16s, I32s, LANES, Pixels, Shader, ShaderId, U32s, Uniforms,
+    high_byte, widen,
+};
+/// The portable SIMD crate the lane types come from, for shaders written elsewhere.
+pub use wide;

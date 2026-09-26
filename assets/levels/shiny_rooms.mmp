@@ -36,9 +36,10 @@ vertices 28
    26      -1.00     4.00   -12.00
    27      -4.00     4.00   -12.00
 
-attributes 1
+attributes 2
 #  id  name    format  count
    0   color   u8      3
+   1   uv      f32     2
 
 values color 21
 #  id   values
@@ -64,6 +65,37 @@ values color 21
    19    108  102   92
    20     28   34   46
 
+values uv 28
+#  id   values
+   0     -2.0000   4.0000
+   1      2.0000   4.0000
+   2      2.0000   0.0000
+   3      0.5000   0.0000
+   4     -0.5000   0.0000
+   5     -2.0000   0.0000
+   6     -2.0000  -2.0000
+   7      2.0000  -2.0000
+   8      0.0000  -2.0000
+   9      4.0000  -2.0000
+   10     4.0000  -0.0000
+   11     0.0000  -0.0000
+   12    -0.5000  -1.5000
+   13    -0.5000  -2.0000
+   14     0.5000  -2.0000
+   15     0.5000  -1.5000
+   16     0.5000  -6.0000
+   17    -0.5000  -6.0000
+   18    -6.0000  -0.0000
+   19    -6.0000  -1.5000
+   20     0.0000  -1.5000
+   21    -2.0000  -6.0000
+   22     2.0000  -6.0000
+   23     2.0000 -10.0000
+   24    -2.0000 -10.0000
+   25   -10.0000  -0.0000
+   26   -10.0000  -2.0000
+   27    -6.0000  -2.0000
+
 sectors 3
 #  id  name      first_surface  surface_count
    0   room_a    0              9
@@ -73,31 +105,31 @@ sectors 3
 surfaces 24
 #  id  sector  adjoin  flags  nverts  vert[:attr ...] ...   (flags: 0x1 = reflective; attr = row in each values table, in declaration order; portals list verts only)
    # --- sector 0: room_a
-   0   0       -1      0x1    6       0:18 1:18 2:18 3:18 4:18 5:18      # floor (reflective)
-   1   0       -1      0x1    6       6:19 7:19 8:19 9:19 10:19 11:19    # ceiling (reflective)
-   2   0       -1      0x0    4       11:2 10:2 1:3 0:3                  # far wall
-   3   0       -1      0x0    4       6:4 11:4 0:5 5:5                   # left wall (-X)
-   4   0       -1      0x0    4       2:5 1:5 10:4 9:4                   # right wall (+X)
-   5   0       -1      0x0    5       5:3 4:3 12:6 7:2 6:2               # doorway wall, -X pillar
-   6   0       -1      0x0    5       3:3 2:3 9:2 8:2 13:6               # doorway wall, +X pillar
-   7   0       -1      0x0    4       12:6 13:6 8:2 7:2                  # doorway wall, lintel
+   0   0       -1      0x1    6       0:18:0 1:18:1 2:18:2 3:18:3 4:18:4 5:18:5 # floor (reflective)
+   1   0       -1      0x1    6       6:19:5 7:19:4 8:19:3 9:19:2 10:19:1 11:19:0 # ceiling (reflective)
+   2   0       -1      0x0    4       11:2:6 10:2:7 1:3:2 0:3:5          # far wall
+   3   0       -1      0x0    4       6:4:8 11:4:9 0:5:10 5:5:11         # left wall (-X)
+   4   0       -1      0x0    4       2:5:11 1:5:10 10:4:9 9:4:8         # right wall (+X)
+   5   0       -1      0x0    5       5:3:5 4:3:4 12:6:12 7:2:13 6:2:6   # doorway wall, -X pillar
+   6   0       -1      0x0    5       3:3:3 2:3:2 9:2:7 8:2:14 13:6:15   # doorway wall, +X pillar
+   7   0       -1      0x0    4       12:6:12 13:6:15 8:2:14 7:2:13      # doorway wall, lintel
    8   0       0       0x0    4       4 3 13 12                          # portal to hallway
    # --- sector 1: hallway
-   9   1       -1      0x1    4       4:7 3:7 14:7 15:7                  # floor (reflective)
-   10  1       -1      0x0    4       16:8 17:8 13:8 12:8                # ceiling
-   11  1       -1      0x0    4       4:9 15:9 16:10 12:10               # left wall (-X)
-   12  1       -1      0x0    4       13:10 17:10 14:9 3:9               # right wall (+X)
+   9   1       -1      0x1    4       4:7:4 3:7:3 14:7:16 15:7:17        # floor (reflective)
+   10  1       -1      0x0    4       16:8:17 17:8:16 13:8:3 12:8:4      # ceiling
+   11  1       -1      0x0    4       4:9:11 15:9:18 16:10:19 12:10:20   # left wall (-X)
+   12  1       -1      0x0    4       13:10:20 17:10:19 14:9:18 3:9:11   # right wall (+X)
    13  1       1       0x0    4       12 13 3 4                          # portal to room_a
    14  1       2       0x0    4       15 14 17 16                        # portal to room_b
    # --- sector 2: room_b
-   15  2       -1      0x1    6       18:20 15:20 14:20 19:20 20:20 21:20 # floor (reflective)
-   16  2       -1      0x0    6       22:12 23:12 24:12 25:12 26:12 27:12 # ceiling
-   17  2       -1      0x0    4       21:13 20:13 23:14 22:14            # far wall
-   18  2       -1      0x0    4       18:15 21:15 22:16 27:16            # left wall (-X)
-   19  2       -1      0x0    4       24:16 23:16 20:15 19:15            # right wall (+X)
-   20  2       -1      0x0    5       27:14 26:14 16:17 15:13 18:13      # doorway wall, -X pillar
-   21  2       -1      0x0    5       17:17 25:14 24:14 19:13 14:13      # doorway wall, +X pillar
-   22  2       -1      0x0    4       26:14 25:14 17:17 16:17            # doorway wall, lintel
+   15  2       -1      0x1    6       18:20:21 15:20:17 14:20:16 19:20:22 20:20:23 21:20:24 # floor (reflective)
+   16  2       -1      0x0    6       22:12:24 23:12:23 24:12:22 25:12:16 26:12:17 27:12:21 # ceiling
+   17  2       -1      0x0    4       21:13:5 20:13:2 23:14:7 22:14:6    # far wall
+   18  2       -1      0x0    4       18:15:18 21:15:25 22:16:26 27:16:27 # left wall (-X)
+   19  2       -1      0x0    4       24:16:27 23:16:26 20:15:25 19:15:18 # right wall (+X)
+   20  2       -1      0x0    5       27:14:6 26:14:13 16:17:12 15:13:4 18:13:5 # doorway wall, -X pillar
+   21  2       -1      0x0    5       17:17:15 25:14:14 24:14:7 19:13:2 14:13:3 # doorway wall, +X pillar
+   22  2       -1      0x0    4       26:14:13 25:14:14 17:17:15 16:17:12 # doorway wall, lintel
    23  2       3       0x0    4       16 17 14 15                        # portal to hallway
 
 adjoins 4
@@ -107,7 +139,7 @@ adjoins 4
    2   14       3       0x3
    3   23       2       0x3
 
-entities 7
+entities 8
 #  id  kind   sector  model      x       y       z       pitch  yaw   roll  scale  name
    0   spawn  0       -          0.00    0.00    6.00    0      0     0     1.00   player_start
    1   prop   0       crate.obj  -2.50   0.00    2.00    0      0     0     1.00   crate_a1
@@ -116,3 +148,4 @@ entities 7
    4   prop   1       crate.obj  0.30    0.00    -6.00   0      10    0     1.00   crate_hall
    5   prop   2       crate.obj  0.00    0.00    -16.00  0      45    0     1.00   crate_b1
    6   prop   2       crate.obj  3.00    0.00    -18.00  0      0     0     1.00   crate_b2
+   7   prop   2       ball.obj   -1.50   1.50    -15.00  0      0     0     1.00   mirror_ball

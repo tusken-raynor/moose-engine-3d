@@ -141,6 +141,33 @@ fn reference(geometry: &ViewGeometry, vp: Viewport) -> Vec<RefPixel> {
     reference_with(geometry, vp, |_, _, _| None)
 }
 
+/// The pixel whose color pixel `x` of a polygon's row shows (the row crossing it at `xs`,
+/// with w `ws`): itself, or for polygons seen in a mirror, which are shaded at half rate
+/// with sample intervals twice as long, the even pixel of its pair counted from its sample
+/// interval's start. The row's last pixel always shows itself.
+fn shown_pixel(p: &moose_view::ViewPolygon, x: i32, xs: (f32, f32), ws: (f32, f32)) -> i32 {
+    let (row_x0, last) = (pixel_edge(xs.0), pixel_edge(xs.1) - 1);
+    if p.mirror.is_none() || x == last {
+        return x;
+    }
+    let c = RasterConfig::default();
+    let n = moose_raster::shader::choose_step(
+        ws.0,
+        ws.1,
+        xs.1 - xs.0,
+        c.step_threshold,
+        c.min_step as i32,
+    ) * 2;
+    let start = row_x0 + (x - row_x0) / n * n;
+    x - (x - start) % 2
+}
+
+/// The perspective-correct interpolation parameter at pixel `x`'s center.
+fn alpha_at(x: i32, xs: (f32, f32), (wl, wr): (f32, f32)) -> f32 {
+    let s = ((x as f32 + 0.5 - xs.0) / (xs.1 - xs.0)).clamp(0.0, 1.0);
+    s * wr / ((1.0 - s) * wl + s * wr)
+}
+
 /// Covered pixels of a polygon on a row, with its exact w, color and world position at
 /// each pixel center.
 fn polygon_row(
@@ -189,7 +216,8 @@ fn polygon_row(
     for x in pixel_edge(xl)..pixel_edge(xr) {
         let s = ((x as f32 + 0.5 - xl) / (xr - xl)).clamp(0.0, 1.0);
         let alpha = s * wr / ((1.0 - s) * wl + s * wr);
-        let ch = |k: usize| (cl[k] + (cr[k] - cl[k]) * alpha).clamp(0.0, 255.0) as u32;
+        let color_alpha = alpha_at(shown_pixel(p, x, (xl, xr), (wl, wr)), (xl, xr), (wl, wr));
+        let ch = |k: usize| (cl[k] + (cr[k] - cl[k]) * color_alpha).clamp(0.0, 255.0) as u32;
         each(
             x as usize,
             wl + (wr - wl) * s,
@@ -260,7 +288,10 @@ fn reference_with(
                 let w = wl + (wr - wl) * s;
                 let i = row as usize * w_px + x as usize;
                 let alpha = s * wr / ((1.0 - s) * wl + s * wr);
-                let ch = |k: usize| (cl[k] + (cr[k] - cl[k]) * alpha).clamp(0.0, 255.0) as u32;
+                let color_alpha =
+                    alpha_at(shown_pixel(p, x, (xl, xr), (wl, wr)), (xl, xr), (wl, wr));
+                let ch =
+                    |k: usize| (cl[k] + (cr[k] - cl[k]) * color_alpha).clamp(0.0, 255.0) as u32;
                 let c = ch(0) << 16 | ch(1) << 8 | ch(2);
                 let p = &mut px[i];
                 if w > p.w {
@@ -311,7 +342,7 @@ fn channel_diff(a: u32, b: u32) -> u32 {
 /// Test-only shader that writes the polygon's number (from its uniforms) instead of a
 /// color, so visibility can be compared exactly.
 mod id_shader {
-    use moose_raster::shader::{AttribDesc, Shader, Uniforms};
+    use moose_raster::shader::{AttribDesc, Pixels, Shader, U32s, Uniforms};
     moose_raster::varyings! { fixed32 {} fixed16 {} float {} }
     pub struct IdShader;
     impl Shader for IdShader {
@@ -319,8 +350,15 @@ mod id_shader {
         type Fixed16 = Fixed16;
         type Floats = Floats;
         const LAYOUT: &'static [AttribDesc] = LAYOUT;
-        fn shade(_: &Fixed32, _: &Fixed16, _: &Floats, uni: &Uniforms) -> u32 {
-            uni.values[0] as u32
+        fn shade(
+            _: &Fixed32,
+            _: &Fixed16,
+            _: &Floats,
+            uni: &Uniforms,
+            _: &moose_assets::Texture,
+            _: Pixels,
+        ) -> U32s {
+            U32s::splat(uni.values[0] as u32)
         }
     }
 }
@@ -347,6 +385,7 @@ fn render_ids(
         Surface {
             shader: id,
             uniforms,
+            texture: None,
             path_override: if p.kind == PolygonKind::World {
                 None
             } else {
@@ -478,12 +517,19 @@ fn threads_and_bands_do_not_change_the_image() {
             )
         });
         for band_rows in [1, 7, 16, 64, 1000] {
-            let config = RasterConfig {
-                band_rows,
-                ..RasterConfig::default()
-            };
-            let img = many.install(|| render(&mut renderer(config), &out, &assets, VP, None));
-            assert!(img == base, "band_rows {band_rows} changed the image");
+            // Setup split across threads (forced, for these small frames) or not.
+            for parallel_setup in [0, usize::MAX] {
+                let config = RasterConfig {
+                    band_rows,
+                    parallel_setup,
+                    ..RasterConfig::default()
+                };
+                let img = many.install(|| render(&mut renderer(config), &out, &assets, VP, None));
+                assert!(
+                    img == base,
+                    "band_rows {band_rows}, parallel_setup {parallel_setup} changed the image"
+                );
+            }
         }
     }
 }
@@ -545,7 +591,7 @@ fn splitscreen_viewports_draw_only_their_own_pixels() {
 
 #[test]
 fn layout_errors_name_the_missing_attribute() {
-    use moose_raster::shader::{AttribDesc, Shader, Uniforms};
+    use moose_raster::shader::{AttribDesc, Pixels, Shader, U32s, Uniforms};
     mod uv_shader {
         moose_raster::varyings! { fixed32 { uv: 2 } fixed16 {} float {} }
     }
@@ -555,8 +601,15 @@ fn layout_errors_name_the_missing_attribute() {
         type Fixed16 = uv_shader::Fixed16;
         type Floats = uv_shader::Floats;
         const LAYOUT: &'static [AttribDesc] = uv_shader::LAYOUT;
-        fn shade(_: &Self::Fixed32, _: &Self::Fixed16, _: &Self::Floats, _: &Uniforms) -> u32 {
-            0
+        fn shade(
+            _: &Self::Fixed32,
+            _: &Self::Fixed16,
+            _: &Self::Floats,
+            _: &Uniforms,
+            _: &moose_assets::Texture,
+            _: Pixels,
+        ) -> U32s {
+            U32s::splat(0)
         }
     }
     let (world, assets) = world();
@@ -866,4 +919,239 @@ fn fresnel_floors_match_the_reference() {
         );
         assert!(worst[k] <= 24, "worst difference {}", worst[k]);
     }
+}
+
+#[test]
+fn shaders_see_their_screen_pixel() {
+    // A shader writing its own framebuffer coordinates: every drawn pixel must name
+    // itself, in an offset viewport, through every path (world spans, props, per-pixel
+    // actors, translucent blending at alpha 1).
+    use moose_raster::shader::{AttribDesc, Pixels, Shader, U32s, Uniforms};
+    mod coords {
+        moose_raster::varyings! { fixed32 {} fixed16 {} float {} }
+    }
+    struct Coords;
+    impl Shader for Coords {
+        type Fixed32 = coords::Fixed32;
+        type Fixed16 = coords::Fixed16;
+        type Floats = coords::Floats;
+        const LAYOUT: &'static [AttribDesc] = coords::LAYOUT;
+        fn shade(
+            _: &coords::Fixed32,
+            _: &coords::Fixed16,
+            _: &coords::Floats,
+            _: &Uniforms,
+            _: &moose_assets::Texture,
+            at: Pixels,
+        ) -> U32s {
+            let x: U32s = moose_raster::wide::bytemuck::cast(at.x_lanes());
+            x | U32s::splat((at.y as u32) << 12)
+        }
+    }
+    struct CoordsTranslucent;
+    impl Shader for CoordsTranslucent {
+        type Fixed32 = coords::Fixed32;
+        type Fixed16 = coords::Fixed16;
+        type Floats = coords::Floats;
+        const LAYOUT: &'static [AttribDesc] = coords::LAYOUT;
+        const TRANSLUCENT: bool = true;
+        fn shade(
+            a: &coords::Fixed32,
+            b: &coords::Fixed16,
+            c: &coords::Floats,
+            u: &Uniforms,
+            t: &moose_assets::Texture,
+            at: Pixels,
+        ) -> U32s {
+            Coords::shade(a, b, c, u, t, at) | U32s::splat(0xFF00_0000)
+        }
+    }
+    let (world, assets) = world();
+    let mut out = ViewGeometry::new();
+    let mut r = Renderer::new(RasterConfig::default());
+    let (opaque, translucent) = (
+        r.register_shader::<Coords>(),
+        r.register_shader::<CoordsTranslucent>(),
+    );
+    let (w, h) = (400u32, 300u32);
+    let vp = Viewport {
+        x: 37,
+        y: 53,
+        width: 320,
+        height: 180,
+    };
+    let mut drawn = 0;
+    for (i, cam) in random_views(&world, 40, 57, vp).into_iter().enumerate() {
+        out.build(&world, &assets, &cam.view());
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut target = Target {
+            pixels: &mut pixels,
+            width: w,
+            height: h,
+        };
+        r.render(&mut target, vp, &out, &assets, |p| {
+            let mut s = Surface::new(if is_entity(p) && i % 2 == 0 {
+                translucent
+            } else {
+                opaque
+            });
+            if is_entity(p) && i % 3 == 0 {
+                s.path_override = Some(RasterPath::PerPixel);
+            }
+            s
+        })
+        .unwrap();
+        for y in vp.y..vp.y + vp.height {
+            for x in vp.x..vp.x + vp.width {
+                let got = pixels[(y * w + x) as usize];
+                if got != RasterConfig::default().background {
+                    assert_eq!(got & 0xFF_FFFF, x | y << 12, "view {i}: pixel ({x}, {y})");
+                    drawn += 1;
+                }
+            }
+        }
+    }
+    assert!(drawn > 40 * 320 * 180 * 9 / 10);
+}
+
+/// A polygon's exact (perspective-correct) attribute values at each covered pixel's center
+/// on `row`, with the same coverage rule as the renderer.
+fn polygon_row_attributes(
+    geometry: &ViewGeometry,
+    p: &moose_view::ViewPolygon,
+    row: i32,
+    mut each: impl FnMut(i32, &[f32]),
+) {
+    let verts = &geometry.vertices[p.vertices()];
+    let lines = &geometry.edge_lines[p.vertices()];
+    let attrs = &geometry.attributes[p.attributes()];
+    let (n, stride) = (verts.len(), p.attrib_stride as usize);
+    let (mut left, mut right): (Crossing, Crossing) = (None, None);
+    for i in 0..n {
+        let (a, c) = (verts[i], verts[(i + 1) % n]);
+        if row < pixel_edge(a.y.min(c.y)) || row >= pixel_edge(a.y.max(c.y)) {
+            continue;
+        }
+        let x = lines[i]
+            .unwrap_or(EdgeLine::between((a.x, a.y), (c.x, c.y)))
+            .x_at_row(row);
+        if c.y > a.y {
+            if left.is_none_or(|(_, l)| x > l) {
+                left = Some((i, x));
+            }
+        } else if right.is_none_or(|(_, r)| x < r) {
+            right = Some((i, x));
+        }
+    }
+    let (Some((li, xl)), Some((ri, xr))) = (left, right) else {
+        return;
+    };
+    let cross = |i: usize| {
+        let (a, c) = (verts[i], verts[(i + 1) % n]);
+        let t = ((row as f32 + 0.5 - a.y) / (c.y - a.y)).clamp(0.0, 1.0);
+        let alpha = t * c.w / ((1.0 - t) * a.w + t * c.w);
+        let j = (i + 1) % n;
+        let v: Vec<f32> = (0..stride)
+            .map(|k| {
+                attrs[i * stride + k] + (attrs[j * stride + k] - attrs[i * stride + k]) * alpha
+            })
+            .collect();
+        (a.w + (c.w - a.w) * t, v)
+    };
+    let ((wl, vl), (wr, vr)) = (cross(li), cross(ri));
+    let mut v = vec![0.0; stride];
+    for x in pixel_edge(xl)..pixel_edge(xr) {
+        let alpha = alpha_at(x, (xl, xr), (wl, wr));
+        for k in 0..stride {
+            v[k] = vl[k] + (vr[k] - vl[k]) * alpha;
+        }
+        each(x, &v);
+    }
+}
+
+#[test]
+fn textured_floors_show_the_texel_under_each_pixel() {
+    // Shiny floors without their reflections (0 bounces) drawn with the plain textured
+    // shader: every floor pixel shows the texel at its exact perspective-correct uv, or
+    // (where the per-pixel interpolation between sample points lands near a texel edge) a
+    // neighboring one.
+    let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    let level = assets.load_level("shiny_rooms.mmp").unwrap();
+    let world = World::new(level, &assets);
+    let texture = assets.load_texture("test_floor.png").unwrap();
+    let mut r = renderer(RasterConfig::default());
+    let textured = r.register_shader::<moose_raster::shaders::TexturedNearest>();
+    let mut out = ViewGeometry::new();
+    out.config.max_reflections = 0;
+    let floor = |p: &moose_view::ViewPolygon| p.flags.reflective();
+    let tex = assets.texture(texture);
+    let (mut exact, mut near, mut total) = (0usize, 0usize, 0usize);
+    for cam in random_views(&world, 60, 61, VP) {
+        out.build(&world, &assets, &cam.view());
+        let mut got = vec![0u32; (VP.width * VP.height) as usize];
+        let mut target = Target {
+            pixels: &mut got,
+            width: VP.width,
+            height: VP.height,
+        };
+        r.render(&mut target, VP, &out, &assets, |p| {
+            if floor(p) {
+                Surface {
+                    texture: Some(texture),
+                    ..Surface::new(textured)
+                }
+            } else {
+                Surface::new(moose_raster::ShaderId(0))
+            }
+        })
+        .unwrap();
+        let owners = reference(&out, VP);
+        for (index, p) in out.polygons.iter().enumerate() {
+            if !floor(p) {
+                continue;
+            }
+            for row in 0..VP.height as i32 {
+                // Each covered pixel's exact uv (color first, then uv).
+                let mut uvs: Vec<(i32, f32, f32)> = Vec::new();
+                polygon_row_attributes(&out, p, row, |x, v| uvs.push((x, v[3], v[4])));
+                for (k, &(x, u, v)) in uvs.iter().enumerate() {
+                    let i = (row as u32 * VP.width + x as u32) as usize;
+                    if owners[i].polygon != index as u32 + 1 {
+                        continue; // hidden
+                    }
+                    total += 1;
+                    let texel =
+                        |tx: i32, ty: i32| tex.texel(tx as u32 & 63, ty as u32 & 63) & 0xFF_FFFF;
+                    let (tx, ty) = ((u * 64.0).floor() as i32, (v * 64.0).floor() as i32);
+                    if got[i] == texel(tx, ty) {
+                        exact += 1;
+                        continue;
+                    }
+                    // Otherwise a texel within the pixel's footprint (the uvs of its
+                    // neighbors on the row) or one beyond: far away, one pixel spans
+                    // several texels.
+                    let around = &uvs[k.saturating_sub(1)..(k + 2).min(uvs.len())];
+                    let range = |f: fn(&(i32, f32, f32)) -> f32| {
+                        let lo = around.iter().map(f).fold(f32::INFINITY, f32::min);
+                        let hi = around.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
+                        ((lo * 64.0).floor() as i32 - 1)..=((hi * 64.0).floor() as i32 + 1)
+                    };
+                    let (us, vs) = (range(|e| e.1), range(|e| e.2));
+                    assert!(
+                        vs.clone()
+                            .any(|ty| us.clone().any(|tx| got[i] == texel(tx, ty))),
+                        "pixel ({x}, {row}): {:06x} is not within its footprint, texels {us:?} x {vs:?}",
+                        got[i]
+                    );
+                    near += 1;
+                }
+            }
+        }
+    }
+    println!("{total} floor pixels: {exact} exact, {near} another texel in their footprint");
+    assert!(total > 100_000, "the views hardly saw the floor");
+    // Texel edges shift by a fraction of a pixel where uv is interpolated linearly between
+    // sample points (and far away every pixel spans several texels): 95.7% exact when
+    // written.
+    assert!(exact * 100 > total * 94, "{exact} of {total} exact");
 }

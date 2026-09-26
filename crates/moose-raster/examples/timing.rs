@@ -1,6 +1,8 @@
 //! Rough per-frame timings over random views of a test level.
 //! Arguments: [WIDTH HEIGHT [LEVEL [BOUNCES [F0]]]] (default 1280 720 two_rooms.mmp 1 0.15);
-//! RAYON_NUM_THREADS=1 for one thread. Shiny surfaces get the Fresnel shader.
+//! RAYON_NUM_THREADS=1 for one thread; FRAMES=N for a longer run (default 500). Shiny
+//! surfaces get the Fresnel shader: textured (metal_tile.png, 5 m fade) on levels with uvs,
+//! filtered by FILTER=trilinear (the default), anisotropic, bilinear or nearest.
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -8,7 +10,10 @@ use std::time::Instant;
 
 use glam::Vec3;
 use moose_assets::Assets;
-use moose_raster::shaders::{VertexColor, VertexColorFresnel};
+use moose_raster::shaders::{
+    TexturedFresnel, TexturedFresnelAnisotropic, TexturedFresnelBilinear, TexturedFresnelNearest,
+    VertexColor, VertexColorFresnel,
+};
 use moose_raster::{RasterConfig, Renderer, Surface, Target};
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
@@ -35,6 +40,18 @@ fn main() {
     let mut renderer = Renderer::new(RasterConfig::default());
     let shader = renderer.register_shader::<VertexColor>();
     let fresnel = renderer.register_shader::<VertexColorFresnel>();
+    let textured_fresnel = match std::env::var("FILTER").as_deref() {
+        Ok("nearest") => renderer.register_shader::<TexturedFresnelNearest>(),
+        Ok("bilinear") => renderer.register_shader::<TexturedFresnelBilinear>(),
+        Ok("anisotropic") => renderer.register_shader::<TexturedFresnelAnisotropic>(),
+        _ => renderer.register_shader::<TexturedFresnel>(),
+    };
+    let has_uvs = assets
+        .mesh(world.geometry)
+        .attribs
+        .iter()
+        .any(|a| a.name == "uv");
+    let texture = has_uvs.then(|| assets.load_texture("metal_tile.png").unwrap());
     let geometry = assets.mesh(world.geometry);
     let mut out = ViewGeometry::new();
     out.config.max_reflections = bounces;
@@ -46,8 +63,9 @@ fn main() {
             .wrapping_add(1442695040888963407);
         lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
     };
-    let frames = 500;
+    let frames: usize = std::env::var("FRAMES").map_or(500, |f| f.parse().unwrap());
     let (mut view_s, mut raster_s) = (0.0f64, 0.0f64);
+    let mut parts = [0.0f64; 4]; // prepare, setup, rows, rows busy per thread
     for _ in 0..frames {
         let mut c = Camera::at_spawn(&world.spawn_points[0], vp);
         c.position = Vec3::new(rnd(-3.5, 3.5), rnd(0.5, 3.5), rnd(0.5, 7.5));
@@ -62,14 +80,20 @@ fn main() {
             height,
         };
         let mirrors = &out.mirrors;
-        renderer
+        let stats = renderer
             .render(&mut target, vp, &out, &assets, |p| match p.source {
                 PolygonSource::World { polygon, .. } if p.reflection.is_some() => {
                     let eye = p.mirror.map_or(c.position, |m| mirrors[m as usize].eye);
                     let n = geometry.polygons[polygon as usize].plane.normal;
-                    let mut s = Surface::new(fresnel);
-                    s.uniforms.values[..7]
-                        .copy_from_slice(&[eye.x, eye.y, eye.z, n.x, n.y, n.z, f0]);
+                    let mut s = Surface {
+                        texture,
+                        ..Surface::new(if texture.is_some() {
+                            textured_fresnel
+                        } else {
+                            fresnel
+                        })
+                    };
+                    s.uniforms.values = [eye.x, eye.y, eye.z, n.x, n.y, n.z, f0, 5.0];
                     s
                 }
                 _ => Surface::new(shader),
@@ -78,11 +102,23 @@ fn main() {
         let t2 = Instant::now();
         view_s += (t1 - t0).as_secs_f64();
         raster_s += (t2 - t1).as_secs_f64();
+        parts[0] += stats.prepare.as_secs_f64();
+        parts[1] += stats.setup.as_secs_f64();
+        parts[2] += stats.rows.as_secs_f64();
+        parts[3] += stats.rows_busy.as_secs_f64() / stats.threads as f64;
     }
+    let ms = |s: f64| s * 1000.0 / frames as f64;
     println!(
         "{file} ({bounces} bounces) {width}x{height}, {frames} frames on {} threads: view {:.3} ms/frame, raster {:.3} ms/frame",
         rayon::current_num_threads(),
         view_s * 1000.0 / frames as f64,
         raster_s * 1000.0 / frames as f64
+    );
+    println!(
+        "  prepare {:.3} ms, setup {:.3} ms, rows {:.3} ms (threads busy {:.0}% of it)",
+        ms(parts[0]),
+        ms(parts[1]),
+        ms(parts[2]),
+        100.0 * parts[3] / parts[2]
     );
 }

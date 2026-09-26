@@ -1,4 +1,5 @@
-"""Generate assets/models/crate.obj and assets/levels/two_rooms.mmp.
+"""Generate the test assets: assets/models/crate.obj, the levels in assets/levels, and the
+placeholder floor texture assets/textures/test_floor.png.
 
 Usage (from repo root): python3 tools/gen_test_assets.py .
 
@@ -6,7 +7,7 @@ Polygons are listed in perimeter order, then auto-oriented so the Newell
 normal points toward a reference point (level: into the sector; crate: out
 of the cube). CCW-front convention.
 """
-import os, sys
+import math, os, struct, sys, zlib
 
 ROOT = sys.argv[1]
 
@@ -92,6 +93,55 @@ def crate_obj():
             idx += 1
         flines.append(f"f {' '.join(ids)}  # {name}")
     return "\n".join(lines + vlines + [""] + flines) + "\n"
+
+
+def ball_obj(radius=0.25, segments=24, rings=12):
+    """A smooth ball (UV sphere) around the origin: `rings` bands of latitude, `segments`
+    around, quads except triangles at the poles. Each vertex's normal is the average of the
+    (unit) normals of every face sharing its position, so shading across faces is smooth."""
+    pts = [(0.0, radius, 0.0)]
+    for r in range(1, rings):
+        lat = math.pi * r / rings
+        y, ring = radius * math.cos(lat), radius * math.sin(lat)
+        for s in range(segments):
+            lon = 2 * math.pi * s / segments
+            pts.append((ring * math.sin(lon), y, ring * math.cos(lon)))
+    pts.append((0.0, -radius, 0.0))
+    bottom = len(pts) - 1
+
+    def at(r, s):  # ring 1..rings-1
+        return 1 + (r - 1) * segments + s % segments
+
+    faces = []
+    for s in range(segments):
+        faces.append([0, at(1, s), at(1, s + 1)])
+        faces.append([bottom, at(rings - 1, s + 1), at(rings - 1, s)])
+        for r in range(1, rings - 1):
+            faces.append([at(r, s), at(r + 1, s), at(r + 1, s + 1), at(r, s + 1)])
+    center = (0.0, 0.0, 0.0)
+    sums = [[0.0, 0.0, 0.0] for _ in pts]
+    for i, f in enumerate(faces):
+        n = newell([pts[k] for k in f])
+        if dot(n, sub(centroid([pts[k] for k in f]), center)) < 0:
+            f.reverse()
+            n = tuple(-x for x in n)
+        length = math.sqrt(dot(n, n))
+        for k in f:
+            for a in range(3):
+                sums[k][a] += n[a] / length
+    normals = [tuple(x / math.sqrt(dot(n, n)) for x in n) for n in sums]
+    grey = "0.700 0.700 0.700"
+    lines = [
+        f"# Moose v2 test prop: a {2 * radius:g} m ball (radius {radius:g} m), origin at its center.",
+        "# Smooth normals: each vertex's normal averages the normals of the faces sharing it.",
+        "# Faces are counter-clockwise viewed from outside (outward facing).",
+        "",
+        "o ball",
+    ]
+    lines += [f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}  {grey}" for p in pts]
+    lines += [f"vn {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}" for n in normals]
+    lines += ["f " + " ".join(f"{k + 1}//{k + 1}" for k in f) for f in faces]
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------- level
@@ -223,12 +273,40 @@ entities = [
 ]
 
 
-def level_text(title, about, shiny=(), darker=()):
+# Texture tile size for generated UVs, in meters: one texture repeat per UV_TILE.
+UV_TILE = 2.0
+
+
+def planar_uv(p, normal):
+    """Texture coordinates for point p on a surface with this normal: projected along the
+    normal's dominant axis, one texture tile per UV_TILE meters, v growing downward on walls."""
+    ax = max(range(3), key=lambda i: abs(normal[i]))
+    x, y, z = p
+    if ax == 1:
+        u, v = x, z
+    elif ax == 0:
+        u, v = z, -y
+    else:
+        u, v = x, -y
+    return (round(u / UV_TILE, 4), round(v / UV_TILE, 4))
+
+
+def level_text(title, about, shiny=(), darker=(), uv=False, props=()):
     """The level as .mmp text. Surfaces listed in `shiny` get the reflective flag (0x1).
     Surfaces listed in `darker` get their vertex colors at half brightness (as new color
-    rows, so other surfaces sharing a color keep it)."""
+    rows, so other surfaces sharing a color keep it). With `uv`, every drawn surface also
+    gets texture coordinates (`uv f32 2`, see planar_uv). `props` are extra entities, after
+    the shared ones."""
     table = list(colors)
     index = dict(cindex)
+    attributes = ATTRIBUTES + ([("uv", "f32", 2)] if uv else [])
+    uvs, uv_index = [], {}
+
+    def uv_row(key):
+        if key not in uv_index:
+            uv_index[key] = len(uvs)
+            uvs.append(key)
+        return uv_index[key]
 
     def darker_row(c):
         key = tuple(int(round(x * 0.5)) for x in colors[c])
@@ -251,16 +329,29 @@ def level_text(title, about, shiny=(), darker=()):
     ]
     for i, v in enumerate(verts):
         o.append(f"   {i:<4} " + " ".join(f"{fmt(x):>8}" for x in v))
-    o += ["", f"attributes {len(ATTRIBUTES)}", "#  id  name    format  count"]
-    for i, (n, f, c) in enumerate(ATTRIBUTES):
+    o += ["", f"attributes {len(attributes)}", "#  id  name    format  count"]
+    for i, (n, f, c) in enumerate(attributes):
         o.append(f"   {i:<3} {n:<7} {f:<7} {c}")
-    rows = [
-        [(v, darker_row(c) if i in darker and c is not None else c) for v, c in s["verts"]]
-        for i, s in enumerate(surfaces)
-    ]
+    rows = []
+    for i, s in enumerate(surfaces):
+        normal = newell([verts[v] for v, _ in s["verts"]])
+        row = []
+        for v, c in s["verts"]:
+            if c is None:
+                row.append((v,))  # portal: vertex index only
+                continue
+            refs = (darker_row(c) if i in darker else c,)
+            if uv:
+                refs += (uv_row(planar_uv(verts[v], normal)),)
+            row.append((v,) + refs)
+        rows.append(row)
     o += ["", f"values color {len(table)}", "#  id   values"]
     for i, c in enumerate(table):
         o.append(f"   {i:<4} " + " ".join(f"{x:>4}" for x in c))
+    if uv:
+        o += ["", f"values uv {len(uvs)}", "#  id   values"]
+        for i, t in enumerate(uvs):
+            o.append(f"   {i:<4} " + " ".join(f"{x:>8.4f}" for x in t))
     o += ["", f"sectors {len(sectors)}", "#  id  name      first_surface  surface_count"]
     for i, (n, f, c) in enumerate(sectors):
         o.append(f"   {i:<3} {n:<9} {f:<14} {c}")
@@ -271,7 +362,7 @@ def level_text(title, about, shiny=(), darker=()):
         if s["sector"] != last_sector:
             o.append(f"   # --- sector {s['sector']}: {sectors[s['sector']][0]}")
             last_sector = s["sector"]
-        vs = " ".join(f"{v}:{c}" if c is not None else f"{v}" for v, c in rows[i])
+        vs = " ".join(":".join(str(r) for r in refs) for refs in rows[i])
         flags = s['flags'] | (0x1 if i in shiny else 0)
         comment = s['comment'] + (" (reflective)" if i in shiny else "")
         o.append(f"   {i:<3} {s['sector']:<7} {s['adjoin']:<7} 0x{flags:<4x} {len(s['verts']):<7} {vs:<34} # {comment}")
@@ -279,23 +370,70 @@ def level_text(title, about, shiny=(), darker=()):
           "#  id  surface  mirror  flags    (0x1 = render through, 0x2 = passable)"]
     for i, (s, m, f) in enumerate(adjoins):
         o.append(f"   {i:<3} {s:<8} {m:<7} 0x{f:x}")
-    o += ["", f"entities {len(entities)}",
+    all_entities = entities + list(props)
+    o += ["", f"entities {len(all_entities)}",
           "#  id  kind   sector  model      x       y       z       pitch  yaw   roll  scale  name"]
-    for i, (k, sec, m, p, r, sc, n) in enumerate(entities):
+    for i, (k, sec, m, p, r, sc, n) in enumerate(all_entities):
         o.append(f"   {i:<3} {k:<6} {sec:<7} {m:<10} " + " ".join(f"{fmt(x):<7}" for x in p)
                  + f" {r[0]:<6} {r[1]:<5} {r[2]:<5} {fmt(sc):<6} {n}")
     return "\n".join(o) + "\n"
 
 
+# ---------------------------------------------------------------- textures
+def png_rgba(width, height, pixels):
+    """A PNG file (8-bit RGBA) from rows of (r, g, b, a) tuples."""
+    raw = b"".join(b"\x00" + bytes(c for px in row for c in px) for row in pixels)
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def test_floor():
+    """64x64 placeholder floor tile: a polished stone slab inside a dark grout border.
+    Alpha is roughness, from 128 (fully shiny) to 255 (fully rough): the slab is shiny
+    with a little variation and a few rough scratches, the grout rough."""
+    n = 64
+    rows = []
+    for y in range(n):
+        row = []
+        for x in range(n):
+            grout = x < 2 or y < 2
+            # Smooth deterministic variation for the stone.
+            s = (math.sin(x * 0.37 + y * 0.11) + math.sin(y * 0.29 - x * 0.07)
+                 + 0.5 * math.sin((x + y) * 0.9)) / 2.5
+            scratch = abs((x - 2 * y + 70) % 41 - 20) < 1 or abs((3 * x + y) % 53 - 26) < 1
+            if grout:
+                rgb, rough = (46, 42, 38), 255
+            else:
+                base = 150 + int(30 * s)
+                rgb = (base, base - 12, base - 26)
+                rough = 200 if scratch else 128 + int(12 * (s + 1))
+            row.append(rgb + (rough,))
+        rows.append(row)
+    return png_rgba(n, n, rows)
+
+
+os.makedirs(os.path.join(ROOT, "assets/textures"), exist_ok=True)
+with open(os.path.join(ROOT, "assets/textures/test_floor.png"), "wb") as f:
+    f.write(test_floor())
+
 os.makedirs(os.path.join(ROOT, "assets/models"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "assets/levels"), exist_ok=True)
 with open(os.path.join(ROOT, "assets/models/crate.obj"), "w") as f:
     f.write(crate_obj())
+with open(os.path.join(ROOT, "assets/models/ball.obj"), "w") as f:
+    f.write(ball_obj())
 with open(os.path.join(ROOT, "assets/levels/two_rooms.mmp"), "w") as f:
     f.write(level_text("Two Rooms", "two box rooms joined by a hallway through two portals."))
 # Same level with shiny (reflective) floors throughout (both rooms and the hallway, so
 # reflections continue across adjacent floors), and room_a's ceiling shiny too. The two room
-# floors and room_a's ceiling are also darker, so their reflections stand out.
+# floors and room_a's ceiling are also darker, so their reflections stand out. A mirror ball
+# floats in room_b (the app bakes a cube map of the room for it).
 room_floors = {sectors[room_a][1], sectors[room_b][1]}
 shiny_floors = room_floors | {sectors[hall][1]}
 room_a_ceiling = sectors[room_a][1] + 1
@@ -304,12 +442,14 @@ with open(os.path.join(ROOT, "assets/levels/shiny_rooms.mmp"), "w") as f:
                        "two_rooms.mmp with reflective floors throughout and a reflective ceiling "
                        "in room_a, darker in the rooms.",
                        shiny=shiny_floors | {room_a_ceiling},
-                       darker=room_floors | {room_a_ceiling}))
+                       darker=room_floors | {room_a_ceiling}, uv=True,
+                       props=[("prop", room_b, "ball.obj", (-1.5, 1.5, -15.0), (0, 0, 0), 1.0,
+                               "mirror_ball")]))
 # The shiny floors with room_a's ceiling reflective too: two facing mirrors, for
 # reflections of reflections.
 with open(os.path.join(ROOT, "assets/levels/mirror_rooms.mmp"), "w") as f:
     f.write(level_text("Mirror Rooms",
                        "shiny floors throughout, darker in the rooms, and room_a's ceiling "
                        "reflective too.",
-                       shiny=shiny_floors | {room_a_ceiling}, darker=room_floors))
+                       shiny=shiny_floors | {room_a_ceiling}, darker=room_floors, uv=True))
 print(f"verts={len(verts)} color_values={len(colors)} surfaces={len(surfaces)} adjoins={len(adjoins)}")

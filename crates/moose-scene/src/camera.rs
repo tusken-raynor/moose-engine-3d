@@ -49,6 +49,35 @@ impl Camera {
         }
     }
 
+    /// A camera for baking face `face` of a cube map
+    /// ([`CUBE_FACES`](moose_assets::CUBE_FACES)) at `position` in `sector`: a square
+    /// `size`x`size` view with a 90 degree field of view, looking down the face's axis with
+    /// its right and up.
+    pub fn cube_face(position: Vec3, sector: u32, face: usize, size: u32) -> Camera {
+        let [forward, _, _] = moose_assets::CUBE_FACES[face];
+        // Forward is (-sin yaw, 0, -cos yaw) level, or straight up or down by pitch.
+        let (yaw, pitch) = if forward[1] != 0.0 {
+            (0.0, forward[1] * std::f32::consts::FRAC_PI_2)
+        } else {
+            ((-forward[0]).atan2(-forward[2]), 0.0)
+        };
+        Camera {
+            position,
+            sector,
+            yaw,
+            pitch,
+            roll: 0.0,
+            fov_y: std::f32::consts::FRAC_PI_2,
+            near: 0.05,
+            viewport: Viewport {
+                x: 0,
+                y: 0,
+                width: size,
+                height: size,
+            },
+        }
+    }
+
     pub fn rotation(&self) -> Quat {
         Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, self.roll)
     }
@@ -138,5 +167,24 @@ impl View {
             ),
             w,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cube_face_cameras_look_along_their_faces() {
+        for (face, axes) in moose_assets::CUBE_FACES.iter().enumerate() {
+            let c = Camera::cube_face(Vec3::ZERO, 0, face, 64);
+            for (got, want) in [c.forward(), c.right(), c.up()].into_iter().zip(axes) {
+                assert!(
+                    got.distance(Vec3::from_array(*want)) < 1e-6,
+                    "face {face}: {got} != {want:?}"
+                );
+            }
+            assert_eq!(c.view().focal, 32.0, "90 degrees across 64 pixels");
+        }
     }
 }

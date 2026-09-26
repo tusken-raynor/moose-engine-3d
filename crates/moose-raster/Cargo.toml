@@ -10,4 +10,5 @@ moose-view = { path = "../moose-view" }
 moose-scene = { path = "../moose-scene" }
 glam.workspace = true
 rayon.workspace = true
+wide.workspace = true
 

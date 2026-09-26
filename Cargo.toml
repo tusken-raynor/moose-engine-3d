@@ -9,3 +9,5 @@ edition = "2024"
 [workspace.dependencies]
 glam = "0.33"
 rayon = "1"
+wide = "1"
+png = "0.18"
