@@ -8,7 +8,7 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
-use crate::level::{EntityKind, EntitySpawn, Level, Portal, PortalFlags, Sector};
+use crate::level::{EntityKind, EntitySpawn, Level, Light, Portal, PortalFlags, Sector};
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
 use crate::store::Assets;
 use crate::text::{Line, tokenize};
@@ -434,13 +434,71 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         });
     }
 
+    // Optional: ambient light (1 1 1 without it: surfaces show their full color), then
+    // point lights.
+    let mut ambient = Vec3::ONE;
+    if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "ambient") {
+        let (line, args) = c.header("ambient", 3)?;
+        let row = Line {
+            no: line,
+            tokens: args,
+        };
+        ambient = Vec3::new(c.float(&row, 0)?, c.float(&row, 1)?, c.float(&row, 2)?);
+        if ambient.min_element() < 0.0 {
+            return Err(c.err(line, "ambient light cannot be negative".to_string()));
+        }
+    }
+    let mut lights = Vec::new();
+    if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "lights") {
+        let section = c.section("lights", false, None)?;
+        for (i, r) in section.rows.iter().enumerate() {
+            // A point light, or a spot light with its direction and cone.
+            if r.tokens.len() != 8 && r.tokens.len() != 13 {
+                return Err(c.err(
+                    r.no,
+                    format!(
+                        "light {i} needs 8 fields (a point light) or 13 (a spot light), found {}",
+                        r.tokens.len()
+                    ),
+                ));
+            }
+            let sector: usize = c.parse(r, 0, "sector index")?;
+            if sector >= sectors.len() {
+                return Err(c.err(r.no, format!("light {i}: sector {sector} does not exist")));
+            }
+            let position = Vec3::new(c.float(r, 1)?, c.float(r, 2)?, c.float(r, 3)?);
+            let color = Vec3::new(c.float(r, 4)?, c.float(r, 5)?, c.float(r, 6)?);
+            let range = c.float(r, 7)?;
+            if color.min_element() < 0.0 {
+                return Err(c.err(r.no, format!("light {i}: color cannot be negative")));
+            }
+            if range <= 0.0 {
+                return Err(c.err(r.no, format!("light {i}: range must be positive")));
+            }
+            let light = if r.tokens.len() == 8 {
+                Light::point(sector as u32, position, color, range)
+            } else {
+                let direction = Vec3::new(c.float(r, 8)?, c.float(r, 9)?, c.float(r, 10)?);
+                let (inner, outer) = (c.float(r, 11)?, c.float(r, 12)?);
+                if direction.length() < 1e-6 {
+                    return Err(c.err(r.no, format!("light {i}: direction cannot be zero")));
+                }
+                if !(0.0 <= inner && inner <= outer && outer <= 180.0) {
+                    return Err(c.err(
+                        r.no,
+                        format!("light {i}: cone angles need 0 <= inner <= outer <= 180"),
+                    ));
+                }
+                Light::spot(sector as u32, position, color, range, direction, inner, outer)
+            };
+            lights.push((r.no, light));
+        }
+    }
+
     if let Some(extra) = c.lines.get(c.pos) {
         return Err(c.err(
             extra.no,
-            format!(
-                "unexpected '{}' after the entities section",
-                extra.tokens[0]
-            ),
+            format!("unexpected '{}' after the last section", extra.tokens[0]),
         ));
     }
 
@@ -612,6 +670,17 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
     }
 
+    // ---- Validation: lights sit inside their sector
+    for (i, (line, light)) in lights.iter().enumerate() {
+        let sector = light.sector as usize;
+        let s = &sectors[sector];
+        let tol = TOLERANCE * (bounds[sector].max - bounds[sector].min).length().max(1.0);
+        if (s.first..s.first + s.count).any(|k| surfaces[k].plane.distance(light.position) < -tol)
+        {
+            return Err(c.err(*line, format!("light {i} is outside sector '{}'", s.name)));
+        }
+    }
+
     // ---- Build: geometry mesh (solid surfaces) and portals, in sector order
     let mut portal_ids = vec![0u32; adjoins.len()];
     let mut next = 0;
@@ -699,5 +768,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         sectors: sectors_out,
         portals,
         spawns,
+        ambient,
+        lights: lights.into_iter().map(|(_, l)| l).collect(),
     })
 }

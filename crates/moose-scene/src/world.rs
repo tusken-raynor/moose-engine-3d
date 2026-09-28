@@ -1,5 +1,5 @@
 use glam::{Affine3A, Quat, Vec3};
-use moose_assets::{Aabb, Assets, EntityKind, Level, MeshId, Plane, Portal, Sector};
+use moose_assets::{Aabb, Assets, EntityKind, Level, MeshId, Plane, Light, Portal, Sector};
 
 /// Distance tolerance for containment and crossing tests, in meters.
 const EPSILON: f32 = 1e-4;
@@ -18,6 +18,14 @@ pub struct World {
     pub portals: Vec<Portal>,
     pub entities: Vec<Entity>,
     pub spawn_points: Vec<SpawnPoint>,
+    /// Light that reaches everything (linear RGB; 1 is a surface's full color).
+    pub ambient: Vec3,
+    /// The level's lights. Set them with [`World::set_lights`], which finds where each
+    /// reaches.
+    lights: Vec<Light>,
+    /// Per sector, the lights that can reach into it (indices into `lights`); see
+    /// [`World::set_lights`].
+    sector_lights: Vec<Vec<u32>>,
     /// Per sector, every polygon bounding it (solid or portal), for containment and tracing.
     boundaries: Vec<Vec<Boundary>>,
 }
@@ -145,12 +153,69 @@ impl World {
             portals: level.portals,
             entities,
             spawn_points,
+            ambient: level.ambient,
+            lights: Vec::new(),
+            sector_lights: Vec::new(),
             boundaries,
         };
         for i in 0..world.entities.len() {
             world.place_entity(i, assets);
         }
+        world.set_lights(level.lights, level.ambient);
         world
+    }
+
+    /// The level's lights.
+    pub fn lights(&self) -> &[Light] {
+        &self.lights
+    }
+
+    /// The lights that can reach into `sector` (indices into [`World::lights`]).
+    pub fn sector_lights(&self, sector: u32) -> &[u32] {
+        &self.sector_lights[sector as usize]
+    }
+
+    /// Replaces the lights and the ambient light, and finds the sectors each light reaches:
+    /// its own, then through every open portal (one that can be seen through) that its
+    /// range (and a spot light's cone) reaches, and on from there. Light never passes through walls. It does pass
+    /// through the whole of an opening, not only the part the light can see through
+    /// earlier openings.
+    pub fn set_lights(&mut self, lights: Vec<Light>, ambient: Vec3) {
+        self.ambient = ambient;
+        self.sector_lights = vec![Vec::new(); self.sectors.len()];
+        let mut reached = vec![false; self.sectors.len()];
+        let mut stack = Vec::new();
+        for (i, light) in lights.iter().enumerate() {
+            reached.fill(false);
+            reached[light.sector as usize] = true;
+            stack.push(light.sector);
+            while let Some(sector) = stack.pop() {
+                self.sector_lights[sector as usize].push(i as u32);
+                for b in &self.boundaries[sector as usize] {
+                    let Some(portal) = b.portal.map(|p| &self.portals[p as usize]) else {
+                        continue;
+                    };
+                    let target = portal.target as usize;
+                    if reached[target] || !portal.flags.render_through() {
+                        continue;
+                    }
+                    let nearest = closest_point_on_polygon(&b.points, b.plane.normal, light.position);
+                    // A spot light's cone must reach the opening too.
+                    let center = b.points.iter().copied().sum::<Vec3>() / b.points.len() as f32;
+                    let radius = b.points.iter().map(|q| q.distance(center)).fold(0.0, f32::max);
+                    if nearest.distance(light.position) < light.range
+                        && light.cone_reaches(center, radius)
+                    {
+                        reached[target] = true;
+                        stack.push(portal.target);
+                    }
+                }
+            }
+        }
+        for list in &mut self.sector_lights {
+            list.sort_unstable();
+        }
+        self.lights = lights;
     }
 
     /// Recomputes an entity's derived `bounds` and `sectors` from its transform.

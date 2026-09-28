@@ -635,6 +635,10 @@ fn filtered(
     g.weights = geometry.weights.clone();
     g.objects = geometry.objects.clone();
     (g.eye, g.focal) = (geometry.eye, geometry.focal);
+    (g.lights, g.ambient) = (geometry.lights.clone(), geometry.ambient);
+    g.light_lists = geometry.light_lists.clone();
+    g.sector_lights = geometry.sector_lights.clone();
+    g.object_lights = geometry.object_lights.clone();
     g.polygons = geometry
         .polygons
         .iter()
@@ -764,7 +768,8 @@ fn translucent_crates_match_the_reference() {
 
 #[test]
 fn a_minimum_step_of_one_is_exact_on_steep_spans() {
-    // With a sample on every pixel of steep spans, only 8.8 stepping and rounding remain.
+    // With sample points as close as perspective asks on steep spans, only 8.8 stepping,
+    // rounding and the interpolation between grid rows (up to 32 apart) remain.
     let (world, assets) = world();
     let mut out = ViewGeometry::new();
     let mut r = translucent_renderer();
@@ -780,7 +785,7 @@ fn a_minimum_step_of_one_is_exact_on_steep_spans() {
             .map(|(&g, w)| channel_diff(g, w.color))
             .fold(worst, u32::max);
     }
-    assert!(worst <= 2, "worst difference {worst} with min_step 1");
+    assert!(worst <= 3, "worst difference {worst} with min_step 1");
 }
 
 #[test]
@@ -792,7 +797,9 @@ fn fresnel_floors_match_the_reference() {
     // point it reflects.
     let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
     let level = assets.load_level("shiny_rooms.mmp").unwrap();
-    let world = World::new(level, &assets);
+    let mut world = World::new(level, &assets);
+    // Unlit: surfaces show their full color, as the reference draws them.
+    world.set_lights(Vec::new(), Vec3::ONE);
     let geometry = assets.mesh(world.geometry);
     let mut r = renderer(RasterConfig::default());
     let fresnel = r.register_material::<moose_raster::shaders::VertexColorFresnel>();
@@ -1048,10 +1055,19 @@ fn textured_floors_show_the_texel_under_each_pixel() {
     // neighboring one.
     let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
     let level = assets.load_level("shiny_rooms.mmp").unwrap();
-    let world = World::new(level, &assets);
+    let mut world = World::new(level, &assets);
+    // Unlit: surfaces show their full color, as the reference draws them.
+    world.set_lights(Vec::new(), Vec3::ONE);
     let texture = assets.load_texture("test_floor.png").unwrap();
-    let mut r = renderer(RasterConfig::default());
-    let textured = r.register_material::<moose_raster::shaders::TexturedNearest>();
+    // Sample points as close as perspective asks, however steep the floor: the default
+    // minimum spacing trades exactness on steep surfaces for speed.
+    let mut r = renderer(RasterConfig {
+        min_step: 1,
+        ..RasterConfig::default()
+    });
+    let textured = r.register_material::<
+        moose_raster::shaders::Textured<{ moose_raster::shaders::filter::NEAREST_MIPMAP_NONE }>,
+    >();
     let mut out = ViewGeometry::new();
     out.config.max_reflections = 0;
     let floor = |p: &moose_view::ViewPolygon| p.flags.reflective();
@@ -1123,6 +1139,108 @@ fn textured_floors_show_the_texel_under_each_pixel() {
     assert!(total > 100_000, "the views hardly saw the floor");
     // Texel edges shift by a fraction of a pixel where uv is interpolated linearly between
     // sample points (and far away every pixel spans several texels): 95.7% exact when
-    // written.
-    assert!(exact * 100 > total * 94, "{exact} of {total} exact");
+    // written; 92.9% since each 32x32 tile spaces its sample points by its own nearest
+    // depth rather than the polygon's farthest (every pixel still within its footprint).
+    assert!(exact * 100 > total * 92, "{exact} of {total} exact");
+}
+
+#[test]
+fn lit_surfaces_match_exact_lighting() {
+    // Point lights evaluated at the lattice's sample points and interpolated between them
+    // (gamma-encoded), against the exact light at every pixel (the same lights, falloff,
+    // cosine law and spot cone at the pixel's own world position), on vertex-colored walls,
+    // floors and crates.
+    use moose_assets::Light;
+    let (mut world, assets) = world();
+    let light = |sector: u32, p: [f32; 3], c: [f32; 3], range: f32| {
+        Light::point(sector, Vec3::from_array(p), Vec3::from_array(c), range)
+    };
+    world.set_lights(
+        vec![
+            light(0, [-2.5, 3.2, 5.5], [1.6, 1.25, 0.85], 7.0),
+            light(0, [2.8, 1.8, 1.2], [1.2, 0.7, 0.4], 5.0),
+            light(1, [0.0, 2.6, -6.0], [0.7, 0.95, 1.2], 5.0),
+            light(2, [2.5, 3.2, -14.5], [0.8, 1.05, 1.6], 7.0),
+            light(2, [-2.8, 1.2, -18.5], [1.3, 0.55, 1.1], 5.0),
+            // shiny_rooms' spot light.
+            Light::spot(
+                0,
+                Vec3::new(2.5, 3.7, 7.6),
+                Vec3::new(3.4, 3.5, 3.9),
+                16.0,
+                Vec3::new(-5.1, -1.3, -7.6),
+                10.0,
+                16.0,
+            ),
+        ],
+        Vec3::new(0.12, 0.12, 0.14),
+    );
+    let mut out = ViewGeometry::new();
+    // Returns how many pixels were compared, how many are off by more than 2 levels, and
+    // the worst difference.
+    let mut compare = |light_spacing: u32, min_step: u32, penumbra_threshold: f32| {
+        let mut r = renderer(RasterConfig {
+            light_spacing,
+            min_step,
+            penumbra_threshold,
+            ..RasterConfig::default()
+        });
+        let (mut pixels, mut off, mut worst) = (0usize, 0usize, 0u32);
+        for cam in random_views(&world, 200, 71, VP) {
+            out.build(&world, &assets, &cam.view());
+            let got = render(&mut r, &out, &assets, VP, None);
+            let want = reference(&out, &assets, VP);
+            for (&g, w) in got.iter().zip(&want) {
+                if w.polygon == 0 {
+                    continue; // background
+                }
+                let p = &out.polygons[w.polygon as usize - 1];
+                let mesh = assets.mesh(p.mesh);
+                let normal = out.objects[p.object as usize].rotation
+                    * mesh.polygons[p.source_polygon() as usize].plane.normal;
+                let mut light = out.ambient;
+                for &i in out.polygon_lights(p) {
+                    let l = out.lights[i as usize];
+                    let d = l.position - w.pos;
+                    let t = (1.0 - d.length_squared() / (l.range * l.range)).max(0.0);
+                    let cos = (normal.dot(d) / d.length().max(1e-4)).max(0.0);
+                    let (scale, offset) = l.cone();
+                    let c = (offset - d.dot(l.direction) / d.length().max(1e-4) * scale)
+                        .clamp(0.0, 1.0);
+                    let cone = c * c * (3.0 - 2.0 * c);
+                    light += l.color * t * t * cos * cone;
+                }
+                // Colors are gamma-encoded, so the lit color is the color times the light
+                // encoded the same way.
+                let lit = |shift: u32, k: usize| {
+                    let encoded = light[k].max(0.0).powf(1.0 / 2.2);
+                    (((w.color >> shift) & 255) as f32 * encoded).min(255.0) as u32
+                };
+                let want = lit(16, 0) << 16 | lit(8, 1) << 8 | lit(0, 2);
+                pixels += 1;
+                let d = channel_diff(g, want);
+                worst = worst.max(d);
+                off += (d > 2) as usize;
+            }
+        }
+        println!(
+            "light spacing {light_spacing}, penumbra threshold {penumbra_threshold}: {pixels} lit pixels, {off} off by more than 2 levels, worst {worst}"
+        );
+        (pixels, off, worst)
+    };
+    // A sample point at every pixel: exact but for 8.8 rounding.
+    let (_, _, worst) = compare(1, 1, 0.0);
+    assert!(worst <= 2, "worst difference {worst} with light spacing 1");
+    // The default spacing (up to 32 px, at most 4 px where a spot light's penumbra
+    // crosses): light changing faster than a cell follows is interpolated coarsely, about
+    // 1.8% of pixels more than 2 levels off (2.5% without the penumbra rule, 1.6% without
+    // the spot light; at 8 px, 0.14%).
+    // The worst (about 77) is a light 0.4 m below a ceiling seen from 11 m away: its bright
+    // spot is a few rows tall there, and the minimum spacing on steep surfaces (4) can
+    // step over its peak.
+    let defaults = RasterConfig::default();
+    let (pixels, off, worst) =
+        compare(defaults.light_spacing, defaults.min_step, defaults.penumbra_threshold);
+    assert!(off * 100 < pixels * 3, "{off} of {pixels} pixels off by more than 2 levels");
+    assert!(worst <= 160, "worst difference {worst}");
 }

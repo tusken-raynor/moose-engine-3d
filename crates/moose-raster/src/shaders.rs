@@ -1,12 +1,114 @@
 //! Standard materials.
 
-use crate::shader::{F32s, Fill, I16s, U32s};
+use crate::shader::{F32s, Fill, I16s, I32s, SampleContext, U32s};
 
-/// XRGB from a `color` output of three 8.8 channels.
+/// The light reaching [`LANES`](crate::shader::LANES) sample points on a surface facing
+/// `normal` (unit length), in linear RGB (1 shows a surface's full color): the ambient light,
+/// plus each light that reaches the polygon, by Lambert's cosine law, a smooth falloff to
+/// nothing at its range, `(1 - d^2 / range^2)^2`, and a spot light's cone (smoothstep from
+/// its outer half-angle to its inner; a point light's cone is whole), and its shadow map
+/// if it has one.
+///
+/// Evaluated at sample points only, and interpolated to pixels in between.
 #[inline(always)]
-fn rgb(c: &[I16s; 3]) -> U32s {
+fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F32s; 3] {
+    let a = ctx.ambient;
+    let mut light = [F32s::fill(a.x), F32s::fill(a.y), F32s::fill(a.z)];
+    let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
+    for l in ctx.lights {
+        let d = [
+            F32s::fill(l.position.x) - position[0],
+            F32s::fill(l.position.y) - position[1],
+            F32s::fill(l.position.z) - position[2],
+        ];
+        let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+        let t = (one - d2 * F32s::fill(1.0 / (l.range * l.range))).max(zero);
+        // cos = n.d / |d|: one reciprocal square root, no division.
+        let n_dot_d = normal[0] * d[0] + normal[1] * d[1] + normal[2] * d[2];
+        let inv_len = d2.max(F32s::fill(1e-8)).recip_sqrt();
+        let cos = (n_dot_d * inv_len).max(zero);
+        // The cone: 1 within the inner half-angle, easing to 0 at the outer (always 1 for a
+        // point light, whose cone is whole). The way from the light to the point is -d.
+        let (scale, offset) = l.cone();
+        let d_dot_dir =
+            d[0] * F32s::fill(l.direction.x) + d[1] * F32s::fill(l.direction.y) + d[2] * F32s::fill(l.direction.z);
+        let c = (F32s::fill(offset) - d_dot_dir * inv_len * F32s::fill(scale))
+            .max(zero)
+            .min(one);
+        let cone = c * c * (F32s::fill(3.0) - c - c);
+        let mut k = t * t * cos * cone;
+        // Its shadow map, if it has one, where any of the points gets some of its light.
+        if let Some(map) = l.shadow.and_then(|i| ctx.shadow_maps.get(i as usize))
+            && k.simd_gt(zero).to_bitmask() != 0
+        {
+            k *= map.visibility(position, normal);
+        }
+        light[0] += F32s::fill(l.color.x) * k;
+        light[1] += F32s::fill(l.color.y) * k;
+        light[2] += F32s::fill(l.color.z) * k;
+    }
+    light
+}
+
+/// The display's gamma: textures, vertex colors and the framebuffer hold gamma-encoded
+/// values, `linear^(1 / GAMMA)`.
+const GAMMA: f32 = 2.2;
+
+/// [`GAMMA_LUT`] entries per unit of the square root of the light.
+const LUT_SCALE: f32 = 256.0;
+
+/// `light^(1 / GAMMA)` at `light = (i / LUT_SCALE)^2`, for linear light from 0 to 16:
+/// indexed by the light's square root, which spreads the entries where the curve is steepest
+/// (the darks), so the nearest entry is within a color level everywhere.
+static GAMMA_LUT: std::sync::LazyLock<[f32; 1025]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|i| (i as f32 / LUT_SCALE).powf(2.0 / GAMMA))
+});
+
+/// Linear `light` gamma-encoded for a 16.16 `light` output: `light^(1 / GAMMA)`, by
+/// [`GAMMA_LUT`]. A gamma-encoded color times the encoded light is the gamma-encoded color
+/// of the lit surface (a power law commutes with products), so pixels need no conversion;
+/// and the light is interpolated between sample points in the display's own terms, where
+/// its steps are even to the eye.
+#[inline(always)]
+fn light_output(light: [F32s; 3]) -> [F32s; 3] {
+    use crate::shader::LANES;
+    let lut = &*GAMMA_LUT;
+    let last = (lut.len() - 1) as f32;
+    light.map(|l| {
+        let i = (l.max(F32s::fill(0.0)).sqrt() * F32s::fill(LUT_SCALE) + F32s::fill(0.5))
+            .min(F32s::fill(last))
+            .trunc_int()
+            .to_array();
+        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize]))
+    })
+}
+
+/// XRGB from a `color` output (three 8.8 channels, 0-255) under the 16.16 `light` (see
+/// [`light_output`]), each channel at most 255. Color and light are interpolated apart and
+/// multiplied per pixel: clamping lit colors at sample points would bend them near edges,
+/// where sample points past the polygon carry values beyond 255 (which the wrapping 8.8
+/// stepping brings back in range inside it).
+#[inline(always)]
+fn lit_rgb(color: &[I16s; 3], light: &[I32s; 3]) -> U32s {
     use crate::shader::high_byte;
-    high_byte(c[0]) << 16 | high_byte(c[1]) << 8 | high_byte(c[2])
+    let byte = U32s::fill(255);
+    let channel = |k: usize| {
+        let l: U32s = wide::bytemuck::cast(light[k]);
+        ((high_byte(color[k]) * l) >> 16_u32).min(byte)
+    };
+    channel(0) << 16 | channel(1) << 8 | channel(2)
+}
+
+/// `texel`'s color channels under the 16.16 `light` (see [`light_output`]; 65536 is 1: a
+/// light of exactly 1 leaves the texel as it is), each at most 255; its alpha is kept.
+#[inline(always)]
+fn lit_texel(texel: U32s, light: &[I32s; 3]) -> U32s {
+    let byte = U32s::fill(255);
+    let channel = |shift: u32, k: usize| {
+        let l: U32s = wide::bytemuck::cast(light[k]);
+        (((((texel >> shift) & byte) * l) >> 16_u32).min(byte)) << shift
+    };
+    (texel & U32s::fill(0xFF00_0000)) | channel(16, 0) | channel(8, 1) | channel(0, 2)
 }
 
 /// The facing term of the Fresnel materials at [`LANES`](crate::shader::LANES) sample
@@ -27,15 +129,15 @@ fn facing_and_distance(eye: glam::Vec3, position: &[F32s; 3], normal: &[F32s; 3]
     (vertex_color_fresnel::facing_lanes(cos), distance)
 }
 
-/// Unlit per-vertex color: the mesh attribute `color` (three 0-255 values), interpolated in
-/// 8.8 fixed point.
+/// Per-vertex color: the mesh attribute `color` (three 0-255 values), lit at sample points
+/// (see [`diffuse`]) and interpolated in 8.8 fixed point.
 pub mod vertex_color {
     use crate::shader::{Material, PixelContext, SampleContext, U32s, VertexContext};
 
     crate::material_io! {
-        vertex { color: 3 }
-        sampled { color: 3 }
-        fixed32 {}
+        vertex { color: 3, face_normal: 3 }
+        sampled { color: 3, normal: 3, position: 3 }
+        fixed32 { light: 3 }
         fixed16 { color: 3 }
         float {}
     }
@@ -47,32 +149,41 @@ pub mod vertex_color {
 
         #[inline(always)]
         fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
-            Sampled { color: v.color }
+            Sampled {
+                color: v.color,
+                normal: v.face_normal,
+                ..Default::default()
+            }
         }
 
         #[inline(always)]
-        fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
-            Interp { color: s.color }
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::diffuse(ctx, &s.position, &s.normal);
+            Interp {
+                color: s.color,
+                light: super::light_output(light),
+            }
         }
 
         #[inline(always)]
-        fn shade_pixel(_: &Fixed32, b: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
-            super::rgb(&b.color)
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
+            super::lit_rgb(&b.color, &a.light)
         }
     }
 }
 
 pub use vertex_color::VertexColor;
 
-/// Per-vertex color (the mesh attribute `color`, three 0-255 values) drawn translucent,
-/// with one opacity for the whole surface: `params.values[0]`, from 0 (invisible) to 1.
+/// Per-vertex color (the mesh attribute `color`, three 0-255 values, lit as
+/// [`VertexColor`]) drawn translucent, with one opacity for the whole surface:
+/// `params.values[0]`, from 0 (invisible) to 1.
 pub mod vertex_color_translucent {
     use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext};
 
     crate::material_io! {
-        vertex { color: 3 }
-        sampled { color: 3 }
-        fixed32 {}
+        vertex { color: 3, face_normal: 3 }
+        sampled { color: 3, normal: 3, position: 3 }
+        fixed32 { light: 3 }
         fixed16 { color: 3 }
         float {}
     }
@@ -85,18 +196,26 @@ pub mod vertex_color_translucent {
 
         #[inline(always)]
         fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
-            Sampled { color: v.color }
+            Sampled {
+                color: v.color,
+                normal: v.face_normal,
+                ..Default::default()
+            }
         }
 
         #[inline(always)]
-        fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
-            Interp { color: s.color }
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::diffuse(ctx, &s.position, &s.normal);
+            Interp {
+                color: s.color,
+                light: super::light_output(light),
+            }
         }
 
         #[inline(always)]
-        fn shade_pixel(_: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
             let alpha = (ctx.params.values[0].clamp(0.0, 1.0) * 255.0).round() as u32;
-            U32s::fill(alpha << 24) | super::rgb(&b.color)
+            U32s::fill(alpha << 24) | super::lit_rgb(&b.color, &a.light)
         }
     }
 }
@@ -123,7 +242,7 @@ pub mod vertex_color_fresnel {
     crate::material_io! {
         vertex { color: 3, face_normal: 3 }
         sampled { color: 3, normal: 3, position: 3 }
-        fixed32 {}
+        fixed32 { light: 3 }
         fixed16 { color: 3, facing: 1 }
         float {}
     }
@@ -178,20 +297,22 @@ pub mod vertex_color_fresnel {
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
             let (facing, _) = super::facing_and_distance(ctx.eye, &s.position, &s.normal);
+            let light = super::diffuse(ctx, &s.position, &s.normal);
             Interp {
                 color: s.color,
                 facing: [facing],
+                light: super::light_output(light),
             }
         }
 
         #[inline(always)]
-        fn shade_pixel(_: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
             // alpha = (1 - F0) * keep, in 1/64 steps of a 0-255 alpha, then rounded.
             let f0 = ctx.params.values[0].clamp(0.0, 1.0);
             let scale = ((1.0 - f0) * 255.0 * 64.0).round() as i16;
             let alpha = keep(b.facing[0]).mul_scale_round(I16s::fill(scale));
             let alpha = widen(alpha + I16s::fill(32)) >> 6;
-            (alpha << 24) | super::rgb(&b.color)
+            (alpha << 24) | super::lit_rgb(&b.color, &a.light)
         }
     }
 }
@@ -224,7 +345,7 @@ pub mod vertex_color_fresnel_disperse {
     crate::material_io! {
         vertex { color: 3, face_normal: 3 }
         sampled { color: 3, normal: 3, position: 3 }
-        fixed32 {}
+        fixed32 { light: 3 }
         fixed16 { color: 3, facing: 1 }
         float { distance: 1 }
     }
@@ -249,9 +370,11 @@ pub mod vertex_color_fresnel_disperse {
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
             let (facing, distance) = super::facing_and_distance(ctx.eye, &s.position, &s.normal);
+            let light = super::diffuse(ctx, &s.position, &s.normal);
             Interp {
                 color: s.color,
                 facing: [facing],
+                light: super::light_output(light),
                 distance: [distance],
             }
         }
@@ -270,7 +393,7 @@ pub mod vertex_color_fresnel_disperse {
 
         #[inline(always)]
         fn shade_over(
-            _: &Fixed32,
+            a: &Fixed32,
             b: &Fixed16,
             c: &Floats,
             ctx: &PixelContext,
@@ -298,62 +421,139 @@ pub mod vertex_color_fresnel_disperse {
             };
             let alpha = ((one - faded) * F32s::fill(255.0) + F32s::fill(0.5)).trunc_int();
             let alpha: U32s = wide::bytemuck::cast(alpha);
-            (alpha << 24) | super::rgb(&b.color)
+            (alpha << 24) | super::lit_rgb(&b.color, &a.light)
         }
     }
 }
 
 pub use vertex_color_fresnel_disperse::VertexColorFresnelDisperse;
 
-/// Texture filtering for the textured materials, as their `FILTER` parameter.
-pub mod filter {
-    /// The nearest texel of the full-size level.
-    pub const NEAREST: u8 = 0;
-    /// Bilinear on the full-size level.
-    pub const BILINEAR: u8 = 1;
-    /// Bilinear on the two mip levels around the level of detail, blended.
-    pub const TRILINEAR: u8 = 2;
-    /// Two trilinear probes along the long axis of each pixel's footprint (2x anisotropic).
-    pub const ANISOTROPIC: u8 = 3;
-}
+/// Texture samplers for the textured materials, as their `FILTER` parameter.
+pub use crate::shader::filter;
 
-/// The texture's color at `uv` with filtering `FILTER` (see [`filter`]), from the built-in
-/// footprint values ([`LOD`](crate::shader::LOD), [`ANISO`](crate::shader::ANISO),
-/// [`ANISO_LOD`](crate::shader::ANISO_LOD)).
+/// The texture's color at `uv` with sampler `FILTER` (see [`filter`]), at the built-in
+/// level of detail ([`LOD`](crate::shader::LOD)), for the pixels `at`.
 #[inline(always)]
 fn texel<const FILTER: u8>(
     tex: &moose_assets::Texture,
     uv: &[crate::shader::I32s; 2],
-    aniso: &[crate::shader::I32s; 2],
     lod: crate::shader::I16s,
-    aniso_lod: crate::shader::I16s,
+    at: crate::shader::Pixels,
 ) -> crate::shader::U32s {
-    use crate::shader::{sample, sample_anisotropic, sample_bilinear, sample_trilinear};
-    match FILTER {
-        filter::NEAREST => sample(tex.base(), uv[0], uv[1]),
-        filter::BILINEAR => sample_bilinear(tex.base(), uv[0], uv[1]),
-        filter::TRILINEAR => sample_trilinear(tex, uv[0], uv[1], lod),
-        _ => sample_anisotropic(tex, uv[0], uv[1], *aniso, lod, aniso_lod),
+    crate::shader::sample_texture::<FILTER>(tex, uv[0], uv[1], lod, at)
+}
+
+/// The coarsest detail noise's cells across one of the texture's full-size texels (each
+/// way), as log2.
+pub const DETAIL_LOG2: i32 = 3;
+/// Octaves of detail noise, each with cells half the size of the one before: the finest
+/// has 2^(`DETAIL_LOG2` + `DETAIL_OCTAVES` - 1) across a texel.
+pub const DETAIL_OCTAVES: i32 = 4;
+/// Each octave's strength over the one before's.
+const DETAIL_PERSISTENCE: f32 = 0.7;
+
+/// `texel` (texture `tex`'s color at `uv`, level of detail `lod`) with procedural detail
+/// where the texture is magnified: its brightness scaled by fractal value noise anchored to
+/// the texture, so it moves with the surface. Each octave ([`DETAIL_OCTAVES`], the first
+/// [`DETAIL_LOG2`] finer than the texels) fades in from where its cells are one pixel across
+/// to where they are two, so the closer the view, the finer the grain it adds, and none of
+/// it shimmers. The first octave scales brightness by up to `strength` either way (1 is from
+/// black to double), each finer one by [`DETAIL_PERSISTENCE`] as much. Each octave's values
+/// are blended across its cells with smoothstep, so its cells show no edges. `mask` (0 to
+/// 255 per lane) scales it all: 0 for none, 255 for full. Octaves no lane of a block is close
+/// enough for cost one compare. Alpha is kept.
+#[inline(always)]
+pub fn detail(
+    texel: crate::shader::U32s,
+    tex: &moose_assets::Texture,
+    uv: &[crate::shader::I32s; 2],
+    lod: crate::shader::I16s,
+    strength: f32,
+    mask: crate::shader::U32s,
+) -> crate::shader::U32s {
+    use crate::shader::{Fill, I32s, U32s};
+    if strength <= 0.0 || mask == U32s::fill(0) {
+        return texel;
     }
+    let lod = I32s::from_i16x8(lod);
+    let base = &tex.levels[0];
+    // Each lane's cell of octave `k` and where in it the point is (0 to 256, smoothstepped),
+    // from 16.16 `uv` with 1.0 across the texture.
+    let cell = |c: I32s, log2: u32, k: i32| {
+        let s = (16 - (log2 as i32 + DETAIL_LOG2 + k)).max(1);
+        let cell: U32s = wide::bytemuck::cast(c >> s);
+        let f: U32s = wide::bytemuck::cast(((c & I32s::fill((1 << s) - 1)) << 8) >> s);
+        (cell, (f * f * (U32s::fill(768) - f - f)) >> 16)
+    };
+    // A hash of a cell corner (lowbias32's mixing, after scrambling x and y apart), its top
+    // byte: 0 to 255.
+    const KX: u32 = 0x8DA6_B343;
+    const KY: u32 = 0xD816_3841;
+    let hash = |h: U32s| {
+        let h = (h ^ (h >> 16)) * U32s::fill(0x7FEB_352D);
+        ((h ^ (h >> 15)) * U32s::fill(0x846C_A68B)) >> 24
+    };
+    let lerp = |a: U32s, b: U32s, f: U32s| (a * (U32s::fill(256) - f) + b * f) >> 8;
+    // The octaves' sum: noise (-128 to 127) times fade (0 to 256) times strength (Q12).
+    let mut sum = I32s::fill(0);
+    let mut amount = strength.min(1.0);
+    for k in 0..DETAIL_OCTAVES {
+        // How far faded in, 0 to 256 (the level of detail is 8.8). Each octave fades in
+        // closer than the one before, so once no lane has this one, none has the rest.
+        let fade = (I32s::fill(-((DETAIL_LOG2 + k) << 8)) - lod)
+            .max(I32s::fill(0))
+            .min(I32s::fill(256));
+        if fade == I32s::fill(0) {
+            break;
+        }
+        let (x, fx) = cell(uv[0], base.width_log2, k);
+        let (y, fy) = cell(uv[1], base.height_log2, k);
+        let (x0, y0) = (x * U32s::fill(KX), y * U32s::fill(KY));
+        // Each octave its own values (seeded after stepping, so neighboring cells share
+        // corners).
+        let seed = U32s::fill(k as u32 * 0x9E37_79B9);
+        let (x1, y1) = (x0 + U32s::fill(KX), (y0 + U32s::fill(KY)) ^ seed);
+        let y0 = y0 ^ seed;
+        let top = lerp(hash(x0 ^ y0), hash(x1 ^ y0), fx);
+        let bottom = lerp(hash(x0 ^ y1), hash(x1 ^ y1), fx);
+        let noise = wide::bytemuck::cast::<U32s, I32s>(lerp(top, bottom, fy)) - I32s::fill(128);
+        sum += noise * fade * I32s::fill((amount * 4096.0).round() as i32);
+        amount *= DETAIL_PERSISTENCE;
+    }
+    if sum == I32s::fill(0) {
+        return texel;
+    }
+    // Brightness scale, 8.8: 1 + the sum (noise / 128 * fade / 256 * strength / 4096), by
+    // the mask (255 as a whole 1).
+    let mask = wide::bytemuck::cast::<U32s, I32s>(mask + (mask >> 7));
+    let scale: U32s = wide::bytemuck::cast(I32s::fill(256) + (((sum >> 19) * mask) >> 8));
+    let channel = |shift: u32| -> U32s {
+        let c: U32s = ((texel >> shift) & U32s::fill(255)) * scale;
+        (c >> 8_u32).min(U32s::fill(255)) << shift
+    };
+    (texel & U32s::fill(0xFF00_0000)) | channel(16) | channel(8) | channel(0)
 }
 
 /// Texture color from the mesh attribute `uv` (two coordinates, 1.0 across the texture,
-/// which tiles), trilinearly filtered with mipmaps (or as [`TexturedAnisotropic`],
-/// [`TexturedBilinear`] and [`TexturedNearest`]), opaque. The texture's alpha is ignored.
+/// which tiles), read with sampler `FILTER` (see [`filter`]; bilinear with blended mip
+/// levels by default), opaque. The texture's alpha masks the detail noise (see [`detail`]):
+/// 0 for none, 255 for full.
+///
+/// Params: detail strength (`values[0]`, 0 for none).
 pub mod textured {
-    use super::filter::TRILINEAR;
+    use super::filter::BILINEAR_MIPMAP_LINEAR;
     use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext};
 
     crate::material_io! {
-        vertex { uv: 2 }
-        sampled { uv: 2, lod: 1, aniso: 2, aniso_lod: 1 }
-        fixed32 { uv: 2, aniso: 2 }
-        fixed16 { lod: 1, aniso_lod: 1 }
+        vertex { uv: 2, face_normal: 3 }
+        sampled { uv: 2, lod: 1, normal: 3, position: 3 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { lod: 1 }
         float {}
     }
 
-    /// Filtering `FILTER`, from [`super::filter`].
-    pub struct Textured<const FILTER: u8 = TRILINEAR>;
+    /// Sampler `FILTER`, from [`super::filter`].
+    pub struct Textured<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
 
     impl<const FILTER: u8> Material for Textured<FILTER> {
         crate::material_types!();
@@ -362,35 +562,89 @@ pub mod textured {
         fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
             Sampled {
                 uv: v.uv,
+                normal: v.face_normal,
                 ..Default::default()
             }
         }
 
         #[inline(always)]
-        fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::diffuse(ctx, &s.position, &s.normal);
             Interp {
                 uv: s.uv,
-                aniso: s.aniso,
                 lod: s.lod,
-                aniso_lod: s.aniso_lod,
+                light: super::light_output(light),
             }
         }
 
         #[inline(always)]
         fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
-            super::texel::<FILTER>(ctx.textures[0], &a.uv, &a.aniso, b.lod[0], b.aniso_lod[0])
-                & U32s::fill(0xFF_FFFF)
+            let tex = ctx.textures[0];
+            let texel = super::texel::<FILTER>(tex, &a.uv, b.lod[0], ctx.at);
+            let strength = ctx.params.values[0];
+            let detailed = super::detail(texel, tex, &a.uv, b.lod[0], strength, texel >> 24_u32);
+            super::lit_texel(detailed, &a.light) & U32s::fill(0xFF_FFFF)
         }
     }
 }
 
 pub use textured::Textured;
-/// [`Textured`] with 2x anisotropic filtering.
-pub type TexturedAnisotropic = textured::Textured<{ filter::ANISOTROPIC }>;
-/// [`Textured`] with bilinear filtering of the full-size level, no mipmaps.
-pub type TexturedBilinear = textured::Textured<{ filter::BILINEAR }>;
-/// [`Textured`] with the nearest texel of the full-size level.
-pub type TexturedNearest = textured::Textured<{ filter::NEAREST }>;
+
+/// [`Textured`], translucent: the texture's color at a uniform opacity, blended over what
+/// is behind.
+///
+/// Params: opacity (`values[0]`, 0 to 1).
+pub mod textured_translucent {
+    use super::filter::BILINEAR_MIPMAP_LINEAR;
+    use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext};
+
+    crate::material_io! {
+        vertex { uv: 2, face_normal: 3 }
+        sampled { uv: 2, lod: 1, normal: 3, position: 3 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { lod: 1 }
+        float {}
+    }
+
+    /// Sampler `FILTER`, from [`super::filter`].
+    pub struct TexturedTranslucent<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
+
+    impl<const FILTER: u8> Material for TexturedTranslucent<FILTER> {
+        crate::material_types!();
+        const TRANSLUCENT: bool = true;
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled {
+                uv: v.uv,
+                normal: v.face_normal,
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::diffuse(ctx, &s.position, &s.normal);
+            Interp {
+                uv: s.uv,
+                lod: s.lod,
+                light: super::light_output(light),
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+            let alpha = (ctx.params.values[0].clamp(0.0, 1.0) * 255.0).round() as u32;
+            let texel = super::lit_texel(
+                super::texel::<FILTER>(ctx.textures[0], &a.uv, b.lod[0], ctx.at),
+                &a.light,
+            );
+            (texel & U32s::fill(0xFF_FFFF)) | U32s::fill(alpha << 24)
+        }
+    }
+}
+
+pub use textured_translucent::TexturedTranslucent;
 
 /// A textured reflective surface: the texture's color drawn over the reflection with a
 /// Fresnel falloff, as [`VertexColorFresnel`], with the texture's alpha as roughness: 128
@@ -401,7 +655,7 @@ pub type TexturedNearest = textured::Textured<{ filter::NEAREST }>;
 ///
 /// Params: F0 (`values[0]`, 0 to 1) and the fade range in meters (`values[1]`, 0 for none).
 pub mod textured_fresnel {
-    use super::filter::TRILINEAR;
+    use super::filter::BILINEAR_MIPMAP_LINEAR;
     use super::vertex_color_fresnel::{ONE, keep};
     use crate::shader::{
         F32s, Fill, I16s, I32s, Material, Over, Params, PixelContext, RowBehind, SampleContext,
@@ -410,14 +664,14 @@ pub mod textured_fresnel {
 
     crate::material_io! {
         vertex { uv: 2, face_normal: 3 }
-        sampled { uv: 2, normal: 3, position: 3, lod: 1, aniso: 2, aniso_lod: 1 }
-        fixed32 { uv: 2, aniso: 2 }
-        fixed16 { facing: 1, lod: 1, aniso_lod: 1 }
+        sampled { uv: 2, normal: 3, position: 3, lod: 1 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { facing: 1, lod: 1 }
         float { distance: 1 }
     }
 
-    /// Filtering `FILTER`, from [`super::filter`].
-    pub struct TexturedFresnel<const FILTER: u8 = TRILINEAR>;
+    /// Sampler `FILTER`, from [`super::filter`].
+    pub struct TexturedFresnel<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
 
     impl<const FILTER: u8> Material for TexturedFresnel<FILTER> {
         crate::material_types!();
@@ -437,12 +691,12 @@ pub mod textured_fresnel {
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
             let (facing, distance) = super::facing_and_distance(ctx.eye, &s.position, &s.normal);
+            let light = super::diffuse(ctx, &s.position, &s.normal);
             Interp {
                 uv: s.uv,
-                aniso: s.aniso,
                 facing: [facing],
                 lod: s.lod,
-                aniso_lod: s.aniso_lod,
+                light: super::light_output(light),
                 distance: [distance],
             }
         }
@@ -467,8 +721,10 @@ pub mod textured_fresnel {
             ctx: &PixelContext,
             over: &Over,
         ) -> U32s {
-            let texel =
-                super::texel::<FILTER>(ctx.textures[0], &a.uv, &a.aniso, b.lod[0], b.aniso_lod[0]);
+            let texel = super::lit_texel(
+                super::texel::<FILTER>(ctx.textures[0], &a.uv, b.lod[0], ctx.at),
+                &a.light,
+            );
             self::over(texel, b, c, ctx.params, over.w, over.behind_w)
         }
     }
@@ -523,12 +779,6 @@ pub mod textured_fresnel {
 }
 
 pub use textured_fresnel::TexturedFresnel;
-/// [`TexturedFresnel`] with 2x anisotropic filtering.
-pub type TexturedFresnelAnisotropic = textured_fresnel::TexturedFresnel<{ filter::ANISOTROPIC }>;
-/// [`TexturedFresnel`] with bilinear filtering of the full-size level, no mipmaps.
-pub type TexturedFresnelBilinear = textured_fresnel::TexturedFresnel<{ filter::BILINEAR }>;
-/// [`TexturedFresnel`] with the nearest texel of the full-size level.
-pub type TexturedFresnelNearest = textured_fresnel::TexturedFresnel<{ filter::NEAREST }>;
 
 /// Water, for shiny floors: [`TexturedFresnel`] with the reflection seen through it rippling
 /// from side to side with the water's own ripples. Textures: `[0]` the rippled water
@@ -542,7 +792,7 @@ pub type TexturedFresnelNearest = textured_fresnel::TexturedFresnel<{ filter::NE
 /// Params: as [`TexturedFresnel`] (`[F0, fade range]`), then the size in meters of one
 /// texel of shift (0 for no shift).
 pub mod water {
-    use super::filter::TRILINEAR;
+    use super::filter::BILINEAR_MIPMAP_LINEAR;
     use super::textured_fresnel::{
         Fixed16, Fixed32, Floats, Interp, Sampled, SampledLanes, TexturedFresnel, Vertex, over,
     };
@@ -554,9 +804,9 @@ pub mod water {
     /// Largest shift, in pixels.
     const MAX_SHIFT: i32 = 32;
 
-    /// The translucent surface, over its reflection. Filtering `FILTER`, from
+    /// The translucent surface, over its reflection. Sampler `FILTER`, from
     /// [`super::filter`].
-    pub struct Water<const FILTER: u8 = TRILINEAR>;
+    pub struct Water<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
 
     impl<const FILTER: u8> Material for Water<FILTER> {
         type Vertex = Vertex;
@@ -603,7 +853,10 @@ pub mod water {
         ) -> U32s {
             let (w, behind_w) = (over.w, over.behind_w);
             let tex = ctx.textures;
-            let texel = super::texel::<FILTER>(tex[0], &a.uv, &a.aniso, b.lod[0], b.aniso_lod[0]);
+            let texel = super::lit_texel(
+                super::texel::<FILTER>(tex[0], &a.uv, b.lod[0], ctx.at),
+                &a.light,
+            );
             // Pixels one meter away per texel of shift.
             let ripple = ctx.params.values[2] * ctx.focal;
             if ripple == 0.0 {
@@ -613,7 +866,7 @@ pub mod water {
             // water, so a fraction of a texel), and the same distance on screen at this depth
             // (w is 1 / depth), rounded to a pixel. The color and the depth behind both come
             // from there, so the fade moves with what it fades.
-            let height = super::texel::<FILTER>(tex[1], &a.uv, &a.aniso, b.lod[0], b.aniso_lod[0])
+            let height = super::texel::<FILTER>(tex[1], &a.uv, b.lod[0], ctx.at)
                 & U32s::fill(0xFF);
             let h = wide::bytemuck::cast::<U32s, I32s>(height) - I32s::fill(128);
             let shift = (h.round_float() * w * F32s::fill(ripple * 0.25))
@@ -642,6 +895,7 @@ pub use water::Water;
 /// Params: the object's radius in meters (`values[0]`) and the cube map's face size in
 /// texels (`values[1]`), for its level of detail.
 pub mod cube_reflection {
+    use super::filter::BILINEAR_MIPMAP_LINEAR;
     use crate::shader::{
         F32s, Fill, Material, PixelContext, SampleContext, U32s, VertexContext, sample_cube,
     };
@@ -654,9 +908,10 @@ pub mod cube_reflection {
         float { reflect: 3, lod: 1 }
     }
 
-    pub struct CubeReflection;
+    /// Sampler `FILTER`, from [`super::filter`].
+    pub struct CubeReflection<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
 
-    impl Material for CubeReflection {
+    impl<const FILTER: u8> Material for CubeReflection<FILTER> {
         crate::material_types!();
         /// The reflection turns fast across a curved mesh's polygons.
         const SAMPLE_SPACING: i32 = 8;
@@ -702,7 +957,7 @@ pub mod cube_reflection {
 
         #[inline(always)]
         fn shade_pixel(_: &Fixed32, _: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
-            sample_cube(ctx.textures[0], c.reflect, c.lod[0].to_array()[0])
+            sample_cube::<FILTER>(ctx.textures[0], c.reflect, c.lod[0].to_array()[0], ctx.at)
         }
     }
 }
@@ -733,6 +988,11 @@ mod tests {
             params,
             focal,
         }
+    }
+
+    /// A 16.16 `light` output of exactly 1: surfaces lit as they are.
+    fn full_light() -> [I32s; 3] {
+        [I32s::from([65536; LANES]); 3]
     }
 
     #[test]
@@ -779,7 +1039,7 @@ mod tests {
         let out = <Water>::shade_over(
             &textured_fresnel::Fixed32 {
                 uv: [u, I32s::from([0; LANES])],
-                aniso: [I32s::from([0; LANES]); 2],
+                light: full_light(),
             },
             &textured_fresnel::Fixed16::default(),
             &floats,
@@ -808,7 +1068,7 @@ mod tests {
 
     #[test]
     fn filtered_heights_shift_by_fractions_rounded() {
-        use super::filter::BILINEAR;
+        use super::filter::BILINEAR_MIPMAP_NONE;
         use super::water::Water;
         // Two cells, shifts of 0 and 6 texels (one pixel each here), and pixels spread
         // between their centers: filtered, the shift climbs through the pixels between
@@ -822,10 +1082,10 @@ mod tests {
         // u from the first cell's center (1/4) to the second's (3/4).
         let u = I32s::from(std::array::from_fn(|i| (1 << 14) + ((i as i32) << 15) / 7));
         let textures = [&tex, &map];
-        let out = Water::<BILINEAR>::shade_over(
+        let out = Water::<BILINEAR_MIPMAP_NONE>::shade_over(
             &textured_fresnel::Fixed32 {
                 uv: [u, I32s::from([0; LANES])],
-                aniso: [I32s::from([0; LANES]); 2],
+                light: full_light(),
             },
             &textured_fresnel::Fixed16::default(),
             &textured_fresnel::Floats {
@@ -862,6 +1122,9 @@ mod tests {
             focal: 360.0,
             object: &Object::IDENTITY,
             params: &params,
+            lights: &[],
+            ambient: Vec3::ONE,
+            shadow_maps: &[],
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -873,7 +1136,7 @@ mod tests {
                 normal: n.map(|c| F32s::from([c * scale; LANES])),
                 position: d.map(|c| F32s::from([c; LANES])),
             };
-            let out = CubeReflection::shade_sample(&s, &ctx);
+            let out = <CubeReflection>::shade_sample(&s, &ctx);
             let got: Vec<f32> = out.reflect.iter().map(|l| l.to_array()[0]).collect();
             let k = got[0] / want[0];
             assert!(k > 0.0);
@@ -903,14 +1166,13 @@ mod tests {
                     std::array::from_fn(|i| ((i % 4) as f32 * 0.25 * 65536.0) as i32 + 8192);
                 let a = textured_fresnel::Fixed32 {
                     uv: [I32s::from(u), I32s::from([0; LANES])],
-                    aniso: [I32s::from([0; LANES]); 2],
+                    light: full_light(),
                 };
                 // The sample stage's value, converted to 8.8 as the renderer does.
                 let bits = (textured_fresnel_facing(cos) * 256.0).round() as i16;
                 let b = textured_fresnel::Fixed16 {
                     facing: [I16s::from([bits; LANES])],
                     lod: [I16s::from([0; LANES])],
-                    aniso_lod: [I16s::from([0; LANES])],
                 };
                 let out = <TexturedFresnel>::shade_pixel(
                     &a,
@@ -956,11 +1218,13 @@ mod tests {
         });
         let bits = (textured_fresnel_facing(cos) * 256.0).round() as i16;
         let out = <TexturedFresnel>::shade_over(
-            &textured_fresnel::Fixed32::default(),
+            &textured_fresnel::Fixed32 {
+                light: full_light(),
+                ..Default::default()
+            },
             &textured_fresnel::Fixed16 {
                 facing: [I16s::from([bits; LANES])],
                 lod: [I16s::from([0; LANES])],
-                aniso_lod: [I16s::from([0; LANES])],
             },
             &textured_fresnel::Floats {
                 distance: [F32s::from([distance; LANES])],

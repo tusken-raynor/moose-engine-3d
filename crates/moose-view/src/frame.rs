@@ -1,7 +1,9 @@
 use std::ops::Range;
 
 use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A};
-use moose_assets::{Assets, EntityKind, Mesh, MeshId, Plane, PolyFlags, Polygon, Portal};
+use moose_assets::{
+    Assets, EntityKind, Mesh, MeshId, Plane, Light, PolyFlags, Polygon, Portal,
+};
 use moose_scene::{View, World};
 
 use crate::clip::{ClipPlane, Clipper, Edge};
@@ -281,6 +283,15 @@ pub struct ViewGeometry {
     /// length in pixels.
     pub eye: Vec3,
     pub focal: f32,
+    /// The world's lights and ambient light; see [`ViewGeometry::polygon_lights`].
+    pub lights: Vec<Light>,
+    pub ambient: Vec3,
+    /// The lights that can reach each polygon, as ranges of `light_lists` (indices into
+    /// `lights`): per sector for level polygons, and per object (parallel to `objects`) for
+    /// an entity's, the lights of every sector it touches.
+    pub light_lists: Vec<u32>,
+    pub sector_lights: Vec<Range<u32>>,
+    pub object_lights: Vec<Range<u32>>,
     pub visits: Vec<SectorVisit>,
     /// Mirrors seen this frame, parents before children. Visits and polygons seen in a
     /// mirror refer to it by index.
@@ -447,8 +458,24 @@ struct Out<'a> {
 }
 
 impl ViewGeometry {
+    /// The lights that can reach polygon `p` (indices into `lights`): those of its sector,
+    /// or for an entity's polygon, of every sector the entity touches. Some may still be
+    /// out of range of it, or behind it.
+    pub fn polygon_lights(&self, p: &ViewPolygon) -> &[u32] {
+        let range = match p.source {
+            PolygonSource::World { sector, .. } => self.sector_lights.get(sector as usize),
+            PolygonSource::Entity { .. } => self.object_lights.get(p.object as usize),
+        };
+        range.map_or(&[], |r| &self.light_lists[r.start as usize..r.end as usize])
+    }
+
+    /// Empty geometry, with an ambient light of 1 (surfaces show their full color) until
+    /// built.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            ambient: Vec3::ONE,
+            ..Self::default()
+        }
     }
 
     /// Normals of a visit's window planes, all through the eye, in homogeneous clip
@@ -525,6 +552,18 @@ impl ViewGeometry {
         self.objects.clear();
         self.objects.push(Object::IDENTITY);
         (self.eye, self.focal) = (view.position, view.focal);
+        self.lights.clear();
+        self.lights.extend_from_slice(world.lights());
+        self.ambient = world.ambient;
+        self.light_lists.clear();
+        self.sector_lights.clear();
+        for sector in 0..world.sectors.len() as u32 {
+            let start = self.light_lists.len() as u32;
+            self.light_lists.extend_from_slice(world.sector_lights(sector));
+            self.sector_lights.push(start..self.light_lists.len() as u32);
+        }
+        self.object_lights.clear();
+        self.object_lights.push(0..0); // the level: per sector instead
         self.visits.clear();
         self.mirrors.clear();
         self.window_planes.clear();
@@ -838,6 +877,22 @@ impl ViewGeometry {
                         rotation: entity.rotation,
                         scale: entity.scale,
                     });
+                    let start = self.light_lists.len();
+                    for &sector in &entity.sectors {
+                        self.light_lists
+                            .extend_from_slice(world.sector_lights(sector));
+                    }
+                    self.light_lists[start..].sort_unstable();
+                    let mut kept = start;
+                    for i in start..self.light_lists.len() {
+                        if kept == start || self.light_lists[kept - 1] != self.light_lists[i] {
+                            self.light_lists[kept] = self.light_lists[i];
+                            kept += 1;
+                        }
+                    }
+                    self.light_lists.truncate(kept);
+                    self.object_lights
+                        .push(start as u32..self.light_lists.len() as u32);
                 }
                 let object = s.entity_objects[ei];
                 let kind = if entity.kind == EntityKind::Actor {

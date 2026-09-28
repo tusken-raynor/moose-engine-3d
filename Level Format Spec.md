@@ -33,7 +33,7 @@ Static meshes referenced by entities are `.obj` files for now.
 - Quoted strings may contain spaces.
 - The file begins with the header `MOOSEMAP 1`.
 - Each remaining section begins with its keyword and a row count. Rows start with an `id` that must equal the row's position, counting from 0.
-- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, `entities`.
+- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, `entities`, then optionally `ambient` and optionally `lights`.
 
 ```
 MOOSEMAP 1
@@ -67,6 +67,12 @@ adjoins 4
 entities 7
 #  id  kind   sector  model      x     y     z     pitch  yaw  roll  scale  name
    1   prop   0       crate.obj  -2.5  0.0   2.0   0      0    0     1.0    crate_a1
+
+ambient 0.12 0.12 0.14
+
+lights 5
+#  id  sector  x      y     z     r     g     b     range
+   0   0       -2.5   3.2   5.5   1.6   1.25  0.85  7.0
 ```
 
 ## Sections
@@ -128,6 +134,21 @@ Adjoins always come in pairs. The two surfaces use the same vertex indices in re
 | `scale` | Uniform scale |
 | `name` | Identifier, for debugging and scripting |
 
+**`ambient r g b`** (optional): light that reaches every surface, in linear RGB, where 1 shows a surface's full color. Without it, ambient light is 1 1 1, so a level with no lights looks as it always did.
+
+**`lights`** (optional): static lights. A row with 8 fields is a point light, which shines every way. A row with 13 fields is a spot light, which adds a direction and a cone.
+
+| Column | Meaning |
+| --- | --- |
+| `sector` | The sector that contains the light |
+| `x y z` | Position in world space |
+| `r g b` | Linear RGB at full strength (close to the light, facing it). 1 shows a surface's full color; more overbrightens. |
+| `range` | Where the light ends, in meters. It fades smoothly to nothing there. |
+| `dx dy dz` | Spot lights only: where it shines (any length) |
+| `inner outer` | Spot lights only: the cone's half-angles in degrees. Full strength within `inner`, fading smoothly to nothing at `outer`. |
+
+A light reaches its own sector, and passes into the next through any open portal (render-through adjoin) within its range and, for a spot light, its cone. It never passes through walls. See the Lighting Spec for how surfaces are lit.
+
 ## Validation (enforced by the loader)
 
 1. The header and version are recognized. Sections appear in order, section counts match their rows, ids are sequential, and every index reference is in range.
@@ -140,6 +161,7 @@ Adjoins always come in pairs. The two surfaces use the same vertex indices in re
 8. Every solid surface vertex references exactly one row per declared attribute; portal surface vertices reference none.
 9. Each entity's origin lies inside its sector: on the inner side of every one of the sector's surface planes. This is an exact test because sectors are convex.
 10. Entity names are unique. Spawn points have no model (`-`); props and actors must have one, and it must load. Scale is positive.
+11. Ambient light and light colors are not negative. Each light's range is positive, and its position lies inside its sector (as for entities). Each light row has 8 or 13 fields. A spot light's direction is not zero, and its angles satisfy 0 ≤ inner ≤ outer ≤ 180.
 
 ## Planned extensions
 

@@ -106,8 +106,19 @@ fn crate_mesh() {
     assert_eq!(m.vertex_positions.len(), 24);
     assert_eq!(m.polygons.len(), 6);
     assert!(m.polygons.iter().all(|p| p.vertex_count == 4));
-    assert_eq!(m.attribs.len(), 1);
+    assert_eq!(m.attribs.len(), 2);
     assert_eq!(m.attrib("color").unwrap().data.len(), 72);
+    // Each face shows the whole texture: its uvs are the four corners of 0-1.
+    let moose_assets::AttribData::F32(uv) = &m.attrib("uv").unwrap().data else {
+        panic!("uvs are f32");
+    };
+    assert_eq!(uv.len(), 24 * 2);
+    for face in uv.chunks_exact(4 * 2) {
+        let mut corners: Vec<[u32; 2]> =
+            face.chunks_exact(2).map(|t| [t[0] as u32, t[1] as u32]).collect();
+        corners.sort();
+        assert_eq!(corners, [[0, 0], [0, 1], [1, 0], [1, 1]]);
+    }
     assert_eq!(
         (m.bounds.min, m.bounds.max),
         (Vec3::new(-0.5, 0.0, -0.5), Vec3::new(0.5, 1.0, 0.5))
@@ -342,4 +353,62 @@ fn errors_point_at_the_line() {
     let line = src.lines().position(|l| l.contains("300")).unwrap() + 1;
     let err = assets().parse_level("two_rooms.mmp", &src).unwrap_err();
     assert_eq!(err.line, Some(line));
+}
+
+/// two_rooms.mmp with an ambient line and `lights` rows appended.
+fn with_lights(ambient: &str, rows: &[&str]) -> String {
+    let mut src = format!("{LEVEL}\n{ambient}\n\nlights {}\n", rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        src += &format!("   {i}   {r}\n");
+    }
+    src
+}
+
+#[test]
+fn loads_ambient_and_lights() {
+    // Without them: full ambient light, no lights.
+    let level = assets().parse_level("two_rooms.mmp", LEVEL).unwrap();
+    assert_eq!((level.ambient, level.lights.len()), (Vec3::ONE, 0));
+    let src = with_lights(
+        "ambient 0.1 0.2 0.3",
+        &["0  -2.0  3.0  5.0   1.5 1.0 0.5  6.0", "2  1.0  1.0  -15.0   0.2 0.4 1.2  3.5"],
+    );
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    assert_eq!(level.ambient, Vec3::new(0.1, 0.2, 0.3));
+    assert_eq!(level.lights.len(), 2);
+    let l = level.lights[1];
+    assert_eq!((l.sector, l.position, l.range), (2, Vec3::new(1.0, 1.0, -15.0), 3.5));
+    assert_eq!(l.color, Vec3::new(0.2, 0.4, 1.2));
+    assert!(l.is_point() && l.cone() == (0.0, 1.0));
+    // A spot light: its direction (normalized) and cone half-angles, in degrees.
+    let src = with_lights(
+        "ambient 0 0 0",
+        &["0  2.0  3.5  7.0   2 2 2  12   0 -2 0  10 20"],
+    );
+    let l = assets().parse_level("two_rooms.mmp", &src).unwrap().lights[0];
+    assert!(!l.is_point());
+    assert_eq!(l.direction, Vec3::NEG_Y);
+    assert!((l.cos_inner - 10f32.to_radians().cos()).abs() < 1e-6);
+    assert!((l.cos_outer - 20f32.to_radians().cos()).abs() < 1e-6);
+}
+
+#[test]
+fn rejects_light_errors() {
+    let reject = |ambient: &str, row: &str, expected: &str| {
+        let src = with_lights(ambient, &[row]);
+        let msg = match assets().parse_level("two_rooms.mmp", &src) {
+            Ok(_) => panic!("loaded despite light {row:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains(expected), "expected '{expected}' in: {msg}");
+    };
+    let fine = "0  0.0 2.0 4.0  1 1 1  5";
+    reject("ambient 1 -1 1", fine, "ambient light cannot be negative");
+    reject("ambient 1 1 1", "7  0.0 2.0 4.0  1 1 1  5", "sector 7 does not exist");
+    reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 -1 1  5", "color cannot be negative");
+    reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  0", "range must be positive");
+    reject("ambient 1 1 1", "0  0.0 2.0 -6.0  1 1 1  5", "outside sector 'room_a'");
+    reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1", "needs 8 fields");
+    reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  5  0 0 0  10 20", "direction cannot be zero");
+    reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  5  0 -1 0  30 20", "cone angles");
 }

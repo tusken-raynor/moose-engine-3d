@@ -1,5 +1,6 @@
-"""Generate the test assets: assets/models/crate.obj, the levels in assets/levels, and the
-placeholder floor texture assets/textures/test_floor.png.
+"""Generate the test assets: assets/models/crate.obj, the levels in assets/levels, the
+placeholder floor texture assets/textures/test_floor.png and the wall textures
+(brick_wall.png, panel_wall.png, stone_wall.png).
 
 Usage (from repo root): python3 tools/gen_test_assets.py .
 
@@ -73,15 +74,27 @@ def crate_obj():
          lambda p: side_lr if p[1] > 0.5 else scale3(side_lr, 0.7)),
     ]
     lines = [
-        "# Moose v2 test prop: 1 m wooden crate.",
+        "# Moose v2 test prop: 1 m crate.",
         "# Origin at bottom-center (y = 0 rests on the floor). Units: meters, +Y up.",
         "# Vertex colors use the 'v x y z r g b' extension (0-1 floats).",
-        "# 4 vertices per face so each face carries its own tint. Faces are",
+        "# 4 vertices per face so each face carries its own tint and its own whole texture",
+        "# (uv 0-1, v growing downward, upright on the sides). Faces are",
         "# counter-clockwise viewed from outside (outward facing).",
         "",
         "o crate",
     ]
-    vlines, flines = [], []
+    def uv(name, p):
+        # Sides: u to the right seen from outside, v down from the top edge. Top: seen from
+        # above with -Z up; bottom: seen from below with +Z up.
+        x, y, z = p
+        if name == "top":
+            return (x + h, z + h)
+        if name == "bottom":
+            return (x + h, h - z)
+        right = {"front": (x, 1), "back": (-x, 1), "right": (-z, 1), "left": (z, 1)}[name]
+        return (right[0] * right[1] + h, 1 - y)
+
+    vlines, tlines, flines = [], [], []
     idx = 1
     for name, pts, color in faces:
         pts = orient_away(pts, center)
@@ -89,10 +102,11 @@ def crate_obj():
         for p in pts:
             c = color(p)
             vlines.append("v " + " ".join(fmt(x) for x in p) + "  " + " ".join(f"{x:.3f}" for x in c))
-            ids.append(str(idx))
+            tlines.append("vt " + " ".join(fmt(t) for t in uv(name, p)))
+            ids.append(f"{idx}/{idx}")
             idx += 1
         flines.append(f"f {' '.join(ids)}  # {name}")
-    return "\n".join(lines + vlines + [""] + flines) + "\n"
+    return "\n".join(lines + vlines + [""] + tlines + [""] + flines) + "\n"
 
 
 def ball_obj(radius=0.25, segments=24, rings=12):
@@ -291,12 +305,14 @@ def planar_uv(p, normal):
     return (round(u / UV_TILE, 4), round(v / UV_TILE, 4))
 
 
-def level_text(title, about, shiny=(), darker=(), uv=False, props=()):
+def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=None, lights=()):
     """The level as .mmp text. Surfaces listed in `shiny` get the reflective flag (0x1).
     Surfaces listed in `darker` get their vertex colors at half brightness (as new color
     rows, so other surfaces sharing a color keep it). With `uv`, every drawn surface also
     gets texture coordinates (`uv f32 2`, see planar_uv). `props` are extra entities, after
-    the shared ones."""
+    the shared ones. `ambient` (r, g, b) and `lights` ((sector, position, color, range) for
+    a point light, plus (direction, inner, outer) in degrees for a spot light) light it;
+    without them it shows its full colors."""
     table = list(colors)
     index = dict(cindex)
     attributes = ATTRIBUTES + ([("uv", "f32", 2)] if uv else [])
@@ -376,6 +392,19 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=()):
     for i, (k, sec, m, p, r, sc, n) in enumerate(all_entities):
         o.append(f"   {i:<3} {k:<6} {sec:<7} {m:<10} " + " ".join(f"{fmt(x):<7}" for x in p)
                  + f" {r[0]:<6} {r[1]:<5} {r[2]:<5} {fmt(sc):<6} {n}")
+    if ambient is not None:
+        o += ["", "ambient " + " ".join(fmt(c) for c in ambient)]
+    if lights:
+        o += ["", f"lights {len(lights)}",
+              "#  id  sector  x       y       z       r      g      b      range  "
+              "[dx     dy     dz     inner  outer]   (spot lights: direction, cone half-angles)"]
+        for i, (sec, p, c, rng, *spot) in enumerate(lights):
+            row = (f"   {i:<3} {sec:<7} " + " ".join(f"{fmt(x):<7}" for x in p)
+                   + " " + " ".join(f"{fmt(x):<6}" for x in c) + f" {fmt(rng):<6}")
+            if spot:
+                (d, inner, outer) = spot
+                row += " " + " ".join(f"{fmt(x):<6}" for x in d) + f" {fmt(inner):<6} {fmt(outer)}"
+            o.append(row.rstrip())
     return "\n".join(o) + "\n"
 
 
@@ -418,9 +447,141 @@ def test_floor():
     return png_rgba(n, n, rows)
 
 
+# Wall textures: 64x64 tiles, one per sector of the test levels (the app gives sector i the
+# i-th, cycling). Tileable: their noise repeats every S texels.
+S = 64
+
+
+def hash2(x, y, seed):
+    h = (x * 374761393 + y * 668265263 + seed * 2147483647) & 0xffffffff
+    h = ((h ^ (h >> 13)) * 1274126177) & 0xffffffff
+    return ((h ^ (h >> 16)) & 0xffff) / 65535.0
+
+
+def value_noise(x, y, cell, seed):
+    """Smooth noise that tiles every S texels (cell divides S)."""
+    n = S // cell
+    gx, gy = x / cell, y / cell
+    x0, y0 = int(gx), int(gy)
+    fx, fy = gx - x0, gy - y0
+    fx, fy = fx * fx * (3 - 2 * fx), fy * fy * (3 - 2 * fy)
+    v = lambda i, j: hash2(i % n, j % n, seed)
+    a = v(x0, y0) + (v(x0 + 1, y0) - v(x0, y0)) * fx
+    b = v(x0, y0 + 1) + (v(x0 + 1, y0 + 1) - v(x0, y0 + 1)) * fx
+    return a + (b - a) * fy
+
+
+def fbm(x, y, seed):
+    return (value_noise(x, y, 16, seed) * 0.5 + value_noise(x, y, 8, seed + 1) * 0.3
+            + value_noise(x, y, 4, seed + 2) * 0.2)
+
+
+def clamp(v):
+    return max(0, min(255, int(round(v))))
+
+
+def brick(x, y):
+    # Running bond: bricks 16x8 with a 1-texel mortar line, rows offset by half a brick.
+    # Alpha masks the close-up detail noise: none on the mortar, full on the bricks.
+    row = y // 8
+    bx = (x + (8 if row % 2 else 0)) % S
+    col = bx // 16
+    mortar = y % 8 == 7 or bx % 16 == 15
+    grit = fbm(x, y, 7) - 0.5
+    speck = hash2(x, y, 3) - 0.5
+    if mortar:
+        m = 150 + grit * 30 + speck * 14
+        return m * 0.95, m * 0.9, m * 0.82, 0
+    tone = hash2(col, row, 11)  # each brick its own shade
+    r = 150 + tone * 45 + grit * 40 + speck * 18
+    g = 70 + tone * 20 + grit * 22 + speck * 10
+    b = 48 + tone * 12 + grit * 16 + speck * 8
+    # Slightly darker lower edge and lighter upper edge give the bricks some depth.
+    edge = y % 8
+    k = 1.12 if edge == 0 else (0.82 if edge == 6 else 1.0)
+    return r * k, g * k, b * k, 255
+
+
+def panel(x, y):
+    # 2x2 metal panels of 32x32: a dark seam, a bevel (light top-left, dark bottom-right),
+    # rivets inset from each corner, and brushed streaks.
+    px, py = x % 32, y % 32
+    streak = value_noise(x, (y // 2) * 2, 4, 21) - 0.5
+    grime = fbm(x, y, 23) - 0.5
+    speck = hash2(x, y, 5) - 0.5
+    base = 118 + streak * 22 + grime * 36 + speck * 8
+    r, g, b = base * 0.86, base * 0.97, base * 0.9
+    if px == 31 or py == 31:
+        return 34, 40, 37
+    if px == 0 or py == 0:
+        r, g, b = r * 1.3, g * 1.3, b * 1.3
+    elif px == 30 or py == 30:
+        r, g, b = r * 0.65, g * 0.65, b * 0.65
+    for cx in (4, 26):
+        for cy in (4, 26):
+            dx, dy = px - cx, py - cy
+            d2 = dx * dx + dy * dy
+            if d2 <= 2:
+                lit = 1.45 if dx + dy < 0 else (1.0 if dx + dy == 0 else 0.6)
+                return 150 * lit, 160 * lit, 152 * lit
+    # A horizontal stripe across the middle of each panel.
+    if 14 <= py <= 17:
+        k = 0.8 if py in (14, 17) else 0.72
+        r, g, b = r * k, g * k, b * k
+    return r, g, b
+
+
+# Stone courses: each 16 rows tall, blocks of varied widths that tile across 64.
+COURSES = [[0, 24, 40], [0, 12, 36, 52], [0, 20, 44], [0, 8, 32, 48]]
+SHIFT = [0, 6, 12, 2]
+
+
+def stone(x, y):
+    course = y // 16
+    cy = y % 16
+    sx = (x + SHIFT[course]) % S
+    starts = COURSES[course]
+    k = max(i for i, s in enumerate(starts) if s <= sx)
+    left = starts[k]
+    right = starts[k + 1] if k + 1 < len(starts) else S
+    cx = sx - left
+    width = right - left
+    joint = cy == 15 or cx == width - 1
+    grit = fbm(x, y, 41) - 0.5
+    speck = hash2(x, y, 9) - 0.5
+    if joint:
+        m = 52 + grit * 20
+        return m * 0.85, m * 0.92, m * 1.1
+    tone = hash2(course * 7 + k, course, 17)
+    v = 112 + tone * 34 + grit * 46 + speck * 16
+    r, g, b = v * 0.78, v * 0.88, v * 1.05
+    # Chiseled edges: light along the top and left, shadow along the bottom and right.
+    if cy == 0 or cx == 0:
+        r, g, b = r * 1.22, g * 1.22, b * 1.22
+    elif cy == 14 or cx == width - 2:
+        r, g, b = r * 0.7, g * 0.7, b * 0.7
+    # A few cracks: dark texels where fine noise dips.
+    if value_noise(x, y, 4, 43 + course) < 0.08:
+        r, g, b = r * 0.7, g * 0.7, b * 0.7
+    return r, g, b
+
+
+def wall_texture(shade):
+    """A 64x64 PNG from `shade(x, y) -> (r, g, b)` (alpha 255) or `(r, g, b, a)`."""
+    def texel(x, y):
+        c = tuple(clamp(c) for c in shade(x, y))
+        return c if len(c) == 4 else c + (255,)
+    return png_rgba(S, S, [[texel(x, y) for x in range(S)] for y in range(S)])
+
+
 os.makedirs(os.path.join(ROOT, "assets/textures"), exist_ok=True)
 with open(os.path.join(ROOT, "assets/textures/test_floor.png"), "wb") as f:
     f.write(test_floor())
+# room_a: warm brick; hallway: grey-green metal panels; room_b: blue-grey stone blocks.
+for name, shade in [("brick_wall.png", brick), ("panel_wall.png", panel),
+                    ("stone_wall.png", stone)]:
+    with open(os.path.join(ROOT, "assets/textures", name), "wb") as f:
+        f.write(wall_texture(shade))
 
 os.makedirs(os.path.join(ROOT, "assets/models"), exist_ok=True)
 os.makedirs(os.path.join(ROOT, "assets/levels"), exist_ok=True)
@@ -431,18 +592,29 @@ with open(os.path.join(ROOT, "assets/models/ball.obj"), "w") as f:
 with open(os.path.join(ROOT, "assets/levels/two_rooms.mmp"), "w") as f:
     f.write(level_text("Two Rooms", "two box rooms joined by a hallway through two portals."))
 # Same level with shiny (reflective) floors throughout (both rooms and the hallway, so
-# reflections continue across adjacent floors), and room_a's ceiling shiny too. The two room
-# floors and room_a's ceiling are also darker, so their reflections stand out. A mirror ball
-# floats in room_b (the app bakes a cube map of the room for it).
+# reflections continue across adjacent floors). The two room floors are also darker, so their
+# reflections stand out. A mirror ball floats in room_b (the app bakes a cube map of the room
+# for it).
 room_floors = {sectors[room_a][1], sectors[room_b][1]}
 shiny_floors = room_floors | {sectors[hall][1]}
 room_a_ceiling = sectors[room_a][1] + 1
+# Lit by a dim ambient light and five point lights (warm ones in room_a, a cool one halfway
+# down the hallway, a cool one and a magenta accent in room_b); the app adds the player's
+# flashlight. (sector, position, color, range in meters[, direction, inner and outer
+# half-angles in degrees, for a spot light].)
+shiny_lights = [
+    (room_a, (-2.5, 3.2, 5.5), (0.8, 0.62, 0.42), 6.0),
+    (room_a, (2.8, 1.8, 1.2), (1.2, 0.7, 0.4), 5.0),
+    (hall, (0.0, 2.6, -6.0), (0.7, 0.95, 1.2), 5.0),
+    (room_b, (2.5, 3.2, -14.5), (0.8, 1.05, 1.6), 7.0),
+    (room_b, (-2.8, 1.2, -18.5), (1.3, 0.55, 1.1), 5.0),
+]
 with open(os.path.join(ROOT, "assets/levels/shiny_rooms.mmp"), "w") as f:
     f.write(level_text("Shiny Rooms",
-                       "two_rooms.mmp with reflective floors throughout and a reflective ceiling "
-                       "in room_a, darker in the rooms.",
-                       shiny=shiny_floors | {room_a_ceiling},
-                       darker=room_floors | {room_a_ceiling}, uv=True,
+                       "two_rooms.mmp with reflective floors throughout, darker in the rooms, "
+                       "lit by five point lights.",
+                       shiny=shiny_floors, darker=room_floors, uv=True,
+                       ambient=(0.01, 0.01, 0.013), lights=shiny_lights,
                        props=[("prop", room_b, "ball.obj", (-1.5, 1.5, -15.0), (0, 0, 0), 1.0,
                                "mirror_ball")]))
 # The shiny floors with room_a's ceiling reflective too: two facing mirrors, for

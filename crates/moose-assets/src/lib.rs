@@ -21,7 +21,7 @@ mod texture;
 
 pub use error::LoadError;
 pub use geom::{Aabb, Plane};
-pub use level::{EntityKind, EntitySpawn, Level, Portal, PortalFlags, Sector};
+pub use level::{EntityKind, EntitySpawn, Level, Light, Portal, PortalFlags, Sector};
 pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};

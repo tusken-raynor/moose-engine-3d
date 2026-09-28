@@ -15,8 +15,10 @@
 use std::ops::Range;
 
 use glam::Vec3;
-use moose_assets::{MipLevel, Texture};
+use moose_assets::{MipLevel, Light, Texture};
 use moose_view::Object;
+
+use crate::shadow::ShadowMap;
 
 use wide::{f32x4, f32x8, i16x8, i32x4, i32x8, u16x8, u32x4, u32x8};
 
@@ -105,11 +107,170 @@ pub fn widen(v: I16s) -> U32s {
     U32s::from(bits)
 }
 
+/// Texture samplers: how texels are read within a mip level (nearest, bilinear, or dithered
+/// as Unreal's software renderer did), and how mip levels are chosen (not at all, the
+/// nearest, blended between the two around the level of detail, or dithered between them).
+/// A sampler is one `u8`, used as a material's `FILTER` parameter so that each is its own
+/// monomorphized shading loop, with no per-pixel branching on it.
+pub mod filter {
+    /// Texel methods: the nearest texel, the four around the point blended, or the nearest
+    /// after moving the point by a 4x4 screen-space pattern of sub-texel offsets
+    /// ([`TEXEL_DITHER`](super::TEXEL_DITHER)), which approximates bilinear filtering with
+    /// one texel read.
+    pub const NEAREST: u8 = 0;
+    pub const BILINEAR: u8 = 1;
+    pub const DITHERED: u8 = 2;
+    /// Mip transitions: the full-size level only, the level nearest the level of detail,
+    /// the two levels around it blended by its fraction, or one of those two per pixel by
+    /// a 4x4 screen-space ordered pattern ([`MIP_DITHER`](super::MIP_DITHER)).
+    pub const MIPMAP_NONE: u8 = 0;
+    pub const MIPMAP_NEAREST: u8 = 1;
+    pub const MIPMAP_LINEAR: u8 = 2;
+    pub const MIPMAP_DITHERED: u8 = 3;
+
+    /// The sampler with texel method `method` and mip transition `mip`.
+    pub const fn of(method: u8, mip: u8) -> u8 {
+        method << 2 | mip
+    }
+    /// A sampler's texel method.
+    pub const fn method(filter: u8) -> u8 {
+        filter >> 2
+    }
+    /// A sampler's mip transition.
+    pub const fn mip(filter: u8) -> u8 {
+        filter & 3
+    }
+
+    pub const NEAREST_MIPMAP_NONE: u8 = of(NEAREST, MIPMAP_NONE);
+    pub const BILINEAR_MIPMAP_NONE: u8 = of(BILINEAR, MIPMAP_NONE);
+    pub const DITHERED_MIPMAP_NONE: u8 = of(DITHERED, MIPMAP_NONE);
+    pub const NEAREST_MIPMAP_NEAREST: u8 = of(NEAREST, MIPMAP_NEAREST);
+    pub const NEAREST_MIPMAP_LINEAR: u8 = of(NEAREST, MIPMAP_LINEAR);
+    pub const NEAREST_MIPMAP_DITHERED: u8 = of(NEAREST, MIPMAP_DITHERED);
+    pub const BILINEAR_MIPMAP_NEAREST: u8 = of(BILINEAR, MIPMAP_NEAREST);
+    pub const BILINEAR_MIPMAP_LINEAR: u8 = of(BILINEAR, MIPMAP_LINEAR);
+    pub const BILINEAR_MIPMAP_DITHERED: u8 = of(BILINEAR, MIPMAP_DITHERED);
+    pub const DITHERED_MIPMAP_NEAREST: u8 = of(DITHERED, MIPMAP_NEAREST);
+    pub const DITHERED_MIPMAP_LINEAR: u8 = of(DITHERED, MIPMAP_LINEAR);
+    pub const DITHERED_MIPMAP_DITHERED: u8 = of(DITHERED, MIPMAP_DITHERED);
+
+    /// Every sampler, in the order the app cycles through them.
+    pub const ALL: [u8; 12] = [
+        NEAREST_MIPMAP_NONE,
+        BILINEAR_MIPMAP_NONE,
+        DITHERED_MIPMAP_NONE,
+        NEAREST_MIPMAP_NEAREST,
+        NEAREST_MIPMAP_LINEAR,
+        NEAREST_MIPMAP_DITHERED,
+        BILINEAR_MIPMAP_NEAREST,
+        BILINEAR_MIPMAP_LINEAR,
+        BILINEAR_MIPMAP_DITHERED,
+        DITHERED_MIPMAP_NEAREST,
+        DITHERED_MIPMAP_LINEAR,
+        DITHERED_MIPMAP_DITHERED,
+    ];
+
+    /// A sampler's name, as its sample function's without `sample_`: "bilinear_mipmap_linear".
+    pub fn name(filter: u8) -> &'static str {
+        const NAMES: [[&str; 4]; 3] = [
+            [
+                "nearest_mipmap_none",
+                "nearest_mipmap_nearest",
+                "nearest_mipmap_linear",
+                "nearest_mipmap_dithered",
+            ],
+            [
+                "bilinear_mipmap_none",
+                "bilinear_mipmap_nearest",
+                "bilinear_mipmap_linear",
+                "bilinear_mipmap_dithered",
+            ],
+            [
+                "dithered_mipmap_none",
+                "dithered_mipmap_nearest",
+                "dithered_mipmap_linear",
+                "dithered_mipmap_dithered",
+            ],
+        ];
+        NAMES[method(filter) as usize][mip(filter) as usize]
+    }
+
+    /// The sampler named `name` (see [`name`]).
+    pub fn named(name: &str) -> Option<u8> {
+        ALL.into_iter().find(|&f| self::name(f) == name)
+    }
+}
+
+/// Registers a material generic over a sampler (its `FILTER` parameter, like
+/// [`Textured`](crate::shaders::Textured)) once per sampler, in [`filter::ALL`] order:
+/// `register_per_filter!(renderer, Textured)` is a `[MaterialId; 12]`.
+#[macro_export]
+macro_rules! register_per_filter {
+    ($renderer:expr, $material:ident) => {{
+        let r = &mut $renderer;
+        [
+            r.register_material::<$material<{ $crate::shader::filter::ALL[0] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[1] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[2] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[3] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[4] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[5] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[6] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[7] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[8] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[9] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[10] }>>(),
+            r.register_material::<$material<{ $crate::shader::filter::ALL[11] }>>(),
+        ]
+    }};
+}
+
+/// Unreal-style texel dithering, as version 1 did it: each pixel's texture coordinates move
+/// by `-e` in u and `+e` in v, with `e` from this matrix at `[x & 3][y & 3]` (screen x and
+/// y), in 1/65536 of a texel (-1/2 to 7/16 of a texel), before the nearest texel is read.
+/// Across 4x4 pixels the reads spread over the neighboring texels about as bilinear
+/// weighting would.
+pub const TEXEL_DITHER: [[i32; 4]; 4] = [
+    [-32768, 0, -28672, 4096],
+    [16384, -16384, 20480, -12288],
+    [-20480, 12288, -24576, 8192],
+    [28672, -4096, 24576, -8192],
+];
+
+/// Ordered dithering between two mip levels, as in version 1's `dev/dither.html`: a pixel
+/// reads the next level down when `MIP_DITHER[y & 3][x & 3] + t >= 16`, where `t` is the
+/// level of detail's fraction in sixteenths (rounded; 0 to 16). So a fraction of `k / 16`
+/// sends `k` of every 16 pixels to the next level.
+pub const MIP_DITHER: [[i32; 4]; 4] = [
+    [7, 12, 4, 14],
+    [11, 2, 9, 1],
+    [5, 15, 6, 13],
+    [8, 0, 10, 3],
+];
+
+/// Each lane's [`TEXEL_DITHER`] offset.
+#[inline(always)]
+fn texel_dither(at: Pixels) -> I32s {
+    let x = at.x_lanes().to_array();
+    let y = (at.y & 3) as usize;
+    I32s::from(std::array::from_fn::<i32, LANES, _>(|i| {
+        TEXEL_DITHER[(x[i] & 3) as usize][y]
+    }))
+}
+
+/// Each lane's [`MIP_DITHER`] threshold.
+#[inline(always)]
+fn mip_dither(at: Pixels) -> I32s {
+    let x = at.x_lanes().to_array();
+    let row = MIP_DITHER[(at.y & 3) as usize];
+    I32s::from(std::array::from_fn::<i32, LANES, _>(|i| row[(x[i] & 3) as usize]))
+}
+
 /// The nearest texel of one mip level for each lane, wrapping (the texture tiles): `u` and
 /// `v` are 16.16 fixed point with 1.0 across the whole texture, `v` down from its top row.
 /// The level must be at most 65536 texels on a side.
 #[inline(always)]
-pub fn sample(tex: &MipLevel, u: I32s, v: I32s) -> U32s {
+pub fn level_nearest(tex: &MipLevel, u: I32s, v: I32s) -> U32s {
     let x = (u >> (16 - tex.width_log2 as i32)) & I32s::fill(tex.width as i32 - 1);
     let y = (v >> (16 - tex.height_log2 as i32)) & I32s::fill(tex.height as i32 - 1);
     gather(tex, (y << tex.width_log2 as i32) | x)
@@ -128,9 +289,9 @@ fn gather(tex: &MipLevel, indices: I32s) -> U32s {
 /// The bilinearly filtered color of one mip level for each lane, wrapping (the texture
 /// tiles): the four texels around the sample point, weighted by how near their centers are,
 /// in all four channels (so a roughness alpha is filtered too). Coordinates as for
-/// [`sample`]; the weights have 8-bit precision.
+/// [`level_nearest`]; the weights have 8-bit precision.
 #[inline(always)]
-pub fn sample_bilinear(tex: &MipLevel, u: I32s, v: I32s) -> U32s {
+pub fn level_bilinear(tex: &MipLevel, u: I32s, v: I32s) -> U32s {
     // Texel coordinates with an 8-bit fraction, half a texel back so that texel centers
     // land on whole numbers.
     let to_texels = |c: I32s, log2: u32| {
@@ -157,63 +318,208 @@ pub fn sample_bilinear(tex: &MipLevel, u: I32s, v: I32s) -> U32s {
     lerp_texels(top, bottom, fy)
 }
 
-/// The trilinearly filtered color for each lane: bilinear on the two mip levels around
-/// `lod`, blended by its fraction. `lod` is 8.8 fixed point, log2 of the texels per pixel
-/// (see [`LOD`]): its integer part picks the level, clamped to the texture's levels (below
-/// 0 is the full-size level), and its 8-bit fraction weights the next level down.
-/// Coordinates as for [`sample`].
-///
-/// A block's lanes nearly always share a level; where they straddle a level boundary, each
-/// level they touch is sampled for all lanes, and each lane keeps its own.
+/// Unreal-style dithered texels of one mip level for each lane (see [`TEXEL_DITHER`]):
+/// the nearest texel after moving the point by the pixel's offset, in this level's texels.
+/// Coordinates as for [`level_nearest`].
 #[inline(always)]
-pub fn sample_trilinear(tex: &Texture, u: I32s, v: I32s, lod: I16s) -> U32s {
-    let last = (tex.levels.len() - 1) as i32;
-    let lod = I32s::from_i16x8(lod)
-        .max(I32s::fill(0))
-        .min(I32s::fill(last << 8));
-    let level: I32s = lod >> 8;
-    let fraction: U32s = wide::bytemuck::cast(lod & I32s::fill(255));
-    let levels = level.to_array();
-    let (lo, hi) = (*levels.iter().min().unwrap(), *levels.iter().max().unwrap());
-    let mut out = U32s::fill(0);
-    // Magnified (or exactly on a level) across the block: the next level has no weight.
-    let whole = fraction == U32s::fill(0);
-    for l in lo..=hi {
-        let near = sample_bilinear(&tex.levels[l as usize], u, v);
-        let blended = if l < last && !whole {
-            let far = sample_bilinear(&tex.levels[l as usize + 1], u, v);
-            lerp_texels(near, far, fraction)
+pub fn level_dithered(tex: &MipLevel, u: I32s, v: I32s, at: Pixels) -> U32s {
+    let e = texel_dither(at);
+    level_nearest(
+        tex,
+        u - (e >> tex.width_log2 as i32),
+        v + (e >> tex.height_log2 as i32),
+    )
+}
+
+/// One mip level read with texel method `method` (see [`filter`]).
+#[inline(always)]
+fn read_level(method: u8, tex: &MipLevel, u: I32s, v: I32s, at: Pixels) -> U32s {
+    match method {
+        filter::NEAREST => level_nearest(tex, u, v),
+        filter::BILINEAR => level_bilinear(tex, u, v),
+        _ => level_dithered(tex, u, v, at),
+    }
+}
+
+/// Reads all lanes from one mip level: what [`mip_transition`] picks levels for. Readers
+/// are types, not closures, so that each read is always inlined and its sampler folds to
+/// constants.
+trait LevelRead {
+    fn read(&self, level: usize) -> U32s;
+}
+
+/// A texture's level, read with sampler `FILTER`'s texel method.
+struct TextureRead<'a, const FILTER: u8> {
+    tex: &'a Texture,
+    u: I32s,
+    v: I32s,
+    at: Pixels,
+}
+
+impl<const FILTER: u8> LevelRead for TextureRead<'_, FILTER> {
+    #[inline(always)]
+    fn read(&self, level: usize) -> U32s {
+        read_level(
+            filter::method(FILTER),
+            &self.tex.levels[level],
+            self.u,
+            self.v,
+            self.at,
+        )
+    }
+}
+
+/// A level blended toward the next by each lane's `fraction` (of 256), except the last
+/// level, or where no lane has a fraction.
+struct Blended<'a, R> {
+    read: &'a R,
+    fraction: U32s,
+    whole: bool,
+    last: usize,
+}
+
+impl<R: LevelRead> LevelRead for Blended<'_, R> {
+    #[inline(always)]
+    fn read(&self, level: usize) -> U32s {
+        let near = self.read.read(level);
+        if level < self.last && !self.whole {
+            lerp_texels(near, self.read.read(level + 1), self.fraction)
         } else {
             near // the smallest level: nothing further to blend
-        };
-        if lo == hi {
-            return blended;
         }
+    }
+}
+
+/// The mip transition `mip` (see [`filter`]): the color at level of detail `lod` (8.8
+/// fixed point, log2 of the texels per pixel, per lane), from a texture with `levels`
+/// levels. Below 0 is the full-size level; past the last level, the last.
+///
+/// A block's lanes nearly always share a level; where they straddle a level boundary (or
+/// dithering spreads them over two), each level they use is read for all lanes, and each
+/// lane keeps its own.
+#[inline(always)]
+fn mip_transition(mip: u8, levels: usize, lod: I32s, at: Pixels, read: &impl LevelRead) -> U32s {
+    if mip == filter::MIPMAP_NONE {
+        return read.read(0);
+    }
+    let last = (levels - 1) as i32;
+    let lod = lod.max(I32s::fill(0)).min(I32s::fill(last << 8));
+    match mip {
+        filter::MIPMAP_NEAREST => {
+            let level: I32s = (lod + I32s::fill(128)) >> 8;
+            per_lane_level(level.min(I32s::fill(last)), read)
+        }
+        filter::MIPMAP_LINEAR => {
+            let fraction: U32s = wide::bytemuck::cast(lod & I32s::fill(255));
+            let blended = Blended {
+                read,
+                fraction,
+                // Magnified (or exactly on a level) across the block: the next level has
+                // no weight.
+                whole: fraction == U32s::fill(0),
+                last: last as usize,
+            };
+            per_lane_level(lod >> 8, &blended)
+        }
+        _ => {
+            // The fraction in sixteenths, rounded; at the last level it is 0.
+            let t: I32s = ((lod & I32s::fill(255)) + I32s::fill(8)) >> 4;
+            let next: I32s = (mip_dither(at) + t) >> 4;
+            let level: I32s = lod >> 8;
+            per_lane_level(level + next, read)
+        }
+    }
+}
+
+/// `read` at each lane's own `level`: every level any lane uses is read for all lanes, and
+/// each lane keeps its own.
+#[inline(always)]
+fn per_lane_level(level: I32s, read: &impl LevelRead) -> U32s {
+    let levels = level.to_array();
+    let (lo, hi) = (*levels.iter().min().unwrap(), *levels.iter().max().unwrap());
+    if lo == hi {
+        return read.read(lo as usize);
+    }
+    let mut out = U32s::fill(0);
+    for l in lo..=hi {
         let this: U32s = wide::bytemuck::cast(level.simd_eq(I32s::fill(l)));
-        out = (blended & this) | (out & !this);
+        if this == U32s::fill(0) {
+            continue;
+        }
+        out = (read.read(l as usize) & this) | (out & !this);
     }
     out
 }
 
-/// 2x anisotropic filtering: two trilinear probes at `uv ± offset` (along the long axis of the
-/// pixel's footprint; see [`ANISO`]) with level of detail `probe_lod` (see [`ANISO_LOD`]),
-/// averaged. Where no lane of the block needs it (offset 0: a round or magnified footprint),
-/// one trilinear probe at `lod`, which is then the same level.
+/// A texture's color for each lane with sampler `FILTER` (see [`filter`]): `u` and `v` as
+/// for [`level_nearest`], `lod` the level of detail (8.8 fixed point, log2 of full-size
+/// texels per pixel; see [`LOD`]), `at` the lanes' screen pixels (for the dithered
+/// samplers). The `sample_*` functions name each sampler.
 #[inline(always)]
-pub fn sample_anisotropic(
+pub fn sample_texture<const FILTER: u8>(
     tex: &Texture,
     u: I32s,
     v: I32s,
-    offset: [I32s; 2],
     lod: I16s,
-    probe_lod: I16s,
+    at: Pixels,
 ) -> U32s {
-    if (offset[0] | offset[1]) == I32s::fill(0) {
-        return sample_trilinear(tex, u, v, lod);
-    }
-    let a = sample_trilinear(tex, u + offset[0], v + offset[1], probe_lod);
-    let b = sample_trilinear(tex, u - offset[0], v - offset[1], probe_lod);
-    lerp_texels(a, b, U32s::fill(128))
+    let read = TextureRead::<FILTER> { tex, u, v, at };
+    mip_transition(
+        filter::mip(FILTER),
+        tex.levels.len(),
+        I32s::from_i16x8(lod),
+        at,
+        &read,
+    )
+}
+
+/// The nearest texel of the full-size level.
+pub fn sample_nearest_mipmap_none(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::NEAREST_MIPMAP_NONE }>(tex, u, v, lod, at)
+}
+/// Bilinear on the full-size level.
+pub fn sample_bilinear_mipmap_none(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::BILINEAR_MIPMAP_NONE }>(tex, u, v, lod, at)
+}
+/// Dithered texels of the full-size level.
+pub fn sample_dithered_mipmap_none(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::DITHERED_MIPMAP_NONE }>(tex, u, v, lod, at)
+}
+/// The nearest texel of the nearest level.
+pub fn sample_nearest_mipmap_nearest(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::NEAREST_MIPMAP_NEAREST }>(tex, u, v, lod, at)
+}
+/// The nearest texels of the two levels around the level of detail, blended.
+pub fn sample_nearest_mipmap_linear(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::NEAREST_MIPMAP_LINEAR }>(tex, u, v, lod, at)
+}
+/// The nearest texel of one of the two levels around the level of detail, dithered.
+pub fn sample_nearest_mipmap_dithered(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::NEAREST_MIPMAP_DITHERED }>(tex, u, v, lod, at)
+}
+/// Bilinear on the nearest level.
+pub fn sample_bilinear_mipmap_nearest(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::BILINEAR_MIPMAP_NEAREST }>(tex, u, v, lod, at)
+}
+/// Bilinear on the two levels around the level of detail, blended (trilinear).
+pub fn sample_bilinear_mipmap_linear(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::BILINEAR_MIPMAP_LINEAR }>(tex, u, v, lod, at)
+}
+/// Bilinear on one of the two levels around the level of detail, dithered.
+pub fn sample_bilinear_mipmap_dithered(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::BILINEAR_MIPMAP_DITHERED }>(tex, u, v, lod, at)
+}
+/// Dithered texels of the nearest level.
+pub fn sample_dithered_mipmap_nearest(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::DITHERED_MIPMAP_NEAREST }>(tex, u, v, lod, at)
+}
+/// Dithered texels of the two levels around the level of detail, blended.
+pub fn sample_dithered_mipmap_linear(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::DITHERED_MIPMAP_LINEAR }>(tex, u, v, lod, at)
+}
+/// Dithered texels of one of the two levels around the level of detail, dithered.
+pub fn sample_dithered_mipmap_dithered(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels) -> U32s {
+    sample_texture::<{ filter::DITHERED_MIPMAP_DITHERED }>(tex, u, v, lod, at)
 }
 
 /// Where each lane's direction `d` lands on a cube map (see [`CUBE_FACES`](moose_assets::CUBE_FACES)): its face, and
@@ -241,62 +547,104 @@ pub fn cube_face_coords(d: [F32s; 3]) -> (I32s, F32s, F32s) {
     (axis | negative, u, v)
 }
 
-/// Bilinear on one level of a cube map ([`Texture::cube`]) at face coordinates from
-/// [`cube_face_coords`], clamped to the face (it does not blend across into the next).
+/// One level of a cube map ([`Texture::cube`]) at face coordinates from
+/// [`cube_face_coords`], read with texel method `method` (see [`filter`]), clamped to the
+/// face (it does not blend across into the next).
 #[inline(always)]
-pub fn sample_cube_level(level: &MipLevel, face: I32s, u: F32s, v: F32s) -> U32s {
+pub fn cube_level(
+    method: u8,
+    level: &MipLevel,
+    face: I32s,
+    u: F32s,
+    v: F32s,
+    at: Pixels,
+) -> U32s {
     let size = level.width as i32;
     // Texel coordinates with an 8-bit fraction, texel centers on whole numbers:
     // ((c + 1) / 2 * size - 0.5) * 256.
     let (scale, offset) = (size as f32 * 128.0, size as f32 * 128.0 - 128.0);
     let last = I32s::fill(size - 1);
-    let to_texels = |c: F32s| {
-        (c * F32s::fill(scale) + F32s::fill(offset))
-            .round_int()
-            .max(I32s::fill(0))
-            .min(I32s::fill((size - 1) << 8))
-    };
+    let max = I32s::fill((size - 1) << 8);
+    let to_texels = |c: F32s| (c * F32s::fill(scale) + F32s::fill(offset)).round_int();
     let (u, v) = (to_texels(u), to_texels(v));
-    let (x0, y0): (I32s, I32s) = (u >> 8, v >> 8);
-    let (x1, y1) = (
-        (x0 + I32s::fill(1)).min(last),
-        (y0 + I32s::fill(1)).min(last),
-    );
     let row = level.width_log2 as i32;
     let base = face << (2 * row);
-    let (y0, y1) = (base + (y0 << row), base + (y1 << row));
-    let at = |i: I32s| {
+    let at_index = |i: I32s| {
         let i = i.to_array();
         U32s::from(std::array::from_fn::<u32, LANES, _>(|k| {
             level.texels[i[k] as usize]
         }))
     };
+    let zero = I32s::fill(0);
+    if method != filter::BILINEAR {
+        // The texel whose square holds the point (half a texel on from its center), moved
+        // first by the pixel's dither offset (in 1/65536 texels, so >> 8 for 8.8).
+        let (du, dv) = if method == filter::DITHERED {
+            let e: I32s = texel_dither(at) >> 8;
+            (-e, e)
+        } else {
+            (zero, zero)
+        };
+        let half = I32s::fill(128);
+        let (x, y): (I32s, I32s) = ((u + half + du) >> 8, (v + half + dv) >> 8);
+        let (x, y) = (x.max(zero).min(last), y.max(zero).min(last));
+        return at_index(base + (y << row) + x);
+    }
+    let (u, v) = (u.max(zero).min(max), v.max(zero).min(max));
+    let (x0, y0): (I32s, I32s) = (u >> 8, v >> 8);
+    let (x1, y1) = (
+        (x0 + I32s::fill(1)).min(last),
+        (y0 + I32s::fill(1)).min(last),
+    );
+    let (y0, y1) = (base + (y0 << row), base + (y1 << row));
     let byte = I32s::fill(255);
     let (fx, fy): (U32s, U32s) = (
         wide::bytemuck::cast(u & byte),
         wide::bytemuck::cast(v & byte),
     );
-    let top = lerp_texels(at(y0 + x0), at(y0 + x1), fx);
-    let bottom = lerp_texels(at(y1 + x0), at(y1 + x1), fx);
+    let top = lerp_texels(at_index(y0 + x0), at_index(y0 + x1), fx);
+    let bottom = lerp_texels(at_index(y1 + x0), at_index(y1 + x1), fx);
     lerp_texels(top, bottom, fy)
 }
 
-/// A cube map's ([`Texture::cube`]) color in each lane's direction `d` (any length): bilinear
-/// on the two levels around `lod` (log2 of face texels per pixel, the same for every lane),
-/// blended by its fraction.
+/// A cube map's ([`Texture::cube`]) color in each lane's direction `d` (any length), with
+/// sampler `FILTER` (see [`filter`]) at level of detail `lod` (log2 of face texels per
+/// pixel, the same for every lane); `at` is the lanes' screen pixels.
 #[inline(always)]
-pub fn sample_cube(tex: &Texture, d: [F32s; 3], lod: f32) -> U32s {
+pub fn sample_cube<const FILTER: u8>(tex: &Texture, d: [F32s; 3], lod: f32, at: Pixels) -> U32s {
     let (face, u, v) = cube_face_coords(d);
-    let last = tex.levels.len() - 1;
-    let lod = lod.clamp(0.0, last as f32);
-    let level = lod as usize;
-    let fraction = ((lod - level as f32) * 256.0) as u32;
-    let near = sample_cube_level(&tex.levels[level], face, u, v);
-    if fraction == 0 || level == last {
-        return near;
+    let lod = I32s::fill((lod.clamp(-64.0, 64.0) * 256.0) as i32);
+    let read = CubeRead::<FILTER> {
+        tex,
+        face,
+        u,
+        v,
+        at,
+    };
+    mip_transition(filter::mip(FILTER), tex.levels.len(), lod, at, &read)
+}
+
+/// A cube map's level, read with sampler `FILTER`'s texel method.
+struct CubeRead<'a, const FILTER: u8> {
+    tex: &'a Texture,
+    face: I32s,
+    u: F32s,
+    v: F32s,
+    at: Pixels,
+}
+
+impl<const FILTER: u8> LevelRead for CubeRead<'_, FILTER> {
+    #[inline(always)]
+    fn read(&self, level: usize) -> U32s {
+        cube_level(
+            filter::method(FILTER),
+            &self.tex.levels[level],
+            self.face,
+            self.u,
+            self.v,
+            self.at,
+        )
     }
-    let far = sample_cube_level(&tex.levels[level + 1], face, u, v);
-    lerp_texels(near, far, U32s::fill(fraction))
 }
 
 /// `a` to `b` by `f` / 256 in every 8-bit channel of every lane: two channels at a time,
@@ -615,7 +963,7 @@ macro_rules! lane_struct {
 ///   [`POSITION`] and [`FACE_NORMAL`]. Struct `Vertex`.
 /// - `sampled`: what `shade_vertex` returns (struct `Sampled`) and `shade_sample` reads,
 ///   exact at each sample point ([`LANES`] points in struct `SampledLanes`). The built-ins
-///   [`POSITION`], [`LOD`], [`ANISO`] and [`ANISO_LOD`] are filled by the engine.
+///   [`POSITION`] and [`LOD`] are filled by the engine.
 /// - `fixed32`, `fixed16`, `float`: what `shade_sample` returns (struct `Interp`, in this
 ///   order) and pixels get, interpolated linearly between sample points in 16.16, 8.8 and
 ///   f32: the groups `Fixed32`, `Fixed16` and `Floats`.
@@ -687,27 +1035,16 @@ pub const POSITION: &str = "position";
 /// space (three values). A mesh attribute cannot supply it.
 pub const FACE_NORMAL: &str = "face_normal";
 
-/// Name of the `sampled` value the texture footprint built-ins ([`LOD`], [`ANISO`],
-/// [`ANISO_LOD`]) are measured from: two texture coordinates for texture slot 0.
+/// Name of the `sampled` value the level of detail built-in ([`LOD`]) is measured from:
+/// two texture coordinates for texture slot 0.
 pub const UV: &str = "uv";
 
 /// Name of the built-in `sampled` value holding the texture level of detail (one value,
 /// usually passed on to an 8.8 varying): log2 of the polygon's texture's full-size texels
 /// per screen pixel. It is computed for each vertex when the polygon is set up, from the
 /// polygon's exact screen-space derivatives of the `sampled` value [`UV`], and
-/// interpolated across it like any value; see [`sample_trilinear`].
+/// interpolated across it like any value; see [`sample_texture`].
 pub const LOD: &str = "lod";
-
-/// Name of the built-in varying holding the anisotropic probe offset (two values, meant for
-/// a 16.16 varying): half the distance between the two probes along the long axis of the
-/// pixel's texture footprint, in uv. 0 where the footprint is round or magnified. See
-/// [`sample_anisotropic`].
-pub const ANISO: &str = "aniso";
-
-/// Name of the built-in varying holding the anisotropic probes' level of detail (one value,
-/// meant for an 8.8 varying): log2 of the texels each probe covers, the larger of the
-/// footprint's short axis and half its long axis. See [`sample_anisotropic`].
-pub const ANISO_LOD: &str = "aniso_lod";
 
 /// A material's values of one kind as a struct of f32 arrays, generated by
 /// [`material_io!`](crate::material_io): `Vertex` and `Sampled`.
@@ -753,6 +1090,12 @@ pub struct SampleContext<'a> {
     pub focal: f32,
     pub object: &'a Object,
     pub params: &'a Params,
+    /// The lights that reach the polygon (those in range of it and in front of it), and
+    /// the light that reaches everything (linear RGB).
+    pub lights: &'a [Light],
+    pub ambient: Vec3,
+    /// The shadow maps lights name (`Light::shadow`).
+    pub shadow_maps: &'a [ShadowMap],
 }
 
 /// What `shade_pixel` sees besides its interpolated values.
@@ -842,10 +1185,10 @@ pub struct SpanJob<'a> {
     pub x_right: f32,
     pub w_left: f32,
     pub w_right: f32,
-    /// The row's sample points, left to right: their screen x and their outputs,
-    /// `Interp::LEN` each in declaration order. A pixel is shaded from the two points around
-    /// its center (the last point's own pixel with the interval before it; a lone point's
-    /// pixel with its own values).
+    /// The row's sample points covering the run, left to right: their screen x (pixel
+    /// centers) and their outputs, output by output (`outs[k * xs.len() + i]` is output `k`
+    /// of point `i`, declaration order). A pixel is shaded from the point at or before its
+    /// center and the next one; the last point shades only its own pixel.
     pub xs: &'a [f32],
     pub outs: &'a [f32],
     /// First pixel of the run; the run covers `x0..x0 + color.len()`, inside the row.
@@ -1036,7 +1379,8 @@ pub fn span<M: Material, const STRIDE: i32>(
 ) {
     let (x0, x1) = (job.x0, job.x0 + color.len() as i32);
     let n_out = M::Interp::LEN;
-    debug_assert_eq!(job.outs.len(), job.xs.len() * n_out);
+    let n = job.xs.len();
+    debug_assert_eq!(job.outs.len(), n * n_out);
     let mut run = Run {
         job,
         x0,
@@ -1045,68 +1389,55 @@ pub fn span<M: Material, const STRIDE: i32>(
         draw,
     };
     let (mut base, mut step) = ([0.0f32; MAX_VARYINGS], [0.0f32; MAX_VARYINGS]);
-    let n = job.xs.len();
-    if n == 1 {
-        let x = job.xs[0];
-        let px = moose_view::pixel_edge(x);
-        if (x0..x1).contains(&px) {
-            let lines = lines::<M>(&job.outs[..n_out], &step[..n_out]);
-            run.interval::<M, STRIDE>(&lines, px, px, px + 1);
-        }
-        return;
-    }
-    for i in 1..n {
-        let (xa, xb) = (job.xs[i - 1], job.xs[i]);
-        // The pixels whose centers lie in [xa, xb), or [xa, xb] for the last interval.
-        let first = moose_view::pixel_edge(xa);
-        let end = if i == n - 1 {
-            (xb - 0.5).floor() as i32 + 1
+    // A half-rate pair shows its first pixel's values, or the row's first pixel's where the
+    // pair starts before the row. An interval shades the pixels whose shown pixel it holds:
+    // from the first shown at or after `a`.
+    let row_first = moose_view::pixel_edge(job.x_left);
+    let pixels_from = |a: i32| {
+        if a <= row_first {
+            row_first
         } else {
-            moose_view::pixel_edge(xb)
+            a + (a - job.vx).rem_euclid(STRIDE) * (STRIDE - 1)
+        }
+    };
+    for i in 0..n {
+        let xa = job.xs[i];
+        // The pixels showing pixels whose centers lie in [xa, xb), or the last point's own.
+        let first = moose_view::pixel_edge(xa);
+        let (end, slope) = match job.xs.get(i + 1) {
+            Some(&xb) => (moose_view::pixel_edge(xb), 1.0 / (xb - xa)),
+            None => (first + 1, 0.0),
         };
-        let (from, to) = (first.max(x0), end.min(x1));
+        let (from, to) = (pixels_from(first).max(x0), pixels_from(end).min(x1));
         if from >= to {
-            if first >= x1 {
+            if pixels_from(first) >= x1 {
                 break;
             }
             continue;
         }
-        let a = &job.outs[(i - 1) * n_out..i * n_out];
-        let b = &job.outs[i * n_out..(i + 1) * n_out];
-        let slope = if xb - xa > 1e-6 { 1.0 / (xb - xa) } else { 0.0 };
-        let offset = first as f32 + 0.5 - xa;
+        let start = first.max(row_first);
+        let offset = start as f32 + 0.5 - xa;
         for k in 0..n_out {
-            step[k] = (b[k] - a[k]) * slope;
-            base[k] = a[k] + step[k] * offset;
+            let a = job.outs[k * n + i];
+            step[k] = if i + 1 < n {
+                (job.outs[k * n + i + 1] - a) * slope
+            } else {
+                0.0
+            };
+            base[k] = a + step[k] * offset;
         }
         let lines = lines::<M>(&base[..n_out], &step[..n_out]);
-        run.interval::<M, STRIDE>(&lines, first, from, to);
+        run.interval::<M, STRIDE>(&lines, start, from, to);
     }
 }
 
-/// Runs `shade_sample` on `count` sample points: `inputs` holds each point's `sampled`
-/// values (declaration order), `out` gets each one's outputs (`Interp`, declaration order).
-pub type SampleFn = fn(inputs: &[f32], count: usize, ctx: &SampleContext, out: &mut [f32]);
+/// Runs `shade_sample` on [`LANES`] sample points: `inputs` holds their `sampled` values
+/// (one lane array per value, declaration order), `out` gets their outputs (`Interp`, one
+/// lane array per output).
+pub type SampleFn = fn(inputs: &[F32s], ctx: &SampleContext, out: &mut [F32s]);
 
-fn sample_stage<M: Material>(inputs: &[f32], count: usize, ctx: &SampleContext, out: &mut [f32]) {
-    let (n_in, n_out) = (M::Sampled::LEN, M::Interp::LEN);
-    let mut lanes = [F32s::default(); MAX_VARYINGS];
-    for start in (0..count).step_by(LANES) {
-        let m = (count - start).min(LANES);
-        // Lanes past the points repeat the last one.
-        for (k, lane) in lanes[..n_in].iter_mut().enumerate() {
-            *lane = F32s::from(std::array::from_fn::<f32, LANES, _>(|j| {
-                inputs[(start + j.min(m - 1)) * n_in + k]
-            }));
-        }
-        let o = M::shade_sample(&M::SampledLanes::from_lanes(&lanes[..n_in]), ctx);
-        o.write_lanes(&mut lanes[..n_out]);
-        for (k, lane) in lanes[..n_out].iter().enumerate() {
-            for (j, v) in lane.to_array().into_iter().take(m).enumerate() {
-                out[(start + j) * n_out + k] = v;
-            }
-        }
-    }
+fn sample_stage<M: Material>(inputs: &[F32s], ctx: &SampleContext, out: &mut [F32s]) {
+    M::shade_sample(&M::SampledLanes::from_lanes(inputs), ctx).write_lanes(out);
 }
 
 /// The lines of all three groups within one sample interval.
@@ -1287,9 +1618,46 @@ mod tests {
         }
         for chunk in dirs.chunks(LANES) {
             let lane = |k: usize| F32s::from(std::array::from_fn(|i| chunk[i % chunk.len()].0[k]));
-            let got = sample_cube(&tex, [lane(0), lane(1), lane(2)], 0.0).to_array();
-            for (i, &(d, want)) in chunk.iter().enumerate() {
-                assert_eq!(got[i], want, "direction {d:?}");
+            let d = [lane(0), lane(1), lane(2)];
+            for got in [
+                sample_cube::<{ filter::BILINEAR_MIPMAP_LINEAR }>(&tex, d, 0.0, PIXELS),
+                sample_cube::<{ filter::NEAREST_MIPMAP_NONE }>(&tex, d, 0.0, PIXELS),
+            ] {
+                for (i, &(d, want)) in chunk.iter().enumerate() {
+                    assert_eq!(got.to_array()[i], want, "direction {d:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dithered_cube_texels_move_by_the_pattern() {
+        // Through each texel's center, the dither moves the point by -e in u and +e in v
+        // (e from -1/2 to 7/16 of a texel): v stays in the texel, and u crosses into the
+        // next one only where e is -1/2 (clamped at the face's edge).
+        let size = 4;
+        let faces: [Vec<u32>; 6] = std::array::from_fn(|f| {
+            (0..size * size)
+                .map(|i| ((f as u32) << 20) | (i << 4))
+                .collect()
+        });
+        let tex = Texture::cube("cube", size, faces).unwrap();
+        for face in 0..6 {
+            for ty in 0..size {
+                for tx in 0..size {
+                    let d = cube_texel_direction(face, tx, ty, size).map(F32s::fill);
+                    for y in 0..4 {
+                        let at = Pixels { x: 0, y, stride: 1 };
+                        let got = sample_cube::<{ filter::DITHERED_MIPMAP_NONE }>(&tex, d, 0.0, at)
+                            .to_array();
+                        for (i, &g) in got.iter().enumerate() {
+                            let e = TEXEL_DITHER[i & 3][y as usize];
+                            let x = if e == -32768 { (tx + 1).min(size - 1) } else { tx };
+                            let want = ((face as u32) << 20) | ((ty * size + x) << 4);
+                            assert_eq!(g, want, "face {face} texel ({tx}, {ty}) pixel ({i}, {y})");
+                        }
+                    }
+                }
             }
         }
     }
@@ -1302,9 +1670,10 @@ mod tests {
         let tex = Texture::cube("cube", 2, faces).unwrap();
         assert_eq!(tex.levels[1].texels, [0x007F_7F7F; 6]);
         let d = cube_texel_direction(5, 0, 0, 2).map(F32s::fill);
-        assert_eq!(sample_cube(&tex, d, 0.0), U32s::fill(0));
-        assert_eq!(sample_cube(&tex, d, 0.5), U32s::fill(0x003F_3F3F));
-        assert_eq!(sample_cube(&tex, d, 9.0), U32s::fill(0x007F_7F7F));
+        let linear = |lod| sample_cube::<{ filter::BILINEAR_MIPMAP_LINEAR }>(&tex, d, lod, PIXELS);
+        assert_eq!(linear(0.0), U32s::fill(0));
+        assert_eq!(linear(0.5), U32s::fill(0x003F_3F3F));
+        assert_eq!(linear(9.0), U32s::fill(0x007F_7F7F));
     }
 
     /// Test shader writing its raw fixed-point varyings as the color: one 8.8 value in the
@@ -1337,33 +1706,37 @@ mod tests {
         }
     }
 
-    /// One pixel's value, the way the span shading works it out before SIMD: from the
-    /// interval holding it, the values at the interval's first pixel and the step per pixel
-    /// in fixed point, stepped with wrapping arithmetic to the pixel it shows (its own, or
-    /// at half rate the even one of its pair, counted from pixel 0, but not before the
-    /// interval's first pixel).
-    fn stepped(xs: &[f32], outs: &[f32], half_rate: bool, px: i32) -> u32 {
-        let last = xs.len() - 2;
-        let i = (0..=last)
-            .find(|&i| {
-                let end = if i == last {
-                    (xs[i + 1] - 0.5).floor() as i32 + 1
-                } else {
-                    pixel_edge(xs[i + 1])
-                };
-                pixel_edge(xs[i]) <= px && px < end
-            })
+    /// One pixel's value, the way the span shading works it out before SIMD: it shows its
+    /// own pixel, or at half rate the even one of its pair (counted from pixel 0, but not
+    /// before the row's first pixel); from the point at or before that one (outputs stored
+    /// output by output), the step to the next point per pixel in fixed point (none after
+    /// the last), stepped there with wrapping arithmetic.
+    fn stepped(xs: &[f32], outs: &[f32], half_rate: bool, row_first: i32, px: i32) -> u32 {
+        let n = xs.len();
+        let shown = if half_rate {
+            (px - px.rem_euclid(2)).max(row_first)
+        } else {
+            px
+        };
+        let i = (0..n)
+            .rev()
+            .find(|&i| pixel_edge(xs[i]) <= shown)
             .unwrap();
-        let (xa, xb) = (xs[i], xs[i + 1]);
+        let xa = xs[i];
         let first = pixel_edge(xa);
-        let shown = if half_rate { px - px.rem_euclid(2) } else { px };
-        let slope = if xb - xa > 1e-6 { 1.0 / (xb - xa) } else { 0.0 };
-        let (a, b) = (&outs[2 * i..2 * i + 2], &outs[2 * i + 2..2 * i + 4]);
-        let step = [(b[0] - a[0]) * slope, (b[1] - a[1]) * slope];
-        let offset = first as f32 + 0.5 - xa;
+        let a = [outs[i], outs[n + i]];
+        let step = match xs.get(i + 1) {
+            Some(&xb) => {
+                let slope = 1.0 / (xb - xa);
+                [(outs[i + 1] - a[0]) * slope, (outs[n + i + 1] - a[1]) * slope]
+            }
+            None => [0.0, 0.0],
+        };
+        let start = first.max(row_first);
+        let offset = start as f32 + 0.5 - xa;
         let base = [a[0] + step[0] * offset, a[1] + step[1] * offset];
         let (du, dc) = (i32::from_f32(step[0]), i16::from_f32(step[1]));
-        let k = (shown - first).max(0);
+        let k = (shown - start).max(0);
         let u = i32::from_f32(base[0]).wrapping_add(du.wrapping_mul(k));
         let c = i16::from_f32(base[1]).wrapping_add(dc.wrapping_mul(k as i16));
         (c as u16 as u32) | ((u as u32) << 16)
@@ -1380,46 +1753,45 @@ mod tests {
         };
         let blank = Texture::solid("blank", 0);
         for round in 0..4000 {
-            // A row's sample points: its two crossings and columns between them.
-            let x_left = rnd(0.0, 50.0);
-            let x_right = x_left + rnd(0.2, 200.0);
-            let mut xs = vec![x_left];
-            let nx = [1, 2, 4, 8, 16, 32][rnd(0.0, 5.99) as usize];
-            let mut c = (x_left / nx as f32).floor() as i32 * nx;
-            while (c as f32 + 0.5) < x_right {
-                if (c as f32 + 0.5) > x_left && rnd(0.0, 1.0) < 0.8 {
-                    xs.push(c as f32 + 0.5);
-                }
-                c += nx;
-            }
-            xs.push(x_right);
-            let outs: Vec<f32> = xs
-                .iter()
-                .flat_map(|_| [rnd(-3.0, 3.0), rnd(0.0, 255.0)])
+            // A row's pixels and the grid columns covering them (from the column at or
+            // before its first pixel to the one at or after its last).
+            let row_x0 = rnd(0.0, 50.0) as i32;
+            let row_x1 = row_x0 + 1 + rnd(0.0, 200.0) as i32;
+            let nx = [2, 4, 8, 16, 32][rnd(0.0, 4.99) as usize];
+            let c0 = row_x0.div_euclid(nx) * nx;
+            let c1 = (row_x1 - 1 + nx - 1).div_euclid(nx) * nx;
+            let xs: Vec<f32> = (c0..=c1)
+                .step_by(nx as usize)
+                .map(|c| c as f32 + 0.5)
                 .collect();
-            let (row_x0, row_x1) = (pixel_edge(x_left), pixel_edge(x_right));
-            if row_x0 >= row_x1 {
-                continue;
-            }
+            let n = xs.len();
+            let outs: Vec<f32> = (0..2 * n)
+                .map(|k| if k < n { rnd(-3.0, 3.0) } else { rnd(0.0, 255.0) })
+                .collect();
             // Half the rows at half rate: each pixel then shows its pair's even pixel.
             let half_rate = round % 2 == 1;
-            let mut job = SpanJob {
-                x_left,
-                x_right,
-                w_left: 1.0,
-                w_right: 1.0,
-                xs: &xs,
-                outs: &outs,
-                x0: row_x0,
-                row: 0,
-                half_rate,
-                vx: 0,
-            };
-            // The row split into random runs, as visibility would.
+            // The row split into random runs, as visibility would, each given only the
+            // points around it.
             let mut x = row_x0;
             while x < row_x1 {
                 let end = (x + 1 + rnd(0.0, 40.0) as i32).min(row_x1);
-                job.x0 = x;
+                let shown = if half_rate { (x - x % 2).max(row_x0) } else { x };
+                let (i0, i1) = (((shown - c0) / nx) as usize, ((end - 1 - c0 + nx - 1) / nx) as usize);
+                let window_outs: Vec<f32> = (0..2)
+                    .flat_map(|k| outs[k * n + i0..=k * n + i1].to_vec())
+                    .collect();
+                let job = SpanJob {
+                    x_left: row_x0 as f32,
+                    x_right: row_x1 as f32,
+                    w_left: 1.0,
+                    w_right: 1.0,
+                    xs: &xs[i0..=i1],
+                    outs: &window_outs,
+                    x0: x,
+                    row: 0,
+                    half_rate,
+                    vx: 0,
+                };
                 let mut color = vec![0u32; (end - x) as usize];
                 draw_span::<raw::Raw>(
                     &job,
@@ -1437,7 +1809,7 @@ mod tests {
                     let px = x + i as i32;
                     assert_eq!(
                         got,
-                        stepped(&xs, &outs, half_rate, px),
+                        stepped(&xs, &outs, half_rate, row_x0, px),
                         "pixel {px} of row {row_x0}..{row_x1} (half rate {half_rate})"
                     );
                 }
@@ -1466,7 +1838,7 @@ mod tests {
                     (f(next()), f(next()))
                 });
                 let fixed = |c: f32| (c * 65536.0).round() as i32;
-                let got = sample_bilinear(
+                let got = level_bilinear(
                     tex.base(),
                     I32s::from(uv.map(|(u, _)| fixed(u))),
                     I32s::from(uv.map(|(_, v)| fixed(v))),
@@ -1495,7 +1867,7 @@ mod tests {
         // At a texel's center it is exactly that texel.
         let tex = Texture::new("t", 4, 4, (0..16).map(|i| i * 0x0101_0101).collect()).unwrap();
         let center = |i: i32| ((i as f32 + 0.5) / 4.0 * 65536.0) as i32;
-        let got = sample_bilinear(
+        let got = level_bilinear(
             tex.base(),
             I32s::from(std::array::from_fn::<i32, LANES, _>(|i| {
                 center(i as i32 % 4)
@@ -1508,9 +1880,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn trilinear_blends_the_two_levels_around_the_lod() {
-        use moose_assets::Texture;
+    /// The screen pixels of lanes that don't depend on them.
+    const PIXELS: Pixels = Pixels {
+        x: 0,
+        y: 0,
+        stride: 1,
+    };
+
+    /// A 64x64 texture of pseudo-random texels, and uv for eight lanes spread across it.
+    fn random_texture() -> (Texture, I32s, I32s) {
         let mut seed = 7u64;
         let texels: Vec<u32> = (0..64 * 64)
             .map(|_| {
@@ -1527,26 +1905,108 @@ mod tests {
         let v = I32s::from(std::array::from_fn::<i32, LANES, _>(|i| {
             20000 - i as i32 * 3111
         }));
-        let at = |level: usize| sample_bilinear(&tex.levels[level], u, v).to_array();
+        (tex, u, v)
+    }
+
+    /// Each sampler and its named function.
+    type SampleFn = fn(&Texture, I32s, I32s, I16s, Pixels) -> U32s;
+    const SAMPLERS: [(u8, SampleFn); 12] = [
+        (filter::NEAREST_MIPMAP_NONE, sample_nearest_mipmap_none),
+        (filter::BILINEAR_MIPMAP_NONE, sample_bilinear_mipmap_none),
+        (filter::DITHERED_MIPMAP_NONE, sample_dithered_mipmap_none),
+        (filter::NEAREST_MIPMAP_NEAREST, sample_nearest_mipmap_nearest),
+        (filter::NEAREST_MIPMAP_LINEAR, sample_nearest_mipmap_linear),
+        (filter::NEAREST_MIPMAP_DITHERED, sample_nearest_mipmap_dithered),
+        (filter::BILINEAR_MIPMAP_NEAREST, sample_bilinear_mipmap_nearest),
+        (filter::BILINEAR_MIPMAP_LINEAR, sample_bilinear_mipmap_linear),
+        (filter::BILINEAR_MIPMAP_DITHERED, sample_bilinear_mipmap_dithered),
+        (filter::DITHERED_MIPMAP_NEAREST, sample_dithered_mipmap_nearest),
+        (filter::DITHERED_MIPMAP_LINEAR, sample_dithered_mipmap_linear),
+        (filter::DITHERED_MIPMAP_DITHERED, sample_dithered_mipmap_dithered),
+    ];
+
+    #[test]
+    fn samplers_are_named_and_listed_once() {
+        assert_eq!(filter::ALL.map(filter::name), SAMPLERS.map(|(f, _)| filter::name(f)));
+        for (f, _) in SAMPLERS {
+            assert_eq!(filter::named(filter::name(f)), Some(f));
+        }
+        let mut all = filter::ALL.to_vec();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 12);
+    }
+
+    #[test]
+    fn whole_levels_read_that_level_with_the_texel_method() {
+        // At a whole level of detail every mip transition reads exactly that level (none:
+        // the full-size one), with its sampler's texel method, at every screen pixel.
+        let (tex, u, v) = random_texture();
+        for (f, sample) in SAMPLERS {
+            for level in 0..tex.levels.len() {
+                for (x, y) in [(0, 0), (1, 2), (6, 3), (3, 7)] {
+                    let at = Pixels { x, y, stride: 1 + (x & 1) };
+                    let read = if filter::mip(f) == filter::MIPMAP_NONE { 0 } else { level };
+                    let want = read_level(filter::method(f), &tex.levels[read], u, v, at);
+                    let got = sample(&tex, u, v, I16s::fill(level as i16 * 256), at);
+                    assert_eq!(got, want, "{} at level {level}, pixel ({x}, {y})", filter::name(f));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dithered_texels_follow_version_one() {
+        // Version 1's scalar read: the offset from the matrix at [x & 3][y & 3], shifted to
+        // the level's size, taken from u and added to v, then the nearest texel.
+        let (tex, _, _) = random_texture();
+        let level = &tex.levels[1];
+        let mut seed = 3u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as i32
+        };
+        for _ in 0..500 {
+            let (u, v) = (next() - (1 << 30), next() - (1 << 30));
+            let (x, y) = (next() & 1023, next() & 1023);
+            let at = Pixels { x, y, stride: 1 };
+            let got = level_dithered(level, I32s::fill(u), I32s::fill(v), at).to_array();
+            for (i, &g) in got.iter().enumerate() {
+                let e = TEXEL_DITHER[((x + i as i32) & 3) as usize][(y & 3) as usize];
+                let coord = |s: i32, size: u32| ((s & 65535) * size as i32) >> 16;
+                let tx = coord(u - (e >> level.width_log2), level.width);
+                let ty = coord(v + (e >> level.height_log2), level.height);
+                assert_eq!(g, level.texels[(ty * level.width as i32 + tx) as usize], "lane {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn mipmap_nearest_rounds_the_level_of_detail() {
+        let (tex, u, v) = random_texture();
+        let level = |l: usize| level_bilinear(&tex.levels[l], u, v);
+        let at = |lod: i16| sample_bilinear_mipmap_nearest(&tex, u, v, I16s::fill(lod), PIXELS);
+        assert_eq!(at(2 * 256 + 127), level(2));
+        assert_eq!(at(2 * 256 + 128), level(3));
+        assert_eq!(at(-700), level(0));
+        assert_eq!(at(40 * 256), level(6));
+    }
+
+    #[test]
+    fn mipmap_linear_blends_the_two_levels_around_the_lod() {
+        let (tex, u, v) = random_texture();
+        let at = |level: usize| level_bilinear(&tex.levels[level], u, v).to_array();
+        let sample = |lod: I16s| sample_bilinear_mipmap_linear(&tex, u, v, lod, PIXELS).to_array();
         let channels_near = |a: u32, b: u32, tol: u32| {
             (0..4).all(|k| ((a >> (8 * k)) & 255).abs_diff((b >> (8 * k)) & 255) <= tol)
         };
-        // Whole levels: exactly bilinear on that level (the next is weighted 0).
-        for level in 0..tex.levels.len() {
-            let got = sample_trilinear(&tex, u, v, I16s::fill(level as i16 * 256)).to_array();
-            assert_eq!(got, at(level), "level {level}");
-        }
         // Below 0 is level 0; past the last is the last.
-        assert_eq!(
-            sample_trilinear(&tex, u, v, I16s::fill(-700)).to_array(),
-            at(0)
-        );
-        assert_eq!(
-            sample_trilinear(&tex, u, v, I16s::fill(40 * 256)).to_array(),
-            at(6)
-        );
+        assert_eq!(sample(I16s::fill(-700)), at(0));
+        assert_eq!(sample(I16s::fill(40 * 256)), at(6));
         // Fractions blend toward the next level.
-        let got = sample_trilinear(&tex, u, v, I16s::fill(2 * 256 + 64)).to_array();
+        let got = sample(I16s::fill(2 * 256 + 64));
         let (a, b) = (at(2), at(3));
         for i in 0..LANES {
             let want = (0..4).fold(0, |c, k| {
@@ -1557,47 +2017,40 @@ mod tests {
         }
         // Lanes on different levels each get their own.
         let lods: [i16; LANES] = [0, 256, 300, 512, 1024, 1100, 256, 0];
-        let got = sample_trilinear(&tex, u, v, I16s::from(lods)).to_array();
+        let got = sample(I16s::from(lods));
         for (i, &lod) in lods.iter().enumerate() {
-            let alone = sample_trilinear(&tex, u, v, I16s::fill(lod)).to_array();
-            assert_eq!(got[i], alone[i], "lane {i} at lod {lod}");
+            assert_eq!(got[i], sample(I16s::fill(lod))[i], "lane {i} at lod {lod}");
         }
     }
 
     #[test]
-    fn anisotropic_averages_two_probes() {
-        use moose_assets::Texture;
-        let texels: Vec<u32> = (0..64 * 64u32)
-            .map(|i| i.wrapping_mul(2654435761))
-            .collect();
-        let tex = Texture::new("t", 64, 64, texels).unwrap();
-        let u = I32s::from(std::array::from_fn::<i32, LANES, _>(|i| {
-            3000 + i as i32 * 5000
-        }));
-        let v = I32s::from(std::array::from_fn::<i32, LANES, _>(|i| {
-            9000 - i as i32 * 2000
-        }));
-        let (lod, probe_lod) = (I16s::fill(2 * 256 + 100), I16s::fill(256 + 100));
-        // No offset: plain trilinear at `lod`.
-        let flat = [I32s::fill(0); 2];
-        assert_eq!(
-            sample_anisotropic(&tex, u, v, flat, lod, probe_lod).to_array(),
-            sample_trilinear(&tex, u, v, lod).to_array()
+    fn mipmap_dithered_picks_levels_by_the_ordered_pattern() {
+        // As dev/dither.html: a fraction of k/16 sends the pixels whose pattern value is at
+        // least 16 - k (k of every 16) to the next level, the rest to this one.
+        let (tex, u, v) = random_texture();
+        let (this, next) = (
+            level_nearest(&tex.levels[2], u, v).to_array(),
+            level_nearest(&tex.levels[3], u, v).to_array(),
         );
-        // An offset: the rounded average of the probes either side, at `probe_lod`.
-        let offset = [I32s::fill(700), I32s::fill(-300)];
-        let got = sample_anisotropic(&tex, u, v, offset, lod, probe_lod).to_array();
-        let a = sample_trilinear(&tex, u + offset[0], v + offset[1], probe_lod).to_array();
-        let b = sample_trilinear(&tex, u - offset[0], v - offset[1], probe_lod).to_array();
-        for i in 0..LANES {
-            for k in 0..4 {
-                let (x, y) = ((a[i] >> (8 * k)) & 255, (b[i] >> (8 * k)) & 255);
-                assert_eq!(
-                    (got[i] >> (8 * k)) & 255,
-                    (x + y) / 2,
-                    "lane {i} channel {k}"
-                );
+        for k in 0..=16 {
+            // A fraction that rounds to k sixteenths.
+            let lod = I16s::fill((2 * 256 + (k * 16).min(255) - (k > 0 && k < 16) as i32 * 3) as i16);
+            let mut to_next = 0;
+            for y in 0..4 {
+                for x0 in [0, 4] {
+                    let at = Pixels { x: x0, y, stride: 1 };
+                    let got = sample_nearest_mipmap_dithered(&tex, u, v, lod, at).to_array();
+                    for i in 0..LANES {
+                        let x = (x0 as usize + i) & 3;
+                        let goes = MIP_DITHER[y as usize][x] + k >= 16;
+                        to_next += goes as i32;
+                        let want = if goes { next[i] } else { this[i] };
+                        assert_eq!(got[i], want, "k {k}, pixel ({}, {y})", x0 as usize + i);
+                    }
+                }
             }
+            // Each pattern cell appears four times across the pixels (16 per row, 4 rows).
+            assert_eq!(to_next, 4 * k, "k {k}");
         }
     }
 

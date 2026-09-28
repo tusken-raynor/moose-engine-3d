@@ -2,9 +2,14 @@
 //! Arguments: [WIDTH HEIGHT [LEVEL [BOUNCES [F0]]]] (default 1280 720 two_rooms.mmp 1 0.15);
 //! RAYON_NUM_THREADS=1 for one thread; FRAMES=N for a longer run (default 500). Shiny
 //! surfaces get the Fresnel shader: textured (metal_tile.png, 5 m fade) on levels with uvs,
-//! filtered by FILTER=trilinear (the default), anisotropic, bilinear or nearest. WATER=1
+//! read with sampler FILTER=bilinear_mipmap_linear (the default; any of the twelve names in
+//! `moose_raster::shaders::filter`, METHOD_mipmap_MIP). WATER=1
 //! makes the textured shiny floors water, its ripples held still 5 s in (redrawing them as
 //! they move costs about 0.13 ms 20 times a second, outside the frame).
+//!
+//! MIN_STEP and LIGHT_SPACING set `RasterConfig`'s spacing limits (in pixels), and
+//! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
+//! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -12,11 +17,10 @@ use std::time::Instant;
 
 use glam::Vec3;
 use moose_assets::Assets;
-use moose_raster::shaders::{
-    TexturedFresnel, TexturedFresnelAnisotropic, TexturedFresnelBilinear, TexturedFresnelNearest,
-    VertexColor, VertexColorFresnel, Water, filter,
+use moose_raster::shaders::{TexturedFresnel, VertexColor, VertexColorFresnel, Water, filter};
+use moose_raster::{
+    Params, RasterConfig, Renderer, Surface, Target, register_per_filter,
 };
-use moose_raster::{Params, RasterConfig, Renderer, Surface, Target};
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
 
@@ -32,28 +36,35 @@ fn main() {
     let f0: f32 = args.get(4).map_or(0.15, |a| a.parse().expect("F0"));
     let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
     let level = assets.load_level(file).unwrap();
-    let world = World::new(level, &assets);
+    let mut world = World::new(level, &assets);
+    if std::env::var("LIGHTS").is_ok_and(|l| l == "0") {
+        world.set_lights(Vec::new(), Vec3::ONE);
+    }
     let vp = Viewport {
         x: 0,
         y: 0,
         width,
         height,
     };
-    let mut renderer = Renderer::new(RasterConfig::default());
+    let setting = |name: &str, default: u32| {
+        std::env::var(name).map_or(default, |v| v.parse().expect("a whole number"))
+    };
+    let defaults = RasterConfig::default();
+    let mut renderer = Renderer::new(RasterConfig {
+        min_step: setting("MIN_STEP", defaults.min_step),
+        light_spacing: setting("LIGHT_SPACING", defaults.light_spacing),
+        penumbra_threshold: std::env::var("PENUMBRA_THRESHOLD")
+            .map_or(defaults.penumbra_threshold, |v| v.parse().expect("a number")),
+        ..defaults
+    });
     let shader = renderer.register_material::<VertexColor>();
     let fresnel = renderer.register_material::<VertexColorFresnel>();
-    let textured_fresnel = match std::env::var("FILTER").as_deref() {
-        Ok("nearest") => renderer.register_material::<TexturedFresnelNearest>(),
-        Ok("bilinear") => renderer.register_material::<TexturedFresnelBilinear>(),
-        Ok("anisotropic") => renderer.register_material::<TexturedFresnelAnisotropic>(),
-        _ => renderer.register_material::<TexturedFresnel>(),
-    };
-    let water = match std::env::var("FILTER").as_deref() {
-        Ok("nearest") => renderer.register_material::<Water<{ filter::NEAREST }>>(),
-        Ok("bilinear") => renderer.register_material::<Water<{ filter::BILINEAR }>>(),
-        Ok("anisotropic") => renderer.register_material::<Water<{ filter::ANISOTROPIC }>>(),
-        _ => renderer.register_material::<Water>(),
-    };
+    let sampler = std::env::var("FILTER").map_or(filter::BILINEAR_MIPMAP_LINEAR, |name| {
+        filter::named(&name).expect("FILTER names a sampler")
+    });
+    let index = filter::ALL.iter().position(|&f| f == sampler).unwrap();
+    let textured_fresnel = register_per_filter!(renderer, TexturedFresnel)[index];
+    let water = register_per_filter!(renderer, Water)[index];
     let use_water = std::env::var("WATER").is_ok_and(|w| w == "1");
     let has_uvs = assets
         .mesh(world.geometry)

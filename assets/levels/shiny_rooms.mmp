@@ -1,4 +1,4 @@
-# Moose v2 test level: two_rooms.mmp with reflective floors throughout and a reflective ceiling in room_a, darker in the rooms.
+# Moose v2 test level: two_rooms.mmp with reflective floors throughout, darker in the rooms, lit by five point lights.
 # Format reference: 'Level Format Spec.md' in the repo root.
 # Right-handed, +Y up, meters. Yaw 0 faces -Z.
 
@@ -41,7 +41,7 @@ attributes 2
    0   color   u8      3
    1   uv      f32     2
 
-values color 21
+values color 20
 #  id   values
    0     102   76   56
    1     217  204  184
@@ -62,8 +62,7 @@ values color 21
    16     98  134  195
    17     98  135  199
    18     51   38   28
-   19    108  102   92
-   20     28   34   46
+   19     28   34   46
 
 values uv 28
 #  id   values
@@ -106,7 +105,7 @@ surfaces 24
 #  id  sector  adjoin  flags  nverts  vert[:attr ...] ...   (flags: 0x1 = reflective; attr = row in each values table, in declaration order; portals list verts only)
    # --- sector 0: room_a
    0   0       -1      0x1    6       0:18:0 1:18:1 2:18:2 3:18:3 4:18:4 5:18:5 # floor (reflective)
-   1   0       -1      0x1    6       6:19:5 7:19:4 8:19:3 9:19:2 10:19:1 11:19:0 # ceiling (reflective)
+   1   0       -1      0x0    6       6:1:5 7:1:4 8:1:3 9:1:2 10:1:1 11:1:0 # ceiling
    2   0       -1      0x0    4       11:2:6 10:2:7 1:3:2 0:3:5          # far wall
    3   0       -1      0x0    4       6:4:8 11:4:9 0:5:10 5:5:11         # left wall (-X)
    4   0       -1      0x0    4       2:5:11 1:5:10 10:4:9 9:4:8         # right wall (+X)
@@ -122,7 +121,7 @@ surfaces 24
    13  1       1       0x0    4       12 13 3 4                          # portal to room_a
    14  1       2       0x0    4       15 14 17 16                        # portal to room_b
    # --- sector 2: room_b
-   15  2       -1      0x1    6       18:20:21 15:20:17 14:20:16 19:20:22 20:20:23 21:20:24 # floor (reflective)
+   15  2       -1      0x1    6       18:19:21 15:19:17 14:19:16 19:19:22 20:19:23 21:19:24 # floor (reflective)
    16  2       -1      0x0    6       22:12:24 23:12:23 24:12:22 25:12:16 26:12:17 27:12:21 # ceiling
    17  2       -1      0x0    4       21:13:5 20:13:2 23:14:7 22:14:6    # far wall
    18  2       -1      0x0    4       18:15:18 21:15:25 22:16:26 27:16:27 # left wall (-X)
@@ -149,3 +148,13 @@ entities 8
    5   prop   2       crate.obj  0.00    0.00    -16.00  0      45    0     1.00   crate_b1
    6   prop   2       crate.obj  3.00    0.00    -18.00  0      0     0     1.00   crate_b2
    7   prop   2       ball.obj   -1.50   1.50    -15.00  0      0     0     1.00   mirror_ball
+
+ambient 0.01 0.01 0.0130
+
+lights 5
+#  id  sector  x       y       z       r      g      b      range  [dx     dy     dz     inner  outer]   (spot lights: direction, cone half-angles)
+   0   0       -2.50   3.20    5.50    0.80   0.62   0.42   6.00
+   1   0       2.80    1.80    1.20    1.20   0.70   0.40   5.00
+   2   1       0.00    2.60    -6.00   0.70   0.95   1.20   5.00
+   3   2       2.50    3.20    -14.50  0.80   1.05   1.60   7.00
+   4   2       -2.80   1.20    -18.50  1.30   0.55   1.10   5.00

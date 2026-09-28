@@ -289,3 +289,53 @@ fn keep_clear_pushes_off_walls_but_not_through_doorways() {
         "{p}"
     );
 }
+
+#[test]
+fn lights_reach_sectors_through_openings_in_range() {
+    use moose_assets::Light;
+    let (mut world, _) = world();
+    let light = |sector: u32, position: Vec3, range: f32| {
+        Light::point(sector, position, Vec3::ONE, range)
+    };
+    world.set_lights(
+        vec![
+            // In room_a, 2 m from the hallway's doorway (z = 0): it reaches the hallway,
+            // but not room_b beyond it (whose doorway is 14 m away).
+            light(0, Vec3::new(0.0, 1.5, 2.0), 5.0),
+            // The same, too short to reach the doorway.
+            light(0, Vec3::new(0.0, 1.5, 2.0), 1.5),
+            // Beside the doorway but behind the wall (x = 3, z = 0.5): the opening, 2 m to
+            // the side, is still in range, so it passes through.
+            light(0, Vec3::new(3.0, 1.5, 0.5), 2.5),
+            // Long range from the hallway's middle: both rooms.
+            light(1, Vec3::new(0.0, 1.5, -6.0), 7.0),
+            // A spot light by the doorway, in range of it, but aimed away from it (at the far
+            // wall, +Z): its cone never reaches the opening.
+            Light::spot(
+                0,
+                Vec3::new(0.0, 1.5, 2.0),
+                Vec3::ONE,
+                10.0,
+                Vec3::Z,
+                10.0,
+                20.0,
+            ),
+            // The same spot light aimed at the doorway: it reaches the hallway.
+            Light::spot(
+                0,
+                Vec3::new(0.0, 1.5, 2.0),
+                Vec3::ONE,
+                10.0,
+                Vec3::NEG_Z,
+                10.0,
+                20.0,
+            ),
+        ],
+        Vec3::splat(0.1),
+    );
+    assert_eq!(world.ambient, Vec3::splat(0.1));
+    assert_eq!(world.lights().len(), 6);
+    assert_eq!(world.sector_lights(0), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(world.sector_lights(1), [0, 2, 3, 5]);
+    assert_eq!(world.sector_lights(2), [3]); // room_b's doorway is 14 m from the spot
+}

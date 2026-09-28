@@ -10,8 +10,12 @@ pub mod shader;
 pub mod shaders;
 
 mod render;
+mod shadow;
 
-pub use render::{LayoutError, RasterConfig, RasterPath, RenderStats, Renderer, Surface, Target};
+pub use shadow::ShadowMap;
+pub use render::{
+    LayoutError, RasterConfig, RasterPath, RenderStats, Renderer, Surface, Target,
+};
 pub use shader::{
     AttribDesc, F32s, Fill, Format, I16s, I32s, LANES, MAX_TEXTURES, Material, MaterialId, Over,
     Params, PixelContext, Pixels, RowBehind, SampleContext, TextureSet, U32s, VertexContext,

@@ -8,15 +8,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use moose_assets::{Assets, MeshId, Texture, TextureId};
+use moose_assets::{Assets, MeshId, Light, Texture, TextureId};
 use moose_scene::Viewport;
 use moose_view::{
     EdgeLine, Object, PolygonKind, ScreenVertex, ViewGeometry, ViewPolygon, pixel_edge,
 };
 use rayon::prelude::*;
 
+use crate::shadow::ShadowMap;
 use crate::shader::{
-    ANISO, ANISO_LOD, Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS,
+    F32s, Fill,
+    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS,
     Material, MaterialEntry, MaterialId, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
@@ -38,20 +40,42 @@ pub struct RasterConfig {
     pub band_rows: u32,
     /// Relative change of w allowed across one sample interval along a span.
     pub step_threshold: f32,
-    /// Smallest sample interval along a span, in pixels (1 to 32; powers of two make the
-    /// most sense). Exact perspective values are taken at least this far apart, however
-    /// steeply w changes. 4 is cheap but can be off by up to about 15 color levels on
-    /// surfaces seen edge-on from very close; 1 is exact there at one division per pixel.
+    /// Smallest grid spacing, in pixels, both ways (1 to 32; powers of two make the most
+    /// sense): steep surfaces, where perspective alone would ask for sample points closer
+    /// together, get them at most this close. Only a surface so steep that w would change by
+    /// more than a quarter across such a cell (seen nearly edge-on) goes closer, so grid
+    /// points past its edges stay where w is well above zero. Wider saves sample work (and
+    /// lighting) on steep surfaces, at the cost of perspective accuracy on them.
     pub min_step: u32,
+    /// How much w may change (relative to its smallest value) across a cell held to
+    /// `min_step` before the cell is made smaller anyway: a surface seen so nearly edge-on
+    /// that it would change more gets finer spacing, so grid points past its edges stay
+    /// where w is well above zero. Infinity always holds to `min_step`, whatever it costs
+    /// pixels at such edges.
+    pub steep_limit: f32,
     /// Color for pixels no polygon covers.
     pub background: u32,
     /// Polygons per frame from which phase 1 (setup and binning) is split across threads.
     /// Below it, one thread does it: waking the pool costs tens of microseconds, far more
     /// than setting up a few hundred polygons.
     pub parallel_setup: usize,
-    /// Debug overlay of the sample lattice: sample rows tinted red, and the pixels sample
-    /// points sit on (columns, and the first and last pixels of rows between sample rows)
-    /// marked green.
+    /// How much a spot light's cone may fade (its factor, from 1 inside to 0 outside) across
+    /// one cell of sample points in a tile its penumbra crosses: such tiles space their
+    /// points so that it fades by at most this across each cell, but no closer than
+    /// `penumbra_spacing`. A narrow penumbra (or one seen up close) gets close points, a
+    /// wide soft one keeps wide cells. 0 turns it off.
+    pub penumbra_threshold: f32,
+    /// The closest sample points `penumbra_threshold` asks for, in pixels.
+    pub penumbra_spacing: u32,
+    /// How far past each side of a tile the fade is measured, in pixels: a margin that
+    /// catches penumbras crossing just a tile's corner.
+    pub penumbra_padding: u32,
+    /// Largest spacing of sample points on a lit polygon (one some light reaches), in
+    /// pixels, in both directions: lighting is evaluated at sample points and interpolated
+    /// between them. Materials and perspective may ask for less.
+    pub light_spacing: u32,
+    /// Debug overlay of the sample lattice: grid rows tinted red, and the grid points on
+    /// them marked green.
     pub show_samples: bool,
 }
 
@@ -62,8 +86,13 @@ impl Default for RasterConfig {
             band_rows: 8,
             step_threshold: 1.0 / 16.0,
             min_step: 4,
+            steep_limit: 0.25,
             background: 0,
             parallel_setup: 1024,
+            light_spacing: 32,
+            penumbra_threshold: 0.125,
+            penumbra_spacing: 4,
+            penumbra_padding: 16,
             show_samples: false,
         }
     }
@@ -184,14 +213,13 @@ struct SetupVertex {
 struct PolygonSetup {
     first_vertex: u32,
     vertex_count: u16,
-    /// Start of this polygon's `sampled` values: `vertex_count * n_vals` values.
-    first_value: u32,
     n_vals: u16,
     /// Its material's outputs per sample point.
     n_out: u16,
-    /// w's change per pixel across and down the screen (w is affine on screen).
-    dwdx: f32,
-    dwdy: f32,
+    /// Its plane functions in `ThreadBins::planes` (see [`fan_planes`]), and its fan's
+    /// triangle count.
+    first_plane: u32,
+    fans: u16,
     row_top: i32,
     row_end: i32,
     /// Nearest point: front-to-back sort key.
@@ -207,6 +235,11 @@ struct PolygonSetup {
     /// edge, stays at full resolution; the shiny surface drawn over a reflection softens it
     /// anyway.
     half_rate: bool,
+    /// The lights that reach it, in `ThreadBins::lights`.
+    first_light: u32,
+    light_count: u16,
+    /// Where its `sampled` world position is among its sampled values, if it has one.
+    position: Option<u16>,
 }
 
 #[derive(Default)]
@@ -224,12 +257,17 @@ struct ThreadBins {
     polygons: Vec<PolygonSetup>,
     vertices: Vec<SetupVertex>,
     lines: Vec<Option<EdgeLine>>,
+    /// Scratch for one polygon's `sampled` values at each vertex, until its planes are made.
     values: Vec<f32>,
     bands: Vec<BandBins>,
-    /// Scratch for one polygon's vertex texture footprints.
-    footprints: Vec<Footprint>,
+    /// Scratch for one polygon's vertex levels of detail.
+    lods: Vec<f32>,
     /// Scratch for one polygon's vertex stage outputs at its source vertices.
     vertex_out: Vec<f32>,
+    /// Every polygon's plane functions (see [`fan_planes`]).
+    planes: Vec<f32>,
+    /// Each polygon's lights (see `PolygonSetup::first_light`).
+    lights: Vec<Light>,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -284,20 +322,27 @@ struct RowScratch {
     viewport_y: i32,
     first_block: i32,
     blocks: usize,
+    /// The band's framebuffer rows: lattices build only the grid rows these need.
+    band_rows: std::ops::Range<i32>,
     /// Per polygon slot of the band and block, its lattice (`slot * blocks + block`), and
-    /// the lattices' sample rows, knots and outputs.
+    /// the lattices' tiles, grid rows and outputs.
     lattices: Vec<Lattice>,
-    sample_rows: Vec<SampleRow>,
-    knots: Vec<Knot>,
-    lattice_values: Vec<f32>,
-    /// Scratch for building a lattice: its sample rows and their points' inputs.
-    sample_ys: Vec<i32>,
-    sample_inputs: Vec<f32>,
-    /// One row's sample points for the run being shaded: x, and outputs, and whether it is
-    /// a sample row.
+    tiles: Vec<Tile>,
+    grid_rows: Vec<GridRow>,
+    grid_values: Vec<f32>,
+    /// One row's sample points for the run being shaded: x, outputs, and whether each is on
+    /// a grid row of its tile (for the overlay).
     points_x: Vec<f32>,
     points_v: Vec<f32>,
-    row_exact: bool,
+    points_exact: Vec<bool>,
+    /// The tiles' runs of the row's sample points, while `row_points` gathers them.
+    segments: Vec<Segment>,
+    /// While a lattice is built: the polygon's first and last pixel on each of the band's
+    /// rows in the block, and the grid points waiting to be evaluated.
+    row_pixels: Vec<(i32, i32)>,
+    pending: Vec<Pending>,
+    /// Each strip's column and row spacing and its least w, while its lattice is built.
+    spacings: Vec<(i32, i32, f32)>,
     world: Vec<u32>,
     span: Vec<u32>,
     pixel: Vec<u32>,
@@ -337,13 +382,18 @@ pub struct Renderer {
     scratch: Vec<Mutex<RowScratch>>,
     /// What untextured polygons sample: 1x1 opaque white.
     blank: Texture,
+    /// Shadow maps, for lights that name one (`Light::shadow`); render them before the
+    /// frame.
+    pub shadow_maps: Vec<ShadowMap>,
 }
 
-/// The textures polygons sample, and the frame's focal length.
+/// The textures polygons sample, and the frame's focal length and ambient light.
 struct Textures<'a> {
     assets: &'a Assets,
     blank: &'a Texture,
     focal: f32,
+    ambient: Vec3,
+    shadow_maps: &'a [ShadowMap],
 }
 
 impl Textures<'_> {
@@ -366,6 +416,7 @@ impl Renderer {
             bins: Vec::new(),
             scratch: Vec::new(),
             blank: Texture::solid("blank", 0xFFFF_FFFF),
+            shadow_maps: Vec::new(),
         }
     }
 
@@ -412,6 +463,8 @@ impl Renderer {
             assets,
             blank: &self.blank,
             focal: geometry.focal,
+            ambient: geometry.ambient,
+            shadow_maps: &self.shadow_maps,
         };
         let setup_started = Instant::now();
         // ---- Phase 1: polygon setup and binning, split by polygon. Each thread writes only
@@ -430,6 +483,8 @@ impl Renderer {
             bins.vertices.clear();
             bins.lines.clear();
             bins.values.clear();
+            bins.planes.clear();
+            bins.lights.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -498,23 +553,16 @@ enum VertexSource {
     FaceNormal,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum FootprintPart {
-    Lod,
-    Aniso,
-    AnisoLod,
-}
-
 /// A material mapped onto a mesh.
 #[derive(Clone, Debug)]
 struct Remap {
     /// The vertex stage's inputs, in declaration order.
     vertex: Vec<VertexSource>,
-    /// Offsets of the `sampled` built-ins: the world position, `uv` (what the footprint is
-    /// measured from) and the footprint's parts.
+    /// Offsets of the `sampled` built-ins: the world position, `uv` (what the level of
+    /// detail is measured from) and the level of detail.
     position: Option<usize>,
     uv: Option<usize>,
-    footprint: Vec<(usize, FootprintPart)>,
+    lod: Option<usize>,
 }
 
 /// Maps a material's vertex inputs onto a mesh's attributes by name, and finds its
@@ -566,7 +614,7 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
         vertex,
         position: None,
         uv: None,
-        footprint: Vec::new(),
+        lod: None,
     };
     let mut offset = 0;
     for want in io.sampled {
@@ -588,21 +636,13 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
             }
             LOD => {
                 expect(1)?;
-                remap.footprint.push((offset, FootprintPart::Lod));
-            }
-            ANISO => {
-                expect(2)?;
-                remap.footprint.push((offset, FootprintPart::Aniso));
-            }
-            ANISO_LOD => {
-                expect(1)?;
-                remap.footprint.push((offset, FootprintPart::AnisoLod));
+                remap.lod = Some(offset);
             }
             _ => {}
         }
         offset += want.count as usize;
     }
-    if !remap.footprint.is_empty() && remap.uv.is_none() {
+    if remap.lod.is_some() && remap.uv.is_none() {
         return Err(LayoutError::MissingAttribute {
             mesh: m.name.clone(),
             name: UV,
@@ -696,7 +736,7 @@ fn setup_polygon(
     }
     // Each (clipped) vertex: the same weighted sum of the outputs that clipping made of its
     // position, then the built-ins.
-    let first_value = bins.values.len() as u32;
+    bins.values.clear();
     let positions = &geometry.world_positions[p.vertices()];
     let n = p.source_vertices as usize;
     for (weights, position) in geometry.weights[p.weights()].chunks_exact(n).zip(positions) {
@@ -715,22 +755,39 @@ fn setup_polygon(
         }
     }
     bins.vertex_out = outs;
-    let (dwdx, dwdy) = w_gradient(verts);
-    if let Some(uv) = remap.uv.filter(|_| !remap.footprint.is_empty()) {
+    if let (Some(uv), Some(lod)) = (remap.uv, remap.lod) {
         let texture = textures.get(s.textures[0]);
         let size = (texture.width() as f32, texture.height() as f32);
-        let values = &bins.values[first_value as usize..];
+        let values = &bins.values;
         let uv_at = |v: usize| (values[v * n_vals + uv], values[v * n_vals + uv + 1]);
-        vertex_footprints(verts, uv_at, size, &mut bins.footprints);
-        for (v, f) in bins.footprints.iter().enumerate() {
-            let values = &mut bins.values[first_value as usize + v * n_vals..];
-            for &(offset, part) in &remap.footprint {
-                match part {
-                    FootprintPart::Lod => values[offset] = f.lod,
-                    FootprintPart::Aniso => values[offset..offset + 2].copy_from_slice(&f.aniso),
-                    FootprintPart::AnisoLod => values[offset] = f.aniso_lod,
-                }
-            }
+        vertex_lods(verts, uv_at, size, &mut bins.lods);
+        for (v, &l) in bins.lods.iter().enumerate() {
+            bins.values[v * n_vals + lod] = l;
+        }
+    }
+    let first_plane = bins.planes.len() as u32;
+    let fans = fan_planes(verts, &bins.values, n_vals, &mut bins.planes);
+    // Its lights: those that can reach its sector (or its entity's sectors), in range of it,
+    // in front of it, and (spot lights) with it in their cone. Mirrored polygons are lit where they really are.
+    let first_light = bins.lights.len() as u32;
+    let positions = &geometry.world_positions[p.vertices()];
+    let normal = Vec3::from_array(face_normal);
+    let (lo, hi) = positions
+        .iter()
+        .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &q| {
+            (lo.min(q), hi.max(q))
+        });
+    let (center, radius) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
+    for &li in geometry.polygon_lights(p) {
+        let light = geometry.lights[li as usize];
+        let height = normal.dot(light.position - positions[0]);
+        let near = light.position.clamp(lo, hi).distance(light.position);
+        if height > 0.0
+            && height < light.range
+            && near < light.range
+            && light.cone_reaches(center, radius)
+        {
+            bins.lights.push(light);
         }
     }
     let first_vertex = bins.vertices.len() as u32;
@@ -745,11 +802,10 @@ fn setup_polygon(
     bins.polygons.push(PolygonSetup {
         first_vertex,
         vertex_count: verts.len() as u16,
-        first_value,
         n_vals: n_vals as u16,
         n_out: layout_len(entry.io.interp) as u16,
-        dwdx,
-        dwdy,
+        first_plane,
+        fans: fans as u16,
         row_top,
         row_end,
         max_w: verts.iter().map(|v| v.w).fold(0.0, f32::max),
@@ -761,6 +817,9 @@ fn setup_polygon(
             .map_or(geometry.eye, |m| geometry.mirrors[m as usize].eye),
         object,
         half_rate: p.mirror.is_some(),
+        first_light,
+        light_count: (bins.lights.len() as u32 - first_light) as u16,
+        position: remap.position.map(|p| p as u16),
     });
     // Bin a reference into every band the polygon's rows touch.
     let id = surface_id(thread, local);
@@ -799,6 +858,7 @@ fn render_band(
     s.first_block = band_top.div_euclid(BLOCK_ROWS);
     s.blocks = ((band_end - 1).div_euclid(BLOCK_ROWS) - s.first_block + 1) as usize;
     (s.viewport_x, s.viewport_y) = (vx, viewport.y as i32);
+    s.band_rows = viewport.y as i32 + band_top..viewport.y as i32 + band_end;
     s.color.resize(vw, 0);
     s.vis_w.resize(vw, 0.0);
     s.vis_state.resize(vw, EMPTY);
@@ -831,9 +891,9 @@ fn render_band(
     let slots = s.world.len() + s.span.len() + s.pixel.len() + s.translucent.len();
     s.lattices.clear();
     s.lattices.resize(slots * s.blocks, Lattice::default());
-    s.sample_rows.clear();
-    s.knots.clear();
-    s.lattice_values.clear();
+    s.tiles.clear();
+    s.grid_rows.clear();
+    s.grid_values.clear();
 
     let rows_in_chunk = chunk.len() / width;
     for r in 0..rows_in_chunk {
@@ -1089,162 +1149,240 @@ fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i3
     })
 }
 
-/// Rows per lattice block: sample rows are at most this far apart, and a block's rows share
-/// one spacing.
-const BLOCK_ROWS: i32 = 8;
+/// Rows per lattice block: grid rows are at most this far apart, and a block's rows share
+/// one spacing (chosen from the whole block, so however the rows are split into bands, a
+/// polygon's grid is the same; each band builds only the grid rows its own rows need).
+const BLOCK_ROWS: i32 = 32;
 
-/// A polygon's sample lattice in one block of rows (see the Material Pipeline Spec), built
-/// the first time one of its runs there is shaded.
+/// Columns per lattice tile: a polygon's grid in a block of rows is split into tiles of this
+/// many columns (counted from the viewport's left edge), each with its own spacing, from the
+/// polygon's nearest part within it. Spacings are powers of two up to this, so every tile's
+/// columns lie on the one global grid, and each point on a row belongs to exactly one tile.
+const TILE_COLS: i32 = MAX_STEP;
+
+/// A polygon's grid in one block of rows (see the Material Pipeline Spec): one tile per
+/// column strip it covers (and the strip after, which holds the point closing its last
+/// interval), each built the first time a run there needs it.
 #[derive(Clone, Copy, Default)]
 struct Lattice {
-    built: bool,
-    /// Column spacing (in shaded pixels times the stride).
-    nx: i32,
-    /// Its sample rows, top to bottom, in `RowScratch::sample_rows`, and its edge knots, top
-    /// to bottom, in `RowScratch::knots`.
-    rows: (u32, u32),
-    knots: (u32, u32),
+    started: bool,
+    /// Its first strip (from the viewport's left edge, in tiles), its strips, and their tiles
+    /// in `RowScratch::tiles`.
+    first_strip: i32,
+    strips: u32,
+    tiles: u32,
+    /// The smallest w of the polygon in the block: a lower bound for every tile's.
+    w_min: f32,
+    /// The polygon's rows in the block.
+    rows: (i32, i32),
 }
 
-/// One sample row of a lattice: exact outputs at its two ends (its first and last pixels'
-/// centers, or where it has none, its edge crossings), at its edge crossings (for the rows
-/// between, whose ends are interpolated along the edges) and at its columns.
-#[derive(Clone, Copy)]
-struct SampleRow {
-    row: i32,
-    /// Where its ends are sampled.
-    x_left: f32,
-    x_right: f32,
+/// A polygon's grid in one tile: its spacing and grid rows. Neighboring tiles whose
+/// spacing is the same share grid rows, as one run of strips (each holding a copy of this).
+#[derive(Clone, Copy, Default)]
+struct Tile {
+    built: bool,
+    /// The run of strips sharing this spacing and these grid rows: its first strip, and the
+    /// strip after its last.
+    first_strip: i32,
+    end_strip: i32,
+    /// Column spacing and row spacing, in pixels.
+    nx: i32,
+    ny: i32,
+    /// Its first grid row, and its grid rows (`ny` apart) in `RowScratch::grid_rows`.
+    first_row: i32,
+    rows: u32,
+}
+
+/// One grid row of a tile: the grid columns it holds, and their outputs.
+#[derive(Clone, Copy, Default)]
+struct GridRow {
     /// First column (a pixel) and how many, `nx` apart.
     col0: i32,
     cols: u32,
-    /// Outputs of the left end, the right end, the left crossing, the right crossing, then
-    /// each column, `n_out` each, in `RowScratch::lattice_values`.
+    /// Its outputs in `RowScratch::grid_values`, output by output, `stride` values each
+    /// (`cols` rounded up to whole lanes).
     values: u32,
+    stride: u32,
 }
 
-/// Points of a sample row before its columns: two ends, two crossings.
-const ROW_POINTS: u32 = 4;
+/// A polygon's plane functions (see [`fan_planes`]), read from `ThreadBins::planes`.
+struct Planes<'a> {
+    /// The origin they are relative to: the polygon's first vertex.
+    ox: f32,
+    oy: f32,
+    /// w: `w0 + wx * dx + wy * dy`.
+    w0: f32,
+    wx: f32,
+    wy: f32,
+    /// Per fan triangle, per `sampled` value: `[c, a, b]` for `value * w = c + a dx + b dy`.
+    fans: &'a [f32],
+    /// The fan's diagonals from the first vertex: `[ex, ey]`, oriented so that a point is
+    /// past one when `ex * dy - ey * dx > 0`.
+    diagonals: &'a [f32],
+    n_fans: usize,
+}
 
-/// A polygon vertex between two sample rows, on its left or right edge chain.
-#[derive(Clone, Copy)]
-struct Knot {
-    y: f32,
-    left: bool,
-    /// Its outputs, in `RowScratch::lattice_values`.
-    values: u32,
+impl<'a> Planes<'a> {
+    fn of(data: &'a [f32], n_fans: usize, n_in: usize) -> Self {
+        let fans_end = 5 + n_fans * n_in * 3;
+        Self {
+            ox: data[0],
+            oy: data[1],
+            w0: data[2],
+            wx: data[3],
+            wy: data[4],
+            fans: &data[5..fans_end],
+            diagonals: &data[fans_end..fans_end + 2 * n_fans.saturating_sub(1)],
+            n_fans,
+        }
+    }
+}
+
+/// A polygon's values as plane functions of the screen, so they are defined anywhere,
+/// on it and past its edges (the grid's points need not lie on it): w, which is affine on
+/// screen for a planar polygon, and each `sampled` value times w, per triangle of the fan
+/// from the first vertex. Values are only affine across a whole polygon if its vertex values
+/// agree, so each triangle has its own planes, exactly as if the polygon were triangulated
+/// (for triangles, and polygons whose values agree, they are all the same). Appends
+/// `[ox, oy, w0, wx, wy]`, then each triangle's planes, then its diagonals, to `out`;
+/// returns the number of triangles.
+fn fan_planes(verts: &[ScreenVertex], values: &[f32], n_in: usize, out: &mut Vec<f32>) -> usize {
+    let n = verts.len();
+    let v0 = verts[0];
+    let area = |i: usize| {
+        let (b, c) = (verts[i], verts[i + 1]);
+        (b.x - v0.x) * (c.y - v0.y) - (c.x - v0.x) * (b.y - v0.y)
+    };
+    // The plane through a triangle's three values of `q`, relative to the first vertex.
+    let plane = |i: usize, q: &dyn Fn(usize) -> f32| {
+        let (b, c) = (verts[i], verts[i + 1]);
+        let (dx1, dy1, dx2, dy2) = (b.x - v0.x, b.y - v0.y, c.x - v0.x, c.y - v0.y);
+        let det = dx1 * dy2 - dx2 * dy1;
+        let (q0, dq1, dq2) = (q(0), q(i) - q(0), q(i + 1) - q(0));
+        [
+            q0,
+            (dq1 * dy2 - dq2 * dy1) / det,
+            (dx1 * dq2 - dx2 * dq1) / det,
+        ]
+    };
+    let n_fans = n - 2;
+    let orient = if (1..n - 1).map(area).sum::<f32>() < 0.0 { -1.0 } else { 1.0 };
+    let widest = (1..n - 1).max_by(|&i, &j| area(i).abs().total_cmp(&area(j).abs()));
+    // A triangle gives a trustworthy plane only if it has some size: slivers left by
+    // clipping make wild planes, and extending one across its wedge magnifies that.
+    let min_area = widest.map_or(0.0, |i| area(i).abs()).mul_add(0.02, 0.0).max(1.0);
+    let flat = |i: usize| area(i).abs() >= min_area;
+    out.extend_from_slice(&[v0.x, v0.y]);
+    match widest.filter(|&i| flat(i)) {
+        Some(i) => out.extend_from_slice(&plane(i, &|v| verts[v].w)),
+        None => out.extend_from_slice(&[v0.w, 0.0, 0.0]),
+    }
+    for t in 0..n_fans {
+        // A degenerate triangle (collinear after clipping) takes the nearest good one's
+        // planes; with none, the values are constant.
+        let i = (t + 1..n - 1)
+            .chain((1..t + 1).rev())
+            .find(|&i| flat(i));
+        for k in 0..n_in {
+            let q = |v: usize| values[v * n_in + k] * verts[v].w;
+            match i {
+                Some(i) => out.extend_from_slice(&plane(i, &q)),
+                None => out.extend_from_slice(&[q(0), 0.0, 0.0]),
+            }
+        }
+    }
+    for v in &verts[2..n - 1] {
+        out.extend_from_slice(&[orient * (v.x - v0.x), orient * (v.y - v0.y)]);
+    }
+    n_fans
 }
 
 /// The sample context of a polygon.
-fn sample_context<'a>(p: &'a PolygonSetup, focal: f32) -> SampleContext<'a> {
+fn sample_context<'a>(
+    p: &'a PolygonSetup,
+    bins: &'a ThreadBins,
+    textures: &Textures<'a>,
+) -> SampleContext<'a> {
+    let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
     SampleContext {
         eye: p.eye,
-        focal,
         object: &p.object,
         params: &p.params,
+        lights: &bins.lights[lights],
+        ambient: textures.ambient,
+        focal: textures.focal,
+        shadow_maps: textures.shadow_maps,
     }
 }
 
-/// Adds the exact `sampled` values at one sample row's points to `inputs` (its left end,
-/// right end, left and right edge crossings, then every column `nx` apart from the
-/// viewport's left edge strictly between the ends), and returns the row, its values offset
-/// counted from the lattice's first point. The ends are its first and last pixels'
-/// centers, or where it has no pixels, its edge crossings. `None` if no edges cross the
-/// row.
-#[allow(clippy::too_many_arguments)]
-fn sample_row_inputs(
-    b: &ThreadBins,
-    p: &PolygonSetup,
-    row: i32,
-    nx: i32,
-    vx: i32,
-    first_point: u32,
-    inputs: &mut Vec<f32>,
-) -> Option<SampleRow> {
-    let range = p.first_vertex as usize..p.first_vertex as usize + p.vertex_count as usize;
-    let verts = &b.vertices[range.clone()];
-    let ((li, x_left), (ri, x_right)) = crossings(verts, &b.lines[range], row)?;
-    let n_in = p.n_vals as usize;
-    let values = &b.values[p.first_value as usize..];
+/// Starts a polygon's lattice for one block of rows: the column strips it covers there
+/// (and the one after, for the point closing its last interval), with a tile for each, not
+/// yet built; and its smallest w there, a lower bound for every tile's.
+fn start_lattice(s: &mut RowScratch, p: &PolygonSetup, verts: &[SetupVertex], block: i32) -> Lattice {
+    let block_top = s.viewport_y + block * BLOCK_ROWS;
+    let (r0, r1) = (
+        p.row_top.max(block_top),
+        p.row_end.min(block_top + BLOCK_ROWS),
+    );
+    // Over the block's rows, a convex polygon's extremes are at its vertices there and its
+    // edges' crossings of the rows' outer lines.
+    let (ya, yb) = (r0 as f32, r1 as f32);
+    let (mut w_min, mut x_min, mut x_max) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY);
     let n = verts.len();
-    let at = inputs.len();
-    inputs.resize(at + 2 * n_in, 0.0);
-    let mut w = [0.0f32; 2];
-    for (side, &i) in [li, ri].iter().enumerate() {
-        let (wi, alpha) = edge_at_row(verts, i, row);
-        w[side] = wi;
-        let (va, vc) = (
-            &values[i * n_in..(i + 1) * n_in],
-            &values[((i + 1) % n) * n_in..((i + 1) % n + 1) * n_in],
-        );
-        let out = &mut inputs[at + side * n_in..at + (side + 1) * n_in];
-        for k in 0..n_in {
-            out[k] = va[k] + (vc[k] - va[k]) * alpha;
+    let mut take = |x: f32, w: f32| {
+        w_min = w_min.min(w);
+        x_min = x_min.min(x);
+        x_max = x_max.max(x);
+    };
+    for i in 0..n {
+        let (a, c) = (verts[i], verts[(i + 1) % n]);
+        if (ya..=yb).contains(&a.y) {
+            take(a.x, a.w);
+        }
+        for y in [ya, yb] {
+            if a.y != c.y && (a.y.min(c.y)..=a.y.max(c.y)).contains(&y) {
+                let t = (y - a.y) / (c.y - a.y);
+                take(a.x + (c.x - a.x) * t, a.w + (c.w - a.w) * t);
+            }
         }
     }
-    // Perspective-correct between the crossings.
-    let span = x_right - x_left;
-    let inv_span = if span > 0.0 { 1.0 / span } else { 0.0 };
-    let alpha = |x: f32| {
-        let s = ((x - x_left) * inv_span).clamp(0.0, 1.0);
-        let den = (1.0 - s) * w[0] + s * w[1];
-        if den > 0.0 { s * w[1] / den } else { s }
-    };
-    let mut crossing = [0.0f32; 2 * MAX_VARYINGS];
-    crossing[..2 * n_in].copy_from_slice(&inputs[at..at + 2 * n_in]);
-    inputs.extend_from_slice(&crossing[..2 * n_in]);
-    let value = |alpha: f32, out: &mut [f32]| {
-        for k in 0..n_in {
-            let (l, r) = (crossing[k], crossing[n_in + k]);
-            out[k] = l + (r - l) * alpha;
-        }
-    };
-    // The ends: the first and last pixels, if any.
-    let (row_x0, row_x1) = (pixel_edge(x_left), pixel_edge(x_right));
-    let (end_left, end_right) = if row_x0 < row_x1 {
-        let (l, r) = (row_x0 as f32 + 0.5, row_x1 as f32 - 0.5);
-        value(alpha(l), &mut inputs[at..at + n_in]);
-        value(alpha(r), &mut inputs[at + n_in..at + 2 * n_in]);
-        (l, r)
+    let vx = s.viewport_x;
+    let strip = |x: f32| (x.floor() as i32 - vx).div_euclid(TILE_COLS);
+    let (first_strip, last_strip) = if x_min <= x_max {
+        (strip(x_min), strip(x_max) + 1)
     } else {
-        (x_left, x_right)
+        (0, 0)
     };
-    // Columns strictly between the ends.
-    let mut c = vx + ((end_left - 0.5 - vx as f32) / nx as f32).floor() as i32 * nx;
-    while c as f32 + 0.5 <= end_left {
-        c += nx;
+    let tiles = s.tiles.len() as u32;
+    let strips = (last_strip - first_strip + 1) as u32;
+    s.tiles
+        .resize(s.tiles.len() + strips as usize, Tile::default());
+    Lattice {
+        started: true,
+        first_strip,
+        strips,
+        tiles,
+        w_min,
+        rows: (r0, r1),
     }
-    let col0 = c;
-    let mut cols = 0;
-    while (c as f32 + 0.5) < end_right {
-        let base = inputs.len();
-        inputs.resize(base + n_in, 0.0);
-        value(alpha(c as f32 + 0.5), &mut inputs[base..]);
-        cols += 1;
-        c += nx;
-    }
-    Some(SampleRow {
-        row,
-        x_left: end_left,
-        x_right: end_right,
-        col0,
-        cols,
-        values: first_point,
-    })
 }
 
-/// Builds a polygon's lattice for the current band: its spacing, its sample rows and edge
-/// knots, and `shade_sample` on all their points at once.
+/// Builds every tile of a polygon's lattice in one block (for the band's rows): each tile's
+/// spacing, then its grid rows, each holding the outputs of `shade_sample` at the tile's grid
+/// columns that the rows it serves need. The polygon's pixels on each row are found once for
+/// all its tiles, and the grid points of all its tiles are evaluated together, [`LANES`] at
+/// a time whichever tiles they belong to: values from the polygon's plane functions
+/// ([`fan_planes`]), one reciprocal of w per point.
 #[allow(clippy::too_many_arguments)]
-fn build_lattice(
+fn build_tiles(
     s: &mut RowScratch,
     bins: &[ThreadBins],
     shaders: &[MaterialEntry],
     config: &RasterConfig,
     textures: &Textures,
-    index: usize,
+    lattice: Lattice,
     id: u32,
-    block: i32,
 ) {
     let (t, l) = split_id(id);
     let b = &bins[t];
@@ -1252,45 +1390,18 @@ fn build_lattice(
     let entry = &shaders[p.material.0 as usize];
     let (n_in, n_out) = (p.n_vals as usize, p.n_out as usize);
     let range = p.first_vertex as usize..p.first_vertex as usize + p.vertex_count as usize;
-    let verts = &b.vertices[range];
-    let block_top = s.viewport_y + block * BLOCK_ROWS;
-    let (r0, r1) = (
-        p.row_top.max(block_top),
-        p.row_end.min(block_top + BLOCK_ROWS),
-    );
+    let (verts, lines) = (&b.vertices[range.clone()], &b.lines[range]);
+    let planes = Planes::of(&b.planes[p.first_plane as usize..], p.fans as usize, n_in);
+    let (vx, vy) = (s.viewport_x, s.viewport_y);
+    let (block_r0, block_r1) = lattice.rows;
+    // The rows this band draws, and the polygon's pixels on each.
+    let (r0, r1) = (block_r0.max(s.band_rows.start), block_r1.min(s.band_rows.end));
+    s.row_pixels.clear();
+    s.row_pixels.extend((r0..r1).map(|r| match crossings(verts, lines, r) {
+        Some(((_, xl), (_, xr))) => (pixel_edge(xl), pixel_edge(xr) - 1),
+        None => (i32::MAX, i32::MIN),
+    }));
 
-    // Spacing: the material's, or less where w changes by more than the threshold across
-    // a cell (relative to its smallest value in the block): across, down, and along the
-    // edges (which row ends are interpolated along). Rows between sample rows also skip the
-    // columns that lie outside the polygon on a sample row, so their first interval runs
-    // as far as an edge moves across in that many rows: that too must stay within the
-    // threshold and the material's spacing.
-    let (ya, yb) = (r0 as f32, r1 as f32);
-    let (mut w_min, mut dwdy, mut slope) = (f32::INFINITY, p.dwdy.abs(), 0.0f32);
-    let n = verts.len();
-    for i in 0..n {
-        let (a, c) = (verts[i], verts[(i + 1) % n]);
-        if (ya..=yb).contains(&a.y) {
-            w_min = w_min.min(a.w);
-        }
-        if a.y != c.y && a.y.max(c.y) >= ya && a.y.min(c.y) <= yb {
-            dwdy = dwdy.max(((c.w - a.w) / (c.y - a.y)).abs());
-            slope = slope.max(((c.x - a.x) / (c.y - a.y)).abs());
-        }
-        for y in [ya, yb] {
-            if a.y != c.y && (a.y.min(c.y)..=a.y.max(c.y)).contains(&y) {
-                w_min = w_min.min(a.w + (c.w - a.w) * (y - a.y) / (c.y - a.y));
-            }
-        }
-    }
-    let limit = |dw: f32| {
-        let perspective = if dw != 0.0 && w_min.is_finite() {
-            config.step_threshold * w_min / dw.abs()
-        } else {
-            f32::INFINITY
-        };
-        perspective.min(entry.sample_spacing as f32)
-    };
     let pow2 = |limit: f32, lo: i32, hi: i32| {
         let mut n = hi;
         while n > lo && n as f32 > limit {
@@ -1299,405 +1410,360 @@ fn build_lattice(
         n
     };
     let stride = if p.half_rate { 2 } else { 1 };
-    let min_step = config.min_step.clamp(1, MAX_STEP as u32) as i32;
-    let nx = pow2(limit(p.dwdx), min_step, MAX_STEP) * stride;
-    let travel = if slope > 0.0 {
-        limit(p.dwdx * slope).min(entry.sample_spacing as f32 / slope)
+    let spacing = if p.light_count > 0 {
+        entry.sample_spacing.min(config.light_spacing.max(1) as i32)
     } else {
-        f32::INFINITY
+        entry.sample_spacing
+    } as f32;
+    let min_step = config.min_step.clamp(1, MAX_STEP as u32) as f32;
+    let w_at = |x: f32, y: f32| planes.w0 + planes.wx * (x - planes.ox) + planes.wy * (y - planes.oy);
+    // The polygon's lights, whose spot lights' penumbra tightens the spacing of the tiles
+    // it crosses (found from the world position among the polygon's values: it is affine on
+    // the polygon, so the first fan triangle's planes hold everywhere).
+    let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
+    let spots: &[Light] = match p.position {
+        Some(_) if config.penumbra_threshold > 0.0 => &b.lights[lights],
+        _ => &[],
     };
-    let ny = pow2(limit(dwdy).min(travel), 1, BLOCK_ROWS);
-
-    // Sample rows: the polygon's first row in the block, the grid rows, and its last row
-    // or the next block's first row (a grid row).
-    s.sample_ys.clear();
-    s.sample_ys.push(r0);
-    let mut y = r0 + (ny - (r0 - s.viewport_y).rem_euclid(ny)) % ny;
-    if y == r0 {
-        y += ny;
-    }
-    while y < r1 {
-        s.sample_ys.push(y);
-        y += ny;
-    }
-    let last = if r1 == p.row_end { r1 - 1 } else { r1 };
-    if *s.sample_ys.last().unwrap() < last {
-        s.sample_ys.push(last);
-    }
-
-    // Their points' exact values, then the knots'.
-    s.sample_inputs.clear();
-    let rows_start = s.sample_rows.len() as u32;
-    let values_start = s.lattice_values.len() as u32;
-    let mut points = 0u32;
-    for k in 0..s.sample_ys.len() {
-        let row = s.sample_ys[k];
-        if let Some(mut sr) =
-            sample_row_inputs(b, p, row, nx, s.viewport_x, points, &mut s.sample_inputs)
-        {
-            sr.values += values_start;
-            points += ROW_POINTS + sr.cols;
-            s.sample_rows.push(sr);
-        }
-    }
-    let rows_end = s.sample_rows.len() as u32;
-    let knots_start = s.knots.len() as u32;
-    if rows_end > rows_start {
-        let (top, bottom) = (
-            s.sample_rows[rows_start as usize].row as f32 + 0.5,
-            s.sample_rows[rows_end as usize - 1].row as f32 + 0.5,
+    let position_at = |x: f32, y: f32, w: f32| {
+        let at = |k: usize| {
+            let c = &planes.fans[k * 3..k * 3 + 3];
+            (c[0] + c[1] * (x - planes.ox) + c[2] * (y - planes.oy)) / w
+        };
+        let k = p.position.unwrap_or(0) as usize;
+        Vec3::new(at(k), at(k + 1), at(k + 2))
+    };
+    // How far a spot light's cone factor (0 outside, 1 inside, before easing) changes
+    // across the rectangle, the most of any spot light's (at its corners and middle, where
+    // w is safely positive, and in range).
+    let penumbra = |xa: f32, xb: f32, ya: f32, yb: f32, w_min: f32| {
+        let points = [(xa, ya), (xb, ya), (xa, yb), (xb, yb), ((xa + xb) / 2.0, (ya + yb) / 2.0)];
+        spots
+            .iter()
+            .filter(|l| !l.is_point())
+            .map(|l| {
+                let (scale, offset) = l.cone();
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &(x, y) in &points {
+                    let w = w_at(x, y);
+                    if w <= w_min * 0.25 {
+                        continue;
+                    }
+                    let d = l.position - position_at(x, y, w);
+                    if d.length_squared() >= l.range * l.range {
+                        continue;
+                    }
+                    let c = (offset - d.dot(l.direction) / d.length().max(1e-6) * scale)
+                        .clamp(0.0, 1.0);
+                    (lo, hi) = (lo.min(c), hi.max(c));
+                }
+                (hi - lo).max(0.0)
+            })
+            .fold(0.0, f32::max)
+    };
+    s.pending.clear();
+    // Each strip's spacing first, so runs of strips with the same one can share grid rows.
+    s.spacings.clear();
+    for i in 0..lattice.strips {
+        let xs = vx + (lattice.first_strip + i as i32) * TILE_COLS;
+        // The polygon's smallest w in the tile, at least: w is a plane, so over the tile's
+        // rectangle it is least at a corner; the block's smallest w bounds it too.
+        let (xa, xb, ya, yb) = (
+            xs as f32,
+            (xs + TILE_COLS) as f32,
+            block_r0 as f32,
+            block_r1 as f32,
         );
-        let values = &b.values[p.first_value as usize..];
-        for i in 0..n {
-            let (prev, v, next) = (verts[(i + n - 1) % n], verts[i], verts[(i + 1) % n]);
-            if v.y <= top || v.y >= bottom {
-                continue;
-            }
-            // On the left chain the outline runs down through it, on the right up.
-            let left = if prev.y < v.y && v.y < next.y {
-                true
-            } else if prev.y > v.y && v.y > next.y {
-                false
-            } else {
-                continue;
-            };
-            s.sample_inputs
-                .extend_from_slice(&values[i * n_in..(i + 1) * n_in]);
-            s.knots.push(Knot {
-                y: v.y,
-                left,
-                values: values_start + points * n_out as u32,
-            });
-            points += 1;
-        }
-        s.knots[knots_start as usize..].sort_by(|a, b| a.y.total_cmp(&b.y));
-    }
-    let knots_end = s.knots.len() as u32;
-    s.lattice_values
-        .resize(values_start as usize + points as usize * n_out, 0.0);
-    // Row values offsets were counted in points; make them value offsets.
-    for sr in &mut s.sample_rows[rows_start as usize..rows_end as usize] {
-        sr.values = values_start + (sr.values - values_start) * n_out as u32;
-    }
-    (entry.sample)(
-        &s.sample_inputs,
-        points as usize,
-        &sample_context(p, textures.focal),
-        &mut s.lattice_values[values_start as usize..],
-    );
-    s.lattices[index] = Lattice {
-        built: true,
-        nx,
-        rows: (rows_start, rows_end),
-        knots: (knots_start, knots_end),
-    };
-}
-
-/// Where a row's sample point comes from.
-#[derive(Clone, Copy, PartialEq)]
-enum PointSource {
-    /// A sample row's own ends: exact.
-    End(u32),
-    /// A row between sample rows: its edge crossings (interpolated along the edges) and its
-    /// first and last pixels (perspective-correct between the crossing and the nearest
-    /// point inside).
-    Crossing(bool),
-    Pixel(bool),
-}
-
-/// A row's sample points, in order: up to two at its left end, columns `nx` apart, up to
-/// two at its right end.
-struct RowLayout {
-    head: [(f32, PointSource); 2],
-    heads: usize,
-    tail: [(f32, PointSource); 2],
-    tails: usize,
-    col0: i32,
-    cols: usize,
-    nx: i32,
-}
-
-impl RowLayout {
-    fn len(&self) -> usize {
-        self.heads + self.cols + self.tails
-    }
-
-    /// Point `i`'s x, and its source (`None` for a column).
-    fn at(&self, i: usize) -> (f32, Option<PointSource>) {
-        if i < self.heads {
-            let (x, src) = self.head[i];
-            (x, Some(src))
-        } else if i < self.heads + self.cols {
-            let c = self.col0 + (i - self.heads) as i32 * self.nx;
-            (c as f32 + 0.5, None)
+        let corners = w_at(xa, ya).min(w_at(xb, ya)).min(w_at(xa, yb)).min(w_at(xb, yb));
+        let w_min = corners.max(lattice.w_min);
+        // Across a penumbra: cells over which the cone fades by at most the threshold. It is
+        // measured past the tile by `penumbra_padding` on every side, as the fade needn't be
+        // spread across the tile: a penumbra crossing just its corner fades fast there, which
+        // the corners alone would take for a slow fade across all of it.
+        let fade = if spots.is_empty() {
+            0.0
         } else {
-            let (x, src) = self.tail[i - self.heads - self.cols];
-            (x, Some(src))
+            let pad = config.penumbra_padding as f32;
+            penumbra(xa - pad, xb + pad, ya - pad, yb + pad, w_min)
+        };
+        let spacing = if fade > 0.0 {
+            spacing.min(
+                (TILE_COLS as f32 * config.penumbra_threshold / fade)
+                    .max(config.penumbra_spacing.max(1) as f32),
+            )
+        } else {
+            spacing
+        };
+        // Spacing: the material's (twice as wide across at half rate, which shades every
+        // other pixel; for lit polygons at most the light spacing), or less where w changes
+        // by more than the threshold across a cell (relative to its smallest value on the
+        // polygon in the tile), but never less than `min_step` unless w would change by more
+        // than the steep limit across a cell. Every grid point a pixel uses is within a cell
+        // of it in each direction, so w stays well above zero even at points past the edges.
+        let relative = |limit: f32, dw: f32| {
+            if dw != 0.0 && w_min.is_finite() {
+                limit * w_min / dw.abs()
+            } else {
+                f32::INFINITY
+            }
+        };
+        let floor = |dw: f32| min_step.min(relative(config.steep_limit, dw));
+        let nx = pow2(
+            relative(config.step_threshold, planes.wx)
+                .min(spacing * stride as f32)
+                .max(floor(planes.wx)),
+            1,
+            TILE_COLS,
+        );
+        let ny = pow2(
+            relative(config.step_threshold, planes.wy)
+                .min(spacing)
+                .max(floor(planes.wy)),
+            1,
+            BLOCK_ROWS,
+        );
+        s.spacings.push((nx, ny, w_min));
+    }
+    let mut i = 0;
+    while i < lattice.strips as usize {
+        // A run of strips with the same spacing; the least w of any of them guards all.
+        let (nx, ny, _) = s.spacings[i];
+        let mut end = i + 1;
+        while end < s.spacings.len() && (s.spacings[end].0, s.spacings[end].1) == (nx, ny) {
+            end += 1;
         }
+        let w_min = s.spacings[i..end]
+            .iter()
+            .map(|&(_, _, w)| w)
+            .fold(f32::INFINITY, f32::min);
+        let (first_strip, end_strip) = (
+            lattice.first_strip + i as i32,
+            lattice.first_strip + end as i32,
+        );
+        let (xs, xe) = (vx + first_strip * TILE_COLS, vx + end_strip * TILE_COLS);
+        // A last guard: keep w off zero at points past the edges.
+        let w_floor = if w_min.is_finite() { w_min / 8.0 } else { 0.0 };
+
+        // Grid rows from the one at or above the polygon's first row in the block and the
+        // band, to the one at or below its last there (the next block's first, at most).
+        let first_row = r0 - (r0 - vy).rem_euclid(ny);
+        let last = r1 - 1;
+        let last_row = last + (ny - (last - vy).rem_euclid(ny)) % ny;
+        let rows = s.grid_rows.len() as u32;
+        let last_col = xe - nx;
+        let mut g = first_row;
+        while g <= last_row {
+            // Its columns: the run's from the one at or before the first pixel of the rows
+            // it serves (those within `ny` of it) to the one at or after the last; the first
+            // column also closes the last interval of the run before.
+            let (mut first_px, mut last_px) = (i32::MAX, i32::MIN);
+            let served = (g - ny + 1).max(r0)..(g + ny).min(r1);
+            for &(a, c) in &s.row_pixels[(served.start - r0) as usize..(served.end - r0) as usize]
+            {
+                first_px = first_px.min(a);
+                last_px = last_px.max(c);
+            }
+            if first_px > last_px || first_px >= xe || last_px < xs - TILE_COLS {
+                s.grid_rows.push(GridRow::default());
+                g += ny;
+                continue;
+            }
+            let col0 = xs + ((first_px - xs).max(0) / nx) * nx;
+            let col_end = if last_px < xs {
+                xs
+            } else {
+                (xs + (last_px - xs + nx - 1) / nx * nx).min(last_col)
+            };
+            let cols = (col_end - col0) / nx + 1;
+            let values = s.grid_values.len();
+            s.grid_values.resize(values + n_out * cols as usize, 0.0);
+            let dy = g as f32 + 0.5 - planes.oy;
+            for j in 0..cols {
+                s.pending.push(Pending {
+                    dx: (col0 + j * nx) as f32 + 0.5 - planes.ox,
+                    dy,
+                    w_floor,
+                    at: (values + j as usize) as u32,
+                    stride: cols as u32,
+                });
+            }
+            s.grid_rows.push(GridRow {
+                col0,
+                cols: cols as u32,
+                values: values as u32,
+                stride: cols as u32,
+            });
+            g += ny;
+        }
+        let tile = Tile {
+            built: true,
+            first_strip,
+            end_strip,
+            nx,
+            ny,
+            first_row,
+            rows,
+        };
+        for k in i..end {
+            s.tiles[lattice.tiles as usize + k] = tile;
+        }
+        i = end;
     }
 
-    /// The number of points at or before `x`.
-    fn count_to(&self, x: f32) -> usize {
-        let (mut lo, mut hi) = (0, self.len());
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if self.at(mid).0 <= x {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+    // Every tile's grid points, LANES at a time.
+    let ctx = sample_context(p, b, textures);
+    let mut inputs = [F32s::default(); MAX_VARYINGS];
+    let mut outputs = [F32s::default(); MAX_VARYINGS];
+    let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
+    for chunk in s.pending.chunks(LANES) {
+        // Lanes past the points repeat the last one.
+        let lane = |f: fn(&Pending) -> f32| {
+            F32s::from(std::array::from_fn::<f32, LANES, _>(|j| {
+                f(&chunk[j.min(chunk.len() - 1)])
+            }))
+        };
+        let (dx, dy) = (lane(|q| q.dx), lane(|q| q.dy));
+        let w = (F32s::fill(planes.w0) + F32s::fill(planes.wx) * dx + F32s::fill(planes.wy) * dy)
+            .max(lane(|q| q.w_floor));
+        let inv = one / w;
+        // Each lane's fan triangle: how many diagonals it is past.
+        let mut fan = zero;
+        for d in planes.diagonals.chunks_exact(2) {
+            let past = (F32s::fill(d[0]) * dy - F32s::fill(d[1]) * dx).simd_gt(zero);
+            fan += past.select(one, zero);
+        }
+        for (k, input) in inputs[..n_in].iter_mut().enumerate() {
+            let at = |t: usize| {
+                let c = &planes.fans[(t * n_in + k) * 3..(t * n_in + k) * 3 + 3];
+                F32s::fill(c[0]) + F32s::fill(c[1]) * dx + F32s::fill(c[2]) * dy
+            };
+            let mut q = at(0);
+            for t in 1..planes.n_fans {
+                let here = fan.simd_eq(F32s::fill(t as f32));
+                if here.to_bitmask() != 0 {
+                    q = here.select(at(t), q);
+                }
+            }
+            *input = q * inv;
+        }
+        (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_out]);
+        for (k, out) in outputs[..n_out].iter().enumerate() {
+            let out = out.to_array();
+            for (j, q) in chunk.iter().enumerate() {
+                s.grid_values[(q.at + k as u32 * q.stride) as usize] = out[j];
             }
         }
-        lo
     }
+}
+
+/// A grid point waiting to be evaluated (see [`build_tiles`]): where it is relative to the
+/// polygon's plane functions' origin, the least w allowed there, and where its first output
+/// goes in `RowScratch::grid_values` (the rest `stride` apart).
+#[derive(Clone, Copy)]
+struct Pending {
+    dx: f32,
+    dy: f32,
+    w_floor: f32,
+    at: u32,
+    stride: u32,
 }
 
 /// Fills `s.points_x` and `s.points_v` with a polygon's sample points on the current row
-/// that shade pixels `x0..x1` (from the last point at or before `x0`'s center to the first
-/// past `x1 - 1`'s): exact on sample rows; elsewhere its crossings interpolated along its
-/// edge chains between knots, the columns inside it on both sample rows around it
-/// interpolated between them, and its first and last pixels perspective-correct between
-/// those. The points are the row's whatever the run, so no pixel depends on how the row
+/// for pixels `x0..x1` (`x0` being the first pixel they show: at half rate, the first
+/// pair's): the grid columns from the one at or before `x0` to the one at or after
+/// `x1 - 1`, tile by tile, each tile's outputs blended between its grid rows above and
+/// below (output by output). The points are the grid's, so no pixel depends on how the row
 /// was split.
-#[allow(clippy::too_many_arguments)]
-fn row_points(
-    s: &mut RowScratch,
-    index: usize,
-    st: (f32, f32, f32, f32),
-    n_out: usize,
-    x0: i32,
-    x1: i32,
-) {
-    let (x_left, x_right, w_left, w_right) = st;
+fn row_points(s: &mut RowScratch, index: usize, n_out: usize, x0: i32, x1: i32) {
     let lattice = s.lattices[index];
-    let rows = &s.sample_rows[lattice.rows.0 as usize..lattice.rows.1 as usize];
-    let row = s.row;
-    let vals = &s.lattice_values;
-    let at = |offset: u32, point: u32| {
-        let i = (offset + point * n_out as u32) as usize;
-        &vals[i..i + n_out]
-    };
-    let (xs, vs) = (&mut s.points_x, &mut s.points_v);
-    xs.clear();
-    vs.clear();
-    vs.reserve(n_out * (x1 - x0 + 8) as usize);
-    let nx = lattice.nx;
-    let below = rows.partition_point(|r| r.row < row);
-    let exact = rows.get(below).filter(|r| r.row == row);
-    s.row_exact = exact.is_some();
-    let brackets = below.checked_sub(1).map(|i| &rows[i]).zip(rows.get(below));
-    let none = (0.0, PointSource::End(0));
-    let layout = if let Some(r) = exact {
-        let two = r.x_right > r.x_left;
-        RowLayout {
-            head: [(r.x_left, PointSource::End(0)), none],
-            heads: 1,
-            tail: [(r.x_right, PointSource::End(1)), none],
-            tails: two as usize,
-            col0: r.col0,
-            cols: r.cols as usize,
-            nx,
-        }
-    } else if let Some((a, b)) = brackets {
-        // Columns inside this row and both sample rows: one run of them.
-        let (lo, hi) = (
-            a.col0.max(b.col0),
-            (a.col0 + a.cols as i32 * nx).min(b.col0 + b.cols as i32 * nx),
+    let (vx, row) = (s.viewport_x, s.row);
+    s.points_x.clear();
+    s.points_exact.clear();
+    s.segments.clear();
+    // The points, tile by tile: each tile's run of them, from its two grid rows.
+    let mut strip = (x0 - vx).div_euclid(TILE_COLS);
+    'strips: loop {
+        debug_assert!(
+            (lattice.first_strip..lattice.first_strip + lattice.strips as i32).contains(&strip),
+            "row {row}: strip {strip} outside the polygon's"
         );
-        let mut col0 = lo;
-        if (col0 as f32 + 0.5) <= x_left {
-            col0 += ((x_left - 0.5 - col0 as f32) / nx as f32).floor() as i32 * nx + nx;
-        }
-        let mut end = hi;
-        let limit = (x_right - 0.5).ceil() as i32; // columns before it are inside
-        if end > limit {
-            end = col0 + ((limit - col0 + nx - 1) / nx).max(0) * nx;
-        }
-        let cols = ((end - col0).max(0) / nx) as usize;
-        let (first, last) = (
-            pixel_edge(x_left) as f32 + 0.5,
-            pixel_edge(x_right) as f32 - 0.5,
+        let tile = s.tiles[(lattice.tiles as i32 + strip - lattice.first_strip) as usize];
+        debug_assert!(tile.built);
+        let (nx, ny) = (tile.nx, tile.ny);
+        let g = row - (row - s.viewport_y).rem_euclid(ny);
+        let fy = (row - g) as f32 / ny as f32;
+        let above = tile.rows as usize + ((g - tile.first_row) / ny) as usize;
+        let a = s.grid_rows[above];
+        let b = if fy > 0.0 { s.grid_rows[above + 1] } else { a };
+        // The run of strips sharing this tile's grid, from the strip holding x0 (or its
+        // first) to its end.
+        let (xs, xe) = (vx + tile.first_strip * TILE_COLS, vx + tile.end_strip * TILE_COLS);
+        let c0 = if x0 > xs { xs + (x0 - xs) / nx * nx } else { xs };
+        let start = s.points_x.len();
+        let mut c = c0;
+        let done = loop {
+            s.points_x.push(c as f32 + 0.5);
+            s.points_exact.push(fy == 0.0);
+            if c >= x1 - 1 {
+                break true;
+            }
+            c += nx;
+            if c >= xe {
+                break false;
+            }
+        };
+        debug_assert!(
+            [a, b]
+                .iter()
+                .all(|r| c0 >= r.col0 && c < r.col0 + r.cols as i32 * nx.max(1) + nx),
+            "row {row}: columns {c0}..{c} outside their grid rows"
         );
-        let (inner_left, inner_right) = if cols > 0 {
-            (
-                col0 as f32 + 0.5,
-                (col0 + (cols as i32 - 1) * nx) as f32 + 0.5,
-            )
-        } else {
-            (x_right, x_left)
-        };
-        let mut layout = RowLayout {
-            head: [(x_left, PointSource::Crossing(true)), none],
-            heads: 1,
-            tail: [none, none],
-            tails: 0,
-            col0,
-            cols,
-            nx,
-        };
-        // The pixels only where they fall strictly between their neighbors.
-        let first_in = first > x_left && first < inner_left.min(x_right) && first <= last;
-        if first_in {
-            layout.head[1] = (first, PointSource::Pixel(false));
-            layout.heads = 2;
+        s.segments.push(Segment {
+            start: start as u32,
+            count: (s.points_x.len() - start) as u32,
+            a,
+            b,
+            ia: ((c0 - a.col0) / nx) as u32,
+            ib: ((c0 - b.col0) / nx) as u32,
+            fy,
+        });
+        if done {
+            break 'strips;
         }
-        let after = if cols > 0 {
-            inner_right
-        } else if first_in {
-            first
-        } else {
-            x_left
-        };
-        if last > after && last < x_right {
-            layout.tail[0] = (last, PointSource::Pixel(true));
-            layout.tails = 1;
-        }
-        layout.tail[layout.tails] = (x_right, PointSource::Crossing(false));
-        layout.tails += 1;
-        layout
-    } else {
-        return; // no sample rows around it: nothing to shade from
-    };
-    let n = layout.len();
-    // The points bracketing the run: from the last at or before its first pixel's center
-    // (the row's last point shades its own pixel as the end of the interval before it) to
-    // the first past its last pixel's.
-    let (lo, hi) = (x0 as f32 + 0.5, (x1 - 1) as f32 + 0.5);
-    let start = layout
-        .count_to(lo)
-        .saturating_sub(1)
-        .min(n.saturating_sub(2));
-    let end = layout.count_to(hi).min(n - 1);
-    // Values.
-    let mut cross = [[0.0f32; MAX_VARYINGS]; 2];
-    let mut fy = 0.0;
-    let ab = if exact.is_none() { brackets } else { None };
-    if let Some((a, b)) = ab {
-        fy = (row - a.row) as f32 / (b.row - a.row) as f32;
-        let y = row as f32 + 0.5;
-        let knots = &s.knots[lattice.knots.0 as usize..lattice.knots.1 as usize];
-        // Along one edge chain: the knots between the two rows' crossings.
-        for (side, left) in [(0, true), (1, false)] {
-            let (top, bottom) = (a.row as f32 + 0.5, b.row as f32 + 0.5);
-            let (mut y0, mut v0) = (top, at(a.values, 2 + side as u32));
-            let (mut y1, mut v1) = (bottom, at(b.values, 2 + side as u32));
-            for k in knots {
-                if k.left != left || k.y <= top || k.y >= bottom {
-                    continue;
-                }
-                if k.y < y {
-                    (y0, v0) = (k.y, at(k.values, 0));
-                } else if k.y < y1 {
-                    (y1, v1) = (k.y, at(k.values, 0));
-                }
-            }
-            let f = if y1 > y0 {
-                ((y - y0) / (y1 - y0)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            for (o, (&p, &q)) in cross[side].iter_mut().zip(v0.iter().zip(v1)) {
-                *o = p + (q - p) * f;
-            }
-        }
+        strip = tile.end_strip;
     }
-    // A point's values (not a pixel's).
-    let value = |i: usize, out: &mut Vec<f32>| match layout.at(i).1 {
-        Some(PointSource::End(side)) => out.extend_from_slice(at(exact.unwrap().values, side)),
-        Some(PointSource::Crossing(left)) => out.extend_from_slice(&cross[!left as usize][..n_out]),
-        Some(PointSource::Pixel(_)) => unreachable!(),
-        None => {
-            let c = layout.col0 + (i - layout.heads) as i32 * nx;
-            if let Some(r) = exact {
-                out.extend_from_slice(at(r.values, ROW_POINTS + ((c - r.col0) / nx) as u32));
-            } else {
-                let (a, b) = ab.unwrap();
-                let va = at(a.values, ROW_POINTS + ((c - a.col0) / nx) as u32);
-                let vb = at(b.values, ROW_POINTS + ((c - b.col0) / nx) as u32);
-                let o = out.len();
-                out.resize(o + n_out, 0.0);
-                for ((o, &p), &q) in out[o..].iter_mut().zip(va).zip(vb) {
-                    *o = p + (q - p) * fy;
-                }
-            }
-        }
-    };
-    let w_at = |x: f32| {
-        let span = x_right - x_left;
-        let t = if span > 0.0 {
-            ((x - x_left) / span).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        w_left + (w_right - w_left) * t
-    };
-    let is_pixel = |i: usize| matches!(layout.at(i).1, Some(PointSource::Pixel(_)));
-    // One end point: its own values, or a pixel's, perspective-correct between its nearest
-    // neighbors that are not pixels themselves (with no columns, the other pixel lies
-    // between).
-    let point = |i: usize, vs: &mut Vec<f32>| {
-        if !is_pixel(i) {
-            value(i, vs);
-            return;
-        }
-        let x = layout.at(i).0;
-        let (mut ia, mut ib) = (i - 1, i + 1);
-        while is_pixel(ia) {
-            ia -= 1;
-        }
-        while is_pixel(ib) {
-            ib += 1;
-        }
-        let at = vs.len();
-        value(ia, vs);
-        value(ib, vs);
-        let (xa, xb) = (layout.at(ia).0, layout.at(ib).0);
-        let (wa, wb) = (w_at(xa), w_at(xb));
-        let t = (x - xa) / (xb - xa);
-        let den = (1.0 - t) * wa + t * wb;
-        let alpha = if den > 0.0 { t * wb / den } else { t };
+    // Outputs, output by output, each tile's run blended between its grid rows at once.
+    let m = s.points_x.len();
+    s.points_v.clear();
+    s.points_v.resize(n_out * m, 0.0);
+    for seg in &s.segments {
+        let (start, count) = (seg.start as usize, seg.count as usize);
+        let (a, b) = (seg.a, seg.b);
         for k in 0..n_out {
-            let (p, q) = (vs[at + k], vs[at + n_out + k]);
-            vs[at + k] = p + (q - p) * alpha;
-        }
-        vs.truncate(at + n_out);
-    };
-    let (heads, cols) = (layout.heads, layout.cols);
-    for i in start..heads.min(end + 1) {
-        point(i, vs);
-        xs.push(layout.at(i).0);
-    }
-    // The columns in the window, all at once: contiguous in their sample rows.
-    let (k0, k1) = (
-        start.max(heads) - heads,
-        (end + 1).min(heads + cols).saturating_sub(heads),
-    );
-    if k0 < k1 {
-        let c0 = layout.col0 + k0 as i32 * nx;
-        for k in k0..k1 {
-            xs.push((layout.col0 + k as i32 * nx) as f32 + 0.5);
-        }
-        let len = (k1 - k0) * n_out;
-        let first = |r: &SampleRow| {
-            (r.values + (ROW_POINTS + ((c0 - r.col0) / nx) as u32) * n_out as u32) as usize
-        };
-        if let Some(r) = exact {
-            let from = first(r);
-            vs.extend_from_slice(&vals[from..from + len]);
-        } else {
-            let (a, b) = ab.unwrap();
-            let (fa, fb) = (first(a), first(b));
-            let (va, vb) = (&vals[fa..fa + len], &vals[fb..fb + len]);
-            let o = vs.len();
-            vs.resize(o + len, 0.0);
-            for ((o, &p), &q) in vs[o..].iter_mut().zip(va).zip(vb) {
-                *o = p + (q - p) * fy;
+            let va = &s.grid_values[a.values as usize + k * a.stride as usize + seg.ia as usize..]
+                [..count];
+            let vb = &s.grid_values[b.values as usize + k * b.stride as usize + seg.ib as usize..]
+                [..count];
+            let out = &mut s.points_v[k * m + start..k * m + start + count];
+            for ((o, &p), &q) in out.iter_mut().zip(va).zip(vb) {
+                *o = p + (q - p) * seg.fy;
             }
         }
     }
-    for i in start.max(heads + cols)..=end {
-        point(i, vs);
-        xs.push(layout.at(i).0);
-    }
+}
+
+/// One tile's run of a row's sample points (see [`row_points`]): where they are among the
+/// row's points, the tile's grid rows above and below, where the run starts in each, and
+/// how far the row is from the one above to the one below.
+#[derive(Clone, Copy)]
+struct Segment {
+    start: u32,
+    count: u32,
+    a: GridRow,
+    b: GridRow,
+    ia: u32,
+    ib: u32,
+    fy: f32,
 }
 
 /// Shades pixels `x0..x1` of a polygon's row into `out` (the row's colors, or the blend
@@ -1721,19 +1787,22 @@ fn shade_points(
     // The lattice of the block holding this row.
     let block = (s.row - s.viewport_y).div_euclid(BLOCK_ROWS);
     let index = slot as usize * s.blocks + (block - s.first_block) as usize;
-    if !s.lattices[index].built {
-        build_lattice(s, bins, shaders, config, textures, index, id, block);
-    }
     let (t, l) = split_id(id);
     let p = &bins[t].polygons[l];
-    row_points(
-        s,
-        index,
-        (x_left, x_right, w_left, w_right),
-        p.n_out as usize,
-        x0,
-        x1,
-    );
+    if !s.lattices[index].started {
+        let range = p.first_vertex as usize..p.first_vertex as usize + p.vertex_count as usize;
+        let lattice = start_lattice(s, p, &bins[t].vertices[range], block);
+        s.lattices[index] = lattice;
+        build_tiles(s, bins, shaders, config, textures, lattice, id);
+    }
+    // A half-rate pair shows its even pixel, or the row's first where the pair starts
+    // before the row, even if hidden.
+    let shown = if p.half_rate {
+        (x0 - (x0 - vx).rem_euclid(2)).max(pixel_edge(x_left))
+    } else {
+        x0
+    };
+    row_points(s, index, p.n_out as usize, shown, x1);
     let job = SpanJob {
         x_left,
         x_right,
@@ -1784,15 +1853,20 @@ fn shade_points(
         span(&job, &mut s.color[run.clone()], Behind::default(), &draw);
     }
     if config.show_samples {
-        let exact = s.row_exact;
-        for c in &mut s.color[run] {
-            if exact {
+        // Pixels on a grid row of their tile tinted red, and the grid points on them green.
+        let n = s.points_x.len();
+        for i in 0..n {
+            if !s.points_exact[i] {
+                continue;
+            }
+            let from = ((s.points_x[i] - 0.5) as i32).max(x0);
+            let to = s.points_x.get(i + 1).map_or(from + 1, |&x| (x - 0.5) as i32).min(x1);
+            for px in from..to {
+                let c = &mut s.color[(px - vx) as usize];
                 *c = blend(0x60FF_2020, *c);
             }
-        }
-        for &x in &s.points_x {
-            let px = (x - 0.5).round() as i32;
-            if x.fract() == 0.5 && (x0..x1).contains(&px) {
+            let px = (s.points_x[i] - 0.5) as i32;
+            if (x0..x1).contains(&px) {
                 s.color[(px - vx) as usize] = 0x20_FF_40;
             }
         }
@@ -1840,63 +1914,19 @@ fn draw_fn(shader: &MaterialEntry, half_rate: bool) -> crate::shader::DrawSpanFn
     }
 }
 
-/// w's change per pixel across and down the screen, from the polygon's widest fan
-/// triangle (w is affine on screen for a planar polygon); 0 for a degenerate polygon.
-fn w_gradient(verts: &[ScreenVertex]) -> (f32, f32) {
-    let n = verts.len();
-    let area = |i: usize| {
-        let (a, b, c) = (verts[0], verts[i], verts[i + 1]);
-        (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)
-    };
-    let Some(i) = (1..n - 1)
-        .max_by(|&i, &j| area(i).abs().total_cmp(&area(j).abs()))
-        .filter(|&i| area(i).abs() > 1e-6)
-    else {
-        return (0.0, 0.0);
-    };
-    let (a, b, c) = (verts[0], verts[i], verts[i + 1]);
-    let det = area(i);
-    let dwdx = ((b.w - a.w) * (c.y - a.y) - (c.w - a.w) * (b.y - a.y)) / det;
-    let dwdy = ((c.w - a.w) * (b.x - a.x) - (b.w - a.w) * (c.x - a.x)) / det;
-    (dwdx, dwdy)
-}
-
-/// A pixel's texture footprint at a vertex: see [`LOD`], [`ANISO`] and [`ANISO_LOD`].
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Footprint {
-    lod: f32,
-    aniso: [f32; 2],
-    aniso_lod: f32,
-}
-
-impl Footprint {
-    /// Everything at the smallest level: for edge-on polygons, where nothing can be measured.
-    const TINY: Footprint = Footprint {
-        lod: 16.0,
-        aniso: [0.0; 2],
-        aniso_lod: 16.0,
-    };
-}
-
-/// Each vertex's texture footprint, from the polygon's exact screen-space derivatives of uv
-/// there, in texels of a `size.0` by `size.1` texture:
-///
-/// - `lod`: log2 of texels per screen pixel, the larger of the x and y footprints
-///   (isotropic filtering).
-/// - `aniso`, `aniso_lod`: 2x anisotropic probes. Each covers `p = max(short, long / 2)`
-///   texels (`aniso_lod = log2 p`), and they sit `±(long - p) / 2` along the long axis (in
-///   uv), so together they span it. A round footprint (`short = long`) gives offset 0, and
-///   the offset grows smoothly with the ratio up to 2:1. Magnified footprints (at most one
-///   texel) take no offset.
+/// Each vertex's texture level of detail ([`LOD`]), from the polygon's exact screen-space
+/// derivatives of uv there, in texels of a `size.0` by `size.1` texture: log2 of texels per
+/// screen pixel, the larger of the x and y footprints. Edge-on polygons, where nothing can
+/// be measured, get the smallest level.
 ///
 /// A planar polygon's `u * w`, `v * w` and `w` are linear across the screen, so their
 /// gradients come from any three of its vertices (the widest triangle, for precision), and
 /// `du/dx = (d(u w)/dx - u dw/dx) / w` at each vertex, and likewise for the rest.
-fn vertex_footprints(
+fn vertex_lods(
     verts: &[ScreenVertex],
     uv: impl Fn(usize) -> (f32, f32),
     size: (f32, f32),
-    out: &mut Vec<Footprint>,
+    out: &mut Vec<f32>,
 ) {
     out.clear();
     let n = verts.len();
@@ -1907,8 +1937,7 @@ fn vertex_footprints(
     };
     let widest = (1..n - 1).max_by(|&i, &j| area(i).abs().total_cmp(&area(j).abs()));
     let Some(i) = widest.filter(|&i| area(i).abs() > 1e-6) else {
-        // Edge-on: nothing to measure; the smallest level is the safe choice.
-        out.extend(std::iter::repeat_n(Footprint::TINY, n));
+        out.extend(std::iter::repeat_n(16.0, n));
         return;
     };
     let (a, b, c) = (verts[0], verts[i], verts[i + 1]);
@@ -1929,32 +1958,11 @@ fn vertex_footprints(
         let d = |g: (f32, f32), c: f32| ((g.0 - c * dw.0) / vert.w, (g.1 - c * dw.1) / vert.w);
         let (dudx, dudy) = d(du, u);
         let (dvdx, dvdy) = d(dv, v);
-        // The same in texels, and each axis's length.
+        // The same in texels, and the longer axis's length.
         let x_len = (dudx * size.0).hypot(dvdx * size.1);
         let y_len = (dudy * size.0).hypot(dvdy * size.1);
-        let (long, short, long_uv) = if x_len >= y_len {
-            (x_len, y_len, (dudx, dvdx))
-        } else {
-            (y_len, x_len, (dudy, dvdy))
-        };
-        let log2 = |t: f32| if t > 0.0 { t.log2() } else { -16.0 };
-        let lod = log2(long);
-        out.push(if long <= 1.0 {
-            // Magnified: one probe, nothing to spread.
-            Footprint {
-                lod,
-                aniso: [0.0; 2],
-                aniso_lod: lod,
-            }
-        } else {
-            let probe = short.max(long / 2.0);
-            let apart = (long - probe) / 2.0 / long; // of the long axis, each way
-            Footprint {
-                lod,
-                aniso: [long_uv.0 * apart, long_uv.1 * apart],
-                aniso_lod: log2(probe),
-            }
-        });
+        let long = x_len.max(y_len);
+        out.push(if long > 0.0 { long.log2() } else { -16.0 });
     }
 }
 
@@ -2062,8 +2070,8 @@ mod tests {
             .map(|&(x, y, w)| ScreenVertex { x, y, w })
             .collect();
         let mut out = Vec::new();
-        vertex_footprints(&verts, |i| uvs[i], size, &mut out);
-        out.iter().map(|f| f.lod).collect()
+        vertex_lods(&verts, |i| uvs[i], size, &mut out);
+        out
     }
 
     #[test]
@@ -2097,45 +2105,6 @@ mod tests {
                 .iter()
                 .all(|&l| l >= 8.0)
         );
-    }
-
-    #[test]
-    fn anisotropic_probes_span_the_long_axis() {
-        let footprints = |w: f32, h: f32| {
-            let verts: Vec<ScreenVertex> = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)]
-                .iter()
-                .map(|&(x, y)| ScreenVertex { x, y, w: 1.0 })
-                .collect();
-            let uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-            let mut out = Vec::new();
-            vertex_footprints(&verts, |i| uvs[i], (64.0, 64.0), &mut out);
-            out
-        };
-        let close = |a: f32, b: f32| (a - b).abs() < 1e-5;
-        // Round (1 texel per pixel both ways, or 2): one probe, at the trilinear level.
-        for side in [64.0, 32.0] {
-            for f in footprints(side, side) {
-                assert!(f.aniso == [0.0; 2] && close(f.aniso_lod, f.lod), "{f:?}");
-            }
-        }
-        // 1 texel per pixel across, 4 down: probes of 2 texels (level 1), a texel either
-        // side of the center along v (1/64 in uv).
-        for f in footprints(64.0, 16.0) {
-            assert!(close(f.lod, 2.0) && close(f.aniso_lod, 1.0), "{f:?}");
-            assert!(
-                close(f.aniso[0], 0.0) && close(f.aniso[1], 1.0 / 64.0),
-                "{f:?}"
-            );
-        }
-        // 1.5 down: probes of 1 texel (the short axis), a quarter texel either side.
-        for f in footprints(64.0, 64.0 / 1.5) {
-            assert!(close(f.aniso_lod, 0.0), "{f:?}");
-            assert!(close(f.aniso[1], 0.25 / 64.0), "{f:?}");
-        }
-        // Magnified: no probes to spread.
-        for f in footprints(256.0, 64.0) {
-            assert_eq!(f.aniso, [0.0; 2]);
-        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
-# Moose v2 test prop: 1 m wooden crate.
+# Moose v2 test prop: 1 m crate.
 # Origin at bottom-center (y = 0 rests on the floor). Units: meters, +Y up.
 # Vertex colors use the 'v x y z r g b' extension (0-1 floats).
-# 4 vertices per face so each face carries its own tint. Faces are
+# 4 vertices per face so each face carries its own tint and its own whole texture
+# (uv 0-1, v growing downward, upright on the sides). Faces are
 # counter-clockwise viewed from outside (outward facing).
 
 o crate
@@ -30,9 +31,34 @@ v -0.50 0.00 0.50  0.364 0.259 0.147
 v -0.50 1.00 0.50  0.520 0.370 0.210
 v -0.50 1.00 -0.50  0.520 0.370 0.210
 
-f 1 2 3 4  # top
-f 5 6 7 8  # bottom
-f 9 10 11 12  # front
-f 13 14 15 16  # back
-f 17 18 19 20  # right
-f 21 22 23 24  # left
+vt 0.00 1.00
+vt 1.00 1.00
+vt 1.00 0.00
+vt 0.00 0.00
+vt 0.00 1.00
+vt 1.00 1.00
+vt 1.00 0.00
+vt 0.00 0.00
+vt 0.00 1.00
+vt 1.00 1.00
+vt 1.00 0.00
+vt 0.00 0.00
+vt 1.00 0.00
+vt 0.00 0.00
+vt 0.00 1.00
+vt 1.00 1.00
+vt 1.00 0.00
+vt 0.00 0.00
+vt 0.00 1.00
+vt 1.00 1.00
+vt 0.00 1.00
+vt 1.00 1.00
+vt 1.00 0.00
+vt 0.00 0.00
+
+f 1/1 2/2 3/3 4/4  # top
+f 5/5 6/6 7/7 8/8  # bottom
+f 9/9 10/10 11/11 12/12  # front
+f 13/13 14/14 15/15 16/16  # back
+f 17/17 18/18 19/19 20/20  # right
+f 21/21 22/22 23/23 24/24  # left

@@ -1,6 +1,6 @@
 # Material Pipeline Spec
 
-Sep 27, 2026 · Approved, implemented Sep 27–28 (steps 1–5 below; where testing changed a detail, the sections below say so)
+Sep 27, 2026 · Approved, implemented Sep 27–28 (steps 1–5 below; where testing changed a detail, the sections below say so). The lattice was then rebuilt as a fixed screen grid with plane functions.
 
 ## Overview and scope
 
@@ -18,22 +18,21 @@ It also replaces how sample points are placed. Today every row is sampled. The n
 
 - The material trait, its declaration macro, and the three stage contexts
 - Running the vertex stage before clipping, without the view module knowing about materials
-- The sample lattice: grid, spacing, sample rows, edge knots, and interpolated rows
+- The sample lattice: grid, plane functions, spacing, and interpolated rows
 - Porting every existing shader, and the app and timing example, to materials
 - Tests, a debug overlay for sample points, and timing comparisons
 
 **Out of scope, deliberately**
 
-- Lights. The sample context gets a place for light lists, filled by the lighting spec that comes next.
+- Lights. The sample context gets a place for light lists, filled by the lighting spec that comes next. (Now built: see the Lighting Spec.)
 - Vertex stages that move vertices. The vertex stage only outputs values for the sample stage. Position changes (animation) are revisited later.
 - Caching vertex-stage outputs for static world geometry. It's a later optimization; the vertex stage is cheap.
-- Helper samples outside polygon edges (see "Interpolated rows").
 
 **What this supersedes in the span buffer spec**
 
 - "Shader system" is replaced by "Material programs" below.
 - "Perspective-correct interpolation: every-N sampling and adaptive N" is replaced by "The sample lattice".
-- "Edge walking" keeps computing x and w per row. It computes varyings only on sample rows.
+- "Edge walking" keeps computing x and w per row. It no longer computes varyings.
 - Everything else stands: phases, bands, span insertion, the per-pixel path, the translucent pass, and the three interpolation formats.
 
 ## Pipeline at a glance
@@ -43,8 +42,8 @@ flowchart LR
   A[View: clip positions<br/>+ source-vertex weights] --> B[Phase 1 setup:<br/>shade_vertex on source vertices,<br/>weights give clipped vertices]
   B --> C[Phase 2, per band:<br/>row spans from x and w only]
   C --> D[Visible runs]
-  D --> E[Sample rows and knots,<br/>computed lazily:<br/>shade_sample, 8 points at a time]
-  E --> F[Row sample points:<br/>exact or interpolated]
+  D --> E[Grid points from plane functions,<br/>computed lazily:<br/>shade_sample, 8 points at a time]
+  E --> F[Row points:<br/>grid rows, or interpolated between them]
   F --> G[shade_pixel, 8 pixels at a time]
 ```
 
@@ -57,10 +56,10 @@ crate::material_io! {
     // Mesh attributes shade_vertex reads, by name (plus built-ins, below).
     vertex { uv: 2 }
     // shade_vertex outputs = shade_sample inputs (plus built-ins, below).
-    sampled { uv: 2, normal: 3, position: 3, lod: 1, aniso: 2, aniso_lod: 1 }
+    sampled { uv: 2, normal: 3, position: 3, lod: 1 }
     // shade_sample outputs = shade_pixel inputs, interpolated in three formats.
-    fixed32 { uv: 2, aniso: 2 }
-    fixed16 { facing: 1, lod: 1, aniso_lod: 1 }
+    fixed32 { uv: 2 }
+    fixed16 { facing: 1, lod: 1 }
     float { distance: 1 }
 }
 ```
@@ -109,7 +108,7 @@ pub trait Material: 'static {
 | `vertex` | `position` | 3 | World position of the source vertex |
 | `vertex` | `face_normal` | 3 | World normal of the source polygon's plane |
 | `sampled` | `position` | 3 | World position of the point: the real surface point, even in a mirror |
-| `sampled` | `lod`, `aniso`, `aniso_lod` | 1, 2, 1 | Texture footprint, as today, from the `sampled` value `uv` and texture slot 0 |
+| `sampled` | `lod` | 1 | Texture level of detail (log2 texels per pixel), from the `sampled` value `uv` and texture slot 0 |
 
 **Contexts.** Values the engine owns reach materials through contexts, not through uniforms the app fills per polygon.
 
@@ -123,7 +122,8 @@ pub struct SampleContext<'a> {
     pub focal: f32,           // pixels per unit at depth 1
     pub object: &'a Object,
     pub params: &'a Params,
-    // Lights: added by the lighting spec.
+    pub lights: &'a [PointLight], // those reaching the polygon (see the Lighting Spec)
+    pub ambient: Vec3,
 }
 pub struct PixelContext<'a> {
     pub at: Pixels,           // screen position of the 8 lanes, as today
@@ -172,106 +172,104 @@ pub struct Over<'a> {         // what shade_over sees, as today
 1. Read the source polygon's vertex attributes for the material's `vertex` names. Converting from the mesh's storage format moves here from the view.
 2. Fill the vertex built-ins: position and face normal in world space, through the object's transform.
 3. Run `shade_vertex` on each source vertex.
-4. Give each clipped vertex its weighted sum of the outputs. Then fill the `sampled` built-ins: world position from the view, and the footprint from `uv`.
-5. Compute the w plane, dw/dx and dw/dy, for spacing selection. w is affine on screen for a planar polygon.
+4. Give each clipped vertex its weighted sum of the outputs. Then fill the `sampled` built-ins: world position from the view, and the level of detail from `uv`.
+5. Compute the plane functions: w, and each value × w per fan triangle (see "Plane functions"). w's plane also gives dw/dx and dw/dy for spacing.
 
 ## The sample lattice
 
+The lattice is a fixed screen grid. Grid points are chosen first and hold no data until a polygon needs them. At each point the polygon's values come from its plane functions, even where the point lies past its edges. Pixels interpolate linearly between the four grid points around them. There is no edge machinery: no crossings, knots or end points carry values. (The first version anchored the lattice on polygon edges instead. It is kept on the `edge-anchored-lattice` branch, commit 685d9bc, in case lighting favors it.)
+
 ### Grid
 
-- Sample rows are the rows `y` with `(y - viewport.y) % Ny == 0`. Sample columns are the pixels `x` with `(x - viewport.x) % Nx == 0`.
-- Lattices are built per **block** of 8 rows, counted from the viewport's top, not per band. `Ny` is 1, 2, 4 or 8, so every block starts on a sample row.
+- Grid rows are the rows `y` with `(y - viewport.y) % Ny == 0`. Grid columns are the pixels `x` with `(x - viewport.x) % Nx == 0`. Points sit at pixel centers.
+- Lattices are built per polygon per **block** of 32 rows (8 until Sep 28), counted from the viewport's top, not per band. `Ny` is a power of two up to 32, so every block starts on a grid row. The spacing is chosen from the whole block, and each band builds only the grid rows its own rows need.
   - A block's lattice doesn't depend on which band or thread draws it.
   - Images are identical for any band size and thread count; the band test checks bands of 1, 8 and more.
-- `Nx` is a power of two from `min_step` (4) to 32. Polygons seen in a mirror (half rate) use twice their `Nx`, as today.
+- `Nx` is a power of two up to 32, the tile width (below), at half rate too. Steep surfaces are held to at least `min_step` (below).
+- **Tiles (Sep 28):** a polygon's grid in a block is split into tiles of 32 columns, and each tile picks its own spacing from the polygon's nearest depth within it. A wall running from beside the camera into the distance is sampled sparsely at its near end and finely only at its far end.
+  - **One global grid:** spacings are powers of two up to the tile width, so every tile's points lie on the one global grid. Each point on a row belongs to exactly one tile, and a pixel interpolates between the points on either side of it whatever tiles they come from, so tiles leave no seams.
+  - **Shared runs:** neighboring tiles with the same spacing share grid rows as one run, so a uniformly sampled surface costs what it did before tiles.
+  - **Evaluated together:** all of a polygon's tiles in a block are built at once. Its pixels on each row are found once, and every tile's grid points are evaluated together, 8 at a time.
 - The grid belongs to the viewport, not to each polygon. So:
   - neighbors share rows and columns;
   - coarser grids are subsets of finer ones;
-  - a pixel's value never depends on how rows were split into runs or bands, which is today's guarantee.
+  - a pixel's value never depends on how rows were split into runs or bands.
 
-### Spacing, per polygon per block
+### Plane functions (pseudo triangulation)
+
+For a planar polygon, `w` is affine on screen, and so is `value × w` for any value that is affine across it. Phase 1 turns each polygon into plane functions, relative to its first vertex:
+
+- **w:** one plane, from the fan triangle with the largest screen area.
+- **Values:** one plane per fan triangle (first vertex, i, i+1) per `sampled` value, of `value × w`. Polygons keep being drawn as n-gons (coverage, spans, visibility). Only their values behave as if the polygon were triangulated as a fan. So arbitrary vertex values on n-gons are fine, with no limit on their number.
+- **Which triangle:** a point's triangle is the number of fan diagonals it lies past (sign tests against each diagonal), done in SIMD lanes. Past the edges, a point uses the wedge it falls in, extended.
+- **Slivers:** triangles under 2% of the widest one's area (or 1 pixel²) are too thin to trust, since extending their planes past the edges magnifies small errors. They take the nearest good triangle's planes.
+
+At a grid point, the `sampled` values are `plane(value × w) / plane(w)`: one reciprocal per point, 8 points at a time. `shade_sample` runs on them and its outputs are stored per grid row, output by output.
+
+### Spacing, per polygon per tile
 
 ```
-w_min   = smallest w of the polygon within the block
-          (at its crossings on the block's first and last rows, and its vertices in the block)
-dwdy    = largest of |dw/dy| and each edge's |dw/dy along the edge| in the block
-slope   = largest |dx/dy| of its edges in the block
-Nx      = largest power of two ≤ min(SAMPLE_SPACING, threshold × w_min / |dw/dx|), in [min_step, 32]
-travel  = min(threshold × w_min / (|dw/dx| × slope), SAMPLE_SPACING / slope)
-Ny      = largest power of two ≤ min(SAMPLE_SPACING, threshold × w_min / dwdy, travel), in [1, 8]
+w_min   = a lower bound of the polygon's w within the tile: the larger of its smallest w in
+          the block (at its crossings on the block's first and last rows, and its vertices
+          in the block) and w's plane at the tile rectangle's corners
+spacing = SAMPLE_SPACING, or at most light_spacing (8) where a light reaches the polygon
+floor_x = min(min_step, w_min / (4 |dw/dx|))        likewise floor_y with dw/dy
+Nx      = largest power of two ≤ max(min(spacing × rate, threshold × w_min / |dw/dx|), floor_x), in [1, 32]
+Ny      = largest power of two ≤ max(min(spacing, threshold × w_min / |dw/dy|), floor_y), in [1, 32]
 ```
 
-`threshold` is today's `step_threshold` (1/16): w may change by at most that fraction across one cell. The two edge terms came out of testing:
+`threshold` is `step_threshold` (1/16): w may change by at most that fraction across one cell. `rate` is 2 at half rate, 1 otherwise.
 
-- **Along edges:** row ends are interpolated along the edges, so w's change along an edge counts too, not only straight down.
-- **Travel:** a row between sample rows skips the columns that lie outside the polygon on a sample row. Its first interval then runs as far as the edge moves across in `Ny` rows. Limiting that travel keeps the interval within the threshold and the material's spacing.
+- **Why w stays positive past the edges:** every grid point a pixel uses lies within one cell of it, and w changes by at most `threshold × w_min` per cell in each direction. So w at such a point is at least about `(1 - 2 × threshold) × w_min`, even off the polygon.
+- **min_step (default 4, Sep 28) caps the sample density on steep surfaces.** Perspective alone asks for sample points every pixel on surfaces seen at a grazing angle, which is costly once lighting runs at every point. With the cap, those surfaces get points at most `min_step` apart, at the cost of perspective accuracy (texture detail shifts by up to a pixel) and of coarser lighting there.
+  - **It never goes past w/4 per cell.** A surface so steep that w would change by more than a quarter across such a cell (seen nearly edge-on) still goes finer. Grid points past its edges then stay where w is at least half its smallest value.
+  - **Why that matters:** before this rule, a floor of 4 on edge-on surfaces put grid points where w crossed zero, and pixels near the edges turned to garbage. A last guard still keeps w at `w_min / 8` or more at every grid point.
+  - **Exact settings:** `min_step` 1 keeps the exact behavior. The app changes it with `[` and `]`, and the light spacing with `-` and `=`.
+- **Half rate doubles only the material's spacing,** not the perspective limit. Otherwise a thin reflected sliver gets 2-pixel cells where w crosses zero within one pixel.
 
 So:
 
-- A face-on wall gets the material's spacing in both directions.
+- A face-on wall gets the material's spacing in both directions: an unlit material gets 32 × 8 cells.
 - A floor seen level gets wide columns (w doesn't change along its rows) and tight rows near the horizon.
-- An unlit material on a face-on wall gets 32 × 8 cells.
 
-### Sample rows
+### Grid rows and columns
 
-For a polygon in a block, the sample rows are:
+- A polygon's grid rows in a block run from the grid row at or above its first row there, to the one at or below its last. The last can be the next block's first row, which that block computes again: one duplicate row per polygon per block.
+- Each grid row holds the columns needed by the rows it serves (those within `Ny` of it): from the column at or before their first pixel to the one at or after their last. Columns past the edges are evaluated like any other.
 
-- its first row in the block;
-- the grid rows it covers;
-- its last row, or if it continues past the block, the next block's first row (a grid row). The next block computes that row too; that's the one duplicate per polygon per block.
+### Rows and pixels
 
-On a sample row, the sample points are:
-
-- its **ends**: its first and last pixels' centers (where it has no pixels, its edge crossings). Its own first and last pixels are therefore exact, even where perspective is extreme.
-- its **left and right edge crossings**, at their exact fractional x. These are the virtual vertices on the edges, used only by the rows in between.
-- every **grid column** whose pixel center lies strictly between the ends.
-
-At each point, the `sampled` values are exact: the crossing values come from each edge's perspective alpha, and the ends and columns from the row's perspective alpha between the crossings, as today. `shade_sample` runs on all of a lattice's points at once, 8 at a time, and its `Interp` outputs are stored as f32 in a per-block cache.
-
-### Edge knots
-
-Along each edge chain, the knots are the chain's crossings on sample rows plus the **real polygon vertices** between them. `shade_sample` also runs on each vertex in the block, with its exact values.
-
-- Row ends on in-between rows follow the actual edge segments, including bends at corners.
-- A vertex's values are never averaged away, which matters for n-gons whose vertex values don't fit one plane.
-- The knots are all exactly on the edges. Mixing in the sample rows' ends, which sit up to a pixel inside, caused visible errors on steep gradients.
-- Two polygons sharing an edge have the same knots on it: its shared endpoints and the same global rows. Shading along a shared edge therefore matches exactly when both use the same `Ny`.
-
-### Interpolated rows
-
-For a row `r` between sample rows `a < r < b`:
-
-- **Row ends:** its edge crossings. Each one's value is interpolated linearly in `y` between the knots above and below it on its chain.
-- **Columns:** a grid column is a sample point on row `r` only if its pixel center lies between the crossings on row `r` and among the columns of both `a` and `b`. Its value is interpolated linearly in `y` between rows `a` and `b`. Columns missing on `a` or `b` (near slanted edges) are skipped, so nothing is ever extrapolated.
-- **First and last pixels:** each is interpolated perspective-correctly between its crossing and the nearest point inside, using the row's exact w at each pixel. The end intervals can be the row's longest, where edges are shallow or `Nx` is clamped to `min_step`.
-- No divides beyond those two points, no vertex values, and no sample stage run on these rows.
-
-**Helper samples (deferred).** Evaluating skipped columns outside the edge would keep intervals regular near shallow edges, as GPU helper pixels do. The travel limit made them unnecessary so far.
-
-### Pixels
-
-- **Intervals:** between consecutive sample points on a row, every value is linear in x. A pixel belongs to the interval its center falls in; the row's last point shades its own pixel as the end of the interval before it.
-- **Lines:** each interval becomes a `Line` whose base is the value at the interval's first pixel center and whose step is per pixel. The existing 8-lane block code runs over those intervals.
-- **Half rate:** pixel pairs start at even pixels counted from the viewport's left edge, whatever the sample points. A pair whose even pixel falls just before its interval takes the interval's first value; extending a steep line backward overflowed 8.8 on thin reflected slivers.
+- **Row points:** a row between grid rows `a` and `b` gets its points by linear interpolation in y of the two rows' outputs (a vectorized loop over contiguous values). A run uses only the columns around its pixels: from the column at or before the first pixel it shows, to the one at or after its last pixel.
+- **Intervals:** between consecutive points, every value is linear in x. A pixel belongs to the interval its center falls in, and the last point shades its own pixel.
+- **Lines:** each interval becomes a `Line` whose base is the value at its first pixel center and whose step is per pixel. The existing 8-lane block code runs over them.
+- **Half rate:** a pixel pair (starting at an even pixel counted from the viewport's left edge) shows its even pixel's values, or the row's first pixel's where the pair starts before the row. It belongs to the interval holding that shown pixel, even when the pixel is hidden by something in front. This matters on thin slivers, where neighboring pixels differ a lot.
+- No edge crossings, vertex values or divides are used on rows.
 
 ### Cache and laziness
 
-- **Row spans are computed from x and w only** (crossings and w, for visibility). Before, every polygon on a row, hidden or not, computed all its values at both crossings. That work is gone.
-- **A polygon's block lattice is computed the first time a visible run needs it,** and kept while the band is drawn. Hidden polygons never run the sample stage.
-- **Each run builds only its own window of the row's points.** The window runs from the point at or before its first pixel to the one past its last. Columns come from arithmetic, and a run's interpolated columns are one vectorized loop over the two sample rows' contiguous values.
+- **Row spans are computed from x and w only** (crossings and w, for visibility).
+- **A polygon's block lattice is built the first time a visible run needs it,** and kept while the band is drawn. Hidden polygons never run the sample stage.
 - **The cache lives in the thread's row scratchpad.** It's indexed by the polygon's slot in the band's lists and the block, and reset at band start, so there's no allocation in steady state.
+
+### Accuracy (against exact per-pixel evaluation)
+
+| Test | Grid | Before the lattice (every row, `min_step` 4) |
+| --- | --- | --- |
+| Vertex colors, 300 views | worst 2 levels, 0 pixels off by more than 2 | up to about 15 levels on edge-on surfaces |
+| Half-transparent crates | worst 2 | up to 24 allowed |
+| Fresnel floors | worst 5 | 6 allowed |
+
+The gain is mostly from `min_step` 1. The per-row design could not afford it everywhere.
 
 ### Measured cost (shiny_rooms, 1280×720, 2 bounces, water on)
 
-| Threads | Before | Lattice |
-| --- | --- | --- |
-| 1 | 6.45 ms | 7.5 ms (+16%) |
-| 10 | about 1.05 ms | 1.3 to 1.5 ms |
+| Threads | Before the lattice | Edge-anchored lattice | Grid |
+| --- | --- | --- | --- |
+| 1 | 6.29 ms | 7.35 ms | 7.20 ms (+14%) |
+| 10 | 1.03 ms | 1.36 ms | 1.27 ms (+23%) |
 
-Pixel shading costs the same as before. The difference is lattice bookkeeping: about 0.4 ms for the row points and 0.3 ms for building lattices, per frame on one thread.
-
-- **Where it doesn't pay yet:** every current material's sample stage is nearly free (pass-through or a few multiplies), so interpolating between sample rows costs about as much as computing each row exactly.
-- **Where it will:** the sample stage runs at about 31,000 points a frame here, against about 107,000 with a sample row every row. That saving grows with each light a material evaluates.
+- **Where the time goes (1 thread):** pixel shading costs the same as before. Building lattices takes about 0.3 ms per frame, interpolating row points about 0.3 ms, and run setup and blending about 0.35 ms.
+- **Sample stage:** about 29,000 grid points a frame, against about 107,000 with every row sampled. That saving grows with each light a material evaluates. Every current material's sample stage is nearly free, so the bookkeeping isn't paid back yet.
 
 ## What each existing shader becomes
 
@@ -281,25 +279,26 @@ Pixel shading costs the same as before. The difference is lattice bookkeeping: a
 | `VertexColorTranslucent` | color | pass through | rgb with params alpha |
 | `VertexColorFresnel` | color, face normal | facing from eye and normal | over: Fresnel alpha |
 | `VertexColorFresnelDisperse` | color, face normal | facing, distance | over: Fresnel and fade |
-| `Textured<F>` | uv | pass through (plus footprint) | texel |
-| `TexturedFresnel<F>` | uv, face normal | facing, distance (plus footprint) | over: roughness, Fresnel, fade |
-| `Water<F>` | uv, face normal | facing, distance (plus footprint) | over: ripple shift, focal from context |
-| `CubeReflection` | normal rotated to world (rotated entities now reflect correctly) | reflection vector from eye; lod from params radius, object center and focal | cube lookup |
+| `Textured<F>` | uv | pass through (plus lod) | texel |
+| `TexturedFresnel<F>` | uv, face normal | facing, distance (plus lod) | over: roughness, Fresnel, fade |
+| `Water<F>` | uv, face normal | facing, distance (plus lod) | over: ripple shift, focal from context |
+| `CubeReflection<F>` | normal rotated to world (rotated entities now reflect correctly) | reflection vector from eye; lod from params radius, object center and focal | cube lookup |
 
 - The pixel math of every shader stays the same. Only where its inputs come from changes.
 - The Fresnel and water materials set `SAMPLE_SPACING` to 16. Everything else keeps the maximum.
 - The app's surface callback loses the eye and normal uniforms. The cube map lod moves into the material.
+- `F` is the texture sampler (added Sep 28): one of twelve, a texel method (nearest, bilinear, or dithered as Unreal's software renderer did, copied from version 1) times a mip transition (none, nearest, linear, or ordered-dithered between the two levels, as version 1's `dev/dither.html`). Each is a `sample_<method>_mipmap_<mip>` function in `shader.rs`, and a compile-time parameter of the material, so no pixel branches on it. The cube map sampler follows the same twelve. Anisotropic filtering, and its `aniso` and `aniso_lod` built-ins, were removed.
 
 ## Tests and tools
 
 - **Lattice rules, exactly:**
-  - sample rows, columns, knots and spacing for known polygons and bands;
+  - grid rows, columns and spacing for known polygons and bands;
   - values on sample rows equal exact per-point evaluation;
   - interpolated rows equal the stated interpolation of those values.
 - **Invariance:** a pixel's value is the same however a row is split into runs (the current bit-for-bit block test, extended to runs). Frames are identical for 1, 2 and many threads (the existing thread and band test).
 - **Vertex stage before clipping:** a polygon clipped by a window shows the same values as the unclipped polygon at the same points, with a nonlinear `shade_vertex` (normalize).
 - **Reference renderer:** it moves from modeling today's per-row sampling to exact per-pixel evaluation. Tolerances derive from the spacing threshold. The texel test keeps its footprint criterion.
-- **Debug overlay:** a config flag and an app key that tint sample rows, knots and columns, so sample placement is visible.
+- **Debug overlay:** a config flag and an app key (O) that tint grid rows red and mark grid points green, so sample placement is visible.
 - **Timing:** `timing` before and after, on shiny_rooms at 1280×720, one thread and all threads.
 
 ## Implementation plan
@@ -316,6 +315,6 @@ Each step ends with every test passing and screenshots checked.
 
 - [x] Rename `Shader` → `Material`, `ShaderId` → `MaterialId`, `Uniforms` → `Params`.
 - [x] `SAMPLE_SPACING`: 16 for the Fresnel and water materials, 32 (perspective only) for the rest, until lighting sets its own.
-- [x] Skipped columns near slanted edges now, helper samples only if needed.
-- [x] `Ny` capped at 8, keeping bands independent (built as 8-row blocks, see above).
+- [x] Grid points past polygon edges are evaluated from plane functions (replacing the edge-anchored lattice and its skipped columns).
+- [x] `Ny` capped at 8, keeping bands independent (built as 8-row blocks, see above). Raised to 32 on Sep 28, with each band building only the grid rows it needs.
 - [x] Vertex-stage output caching for static geometry deferred.
