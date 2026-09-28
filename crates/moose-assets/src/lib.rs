@@ -1,6 +1,6 @@
 //! Asset loading for the Moose engine: in-memory mesh, level and texture types, the
 //! [`Assets`] store that owns them, and loaders for `.obj` models, `.mmp` levels and `.png`
-//! textures.
+//! textures, and Half-Life style rippling water ([`Ripples`]).
 //!
 //! Meshes keep their positions as authored, never merged (each transformed once per frame), and
 //! polygons that own their vertices. Each polygon vertex is a position index plus
@@ -14,6 +14,7 @@ mod level;
 mod mesh;
 mod mmp;
 mod obj;
+mod ripples;
 mod store;
 mod text;
 mod texture;
@@ -23,6 +24,7 @@ pub use geom::{Aabb, Plane};
 pub use level::{EntityKind, EntitySpawn, Level, Portal, PortalFlags, Sector};
 pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
+pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};
 pub use store::{Assets, MeshId, TextureId};
 pub use texture::{CUBE_FACES, MipLevel, Texture, decode_png};
 

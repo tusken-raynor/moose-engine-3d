@@ -88,6 +88,11 @@ impl Assets {
         &self.textures[id.0 as usize]
     }
 
+    /// For textures that change while running, like [`Ripples`](crate::Ripples) water.
+    pub fn texture_mut(&mut self, id: TextureId) -> &mut Texture {
+        &mut self.textures[id.0 as usize]
+    }
+
     pub fn textures(&self) -> &[Texture] {
         &self.textures
     }

@@ -334,6 +334,8 @@ For a shading run that covers only part of a polygon's row (after occlusion), th
 
 Alternative, not adopted: per-polygon plane gradients of w and a·w give any point's attributes with two dot products and a divide, but store a·w in setup data, which breaks the true-value convention.
 
+> **Superseded** by the Material Pipeline Spec's sample lattice: edge walking computes values only on sample rows, and sample points sit on a 2D grid of rows and columns, with the rows between interpolated.
+
 **Every-N sampling**
 
 - At each sample point, compute alpha and the exact attribute values, converting to each attribute's interpolation format (f32, 16.16, or 8.8).
@@ -357,6 +359,8 @@ let n = choose_step(w_ratio);  // large when w_ratio is near zero
 - `choose_step` picks the largest power of two where `w_ratio * N` stays under a tunable threshold, tuned by eye on worst-case scenes.
 
 ## Shader system
+
+> **Superseded** by the Material Pipeline Spec: shaders are now material programs (vertex, sample and pixel stages), and varyings are the sample stage's outputs.
 
 Shaders are Rust types implementing a `Shader` trait, declared through a macro that generates both the varying structs and the layout descriptor from a single attribute list. A registry of type-erased entries dispatches once per span.
 

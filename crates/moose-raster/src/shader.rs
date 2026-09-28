@@ -1,18 +1,22 @@
-//! Shader definition, dispatch, and perspective-correct shading of spans.
+//! Material programs (see the Material Pipeline Spec), dispatch, and perspective-correct
+//! shading of spans.
 //!
-//! A shader's varyings are three homogeneous groups, one per interpolation format: 16.16
-//! fixed point (`Fixed32`), 8.8 fixed point (`Fixed16`) and `f32` (`Floats`). The
-//! [`varyings!`](crate::varyings) macro generates the group structs and the layout
-//! descriptor from one attribute list. A registry of type-erased [`ShaderEntry`]s is
-//! dispatched once per shading run; inside, the loop is monomorphized per shader.
+//! A material has three stages: `shade_vertex` per source polygon vertex, `shade_sample`
+//! at sample points, and `shade_pixel` per pixel. The [`material_io!`](crate::material_io)
+//! macro declares what flows between them. What pixels get is three homogeneous groups,
+//! one per interpolation format: 16.16 fixed point (`Fixed32`), 8.8 fixed point (`Fixed16`)
+//! and `f32` (`Floats`). A registry of type-erased [`MaterialEntry`]s is dispatched once
+//! per shading run; inside, the loop is monomorphized per material.
 //!
-//! Pixels are shaded [`LANES`] at a time with portable SIMD (the `wide` crate: NEON on ARM,
-//! SSE/AVX on x86): every varying of a group holds one value per lane, and `shade` computes
-//! [`LANES`] pixels at once.
+//! Sample points and pixels are shaded [`LANES`] at a time with portable SIMD (the `wide`
+//! crate: NEON on ARM, SSE/AVX on x86): every value holds one sample point or pixel per
+//! lane.
 
 use std::ops::Range;
 
+use glam::Vec3;
 use moose_assets::{MipLevel, Texture};
+use moose_view::Object;
 
 use wide::{f32x4, f32x8, i16x8, i32x4, i32x8, u16x8, u32x4, u32x8};
 
@@ -337,11 +341,29 @@ pub struct AttribDesc {
     pub count: u8,
 }
 
-/// Per-draw constants, copied into the frame at draw time. One shared struct for now
-/// (the spec leaves per-shader uniform types open).
+/// Most textures a polygon can bind (see [`TextureSet`]).
+pub const MAX_TEXTURES: usize = 2;
+
+/// The textures a polygon is drawn with, as its shader sees them: `[0]` is its main texture
+/// (the one [`LOD`] and the other footprint varyings measure), `[1]` a second one for shaders
+/// that want it (a height map, say). Unbound slots hold a 1x1 opaque white texture.
+pub type TextureSet<'a> = [&'a Texture; MAX_TEXTURES];
+
+/// A material's constants for one surface (F0, a fade range, ...), set by the app when it
+/// picks the surface's material. What the engine knows (the eye, the object's transform)
+/// reaches materials through their stage contexts instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Uniforms {
-    pub values: [f32; 8],
+pub struct Params {
+    pub values: [f32; 16],
+}
+
+impl Params {
+    /// `values` first, the rest 0.
+    pub fn new(values: &[f32]) -> Self {
+        let mut u = Self::default();
+        u.values[..values.len()].copy_from_slice(values);
+        u
+    }
 }
 
 /// Element types of the three groups, and their [`LANES`]-wide vectors.
@@ -351,8 +373,9 @@ pub trait Elem: Copy + Default {
     fn from_f32(v: f32) -> Self;
     /// `v` in every lane.
     fn splat(v: Self) -> Self::Lanes;
-    /// Lane `j` holds `base + (offset + j * stride) * step` (`base` and `step` hold one value
-    /// in every lane): the value that many pixels along a line from `base`. In fixed point
+    /// Lane `j` holds `base + max(offset + j * stride, 0) * step` (`base` and `step` hold one
+    /// value in every lane): the value that many pixels along a line from `base`, never
+    /// before it (a half-rate pair can start a pixel before its interval). In fixed point
     /// the arithmetic wraps, exactly as stepping that many times would.
     fn lanes(base: Self::Lanes, step: Self::Lanes, offset: i32, stride: i32) -> Self::Lanes;
 }
@@ -375,6 +398,7 @@ impl Elem for i32 {
         } else {
             iota * I32s::fill(stride)
         } + I32s::fill(offset);
+        let j = if offset < 0 { j.max(I32s::fill(0)) } else { j };
         base + j * step
     }
 }
@@ -397,6 +421,7 @@ impl Elem for i16 {
         } else {
             iota * I16s::fill(stride as i16)
         } + I16s::fill(offset as i16);
+        let j = if offset < 0 { j.max(I16s::fill(0)) } else { j };
         base + j * step
     }
 }
@@ -419,6 +444,11 @@ impl Elem for f32 {
         } else {
             iota * F32s::fill(stride as f32)
         } + F32s::fill(offset as f32);
+        let j = if offset < 0 {
+            j.max(F32s::fill(0.0))
+        } else {
+            j
+        };
         j.mul_add(step, base)
     }
 }
@@ -430,9 +460,9 @@ pub trait Group: Copy + Default {
     const LEN: usize;
     /// The group's lines within one sample interval: see [`Line`].
     type Line: Copy;
-    /// The lines from true values `a` to `b` (this group's, in layout order), `1 / inv`
-    /// pixels apart.
-    fn line(a: &[f32], b: &[f32], inv: f32) -> Self::Line;
+    /// The lines with values `base` at an interval's first pixel and `step` per pixel (this
+    /// group's, in layout order).
+    fn line(base: &[f32], step: &[f32]) -> Self::Line;
     /// The group for [`LANES`] pixels `offset + j * stride` pixels along `line`.
     fn lanes(line: &Self::Line, offset: i32, stride: i32) -> Self;
 }
@@ -448,14 +478,14 @@ pub struct Line<E: Elem, const N: usize> {
 
 impl<E: Elem, const N: usize> Line<E, N> {
     #[inline(always)]
-    pub fn new(a: &[f32], b: &[f32], inv: f32) -> Self {
+    pub fn new(base: &[f32], step: &[f32]) -> Self {
         let mut line = Self {
             base: [E::Lanes::default(); N],
             step: [E::Lanes::default(); N],
         };
         for k in 0..N {
-            line.base[k] = E::splat(E::from_f32(a[k]));
-            line.step[k] = E::splat(E::from_f32((b[k] - a[k]) * inv));
+            line.base[k] = E::splat(E::from_f32(base[k]));
+            line.step[k] = E::splat(E::from_f32(step[k]));
         }
         line
     }
@@ -476,8 +506,8 @@ macro_rules! varying_group {
             type Line = $crate::shader::Line<$elem, { 0 $(+ $n)* }>;
 
             #[inline(always)]
-            fn line(a: &[f32], b: &[f32], inv: f32) -> Self::Line {
-                $crate::shader::Line::new(a, b, inv)
+            fn line(base: &[f32], step: &[f32]) -> Self::Line {
+                $crate::shader::Line::new(base, step)
             }
 
             #[inline(always)]
@@ -500,44 +530,172 @@ macro_rules! varying_group {
     };
 }
 
-/// Declares a shader's varyings: the three group structs `Fixed32`, `Fixed16` and `Floats`,
-/// and `LAYOUT`, all from one list. Varyings are laid out 16.16 first, then 8.8, then f32.
+/// Declares a struct of f32 arrays (one per named value) and its [`Values`] impl. Used by
+/// [`material_io!`](crate::material_io).
+#[macro_export]
+macro_rules! value_struct {
+    ($name:ident; $($f:ident: $n:literal),* $(,)?) => {
+        #[derive(Clone, Copy, Default, Debug, PartialEq)]
+        pub struct $name {
+            $(pub $f: [f32; $n]),*
+        }
+
+        impl $crate::shader::Values for $name {
+            const LEN: usize = 0 $(+ $n)*;
+
+            #[inline(always)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            fn from_flat(flat: &[f32]) -> Self {
+                let mut i = 0;
+                Self {
+                    $($f: {
+                        let a: [f32; $n] = std::array::from_fn(|k| flat[i + k]);
+                        i += $n;
+                        a
+                    }),*
+                }
+            }
+
+            #[inline(always)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            fn write_flat(&self, out: &mut [f32]) {
+                let mut i = 0;
+                $(
+                    out[i..i + $n].copy_from_slice(&self.$f);
+                    i += $n;
+                )*
+            }
+        }
+    };
+}
+
+/// Declares a struct of lane arrays (one per named value, [`LANES`] sample points in each)
+/// and its [`LaneValues`] impl. Used by [`material_io!`](crate::material_io).
+#[macro_export]
+macro_rules! lane_struct {
+    ($name:ident; $($f:ident: $n:literal),* $(,)?) => {
+        #[derive(Clone, Copy, Default, Debug, PartialEq)]
+        pub struct $name {
+            $(pub $f: [$crate::shader::F32s; $n]),*
+        }
+
+        impl $crate::shader::LaneValues for $name {
+            const LEN: usize = 0 $(+ $n)*;
+
+            #[inline(always)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            fn from_lanes(lanes: &[$crate::shader::F32s]) -> Self {
+                let mut i = 0;
+                Self {
+                    $($f: {
+                        let a: [$crate::shader::F32s; $n] = std::array::from_fn(|k| lanes[i + k]);
+                        i += $n;
+                        a
+                    }),*
+                }
+            }
+
+            #[inline(always)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            fn write_lanes(&self, out: &mut [$crate::shader::F32s]) {
+                let mut i = 0;
+                $(
+                    out[i..i + $n].copy_from_slice(&self.$f);
+                    i += $n;
+                )*
+            }
+        }
+    };
+}
+
+/// Declares what flows between a material's stages, all from one list, and the
+/// [`MaterialIo`] `IO` describing it:
+///
+/// - `vertex`: what `shade_vertex` reads: mesh attributes by name, or the built-ins
+///   [`POSITION`] and [`FACE_NORMAL`]. Struct `Vertex`.
+/// - `sampled`: what `shade_vertex` returns (struct `Sampled`) and `shade_sample` reads,
+///   exact at each sample point ([`LANES`] points in struct `SampledLanes`). The built-ins
+///   [`POSITION`], [`LOD`], [`ANISO`] and [`ANISO_LOD`] are filled by the engine.
+/// - `fixed32`, `fixed16`, `float`: what `shade_sample` returns (struct `Interp`, in this
+///   order) and pixels get, interpolated linearly between sample points in 16.16, 8.8 and
+///   f32: the groups `Fixed32`, `Fixed16` and `Floats`.
 ///
 /// ```ignore
-/// varyings! {
-///     fixed32 { uv: 2 }
+/// material_io! {
+///     vertex { color: 3 }
+///     sampled { color: 3 }
+///     fixed32 {}
 ///     fixed16 { color: 3 }
-///     float { normal: 3 }
+///     float {}
 /// }
 /// ```
 #[macro_export]
-macro_rules! varyings {
+macro_rules! material_io {
     (
+        vertex { $($v:ident: $vn:literal),* $(,)? }
+        sampled { $($s:ident: $sn:literal),* $(,)? }
         fixed32 { $($a:ident: $an:literal),* $(,)? }
         fixed16 { $($b:ident: $bn:literal),* $(,)? }
         float { $($c:ident: $cn:literal),* $(,)? }
     ) => {
+        $crate::value_struct!(Vertex; $($v: $vn),*);
+        $crate::value_struct!(Sampled; $($s: $sn),*);
+        $crate::lane_struct!(SampledLanes; $($s: $sn),*);
+        $crate::lane_struct!(Interp; $($a: $an,)* $($b: $bn,)* $($c: $cn),*);
         $crate::varying_group!(Fixed32, i32; $($a: $an),*);
         $crate::varying_group!(Fixed16, i16; $($b: $bn),*);
         $crate::varying_group!(Floats, f32; $($c: $cn),*);
 
-        pub const LAYOUT: &[$crate::shader::AttribDesc] = &[
-            $($crate::shader::AttribDesc { name: stringify!($a), format: $crate::shader::Format::Fixed32, count: $an },)*
-            $($crate::shader::AttribDesc { name: stringify!($b), format: $crate::shader::Format::Fixed16, count: $bn },)*
-            $($crate::shader::AttribDesc { name: stringify!($c), format: $crate::shader::Format::Float, count: $cn },)*
-        ];
+        pub const IO: $crate::shader::MaterialIo = $crate::shader::MaterialIo {
+            vertex: &[
+                $($crate::shader::AttribDesc { name: stringify!($v), format: $crate::shader::Format::Float, count: $vn },)*
+            ],
+            sampled: &[
+                $($crate::shader::AttribDesc { name: stringify!($s), format: $crate::shader::Format::Float, count: $sn },)*
+            ],
+            interp: &[
+                $($crate::shader::AttribDesc { name: stringify!($a), format: $crate::shader::Format::Fixed32, count: $an },)*
+                $($crate::shader::AttribDesc { name: stringify!($b), format: $crate::shader::Format::Fixed16, count: $bn },)*
+                $($crate::shader::AttribDesc { name: stringify!($c), format: $crate::shader::Format::Float, count: $cn },)*
+            ],
+        };
     };
 }
 
-/// Name of the built-in varying holding the world position a pixel shows (three values),
-/// from `ViewGeometry::world_positions`. A mesh attribute cannot supply it.
+/// The associated types and `IO` of a [`Material`] impl, from the names
+/// [`material_io!`](crate::material_io) declares in the same module.
+#[macro_export]
+macro_rules! material_types {
+    () => {
+        type Vertex = Vertex;
+        type Sampled = Sampled;
+        type SampledLanes = SampledLanes;
+        type Interp = Interp;
+        type Fixed32 = Fixed32;
+        type Fixed16 = Fixed16;
+        type Floats = Floats;
+        const IO: $crate::shader::MaterialIo = IO;
+    };
+}
+
+/// Name of the built-in world position (three values): as a `vertex` value, the source
+/// vertex's; as a `sampled` value, the point's (from `ViewGeometry::world_positions`: the
+/// real surface point, even in a mirror). A mesh attribute cannot supply it.
 pub const POSITION: &str = "position";
 
-/// Name of the built-in varying holding the texture level of detail (one value, meant for
-/// an 8.8 varying): log2 of the polygon's texture's full-size texels per screen pixel. It
-/// is computed for each vertex when the polygon is set up, from the polygon's exact
-/// screen-space derivatives of the mesh attribute `uv`, and interpolated across it like any
-/// varying; see [`sample_trilinear`]. A mesh attribute cannot supply it.
+/// Name of the built-in `vertex` value holding the source polygon's plane normal in world
+/// space (three values). A mesh attribute cannot supply it.
+pub const FACE_NORMAL: &str = "face_normal";
+
+/// Name of the `sampled` value the texture footprint built-ins ([`LOD`], [`ANISO`],
+/// [`ANISO_LOD`]) are measured from: two texture coordinates for texture slot 0.
+pub const UV: &str = "uv";
+
+/// Name of the built-in `sampled` value holding the texture level of detail (one value,
+/// usually passed on to an 8.8 varying): log2 of the polygon's texture's full-size texels
+/// per screen pixel. It is computed for each vertex when the polygon is set up, from the
+/// polygon's exact screen-space derivatives of the `sampled` value [`UV`], and
+/// interpolated across it like any value; see [`sample_trilinear`].
 pub const LOD: &str = "lod";
 
 /// Name of the built-in varying holding the anisotropic probe offset (two values, meant for
@@ -551,136 +709,264 @@ pub const ANISO: &str = "aniso";
 /// footprint's short axis and half its long axis. See [`sample_anisotropic`].
 pub const ANISO_LOD: &str = "aniso_lod";
 
-/// A shader: its varyings and a function producing 32-bit colors for [`LANES`] pixels at
-/// once.
+/// A material's values of one kind as a struct of f32 arrays, generated by
+/// [`material_io!`](crate::material_io): `Vertex` and `Sampled`.
+pub trait Values: Copy + Default {
+    /// Number of f32 values.
+    const LEN: usize;
+    /// From `LEN` values in declaration order.
+    fn from_flat(flat: &[f32]) -> Self;
+    fn write_flat(&self, out: &mut [f32]);
+}
+
+/// A material's values of one kind for [`LANES`] sample points, generated by
+/// [`material_io!`](crate::material_io): `SampledLanes` and `Interp`.
+pub trait LaneValues: Copy + Default {
+    /// Number of values (each [`LANES`] wide).
+    const LEN: usize;
+    fn from_lanes(lanes: &[F32s]) -> Self;
+    fn write_lanes(&self, out: &mut [F32s]);
+}
+
+/// What flows between a material's stages, by name: see [`material_io!`](crate::material_io).
+#[derive(Clone, Copy, Debug)]
+pub struct MaterialIo {
+    pub vertex: &'static [AttribDesc],
+    pub sampled: &'static [AttribDesc],
+    pub interp: &'static [AttribDesc],
+}
+
+/// What `shade_vertex` sees besides the vertex: nothing about the eye (vertex outputs are
+/// the same seen directly and in every mirror).
+pub struct VertexContext<'a> {
+    /// Where the mesh is in the world ([`Object::IDENTITY`] for level geometry).
+    pub object: &'a Object,
+    pub params: &'a Params,
+}
+
+/// What `shade_sample` sees besides its sample points.
+pub struct SampleContext<'a> {
+    /// The eye the polygon is seen from: the camera, or for a polygon seen in a mirror, the
+    /// mirror's eye.
+    pub eye: Vec3,
+    /// Pixels per unit of height at depth 1.
+    pub focal: f32,
+    pub object: &'a Object,
+    pub params: &'a Params,
+}
+
+/// What `shade_pixel` sees besides its interpolated values.
+pub struct PixelContext<'a> {
+    /// The screen position of the [`LANES`] pixels.
+    pub at: Pixels,
+    pub textures: &'a TextureSet<'a>,
+    pub params: &'a Params,
+    pub focal: f32,
+}
+
+/// What a translucent pixel is drawn over, for `shade_over`: `w` is the surface's
+/// `1 / depth` at each pixel, `behind_w` that of the opaque surface behind it (both on the
+/// same ray through the pixel, so Euclidean distances along it scale as `1 / w`); lanes past
+/// the end of a run have `behind_w` 0. `row` holds the finished colors and `w` the run is
+/// drawn over, for materials that blend over them themselves (returning alpha 255), reading
+/// them somewhere else along the row.
+pub struct Over<'a> {
+    pub w: F32s,
+    pub behind_w: F32s,
+    pub row: RowBehind<'a>,
+}
+
+/// A material program: three stages, and what flows between them (declared with
+/// [`material_io!`](crate::material_io), filled in with
+/// [`material_types!`](crate::material_types)).
 ///
-/// Varyings come from the mesh's attributes by name, except [`POSITION`] and the names in
-/// `DERIVED`: values the shader computes itself, in `per_sample`, from the others.
+/// - `shade_vertex` runs on each vertex of a source polygon, before clipping; clipped
+///   vertices get the same weighted sums of its outputs that clipping made of positions.
+/// - `shade_sample` runs on exact, perspective-correct `sampled` values at sample points,
+///   [`LANES`] points at once: the place for anything costly or not linear on screen (view
+///   vectors, Fresnel, lighting). Its outputs are interpolated linearly to pixels.
+/// - `shade_pixel` runs on [`LANES`] consecutive pixels (lanes past the end of a run are
+///   computed too, and discarded) and returns their colors.
 ///
-/// Along a span, exact (perspective-correct) values are taken at sample points a few pixels
-/// apart and interpolated linearly between them. `per_sample` runs on the exact values at
-/// each sample point, before interpolating: the place for work too costly per pixel but
-/// not linear on screen (normalizing a view vector, say), whose result is then
-/// interpolated like any varying.
-///
-/// `shade` gets [`LANES`] consecutive pixels in each varying's lanes and returns their
-/// colors in the same lanes. Lanes past the end of a run are computed too, and discarded.
-///
-/// Opaque shaders return XRGB (the top byte is ignored). Translucent shaders
-/// (`TRANSLUCENT = true`) return ARGB: the renderer draws their polygons after all opaque
-/// geometry, back to front, and blends each pixel as `src * a + dst * (1 - a)`. A
-/// translucent shader with `READS_BEHIND = true` is shaded with `shade_over` instead of
-/// `shade`, which also gets the depth of the opaque surface behind the pixel.
-pub trait Shader: 'static {
+/// Opaque materials return XRGB (the top byte is ignored). Translucent ones
+/// (`TRANSLUCENT = true`) return ARGB: they are drawn after all opaque geometry, back to
+/// front, and blended as `src * a + dst * (1 - a)`. A translucent material with
+/// `READS_BEHIND = true` is shaded with `shade_over`, which also sees what is behind.
+pub trait Material: 'static {
+    type Vertex: Values;
+    type Sampled: Values;
+    type SampledLanes: LaneValues;
+    type Interp: LaneValues;
     type Fixed32: Group<Elem = i32>;
     type Fixed16: Group<Elem = i16>;
     type Floats: Group<Elem = f32>;
-    const LAYOUT: &'static [AttribDesc];
-    /// Varyings written by `per_sample` rather than read from the mesh (0 at vertices).
-    const DERIVED: &'static [&'static str] = &[];
+    const IO: MaterialIo;
+    /// Most pixels between sample points this material wants, in both directions;
+    /// perspective may ask for less.
+    const SAMPLE_SPACING: i32 = MAX_STEP;
     const TRANSLUCENT: bool = false;
-    /// Shade with `shade_over`. Translucent shaders only.
+    /// Shade with `shade_over`. Translucent materials only.
     const READS_BEHIND: bool = false;
 
-    /// Runs on the exact varying values at each sample point, in layout order.
-    #[inline(always)]
-    fn per_sample(_values: &mut [f32], _uni: &Uniforms) {}
+    fn shade_vertex(v: &Self::Vertex, ctx: &VertexContext) -> Self::Sampled;
 
-    /// Shades [`LANES`] pixels, at screen position `at`, with the polygon's texture `tex`
-    /// (see [`sample`]).
-    fn shade(
+    fn shade_sample(s: &Self::SampledLanes, ctx: &SampleContext) -> Self::Interp;
+
+    fn shade_pixel(
         a: &Self::Fixed32,
         b: &Self::Fixed16,
         c: &Self::Floats,
-        uni: &Uniforms,
-        tex: &Texture,
-        at: Pixels,
+        ctx: &PixelContext,
     ) -> U32s;
 
-    /// Shades translucent pixels knowing what they are drawn over: `w` is this surface's
-    /// `1 / depth` at each pixel, `behind_w` that of the opaque surface behind it (both on
-    /// the same ray through the pixel, so Euclidean distances along it scale as `1 / w`).
-    /// Lanes past the end of a run have `behind_w` 0.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn shade_over(
         a: &Self::Fixed32,
         b: &Self::Fixed16,
         c: &Self::Floats,
-        uni: &Uniforms,
-        tex: &Texture,
-        at: Pixels,
-        _w: F32s,
-        _behind_w: F32s,
+        ctx: &PixelContext,
+        _over: &Over,
     ) -> U32s {
-        Self::shade(a, b, c, uni, tex, at)
+        Self::shade_pixel(a, b, c, ctx)
     }
 }
 
-/// Most varyings (as f32 values) any shader may declare.
+/// Most values (as f32) of one kind any material may declare.
 pub const MAX_VARYINGS: usize = 32;
 
-/// Everything needed to shade one run of pixels of one polygon on one row.
+/// Everything needed to shade one run of pixels of one polygon on one row, its values
+/// already worked out at the row's sample points.
 pub struct SpanJob<'a> {
     /// The polygon's exact left and right edge crossings on this row, and w there.
     pub x_left: f32,
     pub x_right: f32,
     pub w_left: f32,
     pub w_right: f32,
-    /// True varying values at the two crossings, in the shader's layout order.
-    pub left: &'a [f32],
-    pub right: &'a [f32],
-    /// The polygon's pixels on this row, `row_x0..row_x1`. Sample points sit on a grid
-    /// over this whole range, so a pixel's value never depends on how the row was split.
-    pub row_x0: i32,
-    pub row_x1: i32,
+    /// The row's sample points, left to right: their screen x and their outputs,
+    /// `Interp::LEN` each in declaration order. A pixel is shaded from the two points around
+    /// its center (the last point's own pixel with the interval before it; a lone point's
+    /// pixel with its own values).
+    pub xs: &'a [f32],
+    pub outs: &'a [f32],
     /// First pixel of the run; the run covers `x0..x0 + color.len()`, inside the row.
     pub x0: i32,
     /// The framebuffer row.
     pub row: i32,
-    /// Shade every other pixel (counted from each sample interval's start) and repeat it in
-    /// the next, with sample intervals twice as long: set for polygons seen in a mirror.
+    /// Shade every other pixel and repeat it in the next: set for polygons seen in a mirror.
+    /// Pairs start at even pixels counted from `vx`, the viewport's left edge, wherever
+    /// the sample points are.
     pub half_rate: bool,
-    /// Relative w change per sample interval allowed before sampling more often.
-    pub step_threshold: f32,
-    /// Smallest sample interval allowed, in pixels.
-    pub min_step: i32,
+    pub vx: i32,
 }
 
-/// Shades a run into `color`. `behind` is the opaque `w` under each pixel of the run for
-/// translucent shaders, and empty for opaque ones.
-pub type DrawSpanFn =
-    fn(job: &SpanJob, color: &mut [u32], behind: &[f32], uni: &Uniforms, tex: &Texture);
+/// What a translucent run is drawn over, pixel for pixel (`x0..x0 + len` of the run): the
+/// opaque `w` and the finished color. Empty for opaque runs.
+#[derive(Clone, Copy, Default)]
+pub struct Behind<'a> {
+    pub w: &'a [f32],
+    pub colors: &'a [u32],
+}
 
-/// A registered shader, type-erased.
+/// What a translucent run is drawn over, for reading along the row (see
+/// [`Shader::shade_over`]): pixel `x0 + i` has the finished color `colors[i]` and the opaque
+/// `w[i]` (0 over the background).
 #[derive(Clone, Copy)]
-pub struct ShaderEntry {
-    pub layout: &'static [AttribDesc],
-    pub derived: &'static [&'static str],
+pub struct RowBehind<'a> {
+    colors: &'a [u32],
+    w: &'a [f32],
+    x0: i32,
+}
+
+impl<'a> RowBehind<'a> {
+    /// `colors` and `w` of the same pixels, from `x0`.
+    pub fn new(colors: &'a [u32], w: &'a [f32], x0: i32) -> Self {
+        debug_assert_eq!(colors.len(), w.len());
+        Self { colors, w, x0 }
+    }
+
+    /// Nothing: [`at`](Self::at) reads 0.
+    pub const NONE: RowBehind<'static> = RowBehind {
+        colors: &[],
+        w: &[],
+        x0: 0,
+    };
+
+    /// Each lane's color and opaque `w` at pixel `x`, read together so they always agree,
+    /// clamped to the run, so a read never reaches the pixels of surfaces in front of it.
+    #[inline(always)]
+    pub fn at(&self, x: I32s) -> (U32s, F32s) {
+        let Some(last) = self.colors.len().checked_sub(1) else {
+            return (U32s::fill(0), F32s::fill(0.0));
+        };
+        let i = (x - I32s::fill(self.x0))
+            .max(I32s::fill(0))
+            .min(I32s::fill(last as i32))
+            .to_array();
+        (
+            U32s::from(std::array::from_fn::<u32, LANES, _>(|k| {
+                self.colors[i[k] as usize]
+            })),
+            F32s::from(std::array::from_fn::<f32, LANES, _>(|k| {
+                self.w[i[k] as usize]
+            })),
+        )
+    }
+}
+
+/// What a run is drawn with: the surface's params and textures, and the engine's values
+/// for its stage contexts.
+pub struct Draw<'a> {
+    pub params: &'a Params,
+    pub textures: &'a TextureSet<'a>,
+    pub eye: Vec3,
+    pub focal: f32,
+    pub object: &'a Object,
+}
+
+/// Shades a run into `color`, over `behind` for translucent materials.
+pub type DrawSpanFn = fn(job: &SpanJob, color: &mut [u32], behind: Behind, draw: &Draw);
+
+/// Runs `shade_vertex` on one vertex: `input` holds its `vertex` values, `out` gets its
+/// `sampled` values, both in declaration order.
+pub type VertexFn = fn(input: &[f32], ctx: &VertexContext, out: &mut [f32]);
+
+/// A registered material, type-erased.
+#[derive(Clone, Copy)]
+pub struct MaterialEntry {
+    pub io: MaterialIo,
+    pub vertex: VertexFn,
+    pub sample: SampleFn,
     pub draw_span: DrawSpanFn,
     /// `draw_span` for half-rate spans (see [`SpanJob::half_rate`]).
     pub draw_span_half: DrawSpanFn,
     pub translucent: bool,
     pub reads_behind: bool,
+    pub sample_spacing: i32,
 }
 
-impl ShaderEntry {
-    pub fn of<S: Shader>() -> Self {
+impl MaterialEntry {
+    pub fn of<M: Material>() -> Self {
         const {
             assert!(
-                S::TRANSLUCENT || !S::READS_BEHIND,
-                "only translucent shaders can read what is behind them"
+                M::TRANSLUCENT || !M::READS_BEHIND,
+                "only translucent materials can read what is behind them"
             )
         };
         Self {
-            layout: S::LAYOUT,
-            derived: S::DERIVED,
-            draw_span: span::<S, 1>,
-            draw_span_half: span::<S, 2>,
-            translucent: S::TRANSLUCENT,
-            reads_behind: S::READS_BEHIND,
+            io: M::IO,
+            vertex: vertex_stage::<M>,
+            sample: sample_stage::<M>,
+            draw_span: span::<M, 1>,
+            draw_span_half: span::<M, 2>,
+            translucent: M::TRANSLUCENT,
+            reads_behind: M::READS_BEHIND,
+            sample_spacing: M::SAMPLE_SPACING,
         }
     }
+}
+
+fn vertex_stage<M: Material>(input: &[f32], ctx: &VertexContext, out: &mut [f32]) {
+    M::shade_vertex(&M::Vertex::from_flat(input), ctx).write_flat(out);
 }
 
 /// Blends an ARGB color over an existing one by its alpha: `src * a + dst * (1 - a)` per
@@ -712,9 +998,9 @@ pub fn blend_lanes(src: U32s, dst: U32s) -> U32s {
     out
 }
 
-/// Handle to a registered shader.
+/// Handle to a registered material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ShaderId(pub u16);
+pub struct MaterialId(pub u16);
 
 /// Number of f32 values in a layout.
 pub fn layout_len(layout: &[AttribDesc]) -> usize {
@@ -725,170 +1011,125 @@ pub fn layout_len(layout: &[AttribDesc]) -> usize {
 /// accumulated stepping error under one level.
 pub const MAX_STEP: i32 = 32;
 
-/// Picks the sample interval for a row span: the largest power of two from `min_step` up
-/// to 32 over which w changes by less than `threshold` relative to its smaller end. Rows
-/// of constant w (a floor seen without roll) get the maximum.
-pub fn choose_step(w_left: f32, w_right: f32, span_len: f32, threshold: f32, min_step: i32) -> i32 {
-    let w_ratio = (w_right - w_left).abs() / (w_left.min(w_right) * span_len.max(1.0));
-    let mut n = MAX_STEP;
-    while n / 2 >= min_step && w_ratio * n as f32 >= threshold {
-        n /= 2;
-    }
-    n
-}
-
-/// Perspective-correct interpolation across one row span, set up once per run: the
-/// reciprocal of the span's width is taken here, leaving one divide per sample point.
-struct Perspective {
-    x_left: f32,
-    inv_span: f32,
-    w_left: f32,
-    w_right: f32,
-}
-
-impl Perspective {
-    #[inline(always)]
-    fn new(job: &SpanJob) -> Self {
-        let span = job.x_right - job.x_left;
-        Self {
-            x_left: job.x_left,
-            inv_span: if span > 0.0 { 1.0 / span } else { 0.0 },
-            w_left: job.w_left,
-            w_right: job.w_right,
-        }
-    }
-
-    /// The interpolation parameter at pixel `px`'s center: 0 at the left crossing, 1 at the
-    /// right, perspective-correct.
-    #[inline(always)]
-    fn alpha(&self, px: i32) -> f32 {
-        let s = ((px as f32 + 0.5 - self.x_left) * self.inv_span).clamp(0.0, 1.0);
-        let den = (1.0 - s) * self.w_left + s * self.w_right;
-        if den > 0.0 { s * self.w_right / den } else { s }
-    }
-}
-
-/// True varying values at pixel `px`'s center on the row, perspective-correct: one alpha
-/// from w at the two crossings, shared by every varying.
-#[inline(always)]
-fn values_at(job: &SpanJob, perspective: &Perspective, px: i32, out: &mut [f32]) {
-    let alpha = perspective.alpha(px);
-    for (o, (&l, &r)) in out.iter_mut().zip(job.left.iter().zip(job.right)) {
-        *o = l + (r - l) * alpha;
-    }
-}
-
-/// Shades a run of a polygon's row. Exact values are taken at sample points every N pixels
-/// from the row's first pixel, and at its last pixel. Between them, pixels are shaded in
-/// blocks of [`LANES`] counted from the interval's start: each block's varyings are the
-/// lines between the interval's two sample points, evaluated at all its pixels at once
-/// (`start + offset * step`, in each group's own format), then shaded at once. The grid
-/// belongs to the whole row, so every pixel gets the same value however the row is split
-/// into runs.
-pub fn draw_span<S: Shader>(
-    job: &SpanJob,
-    color: &mut [u32],
-    behind: &[f32],
-    uni: &Uniforms,
-    tex: &Texture,
-) {
+/// Shades a run of a polygon's row from the row's sample points (see [`SpanJob`]): between
+/// two points every value is linear in x, so each interval's pixels are shaded in blocks of
+/// [`LANES`] counted from its first pixel, each block's values evaluated at all its pixels
+/// at once (`base + offset * step`, in each group's own format), then shaded at once. The
+/// points belong to the whole row, so every pixel gets the same value however the row is
+/// split into runs.
+pub fn draw_span<M: Material>(job: &SpanJob, color: &mut [u32], behind: Behind, draw: &Draw) {
     if job.half_rate {
-        span::<S, 2>(job, color, behind, uni, tex);
+        span::<M, 2>(job, color, behind, draw);
     } else {
-        span::<S, 1>(job, color, behind, uni, tex);
+        span::<M, 1>(job, color, behind, draw);
     }
 }
 
-/// [`draw_span`], shading every `STRIDE`th pixel from each sample interval's start (each
-/// block's [`LANES`] lanes cover `LANES * STRIDE` pixels, every lane's color repeated
-/// `STRIDE` times).
-pub fn span<S: Shader, const STRIDE: i32>(
+/// [`draw_span`], shading every `STRIDE`th pixel counted from the viewport's left edge
+/// (each block's [`LANES`] lanes cover `LANES * STRIDE` pixels, every lane's color repeated
+/// `STRIDE` times, from the interval holding the pixel it is repeated in).
+pub fn span<M: Material, const STRIDE: i32>(
     job: &SpanJob,
     color: &mut [u32],
-    behind: &[f32],
-    uni: &Uniforms,
-    tex: &Texture,
+    behind: Behind,
+    draw: &Draw,
 ) {
     let (x0, x1) = (job.x0, job.x0 + color.len() as i32);
-    if x0 >= x1 {
-        return;
-    }
-    debug_assert!(job.row_x0 <= x0 && x1 <= job.row_x1, "run outside its row");
-    let n_vals = S::Fixed32::LEN + S::Fixed16::LEN + S::Floats::LEN;
-    // Sample points are spaced by the chosen interval in shaded pixels, so half-rate spans
-    // sample half as often too.
-    let n = choose_step(
-        job.w_left,
-        job.w_right,
-        job.x_right - job.x_left,
-        job.step_threshold,
-        job.min_step,
-    ) * STRIDE;
-    let last = job.row_x1 - 1;
-    let perspective = Perspective::new(job);
-    // Exact values at the current interval's start (`a`) and end (`b`); the end becomes the
-    // next interval's start by swapping the two, not copying.
-    let (mut a_buf, mut b_buf) = ([0.0f32; MAX_VARYINGS], [0.0f32; MAX_VARYINGS]);
-    let (mut a, mut b) = (&mut a_buf[..n_vals], &mut b_buf[..n_vals]);
-    let mut a_at = i32::MIN; // the pixel `a` currently holds values for
+    let n_out = M::Interp::LEN;
+    debug_assert_eq!(job.outs.len(), job.xs.len() * n_out);
     let mut run = Run {
         job,
         x0,
         color,
         behind,
-        uni,
-        tex,
+        draw,
     };
-    let mut p = x0;
-    while p < x1 {
-        if p == last {
-            values_at(job, &perspective, last, a);
-            S::per_sample(a, uni);
-            let lines = lines::<S>(a, a, 0.0);
-            run.block::<S, STRIDE>(&lines, 0, last, last..last + 1);
-            break;
+    let (mut base, mut step) = ([0.0f32; MAX_VARYINGS], [0.0f32; MAX_VARYINGS]);
+    let n = job.xs.len();
+    if n == 1 {
+        let x = job.xs[0];
+        let px = moose_view::pixel_edge(x);
+        if (x0..x1).contains(&px) {
+            let lines = lines::<M>(&job.outs[..n_out], &step[..n_out]);
+            run.interval::<M, STRIDE>(&lines, px, px, px + 1);
         }
-        // The grid interval holding p: exact at `start` and `end`.
-        let start = job.row_x0 + (p - job.row_x0) / n * n;
-        let end = (start + n).min(last);
-        if a_at != start {
-            values_at(job, &perspective, start, a);
-            S::per_sample(a, uni);
+        return;
+    }
+    for i in 1..n {
+        let (xa, xb) = (job.xs[i - 1], job.xs[i]);
+        // The pixels whose centers lie in [xa, xb), or [xa, xb] for the last interval.
+        let first = moose_view::pixel_edge(xa);
+        let end = if i == n - 1 {
+            (xb - 0.5).floor() as i32 + 1
+        } else {
+            moose_view::pixel_edge(xb)
+        };
+        let (from, to) = (first.max(x0), end.min(x1));
+        if from >= to {
+            if first >= x1 {
+                break;
+            }
+            continue;
         }
-        values_at(job, &perspective, end, b);
-        S::per_sample(b, uni);
-        let lines = lines::<S>(a, b, 1.0 / (end - start) as f32);
-        let stop = end.min(x1);
-        let width = LANES as i32 * STRIDE;
-        let mut block = start + (p - start) / width * width;
-        while block < stop {
-            let pixels = block.max(p)..(block + width).min(stop);
-            run.block::<S, STRIDE>(&lines, block - start, block, pixels);
-            block += width;
+        let a = &job.outs[(i - 1) * n_out..i * n_out];
+        let b = &job.outs[i * n_out..(i + 1) * n_out];
+        let slope = if xb - xa > 1e-6 { 1.0 / (xb - xa) } else { 0.0 };
+        let offset = first as f32 + 0.5 - xa;
+        for k in 0..n_out {
+            step[k] = (b[k] - a[k]) * slope;
+            base[k] = a[k] + step[k] * offset;
         }
-        std::mem::swap(&mut a, &mut b);
-        a_at = end;
-        p = stop;
+        let lines = lines::<M>(&base[..n_out], &step[..n_out]);
+        run.interval::<M, STRIDE>(&lines, first, from, to);
+    }
+}
+
+/// Runs `shade_sample` on `count` sample points: `inputs` holds each point's `sampled`
+/// values (declaration order), `out` gets each one's outputs (`Interp`, declaration order).
+pub type SampleFn = fn(inputs: &[f32], count: usize, ctx: &SampleContext, out: &mut [f32]);
+
+fn sample_stage<M: Material>(inputs: &[f32], count: usize, ctx: &SampleContext, out: &mut [f32]) {
+    let (n_in, n_out) = (M::Sampled::LEN, M::Interp::LEN);
+    let mut lanes = [F32s::default(); MAX_VARYINGS];
+    for start in (0..count).step_by(LANES) {
+        let m = (count - start).min(LANES);
+        // Lanes past the points repeat the last one.
+        for (k, lane) in lanes[..n_in].iter_mut().enumerate() {
+            *lane = F32s::from(std::array::from_fn::<f32, LANES, _>(|j| {
+                inputs[(start + j.min(m - 1)) * n_in + k]
+            }));
+        }
+        let o = M::shade_sample(&M::SampledLanes::from_lanes(&lanes[..n_in]), ctx);
+        o.write_lanes(&mut lanes[..n_out]);
+        for (k, lane) in lanes[..n_out].iter().enumerate() {
+            for (j, v) in lane.to_array().into_iter().take(m).enumerate() {
+                out[(start + j) * n_out + k] = v;
+            }
+        }
     }
 }
 
 /// The lines of all three groups within one sample interval.
-type Lines<S> = (
-    <<S as Shader>::Fixed32 as Group>::Line,
-    <<S as Shader>::Fixed16 as Group>::Line,
-    <<S as Shader>::Floats as Group>::Line,
+type Lines<M> = (
+    <<M as Material>::Fixed32 as Group>::Line,
+    <<M as Material>::Fixed16 as Group>::Line,
+    <<M as Material>::Floats as Group>::Line,
 );
 
-/// The lines from true values `a` to `b` (layout order), `1 / inv` pixels apart.
+/// The lines with values `base` at the interval's first pixel and `step` per pixel
+/// (declaration order).
 #[inline(always)]
-fn lines<S: Shader>(a: &[f32], b: &[f32], inv: f32) -> Lines<S> {
-    let (f32s, f16s) = (S::Fixed32::LEN, S::Fixed16::LEN);
-    let (a32, a16, af) = (&a[..f32s], &a[f32s..f32s + f16s], &a[f32s + f16s..]);
-    let (b32, b16, bf) = (&b[..f32s], &b[f32s..f32s + f16s], &b[f32s + f16s..]);
+fn lines<M: Material>(base: &[f32], step: &[f32]) -> Lines<M> {
+    #[inline(always)]
+    fn split(v: &[f32], f32s: usize, f16s: usize) -> (&[f32], &[f32], &[f32]) {
+        (&v[..f32s], &v[f32s..f32s + f16s], &v[f32s + f16s..])
+    }
+    let (f32s, f16s) = (M::Fixed32::LEN, M::Fixed16::LEN);
+    let ((b32, b16, bf), (s32, s16, sf)) = (split(base, f32s, f16s), split(step, f32s, f16s));
     (
-        S::Fixed32::line(a32, b32, inv),
-        S::Fixed16::line(a16, b16, inv),
-        S::Floats::line(af, bf, inv),
+        M::Fixed32::line(b32, s32),
+        M::Fixed16::line(b16, s16),
+        M::Floats::line(bf, sf),
     )
 }
 
@@ -897,32 +1138,56 @@ struct Run<'a> {
     job: &'a SpanJob<'a>,
     x0: i32,
     color: &'a mut [u32],
-    behind: &'a [f32],
-    uni: &'a Uniforms,
-    tex: &'a Texture,
+    behind: Behind<'a>,
+    draw: &'a Draw<'a>,
 }
 
 impl Run<'_> {
+    /// Shades pixels `from..to` of the interval whose first pixel is `start` (where
+    /// `lines` begin), in blocks of `LANES * STRIDE` pixels, the first at the pair holding
+    /// `from`.
+    #[inline(always)]
+    fn interval<M: Material, const STRIDE: i32>(
+        &mut self,
+        lines: &Lines<M>,
+        start: i32,
+        from: i32,
+        to: i32,
+    ) {
+        let width = LANES as i32 * STRIDE;
+        let mut block = from - (from - self.job.vx).rem_euclid(STRIDE);
+        while block < to {
+            let pixels = block.max(from)..(block + width).min(to);
+            self.block::<M, STRIDE>(lines, block - start, block, pixels);
+            block += width;
+        }
+    }
+
     /// Shades the block of `LANES * STRIDE` pixels starting at pixel `first`, `offset`
     /// pixels along `lines` (one lane every `STRIDE` pixels), and stores the ones in
     /// `pixels`.
     #[inline(always)]
-    fn block<S: Shader, const STRIDE: i32>(
+    fn block<M: Material, const STRIDE: i32>(
         &mut self,
-        lines: &Lines<S>,
+        lines: &Lines<M>,
         offset: i32,
         first: i32,
         pixels: Range<i32>,
     ) {
-        let ga = S::Fixed32::lanes(&lines.0, offset, STRIDE);
-        let gb = S::Fixed16::lanes(&lines.1, offset, STRIDE);
-        let gc = S::Floats::lanes(&lines.2, offset, STRIDE);
-        let at = Pixels {
-            x: first,
-            y: self.job.row,
-            stride: STRIDE,
+        let ga = M::Fixed32::lanes(&lines.0, offset, STRIDE);
+        let gb = M::Fixed16::lanes(&lines.1, offset, STRIDE);
+        let gc = M::Floats::lanes(&lines.2, offset, STRIDE);
+        let ctx = PixelContext {
+            at: Pixels {
+                x: first,
+                y: self.job.row,
+                stride: STRIDE,
+            },
+            textures: self.draw.textures,
+            params: self.draw.params,
+            focal: self.draw.focal,
         };
-        let out = if S::READS_BEHIND {
+        let out = if M::READS_BEHIND {
             // w is linear in screen x.
             let job = self.job;
             let span = job.x_right - job.x_left;
@@ -939,12 +1204,17 @@ impl Run<'_> {
             for (j, b) in behind.iter_mut().enumerate() {
                 let px = first + j as i32 * STRIDE;
                 if let Some(q) = (px..px + STRIDE).find(|q| pixels.contains(q)) {
-                    *b = self.behind[(q - self.x0) as usize];
+                    *b = self.behind.w[(q - self.x0) as usize];
                 }
             }
-            S::shade_over(&ga, &gb, &gc, self.uni, self.tex, at, w, F32s::from(behind))
+            let over = Over {
+                w,
+                behind_w: F32s::from(behind),
+                row: RowBehind::new(self.behind.colors, self.behind.w, self.x0),
+            };
+            M::shade_over(&ga, &gb, &gc, &ctx, &over)
         } else {
-            S::shade(&ga, &gb, &gc, self.uni, self.tex, at)
+            M::shade_pixel(&ga, &gb, &gc, &ctx)
         };
         let lanes = out.to_array();
         let at = (pixels.start - self.x0) as usize;
@@ -982,6 +1252,7 @@ impl Run<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moose_view::pixel_edge;
 
     /// The direction through the center of texel `(x, y)` of face `face` of a `size` cube map.
     fn cube_texel_direction(face: usize, x: u32, y: u32, size: u32) -> [f32; 3] {
@@ -1039,23 +1310,26 @@ mod tests {
     /// Test shader writing its raw fixed-point varyings as the color: one 8.8 value in the
     /// low half, the low 16 bits of one 16.16 value in the high half.
     mod raw {
-        use super::super::{AttribDesc, Fill, I32s, Pixels, Shader, U32s, Uniforms};
-        use moose_assets::Texture;
-        crate::varyings! { fixed32 { u: 1 } fixed16 { c: 1 } float {} }
+        use super::super::{
+            Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext,
+        };
+        crate::material_io! {
+            vertex {}
+            sampled { u: 1, c: 1 }
+            fixed32 { u: 1 }
+            fixed16 { c: 1 }
+            float {}
+        }
         pub struct Raw;
-        impl Shader for Raw {
-            type Fixed32 = Fixed32;
-            type Fixed16 = Fixed16;
-            type Floats = Floats;
-            const LAYOUT: &'static [AttribDesc] = LAYOUT;
-            fn shade(
-                a: &Fixed32,
-                b: &Fixed16,
-                _: &Floats,
-                _: &Uniforms,
-                _: &Texture,
-                _: Pixels,
-            ) -> U32s {
+        impl Material for Raw {
+            crate::material_types!();
+            fn shade_vertex(_: &Vertex, _: &VertexContext) -> Sampled {
+                Sampled::default()
+            }
+            fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
+                Interp { u: s.u, c: s.c }
+            }
+            fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
                 let c: U32s = wide::bytemuck::cast(I32s::from_i16x8(b.c[0]));
                 let u: U32s = wide::bytemuck::cast(a.u[0]);
                 (c & U32s::fill(0xFFFF)) | (u << 16)
@@ -1063,40 +1337,35 @@ mod tests {
         }
     }
 
-    /// The span shading before SIMD, one pixel at a time: exact at sample points and at the
-    /// row's last pixel, stepped by repeated wrapping adds in between.
-    fn stepped(job: &SpanJob, px: i32) -> u32 {
-        // Half-rate spans sample half as often.
-        let n = choose_step(
-            job.w_left,
-            job.w_right,
-            job.x_right - job.x_left,
-            job.step_threshold,
-            job.min_step,
-        ) * if job.half_rate { 2 } else { 1 };
-        let last = job.row_x1 - 1;
-        let perspective = Perspective::new(job);
-        let (mut a, mut b) = ([0.0; 2], [0.0; 2]);
-        let (u, c) = if px == last {
-            values_at(job, &perspective, last, &mut a);
-            (i32::from_f32(a[0]), i16::from_f32(a[1]))
-        } else {
-            let start = job.row_x0 + (px - job.row_x0) / n * n;
-            let end = (start + n).min(last);
-            values_at(job, &perspective, start, &mut a);
-            values_at(job, &perspective, end, &mut b);
-            let inv = 1.0 / (end - start) as f32;
-            let (mut u, mut c) = (i32::from_f32(a[0]), i16::from_f32(a[1]));
-            let (du, dc) = (
-                i32::from_f32((b[0] - a[0]) * inv),
-                i16::from_f32((b[1] - a[1]) * inv),
-            );
-            for _ in start..px {
-                u = u.wrapping_add(du);
-                c = c.wrapping_add(dc);
-            }
-            (u, c)
-        };
+    /// One pixel's value, the way the span shading works it out before SIMD: from the
+    /// interval holding it, the values at the interval's first pixel and the step per pixel
+    /// in fixed point, stepped with wrapping arithmetic to the pixel it shows (its own, or
+    /// at half rate the even one of its pair, counted from pixel 0, but not before the
+    /// interval's first pixel).
+    fn stepped(xs: &[f32], outs: &[f32], half_rate: bool, px: i32) -> u32 {
+        let last = xs.len() - 2;
+        let i = (0..=last)
+            .find(|&i| {
+                let end = if i == last {
+                    (xs[i + 1] - 0.5).floor() as i32 + 1
+                } else {
+                    pixel_edge(xs[i + 1])
+                };
+                pixel_edge(xs[i]) <= px && px < end
+            })
+            .unwrap();
+        let (xa, xb) = (xs[i], xs[i + 1]);
+        let first = pixel_edge(xa);
+        let shown = if half_rate { px - px.rem_euclid(2) } else { px };
+        let slope = if xb - xa > 1e-6 { 1.0 / (xb - xa) } else { 0.0 };
+        let (a, b) = (&outs[2 * i..2 * i + 2], &outs[2 * i + 2..2 * i + 4]);
+        let step = [(b[0] - a[0]) * slope, (b[1] - a[1]) * slope];
+        let offset = first as f32 + 0.5 - xa;
+        let base = [a[0] + step[0] * offset, a[1] + step[1] * offset];
+        let (du, dc) = (i32::from_f32(step[0]), i16::from_f32(step[1]));
+        let k = (shown - first).max(0);
+        let u = i32::from_f32(base[0]).wrapping_add(du.wrapping_mul(k));
+        let c = i16::from_f32(base[1]).wrapping_add(dc.wrapping_mul(k as i16));
         (c as u16 as u32) | ((u as u32) << 16)
     }
 
@@ -1109,44 +1378,42 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
         };
+        let blank = Texture::solid("blank", 0);
         for round in 0..4000 {
-            let row_x0 = rnd(0.0, 50.0) as i32;
-            let row_x1 = row_x0 + 1 + rnd(0.0, 200.0) as i32;
-            let (left, right) = (
-                [rnd(-3.0, 3.0), rnd(0.0, 255.0)],
-                [rnd(-3.0, 3.0), rnd(0.0, 255.0)],
-            );
+            // A row's sample points: its two crossings and columns between them.
+            let x_left = rnd(0.0, 50.0);
+            let x_right = x_left + rnd(0.2, 200.0);
+            let mut xs = vec![x_left];
+            let nx = [1, 2, 4, 8, 16, 32][rnd(0.0, 5.99) as usize];
+            let mut c = (x_left / nx as f32).floor() as i32 * nx;
+            while (c as f32 + 0.5) < x_right {
+                if (c as f32 + 0.5) > x_left && rnd(0.0, 1.0) < 0.8 {
+                    xs.push(c as f32 + 0.5);
+                }
+                c += nx;
+            }
+            xs.push(x_right);
+            let outs: Vec<f32> = xs
+                .iter()
+                .flat_map(|_| [rnd(-3.0, 3.0), rnd(0.0, 255.0)])
+                .collect();
+            let (row_x0, row_x1) = (pixel_edge(x_left), pixel_edge(x_right));
+            if row_x0 >= row_x1 {
+                continue;
+            }
+            // Half the rows at half rate: each pixel then shows its pair's even pixel.
+            let half_rate = round % 2 == 1;
             let mut job = SpanJob {
-                x_left: row_x0 as f32 + rnd(-0.5, 0.5),
-                x_right: row_x1 as f32 + rnd(-0.5, 0.5),
-                w_left: rnd(0.01, 2.0),
-                w_right: rnd(0.01, 2.0),
-                left: &left,
-                right: &right,
-                row_x0,
-                row_x1,
+                x_left,
+                x_right,
+                w_left: 1.0,
+                w_right: 1.0,
+                xs: &xs,
+                outs: &outs,
                 x0: row_x0,
                 row: 0,
-                // Half the rows at half rate: each pixel then shows its pair's even pixel,
-                // counted from its sample interval's start.
-                half_rate: round % 2 == 1,
-                step_threshold: 1.0 / 16.0,
-                min_step: [1, 2, 4, 8][rnd(0.0, 3.99) as usize],
-            };
-            let n = choose_step(
-                job.w_left,
-                job.w_right,
-                job.x_right - job.x_left,
-                job.step_threshold,
-                job.min_step,
-            ) * 2;
-            let shown = |px: i32| {
-                if !job.half_rate || px == row_x1 - 1 {
-                    px
-                } else {
-                    let start = row_x0 + (px - row_x0) / n * n;
-                    px - (px - start) % 2
-                }
+                half_rate,
+                vx: 0,
             };
             // The row split into random runs, as visibility would.
             let mut x = row_x0;
@@ -1154,15 +1421,24 @@ mod tests {
                 let end = (x + 1 + rnd(0.0, 40.0) as i32).min(row_x1);
                 job.x0 = x;
                 let mut color = vec![0u32; (end - x) as usize];
-                let blank = Texture::solid("blank", 0);
-                draw_span::<raw::Raw>(&job, &mut color, &[], &Uniforms::default(), &blank);
+                draw_span::<raw::Raw>(
+                    &job,
+                    &mut color,
+                    Behind::default(),
+                    &Draw {
+                        params: &Params::default(),
+                        textures: &[&blank, &blank],
+                        eye: Vec3::ZERO,
+                        focal: 1.0,
+                        object: &Object::IDENTITY,
+                    },
+                );
                 for (i, &got) in color.iter().enumerate() {
                     let px = x + i as i32;
                     assert_eq!(
                         got,
-                        stepped(&job, shown(px)),
-                        "pixel {px} of row {row_x0}..{row_x1} (half rate {})",
-                        job.half_rate
+                        stepped(&xs, &outs, half_rate, px),
+                        "pixel {px} of row {row_x0}..{row_x1} (half rate {half_rate})"
                     );
                 }
                 x = end;

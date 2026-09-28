@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use glam::{Affine3A, Mat3A, Vec3, Vec3A};
+use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A};
 use moose_assets::{Assets, EntityKind, Mesh, MeshId, Plane, PolyFlags, Polygon, Portal};
 use moose_scene::{View, World};
 
@@ -122,12 +122,17 @@ pub enum PolygonSource {
 pub struct ViewPolygon {
     pub first_vertex: u32,
     pub vertex_count: u16,
-    /// Start of this polygon's values in `ViewGeometry::attributes`: `attrib_stride` floats
-    /// per vertex, in the order of the source mesh's `attribs`.
-    pub first_attrib: u32,
-    pub attrib_stride: u16,
+    /// Start of this polygon's weights in `ViewGeometry::weights`: `source_vertices` per
+    /// vertex. Each vertex is the weighted sum of the source polygon's vertices (in their
+    /// mesh order), so any per-vertex value (a mesh attribute, a vertex shader's output)
+    /// at a clipped vertex is the same weighted sum of its values at the source vertices:
+    /// clipping is linear.
+    pub first_weight: u32,
+    pub source_vertices: u16,
     /// Source mesh, for its attribute names and layout.
     pub mesh: MeshId,
+    /// Index in `ViewGeometry::objects`: where the source mesh is in the world.
+    pub object: u32,
     pub kind: PolygonKind,
     pub source: PolygonSource,
     /// The source polygon's flags.
@@ -146,9 +151,41 @@ impl ViewPolygon {
         self.first_vertex as usize..self.first_vertex as usize + self.vertex_count as usize
     }
 
-    pub fn attributes(&self) -> Range<usize> {
-        let len = self.vertex_count as usize * self.attrib_stride as usize;
-        self.first_attrib as usize..self.first_attrib as usize + len
+    pub fn weights(&self) -> Range<usize> {
+        let len = self.vertex_count as usize * self.source_vertices as usize;
+        self.first_weight as usize..self.first_weight as usize + len
+    }
+
+    /// The source polygon's index in its mesh.
+    pub fn source_polygon(&self) -> u32 {
+        match self.source {
+            PolygonSource::World { polygon, .. } | PolygonSource::Entity { polygon, .. } => polygon,
+        }
+    }
+}
+
+/// Where a mesh is in the world: model to world is scale, then rotation, then translation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Object {
+    pub position: Vec3,
+    pub rotation: Quat,
+    pub scale: f32,
+}
+
+impl Object {
+    /// Level geometry: already in world space.
+    pub const IDENTITY: Object = Object {
+        position: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+        scale: 1.0,
+    };
+
+    pub fn transform(&self) -> Affine3A {
+        Affine3A::from_scale_rotation_translation(
+            Vec3::splat(self.scale),
+            self.rotation,
+            self.position,
+        )
     }
 }
 
@@ -233,8 +270,17 @@ pub struct ViewGeometry {
     /// Per vertex, the world position the vertex shows: the real point on the surface, not
     /// its reflection, for polygons seen in a mirror.
     pub world_positions: Vec<Vec3>,
-    pub attributes: Vec<f32>,
+    /// Per vertex, its weights over the source polygon's vertices; see
+    /// [`ViewPolygon::first_weight`].
+    pub weights: Vec<f32>,
     pub polygons: Vec<ViewPolygon>,
+    /// Where each polygon's mesh is: `[0]` is the level ([`Object::IDENTITY`]), then one per
+    /// entity drawn.
+    pub objects: Vec<Object>,
+    /// The eye the view was built for (mirrors have their own, in `mirrors`), and its focal
+    /// length in pixels.
+    pub eye: Vec3,
+    pub focal: f32,
     pub visits: Vec<SectorVisit>,
     /// Mirrors seen this frame, parents before children. Visits and polygons seen in a
     /// mirror refer to it by index.
@@ -251,6 +297,8 @@ pub struct ViewGeometry {
 #[derive(Default)]
 struct Scratch {
     level: LevelCache,
+    /// Per entity, its index in `objects` this frame, once drawn.
+    entity_objects: Vec<u32>,
     entity_view: Vec<Vec3>,
     entity_world: Vec<Vec3>,
     record: Vec<f32>,
@@ -394,7 +442,7 @@ struct Out<'a> {
     vertices: &'a mut Vec<ScreenVertex>,
     edge_lines: &'a mut Vec<Option<EdgeLine>>,
     world_positions: &'a mut Vec<Vec3>,
-    attributes: &'a mut Vec<f32>,
+    weights: &'a mut Vec<f32>,
     polygons: &'a mut Vec<ViewPolygon>,
 }
 
@@ -410,6 +458,31 @@ impl ViewGeometry {
         self.window_planes[range(&visit.window)]
             .iter()
             .map(|p| p.normal)
+    }
+
+    /// A polygon's mesh attributes at each of its (clipped) vertices, as f32 in the mesh's
+    /// attribute order: the weighted sums of the source vertices' values. `mesh` is the
+    /// polygon's source mesh. Appends to `out`; returns the values per vertex.
+    pub fn vertex_attributes(&self, p: &ViewPolygon, mesh: &Mesh, out: &mut Vec<f32>) -> usize {
+        let source = &mesh.polygons[p.source_polygon() as usize];
+        let n = p.source_vertices as usize;
+        let stride: usize = mesh.attribs.iter().map(|a| a.count as usize).sum();
+        for weights in self.weights[p.weights()].chunks_exact(n) {
+            for a in &mesh.attribs {
+                let count = a.count as usize;
+                for c in 0..count {
+                    let mut sum = 0.0;
+                    for (k, &wk) in weights.iter().enumerate() {
+                        if wk != 0.0 {
+                            let v = source.first_vertex as usize + k;
+                            sum += wk * a.data.get_f32(v * count + c);
+                        }
+                    }
+                    out.push(sum);
+                }
+            }
+        }
+        stride
     }
 
     /// Where a level point seen in `mirror` appears: reflected across the mirror's plane,
@@ -447,8 +520,11 @@ impl ViewGeometry {
         self.vertices.clear();
         self.edge_lines.clear();
         self.world_positions.clear();
-        self.attributes.clear();
+        self.weights.clear();
         self.polygons.clear();
+        self.objects.clear();
+        self.objects.push(Object::IDENTITY);
+        (self.eye, self.focal) = (view.position, view.focal);
         self.visits.clear();
         self.mirrors.clear();
         self.window_planes.clear();
@@ -460,9 +536,11 @@ impl ViewGeometry {
             vertices: &mut self.vertices,
             edge_lines: &mut self.edge_lines,
             world_positions: &mut self.world_positions,
-            attributes: &mut self.attributes,
+            weights: &mut self.weights,
             polygons: &mut self.polygons,
         };
+        s.entity_objects.clear();
+        s.entity_objects.resize(world.entities.len(), u32::MAX);
         let geometry = assets.mesh(world.geometry);
         let eye = view.position;
         // World to homogeneous clip coordinates (x, y, w), where the viewport spans
@@ -565,9 +643,11 @@ impl ViewGeometry {
                         space.reversed(),
                         &mut |i| (level_pos(i), geometry.positions[i as usize]),
                     );
-                    let (clipped, edges) =
-                        s.clipper
-                            .clip(&s.record, RECORD + attrib_stride(geometry), &s.planes);
+                    let (clipped, edges) = s.clipper.clip(
+                        &s.record,
+                        RECORD + polygon.vertex_count as usize,
+                        &s.planes,
+                    );
                     if clipped.is_empty() {
                         self.stats.world_outside += 1;
                         continue;
@@ -578,8 +658,9 @@ impl ViewGeometry {
                         clipped,
                         edges,
                         &self.window_lines[range(&visit.window)],
-                        geometry,
+                        polygon.vertex_count as usize,
                         world.geometry,
+                        0,
                         PolygonKind::World,
                         PolygonSource::World {
                             sector: visit.sector,
@@ -750,6 +831,15 @@ impl ViewGeometry {
                 s.entity_world
                     .extend(mesh.positions.iter().map(|&p| model.transform_point3(p)));
                 let eye_model = model.inverse().transform_point3(space.eye);
+                if s.entity_objects[ei] == u32::MAX {
+                    s.entity_objects[ei] = self.objects.len() as u32;
+                    self.objects.push(Object {
+                        position: entity.position,
+                        rotation: entity.rotation,
+                        scale: entity.scale,
+                    });
+                }
+                let object = s.entity_objects[ei];
                 let kind = if entity.kind == EntityKind::Actor {
                     PolygonKind::Actor
                 } else {
@@ -764,9 +854,11 @@ impl ViewGeometry {
                     build_record(&mut s.record, mesh, polygon, space.reversed(), &mut |i| {
                         (entity_view[i as usize], entity_world[i as usize])
                     });
-                    let (clipped, edges) =
-                        s.clipper
-                            .clip(&s.record, RECORD + attrib_stride(mesh), &s.planes);
+                    let (clipped, edges) = s.clipper.clip(
+                        &s.record,
+                        RECORD + polygon.vertex_count as usize,
+                        &s.planes,
+                    );
                     if clipped.is_empty() {
                         self.stats.entity_polygons_outside += 1;
                         continue;
@@ -777,8 +869,9 @@ impl ViewGeometry {
                         clipped,
                         edges,
                         &[], // entities are not clipped to portals: every edge between its endpoints
-                        mesh,
+                        polygon.vertex_count as usize,
                         entity.mesh,
+                        object,
                         kind,
                         PolygonSource::Entity {
                             entity: ei as u32,
@@ -895,16 +988,13 @@ fn range(r: &Range<u32>) -> Range<usize> {
     r.start as usize..r.end as usize
 }
 
-fn attrib_stride(mesh: &Mesh) -> usize {
-    mesh.attribs.iter().map(|a| a.count as usize).sum()
-}
-
-/// Floats in a clip record before the attributes: clip-space x, y, w, then world x, y, z.
+/// Floats in a clip record before the weights: clip-space x, y, w, then world x, y, z.
 const RECORD: usize = 6;
 
-/// Writes a polygon as interleaved records: clip-space x, y, w, world position, then
-/// attributes as f32. `position` gives a position index's clip and world coordinates.
-/// `reversed` walks the outline backwards (for polygons seen in a mirror).
+/// Writes a polygon as interleaved records: clip-space x, y, w, world position, then its
+/// weights over the polygon's vertices (1 on itself). `position` gives a position index's
+/// clip and world coordinates. `reversed` walks the outline backwards (for polygons seen in
+/// a mirror); weights stay in the polygon's own vertex order.
 fn build_record(
     record: &mut Vec<f32>,
     mesh: &Mesh,
@@ -923,10 +1013,8 @@ fn build_record(
         let (clip, world) = position(mesh.vertex_positions[v]);
         record.extend_from_slice(&clip.to_array());
         record.extend_from_slice(&world.to_array());
-        for a in &mesh.attribs {
-            let n = a.count as usize;
-            record.extend((v * n..(v + 1) * n).map(|i| a.data.get_f32(i)));
-        }
+        let own = v - vertices.start;
+        record.extend((0..vertices.len()).map(|k| if k == own { 1.0 } else { 0.0 }));
     }
 }
 
@@ -983,16 +1071,17 @@ fn emit(
     records: &[f32],
     edges: &[Edge],
     plane_lines: &[EdgeLine],
-    mesh: &Mesh,
+    source_vertices: usize,
     id: MeshId,
+    object: u32,
     kind: PolygonKind,
     source: PolygonSource,
     flags: PolyFlags,
     mirror: Option<u32>,
 ) {
-    let stride = RECORD + attrib_stride(mesh);
+    let stride = RECORD + source_vertices;
     let first_vertex = out.vertices.len() as u32;
-    let first_attrib = out.attributes.len() as u32;
+    let first_weight = out.weights.len() as u32;
     for (r, edge) in records.chunks_exact(stride).zip(edges) {
         let (x, y) = to_screen(view, Vec3::from_slice(r));
         out.vertices.push(ScreenVertex {
@@ -1005,14 +1094,15 @@ fn emit(
             Edge::Input(_) => None,
         });
         out.world_positions.push(Vec3::from_slice(&r[3..6]));
-        out.attributes.extend_from_slice(&r[RECORD..]);
+        out.weights.extend_from_slice(&r[RECORD..]);
     }
     out.polygons.push(ViewPolygon {
         first_vertex,
         vertex_count: (out.vertices.len() as u32 - first_vertex) as u16,
-        first_attrib,
-        attrib_stride: (stride - RECORD) as u16,
+        first_weight,
+        source_vertices: source_vertices as u16,
         mesh: id,
+        object,
         kind,
         source,
         flags,

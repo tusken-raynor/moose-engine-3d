@@ -13,7 +13,8 @@ mod render;
 
 pub use render::{LayoutError, RasterConfig, RasterPath, RenderStats, Renderer, Surface, Target};
 pub use shader::{
-    AttribDesc, F32s, Fill, Format, I16s, I32s, LANES, Pixels, Shader, ShaderId, U32s, Uniforms,
+    AttribDesc, F32s, Fill, Format, I16s, I32s, LANES, MAX_TEXTURES, Material, MaterialId, Over,
+    Params, PixelContext, Pixels, RowBehind, SampleContext, TextureSet, U32s, VertexContext,
     high_byte, widen,
 };
 /// The portable SIMD crate the lane types come from, for shaders written elsewhere.

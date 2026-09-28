@@ -18,24 +18,31 @@
 //!   --floor-texture NAME  texture for shiny surfaces, in assets/textures (default
 //!                         metal_tile.png, falling back to test_floor.png); used when the
 //!                         level has uvs
+//!   --no-water            shiny floors start as plain reflective tiles, not water (V toggles);
+//!                         water ripples like Half-Life's software renderer's
+//!   --time T              seconds into the water's animation, for --screenshot
+//!   --show-samples        overlay where shading is sampled (sample rows red, sample
+//!                         points green; O toggles)
 //!
 //! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift faster,
 //! R back to spawn, [ ] minimum sample interval, F floor reflectance (F0), G reflection fade
-//! range, L texture filtering (nearest, bilinear, trilinear, anisotropic), B reflection bounces (0-4), T
-//! translucent crates, P per-pixel crates, Tab frame cap on/off, F12 screenshot, Esc quit.
+//! range, L texture filtering (nearest, bilinear, trilinear, anisotropic), B reflection bounces (0-4), V
+//! water floors on/off, T
+//! translucent crates, P per-pixel crates, O sample lattice overlay, Tab frame cap on/off, F12
+//! screenshot, Esc quit.
 
 use std::path::Path;
 use std::time::Instant;
 
 use glam::Vec3;
-use moose_assets::{Assets, Texture, TextureId};
+use moose_assets::{Assets, RIPPLE_SIZE, Ripples, Texture, TextureId};
 use moose_present::{Display, Key};
 use moose_raster::shaders::{
     CubeReflection, Textured, TexturedAnisotropic, TexturedBilinear, TexturedFresnel,
     TexturedFresnelAnisotropic, TexturedFresnelBilinear, TexturedFresnelNearest, TexturedNearest,
-    VertexColor, VertexColorFresnel, VertexColorTranslucent,
+    VertexColor, VertexColorFresnel, VertexColorTranslucent, Water, filter,
 };
-use moose_raster::{RasterConfig, RasterPath, Renderer, ShaderId, Surface, Target};
+use moose_raster::{MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target};
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
 
@@ -64,6 +71,9 @@ const DEFAULT_FLOOR_TEXTURE: &str = "metal_tile.png";
 const BALL_MODEL: &str = "ball.obj";
 /// Mirror ball cube map faces are this many texels across.
 const CUBE_SIZE: u32 = 128;
+/// Meters per texture repeat on the test levels' floors (`UV_TILE` in
+/// tools/gen_test_assets.py): with the water texture's size, the size of a ripple's shift.
+const WATER_TILE: f32 = 2.0;
 
 struct Options {
     level: String,
@@ -78,6 +88,9 @@ struct Options {
     /// Index into `FILTERS`.
     filter: usize,
     floor_texture: String,
+    water: bool,
+    time: f32,
+    show_samples: bool,
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -93,6 +106,9 @@ fn parse_args() -> Result<Options, String> {
         fps: MAX_FPS,
         filter: 2,
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
+        water: true,
+        time: 0.0,
+        show_samples: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -126,6 +142,9 @@ fn parse_args() -> Result<Options, String> {
                     .ok_or(format!("--filter is one of {}", FILTERS.join(", ")))?;
             }
             "--floor-texture" => o.floor_texture = value()?,
+            "--no-water" => o.water = false,
+            "--show-samples" => o.show_samples = true,
+            "--time" => o.time = value()?.parse().map_err(|_| "bad --time")?,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -142,6 +161,8 @@ struct Settings {
     fade_range: f32,
     /// Texture filtering, an index into `FILTERS`; L cycles.
     filter: usize,
+    /// Shiny floors are water; V toggles.
+    water: bool,
 }
 
 /// A mirror ball's baked surroundings.
@@ -158,15 +179,21 @@ struct App {
     camera: Camera,
     geometry: ViewGeometry,
     renderer: Renderer,
-    opaque: ShaderId,
-    translucent: ShaderId,
-    fresnel: ShaderId,
+    opaque: MaterialId,
+    translucent: MaterialId,
+    fresnel: MaterialId,
     /// The textured shaders, one per filter in `FILTERS`.
-    textured: [ShaderId; 4],
-    textured_fresnel: [ShaderId; 4],
+    textured: [MaterialId; 4],
+    textured_fresnel: [MaterialId; 4],
+    /// The water shader, one per filter in `FILTERS`.
+    water: [MaterialId; 4],
+    /// The water's ripples, and the floor texture rippled by them with its height map
+    /// (redrawn as they move).
+    ripples: Ripples,
+    water_textures: Option<[TextureId; 2]>,
     /// The shiny surfaces' texture, if the level has uvs to map it with.
     floor_texture: Option<TextureId>,
-    cube_reflection: ShaderId,
+    cube_reflection: MaterialId,
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
     settings: Settings,
@@ -195,23 +222,32 @@ impl App {
             .ok_or("the level has no spawn point")?;
         let mut camera = Camera::at_spawn(spawn, viewport);
         camera.move_to(&world, camera.position + Vec3::Y * EYE_HEIGHT);
-        let mut renderer = Renderer::new(RasterConfig::default());
-        let opaque = renderer.register_shader::<VertexColor>();
-        let translucent = renderer.register_shader::<VertexColorTranslucent>();
-        let fresnel = renderer.register_shader::<VertexColorFresnel>();
+        let mut renderer = Renderer::new(RasterConfig {
+            show_samples: options.show_samples,
+            ..RasterConfig::default()
+        });
+        let opaque = renderer.register_material::<VertexColor>();
+        let translucent = renderer.register_material::<VertexColorTranslucent>();
+        let fresnel = renderer.register_material::<VertexColorFresnel>();
         let textured = [
-            renderer.register_shader::<TexturedNearest>(),
-            renderer.register_shader::<TexturedBilinear>(),
-            renderer.register_shader::<Textured>(),
-            renderer.register_shader::<TexturedAnisotropic>(),
+            renderer.register_material::<TexturedNearest>(),
+            renderer.register_material::<TexturedBilinear>(),
+            renderer.register_material::<Textured>(),
+            renderer.register_material::<TexturedAnisotropic>(),
         ];
         let textured_fresnel = [
-            renderer.register_shader::<TexturedFresnelNearest>(),
-            renderer.register_shader::<TexturedFresnelBilinear>(),
-            renderer.register_shader::<TexturedFresnel>(),
-            renderer.register_shader::<TexturedFresnelAnisotropic>(),
+            renderer.register_material::<TexturedFresnelNearest>(),
+            renderer.register_material::<TexturedFresnelBilinear>(),
+            renderer.register_material::<TexturedFresnel>(),
+            renderer.register_material::<TexturedFresnelAnisotropic>(),
         ];
-        let cube_reflection = renderer.register_shader::<CubeReflection>();
+        let water = [
+            renderer.register_material::<Water<{ filter::NEAREST }>>(),
+            renderer.register_material::<Water<{ filter::BILINEAR }>>(),
+            renderer.register_material::<Water<{ filter::TRILINEAR }>>(),
+            renderer.register_material::<Water<{ filter::ANISOTROPIC }>>(),
+        ];
+        let cube_reflection = renderer.register_material::<CubeReflection>();
         let has_uvs = assets
             .mesh(world.geometry)
             .attribs
@@ -231,6 +267,14 @@ impl App {
         } else {
             None
         };
+        let ripples = Ripples::new(1);
+        let water_textures = floor_texture.map(|floor| {
+            let water = ripples.texture("water", assets.texture(floor).base());
+            [
+                assets.add_texture(water),
+                assets.add_texture(ripples.heights("water heights")),
+            ]
+        });
         let cube_maps = vec![None; world.entities.len()];
         let mut app = App {
             assets,
@@ -247,6 +291,9 @@ impl App {
             fresnel,
             textured,
             textured_fresnel,
+            water,
+            ripples,
+            water_textures,
             floor_texture,
             cube_reflection,
             cube_maps,
@@ -256,6 +303,7 @@ impl App {
                 reflectance: options.f0.clamp(0.0, 1.0),
                 fade_range: options.fade.max(0.0),
                 filter: options.filter,
+                water: options.water,
             },
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
@@ -263,6 +311,20 @@ impl App {
         };
         app.bake_cube_maps()?;
         Ok(app)
+    }
+
+    /// Moves the water's animation to `time` seconds, redrawing its textures if the ripples
+    /// moved.
+    fn set_time(&mut self, time: f32) {
+        if let (Some([water, heights]), Some(floor)) = (self.water_textures, self.floor_texture)
+            && self.ripples.advance_to(time as f64)
+        {
+            let rippled = self
+                .ripples
+                .texture("water", self.assets.texture(floor).base());
+            *self.assets.texture_mut(water) = rippled;
+            *self.assets.texture_mut(heights) = self.ripples.heights("water heights");
+        }
     }
 
     /// Bakes a cube map for each mirror ball: the level rendered six times from the ball's
@@ -335,10 +397,9 @@ impl App {
             self.textured_fresnel[s.filter],
             self.floor_texture,
         );
+        let (water, water_textures) = (self.water[s.filter], self.water_textures);
         let level = self.assets.mesh(self.world.geometry);
-        let (cube_reflection, cube_maps, entities) =
-            (self.cube_reflection, &self.cube_maps, &self.world.entities);
-        let (eye, mirrors) = (camera.position, &self.geometry.mirrors);
+        let (cube_reflection, cube_maps) = (self.cube_reflection, &self.cube_maps);
         let mut target = Target {
             pixels,
             width,
@@ -353,62 +414,56 @@ impl App {
                 |p| {
                     if let PolygonSource::World { polygon, .. } = p.source {
                         // Shiny surfaces are textured, if there is a texture to map.
-                        let texture = floor_texture.filter(|_| p.flags.reflective());
+                        let n = level.polygons[polygon as usize].plane.normal;
+                        // Shiny textured floors are water, if it is on: the rippling texture
+                        // and its height map.
+                        let water_textures =
+                            water_textures.filter(|_| s.water && p.flags.reflective() && n.y > 0.9);
+                        let is_water = water_textures.is_some();
+                        let textures = match water_textures {
+                            Some([water, heights]) => [Some(water), Some(heights)],
+                            None => [floor_texture.filter(|_| p.flags.reflective()), None],
+                        };
+                        let texture = textures[0];
                         // A shiny surface whose reflection was drawn is drawn over it. Past the
                         // bounce limit (or with its reflection not drawn), it is plain.
                         if p.reflection.is_none() {
                             return Surface {
-                                texture,
+                                textures,
                                 ..Surface::new(if texture.is_some() { textured } else { opaque })
                             };
                         }
-                        // Seen in a mirror, its view vectors come from that mirror's eye.
-                        let eye = p.mirror.map_or(eye, |m| mirrors[m as usize].eye);
-                        let n = level.polygons[polygon as usize].plane.normal;
-                        let mut surface = Surface {
-                            texture,
-                            ..Surface::new(if texture.is_some() {
-                                textured_fresnel
-                            } else {
-                                fresnel
+                        return Surface {
+                            textures,
+                            // Water shifts what is behind it by its texels' size (meters per
+                            // repeat over texels per repeat).
+                            params: Params::new(&[
+                                s.reflectance,
+                                s.fade_range,
+                                WATER_TILE / RIPPLE_SIZE as f32,
+                            ]),
+                            ..Surface::new(match texture {
+                                Some(_) if is_water => water,
+                                Some(_) => textured_fresnel,
+                                None => fresnel,
                             })
                         };
-                        surface.uniforms.values[..7].copy_from_slice(&[
-                            eye.x,
-                            eye.y,
-                            eye.z,
-                            n.x,
-                            n.y,
-                            n.z,
-                            s.reflectance,
-                        ]);
-                        surface.uniforms.values[7] = s.fade_range;
-                        return surface;
                     }
                     if let PolygonSource::Entity { entity, .. } = p.source
                         && let Some(cube) = cube_maps[entity as usize]
                     {
-                        let eye = p.mirror.map_or(eye, |m| mirrors[m as usize].eye);
-                        let distance = entities[entity as usize].position.distance(eye);
-                        // Face texels per pixel at the middle of the ball, where the view
-                        // turns least across it: a pixel spans 1 / r of the normal's angle (r
-                        // the ball's radius in pixels), so 2 / r of the reflection's, and a
-                        // face texel spans about (pi / 2) / size.
-                        let r = view.focal * cube.radius / distance.max(1e-3);
-                        let lod = (4.0 * CUBE_SIZE as f32 / (std::f32::consts::PI * r)).log2();
-                        let mut surface = Surface {
-                            texture: Some(cube.texture),
+                        return Surface {
+                            textures: [Some(cube.texture), None],
+                            params: Params::new(&[cube.radius, CUBE_SIZE as f32]),
                             ..Surface::new(cube_reflection)
                         };
-                        surface.uniforms.values[..4].copy_from_slice(&[eye.x, eye.y, eye.z, lod]);
-                        return surface;
                     }
                     let mut surface = Surface::new(if s.translucent_crates {
                         translucent
                     } else {
                         opaque
                     });
-                    surface.uniforms.values[0] = 0.5;
+                    surface.params.values[0] = 0.5;
                     if s.per_pixel_crates {
                         surface.path_override = Some(RasterPath::PerPixel);
                     }
@@ -475,6 +530,7 @@ fn run() -> Result<(), String> {
                 .ok_or("--at is outside the level")?;
             (app.camera.yaw, app.camera.pitch) = (yaw.to_radians(), pitch.to_radians());
         }
+        app.set_time(options.time);
         let (view_ms, raster_ms) = app.render()?;
         app.save_png(Path::new(path))?;
         println!(
@@ -495,6 +551,7 @@ fn run() -> Result<(), String> {
     let mut display = Display::open("Moose", app.width, app.height, if capped { cap } else { 0 })?;
     let mut shots = 0;
     let mut last = Instant::now();
+    let started = last;
     let (mut title_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
     while display.is_open() && !display.key_down(Key::Escape) {
         let now = Instant::now();
@@ -579,17 +636,25 @@ fn run() -> Result<(), String> {
             let bounces = &mut app.geometry.config.max_reflections;
             *bounces = (*bounces + 1) % 5;
         }
+        if display.key_pressed(Key::V) {
+            app.settings.water = !app.settings.water;
+        }
         if display.key_pressed(Key::T) {
             app.settings.translucent_crates = !app.settings.translucent_crates;
         }
         if display.key_pressed(Key::P) {
             app.settings.per_pixel_crates = !app.settings.per_pixel_crates;
         }
+        if display.key_pressed(Key::O) {
+            let config = &mut app.renderer.config;
+            config.show_samples = !config.show_samples;
+        }
         if display.key_pressed(Key::Tab) {
             capped = !capped;
             display.set_max_fps(if capped { cap } else { 0 });
         }
 
+        app.set_time(started.elapsed().as_secs_f32());
         let (view_ms, raster_ms) = app.render()?;
         if display.key_pressed(Key::F12) {
             shots += 1;
@@ -608,7 +673,7 @@ fn run() -> Result<(), String> {
             let sector = &app.world.sectors[app.camera.sector as usize].name;
             let cfg = &app.renderer.config;
             display.set_title(&format!(
-                "Moose | {:.0} fps{} | view {:.2} ms, raster {:.2} ms | {sector} ({:.1}, {:.1}, {:.1}) | bounces {} mirrors {} F0 {} fade {} m | {} | min_step {} | crates {}{}",
+                "Moose | {:.0} fps{} | view {:.2} ms, raster {:.2} ms | {sector} ({:.1}, {:.1}, {:.1}) | bounces {} mirrors {} F0 {} fade {} m | {}{} | min_step {} | crates {}{}",
                 frames as f64 / elapsed,
                 if capped { format!(" (cap {cap})") } else { String::new() },
                 view_sum / frames as f64,
@@ -621,6 +686,7 @@ fn run() -> Result<(), String> {
                 app.settings.reflectance,
                 app.settings.fade_range,
                 FILTERS[app.settings.filter],
+                if app.settings.water { " | water" } else { "" },
                 cfg.min_step,
                 if app.settings.translucent_crates { "translucent" } else { "opaque" },
                 if app.settings.per_pixel_crates { ", per-pixel" } else { "" },

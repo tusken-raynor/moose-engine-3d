@@ -2,7 +2,9 @@
 //! Arguments: [WIDTH HEIGHT [LEVEL [BOUNCES [F0]]]] (default 1280 720 two_rooms.mmp 1 0.15);
 //! RAYON_NUM_THREADS=1 for one thread; FRAMES=N for a longer run (default 500). Shiny
 //! surfaces get the Fresnel shader: textured (metal_tile.png, 5 m fade) on levels with uvs,
-//! filtered by FILTER=trilinear (the default), anisotropic, bilinear or nearest.
+//! filtered by FILTER=trilinear (the default), anisotropic, bilinear or nearest. WATER=1
+//! makes the textured shiny floors water, its ripples held still 5 s in (redrawing them as
+//! they move costs about 0.13 ms 20 times a second, outside the frame).
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -12,9 +14,9 @@ use glam::Vec3;
 use moose_assets::Assets;
 use moose_raster::shaders::{
     TexturedFresnel, TexturedFresnelAnisotropic, TexturedFresnelBilinear, TexturedFresnelNearest,
-    VertexColor, VertexColorFresnel,
+    VertexColor, VertexColorFresnel, Water, filter,
 };
-use moose_raster::{RasterConfig, Renderer, Surface, Target};
+use moose_raster::{Params, RasterConfig, Renderer, Surface, Target};
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
 
@@ -38,20 +40,36 @@ fn main() {
         height,
     };
     let mut renderer = Renderer::new(RasterConfig::default());
-    let shader = renderer.register_shader::<VertexColor>();
-    let fresnel = renderer.register_shader::<VertexColorFresnel>();
+    let shader = renderer.register_material::<VertexColor>();
+    let fresnel = renderer.register_material::<VertexColorFresnel>();
     let textured_fresnel = match std::env::var("FILTER").as_deref() {
-        Ok("nearest") => renderer.register_shader::<TexturedFresnelNearest>(),
-        Ok("bilinear") => renderer.register_shader::<TexturedFresnelBilinear>(),
-        Ok("anisotropic") => renderer.register_shader::<TexturedFresnelAnisotropic>(),
-        _ => renderer.register_shader::<TexturedFresnel>(),
+        Ok("nearest") => renderer.register_material::<TexturedFresnelNearest>(),
+        Ok("bilinear") => renderer.register_material::<TexturedFresnelBilinear>(),
+        Ok("anisotropic") => renderer.register_material::<TexturedFresnelAnisotropic>(),
+        _ => renderer.register_material::<TexturedFresnel>(),
     };
+    let water = match std::env::var("FILTER").as_deref() {
+        Ok("nearest") => renderer.register_material::<Water<{ filter::NEAREST }>>(),
+        Ok("bilinear") => renderer.register_material::<Water<{ filter::BILINEAR }>>(),
+        Ok("anisotropic") => renderer.register_material::<Water<{ filter::ANISOTROPIC }>>(),
+        _ => renderer.register_material::<Water>(),
+    };
+    let use_water = std::env::var("WATER").is_ok_and(|w| w == "1");
     let has_uvs = assets
         .mesh(world.geometry)
         .attribs
         .iter()
         .any(|a| a.name == "uv");
     let texture = has_uvs.then(|| assets.load_texture("metal_tile.png").unwrap());
+    let water_textures = texture.filter(|_| use_water).map(|t| {
+        let mut ripples = moose_assets::Ripples::new(1);
+        ripples.advance_to(5.0);
+        let rippled = ripples.texture("water", assets.texture(t).base());
+        [
+            assets.add_texture(rippled),
+            assets.add_texture(ripples.heights("water heights")),
+        ]
+    });
     let geometry = assets.mesh(world.geometry);
     let mut out = ViewGeometry::new();
     out.config.max_reflections = bounces;
@@ -79,21 +97,27 @@ fn main() {
             width,
             height,
         };
-        let mirrors = &out.mirrors;
         let stats = renderer
             .render(&mut target, vp, &out, &assets, |p| match p.source {
                 PolygonSource::World { polygon, .. } if p.reflection.is_some() => {
-                    let eye = p.mirror.map_or(c.position, |m| mirrors[m as usize].eye);
                     let n = geometry.polygons[polygon as usize].plane.normal;
-                    let mut s = Surface {
-                        texture,
-                        ..Surface::new(if texture.is_some() {
-                            textured_fresnel
-                        } else {
-                            fresnel
-                        })
+                    let water_textures = water_textures.filter(|_| n.y > 0.9);
+                    let mut s = match water_textures {
+                        Some([water_texture, heights]) => Surface {
+                            textures: [Some(water_texture), Some(heights)],
+                            ..Surface::new(water)
+                        },
+                        None => Surface {
+                            textures: [texture, None],
+                            ..Surface::new(if texture.is_some() {
+                                textured_fresnel
+                            } else {
+                                fresnel
+                            })
+                        },
                     };
-                    s.uniforms.values = [eye.x, eye.y, eye.z, n.x, n.y, n.z, f0, 5.0];
+                    // Water shifts by its texels' size: 2 m tiles of 128 texels.
+                    s.params = Params::new(&[f0, 5.0, 2.0 / moose_assets::RIPPLE_SIZE as f32]);
                     s
                 }
                 _ => Surface::new(shader),

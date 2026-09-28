@@ -183,17 +183,17 @@ fn assert_invariants(out: &ViewGeometry, cam: &Camera, what: &str) {
     }
     for p in &out.polygons {
         assert!(p.vertex_count >= 3, "{what}: degenerate polygon");
-        // Color first (the test levels' meshes, the crate and the ball), maybe followed by uv
-        // (levels) or a normal (the ball).
-        let stride = p.attrib_stride as usize;
-        assert!(matches!(stride, 3 | 5 | 6), "{what}: stride {stride}");
-        // Colors are u8 values carried as f32; clipping only interpolates, so they stay in range.
-        assert!(
-            out.attributes[p.attributes()]
-                .chunks_exact(stride)
-                .all(|v| v[..3].iter().all(|&c| (-1e-3..=255.001).contains(&c))),
-            "{what}: color out of range"
-        );
+        // Clipping only interpolates: each vertex is a convex combination of the source
+        // polygon's vertices.
+        let n = p.source_vertices as usize;
+        for weights in out.weights[p.weights()].chunks_exact(n) {
+            let sum: f32 = weights.iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-4
+                    && weights.iter().all(|&w| (-1e-5..=1.0 + 1e-5).contains(&w)),
+                "{what}: weights {weights:?}"
+            );
+        }
     }
 }
 
