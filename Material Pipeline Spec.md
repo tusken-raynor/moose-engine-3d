@@ -298,7 +298,7 @@ The gain is mostly from `min_step` 1. The per-row design could not afford it eve
 - **Invariance:** a pixel's value is the same however a row is split into runs (the current bit-for-bit block test, extended to runs). Frames are identical for 1, 2 and many threads (the existing thread and band test).
 - **Vertex stage before clipping:** a polygon clipped by a window shows the same values as the unclipped polygon at the same points, with a nonlinear `shade_vertex` (normalize).
 - **Reference renderer:** it moves from modeling today's per-row sampling to exact per-pixel evaluation. Tolerances derive from the spacing threshold. The texel test keeps its footprint criterion.
-- **Debug overlay:** a config flag and an app key (O) that tint grid rows red and mark grid points green, so sample placement is visible.
+- **Debug overlay:** a config flag and an app setting (options menu, Sampling page: sample overlay) that tint grid rows red and mark grid points green, so sample placement is visible.
 - **Timing:** `timing` before and after, on shiny_rooms at 1280×720, one thread and all threads.
 
 ## Implementation plan
@@ -318,3 +318,15 @@ Each step ends with every test passing and screenshots checked.
 - [x] Grid points past polygon edges are evaluated from plane functions (replacing the edge-anchored lattice and its skipped columns).
 - [x] `Ny` capped at 8, keeping bands independent (built as 8-row blocks, see above). Raised to 32 on Sep 28, with each band building only the grid rows it needs.
 - [x] Vertex-stage output caching for static geometry deferred.
+
+## Planned: material variants per scenario
+
+Noted Sep 29, to build later. Very likely worth it: mirrors redraw whole sectors, so a cheaper material there saves on every reflective surface without changing the default look. A material can name cheaper materials to draw with in particular scenarios, starting with polygons seen in a reflection.
+
+- **Default:** a polygon is shaded the same in every scenario, as today. Nothing changes unless a variant is registered.
+- **Registered once per material:** `renderer.set_variant(material, Scenario::Reflection, cheaper)`. Every surface using that material then uses the cheaper one when seen in a mirror.
+- **Per-surface override:** optional, on `Surface`, for an object that should look different from its material's default (a hero prop kept fully shaded in mirrors, say).
+- **Where it's picked:** polygon setup, before sampling. The variant is an ordinary registered material, so it's validated against the mesh the usual way, and it shares the surface's params and textures.
+- **Later scenarios:** cube-map baking, deeper reflection bounces, distant objects.
+- **What a reflection variant might skip:** shadowed lights, detail noise, Fresnel, dithered samplers, and close sample spacing.
+

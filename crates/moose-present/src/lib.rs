@@ -67,6 +67,11 @@ impl Display {
         self.window.is_key_pressed(key, KeyRepeat::No)
     }
 
+    /// True once for each press of `key`, and again as it repeats while held.
+    pub fn key_repeated(&self, key: Key) -> bool {
+        self.window.is_key_pressed(key, KeyRepeat::Yes)
+    }
+
     pub fn mouse_down(&self, button: MouseButton) -> bool {
         self.window.get_mouse_down(button)
     }

@@ -8,7 +8,10 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
-use crate::level::{EntityKind, EntitySpawn, Level, Light, Portal, PortalFlags, Sector};
+use crate::level::{
+    DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, Oscillation, Portal,
+    PortalFlags, Sector,
+};
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
 use crate::store::Assets;
 use crate::text::{Line, tokenize};
@@ -47,6 +50,56 @@ struct EntityRec {
     position: Vec3,
     rotation: Quat,
     scale: f32,
+    is_static: bool,
+    occluder: OccluderRec,
+}
+
+/// An entity's occluder as written: a proxy model is loaded with the entity's.
+enum OccluderRec {
+    Ready(Occluder),
+    Model(String),
+}
+
+/// Parses an `occluder=` option's value: `none`, `mesh`, `lod:N`, `model:FILE` or
+/// `facing:SIDES:RADIUS[:X:Y:Z]`.
+fn occluder_option(value: &str) -> Result<OccluderRec, String> {
+    let parts: Vec<&str> = value.split(':').collect();
+    let number = |s: &str| {
+        s.parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("'{s}' is not a number"))
+    };
+    Ok(match parts.as_slice() {
+        ["none"] => OccluderRec::Ready(Occluder::None),
+        ["mesh"] => OccluderRec::Ready(Occluder::Mesh),
+        ["lod", n] => OccluderRec::Ready(Occluder::Lod(
+            n.parse().map_err(|_| format!("'{n}' is not a level of detail"))?,
+        )),
+        ["model", file] if !file.is_empty() => OccluderRec::Model(file.to_string()),
+        ["facing", sides, radius, rest @ ..] if rest.is_empty() || rest.len() == 3 => {
+            let sides: u8 = sides
+                .parse()
+                .ok()
+                .filter(|n| (3..=64).contains(n))
+                .ok_or_else(|| format!("facing polygons have 3 to 64 sides, not '{sides}'"))?;
+            let radius = number(radius)?;
+            if radius <= 0.0 {
+                return Err("a facing polygon's radius must be positive".to_string());
+            }
+            let center = match rest {
+                [x, y, z] => Vec3::new(number(x)?, number(y)?, number(z)?),
+                _ => Vec3::ZERO,
+            };
+            OccluderRec::Ready(Occluder::Facing { sides, radius, center })
+        }
+        _ => {
+            return Err(format!(
+                "unknown occluder '{value}' (expected none, mesh, lod:N, model:FILE or \
+                 facing:SIDES:RADIUS[:X:Y:Z])"
+            ));
+        }
+    })
 }
 
 struct Cursor<'a> {
@@ -285,6 +338,12 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 format!("surface {i}: unknown surface flags 0x{flags:x}"),
             ));
         }
+        if flags & PolyFlags::ALL == PolyFlags::ALL {
+            return Err(c.err(
+                r.no,
+                format!("surface {i}: a surface cannot be both reflective and sky"),
+            ));
+        }
         if flags != 0 && adjoin.is_some() {
             return Err(c.err(
                 r.no,
@@ -375,9 +434,15 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     }
 
     // ---- Entities
-    let section = c.section("entities", false, Some(11))?;
+    let section = c.section("entities", false, None)?;
     let mut entities = Vec::new();
     for r in &section.rows {
+        if r.tokens.len() < 11 {
+            return Err(c.err(
+                r.no,
+                format!("entity row needs 11 fields, found {}", r.tokens.len()),
+            ));
+        }
         let name = r.tokens[10].clone();
         let kind = match r.tokens[0].as_str() {
             "spawn" => EntityKind::Spawn,
@@ -422,6 +487,24 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         if scale <= 0.0 {
             return Err(c.err(r.no, format!("entity '{name}': scale must be positive")));
         }
+        // Options after the name.
+        let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
+        for option in &r.tokens[11..] {
+            let fail = |m: String| c.err(r.no, format!("entity '{name}': {m}"));
+            if kind == EntityKind::Spawn {
+                return Err(fail(format!("spawn points take no options ('{option}')")));
+            }
+            match option.split_once('=') {
+                None if option == "static" => {
+                    if kind == EntityKind::Actor {
+                        return Err(fail("only props can be static".to_string()));
+                    }
+                    is_static = true;
+                }
+                Some(("occluder", value)) => occluder = occluder_option(value).map_err(fail)?,
+                _ => return Err(fail(format!("unknown option '{option}'"))),
+            }
+        }
         entities.push(EntityRec {
             line: r.no,
             name,
@@ -431,6 +514,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             position,
             rotation,
             scale,
+            is_static,
+            occluder,
         });
     }
 
@@ -452,13 +537,13 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "lights") {
         let section = c.section("lights", false, None)?;
         for (i, r) in section.rows.iter().enumerate() {
-            // A point light, or a spot light with its direction and cone.
-            if r.tokens.len() != 8 && r.tokens.len() != 13 {
+            // A point light, or a spot light with its direction and cone; then options.
+            let fields = r.tokens.iter().take_while(|t| !t.contains('=')).count();
+            if fields != 8 && fields != 13 {
                 return Err(c.err(
                     r.no,
                     format!(
-                        "light {i} needs 8 fields (a point light) or 13 (a spot light), found {}",
-                        r.tokens.len()
+                        "light {i} needs 8 fields (a point light) or 13 (a spot light), found {fields}"
                     ),
                 ));
             }
@@ -475,7 +560,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             if range <= 0.0 {
                 return Err(c.err(r.no, format!("light {i}: range must be positive")));
             }
-            let light = if r.tokens.len() == 8 {
+            let mut light = if fields == 8 {
                 Light::point(sector as u32, position, color, range)
             } else {
                 let direction = Vec3::new(c.float(r, 8)?, c.float(r, 9)?, c.float(r, 10)?);
@@ -491,7 +576,89 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 }
                 Light::spot(sector as u32, position, color, range, direction, inner, outer)
             };
+            light.is_static = true;
+            for option in &r.tokens[fields..] {
+                let fail = |m: String| c.err(r.no, format!("light {i}: {m}"));
+                match option.split_once('=') {
+                    Some(("radius", v)) => {
+                        light.radius = v
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|r| r.is_finite() && *r >= 0.0)
+                            .ok_or_else(|| fail(format!("radius '{v}' must be 0 or more")))?;
+                    }
+                    Some(("shadows", "on")) => light.shadows = true,
+                    Some(("shadows", "off")) => light.shadows = false,
+                    Some(("oscillate", v)) => {
+                        let n: Vec<f32> = v
+                            .split(':')
+                            .map(|x| x.parse::<f32>().ok().filter(|x| x.is_finite()))
+                            .collect::<Option<_>>()
+                            .filter(|n: &Vec<f32>| n.len() == 4)
+                            .ok_or_else(|| fail(format!("oscillate is DX:DY:DZ:PERIOD, not '{v}'")))?;
+                        if n[3] <= 0.0 {
+                            return Err(fail("an oscillation's period must be positive".into()));
+                        }
+                        light.motion = Some(Oscillation {
+                            offset: Vec3::new(n[0], n[1], n[2]),
+                            period: n[3],
+                        });
+                        // It moves: its shadows are worked out as it goes, not kept.
+                        light.is_static = false;
+                    }
+                    _ => return Err(fail(format!("unknown option '{option}'"))),
+                }
+            }
             lights.push((r.no, light));
+        }
+    }
+
+    // Optional: directional lights, entering through sky surfaces.
+    let mut directional = Vec::new();
+    if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "directional") {
+        let section = c.section("directional", false, None)?;
+        for (i, r) in section.rows.iter().enumerate() {
+            let fields = r.tokens.iter().take_while(|t| !t.contains('=')).count();
+            if fields != 7 {
+                return Err(c.err(
+                    r.no,
+                    format!("directional light {i} needs 7 fields, found {fields}"),
+                ));
+            }
+            let direction = Vec3::new(c.float(r, 0)?, c.float(r, 1)?, c.float(r, 2)?);
+            let color = Vec3::new(c.float(r, 3)?, c.float(r, 4)?, c.float(r, 5)?);
+            let angle = c.float(r, 6)?;
+            if direction.length() < 1e-6 {
+                return Err(c.err(r.no, format!("directional light {i}: direction cannot be zero")));
+            }
+            if color.min_element() < 0.0 {
+                return Err(c.err(r.no, format!("directional light {i}: color cannot be negative")));
+            }
+            if !(0.0..=45.0).contains(&angle) {
+                return Err(c.err(
+                    r.no,
+                    format!("directional light {i}: angle must be from 0 to 45 degrees"),
+                ));
+            }
+            let mut shadows = true;
+            for option in &r.tokens[fields..] {
+                match option.as_str() {
+                    "shadows=on" => shadows = true,
+                    "shadows=off" => shadows = false,
+                    _ => {
+                        return Err(c.err(
+                            r.no,
+                            format!("directional light {i}: unknown option '{option}'"),
+                        ));
+                    }
+                }
+            }
+            directional.push(DirectionalLight {
+                direction: direction.normalize(),
+                color,
+                angle,
+                shadows,
+            });
         }
     }
 
@@ -670,6 +837,21 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
     }
 
+    // ---- Validation: moving lights stay inside the level (both ends of their swing)
+    let inside_level = |p: Vec3| {
+        sectors.iter().enumerate().any(|(si, s)| {
+            let tol = TOLERANCE * (bounds[si].max - bounds[si].min).length().max(1.0);
+            (s.first..s.first + s.count).all(|k| surfaces[k].plane.distance(p) >= -tol)
+        })
+    };
+    for (i, (line, light)) in lights.iter().enumerate() {
+        if let Some(m) = light.motion
+            && !(inside_level(light.position + m.offset) && inside_level(light.position - m.offset))
+        {
+            return Err(c.err(*line, format!("light {i} swings outside the level")));
+        }
+    }
+
     // ---- Validation: lights sit inside their sector
     for (i, (line, light)) in lights.iter().enumerate() {
         let sector = light.sector as usize;
@@ -749,6 +931,14 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             ),
             None => None,
         };
+        let occluder = match e.occluder {
+            OccluderRec::Ready(o) => o,
+            OccluderRec::Model(file) => Occluder::Model(
+                assets
+                    .load_mesh(&file)
+                    .map_err(|err| c.err(e.line, format!("entity '{}': occluder: {err}", e.name)))?,
+            ),
+        };
         spawns.push(EntitySpawn {
             name: e.name,
             kind: e.kind,
@@ -757,6 +947,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             position: e.position,
             rotation: e.rotation,
             scale: e.scale,
+            is_static: e.is_static,
+            occluder,
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
@@ -770,5 +962,6 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         spawns,
         ambient,
         lights: lights.into_iter().map(|(_, l)| l).collect(),
+        directional,
     })
 }

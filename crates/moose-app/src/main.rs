@@ -2,18 +2,22 @@
 //!
 //! cargo run --release -p moose-app -- [options]
 //!
-//! Options:
+//! Options (all but the screenshot ones can also be changed in the options menu, Esc):
 //!   --level NAME          level in assets/levels (default shiny_rooms.mmp)
 //!   --size WxH            framebuffer size (default 1280x720)
 //!   --filter NAME         texture sampler: METHOD_mipmap_MIP, with METHOD nearest, bilinear
 //!                         or dithered and MIP none, nearest, linear or dithered (default
 //!                         bilinear_mipmap_linear)
-//!   --fps N               frame rate cap (default 60; 0 starts uncapped, Tab toggles)
+//!   --fps N               frame rate cap (default 60; 0 starts uncapped)
 //!   --screenshot FILE     render one frame from the spawn point to a PNG and exit,
 //!                         without opening a window
-//!   --at X,Y,Z,YAW,PITCH  camera for --screenshot (degrees)
+//!   --at X,Y,Z,YAW,PITCH[,ROLL]  camera for --screenshot (degrees)
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
-//!                         on a player standing there (U remounts it)
+//!                         on a player standing there
+//!   --flashlight-at X,Y,Z,DX,DY,DZ  start with the flashlight locked at X,Y,Z, aimed along
+//!                         DX,DY,DZ
+//!   --translucent-crates, --per-pixel-crates, --unlit  start with translucent or
+//!                         per-pixel crates, or with lighting off
 //!   --bounces N           how many reflections deep mirrors go (default 1)
 //!   --f0 X                reflectance of shiny surfaces seen head-on, 0-1 (default 0.15)
 //!   --fade M              how far past a textured shiny surface its reflection fades out,
@@ -21,43 +25,45 @@
 //!   --floor-texture NAME  texture for shiny surfaces, in assets/textures (default
 //!                         metal_tile.png, falling back to test_floor.png); used when the
 //!                         level has uvs
-//!   --water               shiny floors start as water, not plain reflective tiles (V toggles);
+//!   --water               shiny floors start as water, not plain reflective tiles;
 //!                         water ripples like Half-Life's software renderer's
-//!   --no-flashlight       start with the player's flashlight off (H toggles)
-//!   --no-shadows          start with the flashlight's shadows off (Z toggles)
+//!   --no-flashlight       start with the player's flashlight off
+//!   --no-shadows          start with shadows off
+//!   --no-sun              start with the level's directional lights off
+//!   --light-scale K       the level's point and spot lights' source sizes (their shadows'
+//!                         softness) times K (default 1)
+//!   --no-shadow-cache     carve static lights' shadows every frame (to compare)
+//!   --no-dynamic-shadows  only baked shadows: none from the flashlight or moving lights,
+//!                         moving occluders, or on moving surfaces (no carving per frame)
+//!   --hud, --menu PAGE    for --screenshot: draw the debug HUD, or a menu page (main,
+//!                         lighting, flashlight, rendering, sampling, controls), over it
+//!   --sun-angle A         directional lights' source size in degrees, instead of the
+//!                         level's
 //!   --light-radius R      radius of the flashlight's source in meters: its shadows soften
-//!                         over the part of it an occluder covers (default 0.05; 0 is hard;
-//!                         X cycles 0, 0.02, 0.05, 0.1, 0.2)
-//!   --level-lights        start with the level's own lights on (N toggles; off by default,
-//!                         leaving the flashlight and the ambient light)
+//!                         over the part of it an occluder covers (default 0.05; 0 is hard)
+//!   --level-lights        start with the level's own lights on (off by default, leaving the
+//!                         flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
 //!   --show-samples        overlay where shading is sampled (sample rows red, sample
-//!                         points green; O toggles)
-//!   --min-step N          smallest sample spacing on steep surfaces, in pixels ([ ] halve
-//!                         and double it)
-//!   --light-spacing N     widest sample spacing on lit surfaces, in pixels (- = halve and
-//!                         double it)
+//!                         points green)
+//!   --min-step N          smallest sample spacing on steep surfaces, in pixels
+//!   --light-spacing N     widest sample spacing on lit surfaces, in pixels
 //!   --steep-limit X       how much depth may change across a cell held to the minimum
 //!                         spacing before steep surfaces go finer anyway (default 0.25;
-//!                         "off" never does; ; cycles 1/8, 1/4, 1/2, 1, off)
+//!                         "off" never does)
 //!   --penumbra-threshold X  how much a spot light's cone may fade across a cell of sample
 //!                         points where its penumbra crosses (default 0.125; 0 for no
-//!                         limit; J cycles 1/4, 1/8, 1/16, off)
-//!   --penumbra X          spot lights' penumbra as a multiple of their own (default 1;
-//!                         9 and 0 shrink and grow it)
+//!                         limit)
+//!   --penumbra X          spot lights' penumbra as a multiple of their own (default 1)
 //!   --step-threshold X    how much depth may change across a cell before perspective asks
-//!                         for finer spacing (default 1/16 = 0.0625; , . halve and double it)
+//!                         for finer spacing (default 1/16 = 0.0625)
 //!
-//! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift faster,
-//! R back to spawn, [ ] minimum sample interval, - = light sample spacing, ; steep surface
-//! limit, , . perspective threshold, F floor reflectance (F0), G reflection fade
-//! range, L texture sampler (the twelve of --filter; Shift+L back), B reflection bounces (0-4), V
-//! water floors on/off, T
-//! translucent crates, P per-pixel crates, O sample lattice overlay, Tab frame cap on/off, F12
-//! screenshot, M mouse smoothing (off, 50, 100, 150 ms), K lights on/off, H flashlight on/off, U lock the
-//! flashlight where it is (again: back on the shoulder), Z flashlight shadows on/off, X flashlight size (shadow softness), N level
-//! lights on/off,
-//! 9 0 spot light penumbra narrower and wider, Esc quit.
+//! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift
+//! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
+//! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
+//! reproduces this view, F3 debug HUD, F12 screenshot. Every other setting is in the menu.
+
+mod ui;
 
 use std::path::Path;
 use std::time::Instant;
@@ -66,14 +72,14 @@ use glam::Vec3;
 use moose_assets::{Assets, Light, MeshId, RIPPLE_SIZE, Ripples, Texture, TextureId};
 use moose_present::{Display, Key};
 use moose_raster::shaders::{
-    CubeReflection, Textured, TexturedFresnel, TexturedTranslucent, VertexColor,
+    CubeReflection, Textured, TexturedFresnel, TexturedTranslucent, UnlitColor, VertexColor,
     VertexColorFresnel, VertexColorTranslucent, Water, filter,
 };
 use moose_raster::{
     MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target, register_per_filter,
 };
-use moose_scene::{Camera, Occluder, Viewport, World};
-use moose_view::{PolygonSource, ViewGeometry};
+use moose_scene::{Camera, Viewport, World};
+use moose_view::{MAX_SHADOW_SLOTS, PolygonSource, ViewGeometry};
 
 const EYE_HEIGHT: f32 = 1.7;
 const MOVE_SPEED: f32 = 3.0; // m/s
@@ -112,14 +118,14 @@ fn sampler_index(f: u8) -> usize {
     filter::ALL.iter().position(|&g| g == f).expect("a sampler")
 }
 
-/// Penumbra thresholds J cycles through (see `RasterConfig::penumbra_threshold`; 0 is
+/// Penumbra thresholds the menu steps through (see `RasterConfig::penumbra_threshold`; 0 is
 /// off).
 const PENUMBRA_THRESHOLDS: [f32; 4] = [0.25, 0.125, 0.0625, 0.0];
 
-/// How much 9 and 0 shrink and grow spot lights' penumbra, each press.
+/// How much the menu shrinks and grows spot lights' penumbra, each step.
 const PENUMBRA_STEP: f32 = 1.25;
 
-/// The player's flashlight (H toggles): a spot light mounted on their right shoulder, at
+/// The player's flashlight: a spot light mounted on their right shoulder, at
 /// this offset from the eye in camera space (x right, y up, -z forward), aimed where they
 /// look.
 const FLASHLIGHT_OFFSET: Vec3 = Vec3::new(0.25, -0.2, 0.0);
@@ -128,11 +134,17 @@ const FLASHLIGHT_COLOR: Vec3 = Vec3::new(3.4, 3.5, 3.9);
 const FLASHLIGHT_RANGE: f32 = 16.0;
 /// Its cone's inner and outer half-angles, in degrees.
 const FLASHLIGHT_CONE: (f32, f32) = (6.0, 20.0);
-/// Sizes of its source X cycles through (radius in meters, `--light-radius`): its shadows
+/// Multiples of the level's point and spot lights' source sizes (their `radius=`) the
+/// menu steps through: 0 casts hard shadows, 1 is as authored.
+const LIGHT_SCALES: [f32; 5] = [0.0, 0.5, 1.0, 2.0, 4.0];
+/// Angular sizes of directional lights' sources the menu steps through, in degrees (the sun is
+/// about 0.53): their shadows soften over the part of it an occluder covers.
+const SUN_ANGLES: [f32; 5] = [0.0, 0.53, 2.0, 5.0, 10.0];
+/// Sizes of its source the menu steps through (radius in meters, `--light-radius`): its shadows
 /// soften over the part of it an occluder covers; 0 casts hard shadows.
 const FLASHLIGHT_RADII: [f32; 5] = [0.0, 0.02, 0.05, 0.1, 0.2];
 
-/// Steep surface limits `;` cycles through (see `RasterConfig::steep_limit`).
+/// Steep surface limits the menu steps through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
 
 /// Entities with this model are crates, textured with `CRATE_TEXTURE` (in assets/textures):
@@ -148,13 +160,19 @@ const CUBE_SIZE: u32 = 128;
 /// tools/gen_test_assets.py): with the water texture's size, the size of a ripple's shift.
 const WATER_TILE: f32 = 2.0;
 
+#[derive(Clone)]
 struct Options {
     level: String,
     width: u32,
     height: u32,
     screenshot: Option<String>,
-    at: Option<[f32; 5]>,
-    lock_flashlight: Option<[f32; 5]>,
+    at: Option<[f32; 6]>,
+    lock_flashlight: Option<[f32; 6]>,
+    /// The flashlight locked at this position, aimed this way.
+    flashlight_at: Option<[f32; 6]>,
+    translucent_crates: bool,
+    per_pixel_crates: bool,
+    unlit: bool,
     bounces: u8,
     f0: f32,
     fade: f32,
@@ -166,6 +184,14 @@ struct Options {
     no_flashlight: bool,
     level_lights: bool,
     no_shadows: bool,
+    no_sun: bool,
+    light_scale: f32,
+    /// For screenshots: draw the debug HUD, or a menu page, over the frame.
+    hud: bool,
+    menu: Option<Page>,
+    no_shadow_cache: bool,
+    no_dynamic_shadows: bool,
+    sun_angle: Option<f32>,
     light_radius: f32,
     time: f32,
     show_samples: bool,
@@ -178,14 +204,21 @@ struct Options {
     penumbra: f32,
 }
 
-/// `X,Y,Z,YAW,PITCH` for `option`.
-fn pose(text: &str, option: &str) -> Result<[f32; 5], String> {
-    let v: Vec<f32> = text
-        .split(',')
+/// `X,Y,Z,YAW,PITCH[,ROLL]` for `option` (roll 0 if not given).
+fn pose(text: &str, option: &str) -> Result<[f32; 6], String> {
+    let mut v = numbers(text, option)?;
+    if v.len() == 5 {
+        v.push(0.0);
+    }
+    v.try_into().map_err(|_| format!("{option} is X,Y,Z,YAW,PITCH[,ROLL]"))
+}
+
+/// Comma-separated numbers for `option`.
+fn numbers(text: &str, option: &str) -> Result<Vec<f32>, String> {
+    text.split(',')
         .map(|n| n.trim().parse::<f32>())
         .collect::<Result<_, _>>()
-        .map_err(|_| format!("bad {option}"))?;
-    v.try_into().map_err(|_| format!("{option} is X,Y,Z,YAW,PITCH"))
+        .map_err(|_| format!("bad {option}"))
 }
 
 fn parse_args() -> Result<Options, String> {
@@ -196,6 +229,10 @@ fn parse_args() -> Result<Options, String> {
         screenshot: None,
         at: None,
         lock_flashlight: None,
+        flashlight_at: None,
+        translucent_crates: false,
+        per_pixel_crates: false,
+        unlit: false,
         bounces: 2,
         f0: 0.15,
         fade: 5.0,
@@ -205,6 +242,13 @@ fn parse_args() -> Result<Options, String> {
         water: false,
         no_flashlight: false,
         no_shadows: false,
+        no_sun: false,
+        light_scale: 1.0,
+        hud: false,
+        menu: None,
+        no_shadow_cache: false,
+        no_dynamic_shadows: false,
+        sun_angle: None,
         light_radius: FLASHLIGHT_RADII[2],
         level_lights: false,
         time: 0.0,
@@ -230,6 +274,14 @@ fn parse_args() -> Result<Options, String> {
             "--screenshot" => o.screenshot = Some(value()?),
             "--at" => o.at = Some(pose(&value()?, "--at")?),
             "--lock-flashlight" => o.lock_flashlight = Some(pose(&value()?, "--lock-flashlight")?),
+            "--flashlight-at" => {
+                let v = numbers(&value()?, "--flashlight-at")?;
+                o.flashlight_at =
+                    Some(v.try_into().map_err(|_| "--flashlight-at is X,Y,Z,DX,DY,DZ")?);
+            }
+            "--translucent-crates" => o.translucent_crates = true,
+            "--per-pixel-crates" => o.per_pixel_crates = true,
+            "--unlit" => o.unlit = true,
             "--bounces" => o.bounces = value()?.parse().map_err(|_| "bad --bounces")?,
             "--f0" => o.f0 = value()?.parse().map_err(|_| "bad --f0")?,
             "--fade" => o.fade = value()?.parse().map_err(|_| "bad --fade")?,
@@ -245,6 +297,21 @@ fn parse_args() -> Result<Options, String> {
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--no-shadows" => o.no_shadows = true,
+            "--no-sun" => o.no_sun = true,
+            "--hud" => o.hud = true,
+            "--menu" => {
+                let name = value()?;
+                o.menu = Some(Page::named(&name).ok_or(format!(
+                    "--menu is one of {}",
+                    Page::ALL.map(Page::name).join(", ")
+                ))?);
+            }
+            "--light-scale" => {
+                o.light_scale = value()?.parse().map_err(|_| "bad --light-scale")?
+            }
+            "--no-shadow-cache" => o.no_shadow_cache = true,
+            "--no-dynamic-shadows" => o.no_dynamic_shadows = true,
+            "--sun-angle" => o.sun_angle = Some(value()?.parse().map_err(|_| "bad --sun-angle")?),
             "--light-radius" => {
                 o.light_radius = value()?.parse().map_err(|_| "bad --light-radius")?
             }
@@ -281,32 +348,44 @@ fn parse_args() -> Result<Options, String> {
 struct Settings {
     translucent_crates: bool,
     per_pixel_crates: bool,
-    /// F0 of shiny surfaces; F steps through `REFLECTANCE`.
+    /// F0 of shiny surfaces, one of `REFLECTANCE`.
     reflectance: f32,
-    /// Fade range of textured shiny surfaces' reflections; G steps through `FADE_RANGE`.
+    /// Fade range of textured shiny surfaces' reflections, one of `FADE_RANGE`.
     fade_range: f32,
-    /// Texture sampler, an index into `filter::ALL`; L cycles (Shift+L backward).
+    /// Texture sampler, an index into `filter::ALL`.
     filter: usize,
-    /// Shiny floors are water; V toggles.
+    /// Shiny floors are water.
     water: bool,
-    /// The level's lights are on; K toggles (off, surfaces show their full color).
+    /// Lighting is on (off, surfaces show their full color).
     lit: bool,
     /// Spot lights' penumbra (the angle over which their cone fades) as a multiple of the
-    /// level's, around the middle of the fade; 9 and 0 shrink and grow it.
+    /// level's, around the middle of the fade.
     penumbra: f32,
-    /// The player's flashlight is on; H toggles.
+    /// The player's flashlight is on.
     flashlight: bool,
-    /// The level's own lights are on (the flashlight and ambient light aside); N toggles.
+    /// The level's own lights are on (the flashlight and ambient light aside).
     level_lights: bool,
-    /// The flashlight casts shadows; Z toggles.
+    /// Lights cast shadows.
     shadows: bool,
-    /// The radius of the flashlight's source, in meters (X cycles `FLASHLIGHT_RADII`).
+    /// The level's directional lights (the sun) are on.
+    sun: bool,
+    /// Their source's angular size in degrees, if not the level's (one of `SUN_ANGLES`).
+    sun_angle: Option<f32>,
+    /// The level's point and spot lights' source sizes, as a multiple of the level's (one
+    /// of `LIGHT_SCALES`).
+    light_scale: f32,
+    /// The radius of the flashlight's source, in meters (one of `FLASHLIGHT_RADII`).
     light_radius: f32,
-    /// Where the flashlight was left when U locked it in place (sector, position, direction);
-    /// `None` while it is on the player's shoulder. U again remounts it.
+    /// Where the flashlight was left when it was locked in place (sector, position,
+    /// direction); `None` while it is on the player's shoulder.
     flashlight_lock: Option<(u32, Vec3, Vec3)>,
-    /// Mouse look smoothing, an index into `MOUSE_SMOOTHING`; M cycles.
+    /// Mouse look smoothing, an index into `MOUSE_SMOOTHING`.
     smoothing: usize,
+    /// The frame rate is capped, at `cap` frames a second.
+    capped: bool,
+    cap: u32,
+    /// The debug HUD is showing; F3 toggles.
+    hud: bool,
 }
 
 /// A mirror ball's baked surroundings.
@@ -326,6 +405,8 @@ struct App {
     geometry: ViewGeometry,
     renderer: Renderer,
     opaque: MaterialId,
+    /// Sky surfaces: their vertex colors, unlit.
+    unlit: MaterialId,
     translucent: MaterialId,
     fresnel: MaterialId,
     /// The textured shaders, one per sampler in `filter::ALL`.
@@ -352,6 +433,11 @@ struct App {
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
     settings: Settings,
+    /// The levels in assets/levels (file names, sorted), and the one loaded.
+    levels: Vec<String>,
+    level: String,
+    /// Seconds since the start: for the water's ripples and moving lights.
+    time: f32,
     pixels: Vec<u32>,
     width: u32,
     height: u32,
@@ -390,6 +476,7 @@ impl App {
             ..defaults
         });
         let opaque = renderer.register_material::<VertexColor>();
+        let unlit = renderer.register_material::<UnlitColor>();
         let translucent = renderer.register_material::<VertexColorTranslucent>();
         let fresnel = renderer.register_material::<VertexColorFresnel>();
         let textured = register_per_filter!(renderer, Textured);
@@ -406,20 +493,6 @@ impl App {
             )),
             None => None,
         };
-        // What casts shadows: crates as themselves (boxes), mirror balls as spheres.
-        let mut world = world;
-        let ball = assets.mesh_id(BALL_MODEL);
-        for entity in &mut world.entities {
-            if crate_texture.is_some_and(|(mesh, _)| mesh == entity.mesh) {
-                entity.occluder = Occluder::Mesh;
-            } else if Some(entity.mesh) == ball {
-                let b = assets.mesh(entity.mesh).bounds;
-                entity.occluder = Occluder::Sphere {
-                    center: (b.min + b.max) * 0.5,
-                    radius: (b.max.x - b.min.x) * 0.5,
-                };
-            }
-        }
         let has_uvs = assets
             .mesh(world.geometry)
             .attribs
@@ -465,10 +538,13 @@ impl App {
             geometry: {
                 let mut g = ViewGeometry::new();
                 g.config.max_reflections = options.bounces;
+                g.config.cache_shadows = !options.no_shadow_cache;
+                g.config.dynamic_shadows = !options.no_dynamic_shadows;
                 g
             },
             renderer,
             opaque,
+            unlit,
             translucent,
             fresnel,
             textured,
@@ -484,21 +560,30 @@ impl App {
             cube_reflection,
             cube_maps,
             settings: Settings {
-                translucent_crates: false,
-                per_pixel_crates: false,
+                translucent_crates: options.translucent_crates,
+                per_pixel_crates: options.per_pixel_crates,
                 reflectance: options.f0.clamp(0.0, 1.0),
                 fade_range: options.fade.max(0.0),
                 filter: options.filter,
                 water: options.water,
-                lit: true,
+                lit: !options.unlit,
                 penumbra: options.penumbra.clamp(1.0 / 64.0, 64.0),
                 flashlight: !options.no_flashlight,
                 level_lights: true,
                 shadows: !options.no_shadows,
+                sun: !options.no_sun,
+                light_scale: options.light_scale.max(0.0),
+                sun_angle: options.sun_angle.map(|a| a.clamp(0.0, 45.0)),
                 light_radius: options.light_radius.max(0.0),
                 flashlight_lock: None,
                 smoothing: 2,
+                capped: options.fps != 0,
+                cap: if options.fps == 0 { MAX_FPS } else { options.fps },
+                hud: options.hud || options.screenshot.is_none(),
             },
+            time: 0.0,
+            levels: level_files(root),
+            level: options.level.clone(),
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -506,6 +591,14 @@ impl App {
         // Mirror balls' cube maps see the level's lights only, not the flashlight where the
         // player happens to start.
         app.apply_lights(false);
+        // The static lights' shadows on static surfaces, carved now rather than as each
+        // surface is first seen.
+        let started = Instant::now();
+        let baked = app.geometry.bake_shadows(&app.world, &app.assets);
+        println!(
+            "baked {baked} static light shadows in {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
         app.bake_cube_maps()?;
         app.settings.level_lights = options.level_lights;
         Ok(app)
@@ -514,6 +607,7 @@ impl App {
     /// Moves the water's animation to `time` seconds, redrawing its textures if the ripples
     /// moved.
     fn set_time(&mut self, time: f32) {
+        self.time = time;
         if let (Some([water, heights]), Some(floor)) = (self.water_textures, self.floor_texture)
             && self.ripples.advance_to(time as f64)
         {
@@ -578,20 +672,42 @@ impl App {
                 l.cos_outer.clamp(-1.0, 1.0).acos().to_degrees(),
             );
             let (middle, half) = ((inner + outer) / 2.0, (outer - inner) / 2.0 * k);
-            Light::spot(
-                l.sector,
-                l.position,
-                l.color,
-                l.range,
-                l.direction,
-                (middle - half).clamp(0.0, 180.0),
-                (middle + half).clamp(0.0, 180.0),
-            )
+            let cos = |degrees: f32| degrees.clamp(0.0, 180.0).to_radians().cos();
+            Light {
+                cos_inner: cos(middle - half),
+                cos_outer: cos(middle + half),
+                ..l
+            }
         };
-        let mut lights: Vec<Light> = match self.settings.level_lights {
-            true => self.lights.0.iter().map(|&l| scaled(l)).collect(),
-            false => Vec::new(),
-        };
+        // The level's lights (N) and its directional lights (I, with the angle Y sets).
+        // Those that cast shadows have fixed shadow slots after the flashlight's (their
+        // place in the level plus 1), so their cached shadows stay theirs whatever is on.
+        let s = &self.settings;
+        let mut lights: Vec<Light> = Vec::new();
+        for (i, &l) in self.lights.0.iter().enumerate() {
+            let mut l = scaled(l);
+            // A moving light where it is now, in the sector it is in.
+            if l.motion.is_some() {
+                l.position = l.at_time(self.time);
+                l.sector = self.world.find_sector(l.position).unwrap_or(l.sector);
+            }
+            if l.directional {
+                if !s.sun {
+                    continue;
+                }
+                if let Some(angle) = s.sun_angle {
+                    l.radius = (angle.to_radians() / 2.0).sin();
+                }
+            } else if !s.level_lights {
+                continue;
+            } else {
+                l.radius *= s.light_scale;
+            }
+            if s.shadows && l.shadows && i + 1 < MAX_SHADOW_SLOTS as usize {
+                l.shadow = Some(i as u8 + 1);
+            }
+            lights.push(l);
+        }
         if flashlight && self.settings.flashlight {
             let mut light = scaled(self.flashlight());
             // Shadow slot 0: the view carves its shadows into polygons.
@@ -602,7 +718,7 @@ impl App {
         self.world.set_lights(lights, self.lights.1);
     }
 
-    /// The player's flashlight: where U locked it, or on their shoulder.
+    /// The player's flashlight: where it was locked, or on their shoulder.
     fn flashlight(&self) -> Light {
         let (sector, position, direction) = self.settings.flashlight_lock.unwrap_or_else(|| self.mount());
         Light::spot(
@@ -617,14 +733,275 @@ impl App {
     }
 
     /// Puts the camera at `[x, y, z, yaw, pitch]` (degrees); `option` names it in errors.
-    fn place_camera(&mut self, [x, y, z, yaw, pitch]: [f32; 5], option: &str) -> Result<(), String> {
+    fn place_camera(&mut self, [x, y, z, yaw, pitch, roll]: [f32; 6], option: &str) -> Result<(), String> {
         self.camera.position = Vec3::new(x, y, z);
         self.camera.sector = self
             .world
             .find_sector(self.camera.position)
             .ok_or(format!("{option} is outside the level"))?;
-        (self.camera.yaw, self.camera.pitch) = (yaw.to_radians(), pitch.to_radians());
+        (self.camera.yaw, self.camera.pitch, self.camera.roll) =
+            (yaw.to_radians(), pitch.to_radians(), roll.to_radians());
         Ok(())
+    }
+
+    /// A menu page's rows: each item's label and, for a setting, its value now.
+    fn rows(&self, page: Page) -> Vec<ui::Row> {
+        self.items(page)
+            .iter()
+            .map(|&item| match item {
+                Item::Load(i) => {
+                    let name = &self.levels[i as usize];
+                    ui::Row {
+                        label: name.trim_end_matches(".mmp").to_string(),
+                        value: (*name == self.level).then(|| "loaded".to_string()),
+                    }
+                }
+                _ => ui::Row {
+                    label: item.label().to_string(),
+                    value: match item {
+                        Item::Set(s) => Some(self.value(s)),
+                        _ => None,
+                    },
+                },
+            })
+            .collect()
+    }
+
+    /// A menu page's items: the page's own, or for the level list, one per level file.
+    fn items(&self, page: Page) -> Vec<Item> {
+        match page {
+            Page::Levels => (0..self.levels.len() as u16).map(Item::Load).collect(),
+            _ => page.items().to_vec(),
+        }
+    }
+
+    /// A setting's value, as the menu shows it.
+    fn value(&self, setting: Setting) -> String {
+        let (s, cfg) = (&self.settings, &self.renderer.config);
+        let on = |b: bool| if b { "on" } else { "off" }.to_string();
+        let fraction = |t: f32| if t > 0.0 { format!("1/{}", (1.0 / t).round()) } else { "off".into() };
+        match setting {
+            Setting::Lit => on(s.lit),
+            Setting::LevelLights => {
+                let n = self.lights.0.iter().filter(|l| !l.directional).count();
+                format!("{} ({n})", on(s.level_lights))
+            }
+            Setting::LevelLightSize => format!("x{}", s.light_scale),
+            Setting::Sun => match self.lights.0.iter().any(|l| l.directional) {
+                true => on(s.sun),
+                false => "none here".into(),
+            },
+            Setting::SunSize => match self.lights.0.iter().any(|l| l.directional) {
+                true => format!("{}°", s.sun_angle.unwrap_or(self.level_sun_angle())),
+                false => "-".into(),
+            },
+            Setting::SpotPenumbra => format!("x{:.2}", s.penumbra),
+            Setting::Shadows => on(s.shadows),
+            Setting::DynamicShadows => on(self.geometry.config.dynamic_shadows),
+            Setting::Flashlight => on(s.flashlight),
+            Setting::FlashlightMount => {
+                if s.flashlight_lock.is_some() { "locked here" } else { "shoulder" }.into()
+            }
+            Setting::FlashlightSize => format!("{} cm", (s.light_radius * 100.0).round()),
+            Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
+            Setting::Water => on(s.water),
+            Setting::Bounces => self.geometry.config.max_reflections.to_string(),
+            Setting::Reflectance => s.reflectance.to_string(),
+            Setting::Fade => if s.fade_range > 0.0 { format!("{} m", s.fade_range) } else { "off".into() },
+            Setting::TranslucentCrates => on(s.translucent_crates),
+            Setting::PerPixelCrates => on(s.per_pixel_crates),
+            Setting::FrameCap => if s.capped { format!("{} fps", s.cap) } else { "off".into() },
+            Setting::Overlay => on(cfg.show_samples),
+            Setting::MinStep => format!("{} px", cfg.min_step),
+            Setting::LightSpacing => format!("{} px", cfg.light_spacing),
+            Setting::SteepLimit => {
+                if cfg.steep_limit.is_finite() { cfg.steep_limit.to_string() } else { "off".into() }
+            }
+            Setting::StepThreshold => fraction(cfg.step_threshold),
+            Setting::PenumbraThreshold => fraction(cfg.penumbra_threshold),
+            Setting::MouseSmoothing => match MOUSE_SMOOTHING[s.smoothing] {
+                0.0 => "off".into(),
+                w => format!("{} ms", (w * 1000.0).round()),
+            },
+            Setting::Hud => on(s.hud),
+        }
+    }
+
+    /// The level's directional lights' angular size in degrees (0 without any).
+    fn level_sun_angle(&self) -> f32 {
+        self.lights
+            .0
+            .iter()
+            .find(|l| l.directional)
+            .map_or(0.0, |l| (l.radius.asin() * 2.0).to_degrees())
+    }
+
+    /// Changes a setting one step (`dir` +1 or -1; on/off settings just toggle).
+    fn change(&mut self, setting: Setting, dir: i32) {
+        let (s, cfg) = (&mut self.settings, &mut self.renderer.config);
+        let wrap = |i: usize, n: usize| (i as i32 + dir).rem_euclid(n as i32) as usize;
+        match setting {
+            Setting::Lit => s.lit = !s.lit,
+            Setting::LevelLights => s.level_lights = !s.level_lights,
+            Setting::LevelLightSize => s.light_scale = cycle(&LIGHT_SCALES, s.light_scale, dir),
+            Setting::Sun => s.sun = !s.sun,
+            Setting::SunSize => {
+                let level = self.level_sun_angle();
+                let s = &mut self.settings;
+                s.sun_angle = Some(cycle(&SUN_ANGLES, s.sun_angle.unwrap_or(level), dir));
+            }
+            Setting::SpotPenumbra => {
+                s.penumbra = if dir > 0 {
+                    (s.penumbra * PENUMBRA_STEP).min(64.0)
+                } else {
+                    (s.penumbra / PENUMBRA_STEP).max(1.0 / 64.0)
+                }
+            }
+            Setting::Shadows => s.shadows = !s.shadows,
+            Setting::DynamicShadows => {
+                let d = &mut self.geometry.config.dynamic_shadows;
+                *d = !*d;
+            }
+            Setting::Flashlight => s.flashlight = !s.flashlight,
+            Setting::FlashlightMount => {
+                let mount = self.mount();
+                let s = &mut self.settings;
+                s.flashlight_lock = match s.flashlight_lock {
+                    Some(_) => None,
+                    None => Some(mount),
+                };
+            }
+            Setting::FlashlightSize => s.light_radius = cycle(&FLASHLIGHT_RADII, s.light_radius, dir),
+            Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
+            Setting::Water => s.water = !s.water,
+            Setting::Bounces => {
+                let b = &mut self.geometry.config.max_reflections;
+                *b = wrap(*b as usize, 5) as u8;
+            }
+            Setting::Reflectance => s.reflectance = cycle(&REFLECTANCE, s.reflectance, dir),
+            Setting::Fade => s.fade_range = cycle(&FADE_RANGE, s.fade_range, dir),
+            Setting::TranslucentCrates => s.translucent_crates = !s.translucent_crates,
+            Setting::PerPixelCrates => s.per_pixel_crates = !s.per_pixel_crates,
+            Setting::FrameCap => s.capped = !s.capped,
+            Setting::Overlay => cfg.show_samples = !cfg.show_samples,
+            Setting::MinStep => {
+                cfg.min_step = cycle(&PIXEL_STEPS, cfg.min_step as f32, dir) as u32;
+            }
+            Setting::LightSpacing => {
+                cfg.light_spacing = cycle(&PIXEL_STEPS, cfg.light_spacing as f32, dir) as u32;
+            }
+            Setting::SteepLimit => cfg.steep_limit = cycle(&STEEP_LIMITS, cfg.steep_limit, dir),
+            Setting::StepThreshold => {
+                cfg.step_threshold = cycle(&STEP_THRESHOLDS, cfg.step_threshold, dir);
+            }
+            Setting::PenumbraThreshold => {
+                cfg.penumbra_threshold = cycle(&PENUMBRA_THRESHOLDS, cfg.penumbra_threshold, -dir);
+            }
+            Setting::MouseSmoothing => s.smoothing = wrap(s.smoothing, MOUSE_SMOOTHING.len()),
+            Setting::Hud => s.hud = !s.hud,
+        }
+    }
+
+    /// The debug HUD's lines: frame rate and times, where the camera is, and what's on.
+    fn hud(&self, fps: f64, view_ms: f64, raster_ms: f64) -> Vec<String> {
+        let (c, s) = (&self.camera, &self.settings);
+        let on = |b: bool, name: &str| if b { name.to_string() } else { format!("{name} off") };
+        vec![
+            format!(
+                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms",
+                if s.capped { format!(" (cap {})", s.cap) } else { String::new() },
+            ),
+            format!(
+                "{}  ({:.1}, {:.1}, {:.1})  yaw {:.0}  pitch {:.0}",
+                self.world.sectors[c.sector as usize].name,
+                c.position.x,
+                c.position.y,
+                c.position.z,
+                c.yaw.to_degrees().rem_euclid(360.0),
+                c.pitch.to_degrees(),
+            ),
+            format!(
+                "{} polygons   {} mirrors   {}",
+                self.geometry.polygons.len(),
+                self.geometry.mirrors.len(),
+                filter::name(filter::ALL[s.filter]),
+            ),
+            if s.lit {
+                format!(
+                    "{}   {}   {}{}   {}",
+                    on(s.level_lights, "level lights"),
+                    on(s.sun, "sun"),
+                    on(s.flashlight, "flashlight"),
+                    if s.flashlight_lock.is_some() { " (locked)" } else { "" },
+                    on(s.shadows, "shadows"),
+                )
+            } else {
+                "lighting off".into()
+            },
+        ]
+    }
+
+    /// A command line that starts the app (as a screenshot) exactly where the camera is,
+    /// with the current settings and the water at `time` seconds: for reporting what's on
+    /// screen. Options the app can't be started with are listed after it.
+    fn command_line(&self, options: &Options, time: f32) -> String {
+        let (c, s, cfg) = (&self.camera, &self.settings, &self.renderer.config);
+        let mut line = format!(
+            "cargo run --release -p moose-app -- --level {} --size {}x{} --at {},{},{},{},{},{}",
+            options.level,
+            self.width,
+            self.height,
+            c.position.x,
+            c.position.y,
+            c.position.z,
+            c.yaw.to_degrees(),
+            c.pitch.to_degrees(),
+            c.roll.to_degrees(),
+        );
+        let mut add = |option: String| {
+            line.push(' ');
+            line.push_str(&option);
+        };
+        if let Some((_, p, d)) = s.flashlight_lock {
+            add(format!("--flashlight-at {},{},{},{},{},{}", p.x, p.y, p.z, d.x, d.y, d.z));
+        }
+        add(format!("--filter {}", filter::name(filter::ALL[s.filter])));
+        add(format!("--bounces {}", self.geometry.config.max_reflections));
+        add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
+        add(format!(
+            "--light-radius {} --light-scale {} --penumbra {}",
+            s.light_radius, s.light_scale, s.penumbra
+        ));
+        if let Some(angle) = s.sun_angle {
+            add(format!("--sun-angle {angle}"));
+        }
+        add(format!(
+            "--min-step {} --light-spacing {} --steep-limit {} --step-threshold {} --penumbra-threshold {}",
+            cfg.min_step,
+            cfg.light_spacing,
+            if cfg.steep_limit.is_finite() { cfg.steep_limit.to_string() } else { "off".into() },
+            cfg.step_threshold,
+            cfg.penumbra_threshold,
+        ));
+        add(format!("--time {time}"));
+        for (on, flag) in [
+            (s.water, "--water"),
+            (!s.flashlight, "--no-flashlight"),
+            (s.level_lights, "--level-lights"),
+            (!s.shadows, "--no-shadows"),
+            (!self.geometry.config.dynamic_shadows, "--no-dynamic-shadows"),
+            (!s.sun, "--no-sun"),
+            (!s.lit, "--unlit"),
+            (s.translucent_crates, "--translucent-crates"),
+            (s.per_pixel_crates, "--per-pixel-crates"),
+            (cfg.show_samples, "--show-samples"),
+        ] {
+            if on {
+                add(flag.to_string());
+            }
+        }
+        add("--screenshot report.png".to_string());
+        line
     }
 
     /// Where the flashlight sits on the player's shoulder (or as far toward it as the walls
@@ -669,8 +1046,8 @@ impl App {
         let view = camera.view();
         self.geometry.build(&self.world, &self.assets, &view);
         let t1 = Instant::now();
-        let (opaque, translucent, fresnel, s) =
-            (self.opaque, self.translucent, self.fresnel, &self.settings);
+        let (opaque, unlit, translucent, fresnel, s) =
+            (self.opaque, self.unlit, self.translucent, self.fresnel, &self.settings);
         let (textured, textured_fresnel, floor_texture) = (
             self.textured[s.filter],
             self.textured_fresnel[s.filter],
@@ -695,6 +1072,9 @@ impl App {
                 &self.assets,
                 |p| {
                     if let PolygonSource::World { sector, polygon } = p.source {
+                        if p.flags.sky() {
+                            return Surface::new(unlit);
+                        }
                         // Shiny surfaces are textured, if there is a texture to map, and so
                         // are other walls, with their sector's texture.
                         let n = level.polygons[polygon as usize].plane.normal;
@@ -707,7 +1087,13 @@ impl App {
                         let is_water = water_textures.is_some();
                         let textures = match water_textures {
                             Some([water, heights]) => [Some(water), Some(heights)],
-                            None => [floor_texture.filter(|_| p.flags.reflective()).or(wall), None],
+                            // Floors (shiny or not) get the floor texture.
+                            None => [
+                                floor_texture
+                                    .filter(|_| p.flags.reflective() || n.y > 0.9)
+                                    .or(wall),
+                                None,
+                            ],
                         };
                         let texture = textures[0];
                         // A shiny surface whose reflection was drawn is drawn over it. Past the
@@ -808,6 +1194,292 @@ impl App {
     }
 }
 
+/// The level files (`.mmp`) in the assets' levels folder, sorted.
+fn level_files(assets: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(Path::new(assets).join("levels"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".mmp"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// Numbers the menu steps through for pixel spacings.
+const PIXEL_STEPS: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
+/// Perspective thresholds the menu steps through (see `RasterConfig::step_threshold`).
+const STEP_THRESHOLDS: [f32; 9] = [
+    1.0 / 256.0,
+    1.0 / 128.0,
+    1.0 / 64.0,
+    1.0 / 32.0,
+    1.0 / 16.0,
+    1.0 / 8.0,
+    1.0 / 4.0,
+    1.0 / 2.0,
+    1.0,
+];
+
+/// The value `dir` steps from `now` in `list`, wrapping around: from `now`'s place in it,
+/// or if it isn't there, from the nearest value beyond it that way.
+fn cycle(list: &[f32], now: f32, dir: i32) -> f32 {
+    let same = |x: f32| x == now || (x - now).abs() <= 1e-4 * x.abs().max(1e-3);
+    let n = list.len() as i32;
+    let i = match list.iter().position(|&x| same(x)) {
+        Some(i) => i as i32 + dir,
+        None if dir > 0 => list.iter().position(|&x| x > now).map_or(n, |i| i as i32),
+        None => list.iter().rposition(|&x| x < now).map_or(-1, |i| i as i32),
+    };
+    list[i.rem_euclid(n) as usize]
+}
+
+/// A page of the options menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    Main,
+    Levels,
+    Lighting,
+    Flashlight,
+    Rendering,
+    Sampling,
+    Controls,
+}
+
+/// A row of a menu page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Item {
+    Resume,
+    Respawn,
+    Open(Page),
+    Quit,
+    Set(Setting),
+    /// Load a level: an index into `App::levels`.
+    Load(u16),
+}
+
+/// A setting the menu shows and changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Setting {
+    Lit,
+    LevelLights,
+    LevelLightSize,
+    Sun,
+    SunSize,
+    SpotPenumbra,
+    Shadows,
+    DynamicShadows,
+    Flashlight,
+    FlashlightMount,
+    FlashlightSize,
+    Filter,
+    Water,
+    Bounces,
+    Reflectance,
+    Fade,
+    TranslucentCrates,
+    PerPixelCrates,
+    FrameCap,
+    Overlay,
+    MinStep,
+    LightSpacing,
+    SteepLimit,
+    StepThreshold,
+    PenumbraThreshold,
+    MouseSmoothing,
+    Hud,
+}
+
+impl Page {
+    const ALL: [Page; 7] = [
+        Page::Main,
+        Page::Levels,
+        Page::Lighting,
+        Page::Flashlight,
+        Page::Rendering,
+        Page::Sampling,
+        Page::Controls,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Page::Main => "main",
+            Page::Levels => "levels",
+            Page::Lighting => "lighting",
+            Page::Flashlight => "flashlight",
+            Page::Rendering => "rendering",
+            Page::Sampling => "sampling",
+            Page::Controls => "controls",
+        }
+    }
+
+    fn named(name: &str) -> Option<Page> {
+        Page::ALL.into_iter().find(|p| p.name() == name)
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Page::Main => "Moose",
+            Page::Levels => "Levels",
+            Page::Lighting => "Lighting",
+            Page::Flashlight => "Flashlight",
+            Page::Rendering => "Rendering",
+            Page::Sampling => "Sampling (debug)",
+            Page::Controls => "Controls",
+        }
+    }
+
+    fn items(self) -> &'static [Item] {
+        use Item::*;
+        use Setting::*;
+        match self {
+            Page::Main => &[
+                Resume,
+                Open(Page::Levels),
+                Open(Page::Lighting),
+                Open(Page::Flashlight),
+                Open(Page::Rendering),
+                Open(Page::Sampling),
+                Open(Page::Controls),
+                Respawn,
+                Quit,
+            ],
+            Page::Lighting => &[
+                Set(Lit),
+                Set(Shadows),
+                Set(DynamicShadows),
+                Set(LevelLights),
+                Set(LevelLightSize),
+                Set(Sun),
+                Set(SunSize),
+                Set(SpotPenumbra),
+            ],
+            Page::Flashlight => &[Set(Flashlight), Set(FlashlightMount), Set(FlashlightSize)],
+            Page::Rendering => &[
+                Set(Filter),
+                Set(Water),
+                Set(Bounces),
+                Set(Reflectance),
+                Set(Fade),
+                Set(TranslucentCrates),
+                Set(PerPixelCrates),
+                Set(FrameCap),
+            ],
+            Page::Sampling => &[
+                Set(Overlay),
+                Set(MinStep),
+                Set(LightSpacing),
+                Set(SteepLimit),
+                Set(StepThreshold),
+                Set(PenumbraThreshold),
+            ],
+            Page::Controls => &[Set(MouseSmoothing), Set(Hud)],
+            // The levels found in assets/levels (see `App::items`).
+            Page::Levels => &[],
+        }
+    }
+
+    /// Lines shown under a page's rows.
+    fn notes(self) -> &'static [&'static str] {
+        match self {
+            Page::Controls => &[
+                "WASD move, mouse or arrows look, Q/E roll",
+                "Space/C up/down, Shift faster",
+                "U lock the flashlight in place / remount it",
+                "Esc menu, F1 print a command line for this view",
+                "F3 debug HUD, F12 screenshot",
+            ],
+            Page::Flashlight => &[
+                "Locking leaves it where it is: walk around",
+                "to see its shadows. U does it from anywhere.",
+            ],
+            Page::Sampling => &["How shading is sampled: for tuning and debugging."],
+            Page::Levels => &["Settings carry over; you start at its spawn."],
+            _ => &[],
+        }
+    }
+}
+
+impl Item {
+    fn label(self) -> &'static str {
+        match self {
+            Item::Resume => "Resume",
+            Item::Respawn => "Back to spawn",
+            Item::Quit => "Quit",
+            Item::Load(_) => "Load level",
+            Item::Open(page) => match page {
+                Page::Lighting => "Lighting",
+                Page::Flashlight => "Flashlight",
+                Page::Rendering => "Rendering",
+                Page::Sampling => "Sampling (debug)",
+                Page::Controls => "Controls",
+                Page::Levels => "Levels",
+                Page::Main => "Back",
+            },
+            Item::Set(s) => match s {
+                Setting::Lit => "All lighting",
+                Setting::LevelLights => "Level lights",
+                Setting::LevelLightSize => "Level light size",
+                Setting::Sun => "Sun",
+                Setting::SunSize => "Sun size",
+                Setting::SpotPenumbra => "Spot cone edge",
+                Setting::Shadows => "Shadows",
+                Setting::DynamicShadows => "Dynamic shadows",
+                Setting::Flashlight => "Flashlight",
+                Setting::FlashlightMount => "Mount",
+                Setting::FlashlightSize => "Size",
+                Setting::Filter => "Texture filter",
+                Setting::Water => "Water floors",
+                Setting::Bounces => "Reflection bounces",
+                Setting::Reflectance => "Floor reflectance",
+                Setting::Fade => "Reflection fade",
+                Setting::TranslucentCrates => "Translucent crates",
+                Setting::PerPixelCrates => "Per-pixel crates",
+                Setting::FrameCap => "Frame cap",
+                Setting::Overlay => "Sample overlay",
+                Setting::MinStep => "Minimum step",
+                Setting::LightSpacing => "Light spacing",
+                Setting::SteepLimit => "Steep limit",
+                Setting::StepThreshold => "Perspective threshold",
+                Setting::PenumbraThreshold => "Penumbra threshold",
+                Setting::MouseSmoothing => "Mouse smoothing",
+                Setting::Hud => "Debug HUD",
+            },
+        }
+    }
+}
+
+/// The options menu: open or not, the page showing, the selected row on it, and the pages
+/// it was opened from.
+struct Menu {
+    open: bool,
+    page: Page,
+    selected: usize,
+    back: Vec<(Page, usize)>,
+}
+
+/// Draws the menu page or the HUD over the app's frame, as the settings say.
+fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>) {
+    let rows = menu.map(|(page, _)| app.rows(page));
+    let mut canvas = ui::Canvas {
+        pixels: &mut app.pixels,
+        width: app.width as usize,
+        height: app.height as usize,
+    };
+    if let Some(lines) = hud {
+        ui::draw_hud(&mut canvas, &lines);
+    }
+    if let (Some((page, selected)), Some(rows)) = (menu, rows) {
+        let hint = match page {
+            Page::Main => "Up/Down choose   Enter pick   Esc close",
+            Page::Levels => "Up/Down choose   Enter load   Backspace back",
+            _ => "Up/Down choose   Left/Right change   Backspace back",
+        };
+        ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), hint);
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -816,7 +1488,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let options = parse_args()?;
+    let mut options = parse_args()?;
     let mut app = App::new(&options)?;
     if let Some(at) = options.lock_flashlight {
         // The flashlight locked where it would be on a player standing there.
@@ -825,6 +1497,14 @@ fn run() -> Result<(), String> {
         app.settings.flashlight_lock = Some(app.mount());
         app.camera = camera;
     }
+    if let Some([x, y, z, dx, dy, dz]) = options.flashlight_at {
+        let position = Vec3::new(x, y, z);
+        let sector = app
+            .world
+            .find_sector(position)
+            .ok_or("--flashlight-at is outside the level")?;
+        app.settings.flashlight_lock = Some((sector, position, Vec3::new(dx, dy, dz).normalize()));
+    }
 
     if let Some(path) = &options.screenshot {
         if let Some(at) = options.at {
@@ -832,6 +1512,8 @@ fn run() -> Result<(), String> {
         }
         app.set_time(options.time);
         let (view_ms, raster_ms) = app.render()?;
+        let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms));
+        draw_ui(&mut app, options.menu.map(|page| (page, 0)), hud);
         app.save_png(Path::new(path))?;
         println!(
             "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
@@ -842,215 +1524,180 @@ fn run() -> Result<(), String> {
 
     // Tab switches between the cap and uncapped; `--fps 0` starts uncapped with the default
     // cap to switch to.
-    let cap = if options.fps == 0 {
-        MAX_FPS
-    } else {
-        options.fps
-    };
-    let mut capped = options.fps != 0;
-    let mut display = Display::open("Moose", app.width, app.height, if capped { cap } else { 0 })?;
+    let title = format!("Moose - {}", app.world.name);
+    let s = &app.settings;
+    let mut display =
+        Display::open(&title, app.width, app.height, if s.capped { s.cap } else { 0 })?;
+    let mut capped = s.capped;
     let mut shots = 0;
     let mut last = Instant::now();
     let started = last;
-    let (mut title_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
+    let mut menu = Menu {
+        open: false,
+        page: Page::Main,
+        selected: 0,
+        back: Vec::new(),
+    };
+    // Frame rate and times, averaged over half a second for the HUD.
+    let (mut stats_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
+    let mut stats = (0.0, 0.0, 0.0);
     // Pointer motion still being turned (see `MOUSE_SMOOTHING`): when its window starts,
     // and the motion, in pixels. And the time of this frame's start, in seconds.
     let mut look: Vec<(f64, (f32, f32))> = Vec::new();
     let mut clock = 0.0f64;
-    while display.is_open() && !display.key_down(Key::Escape) {
+    'frames: while display.is_open() {
         let now = Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
 
-        // Look.
-        let turn = TURN_SPEED * dt;
-        let c = &mut app.camera;
-        if display.key_down(Key::Left) {
-            c.yaw += turn;
+        if display.key_pressed(Key::Escape) {
+            menu.open = !menu.open;
+            (menu.page, menu.selected) = (Page::Main, 0);
+            menu.back.clear();
         }
-        if display.key_down(Key::Right) {
-            c.yaw -= turn;
-        }
-        if display.key_down(Key::Up) {
-            c.pitch += turn;
-        }
-        if display.key_down(Key::Down) {
-            c.pitch -= turn;
-        }
-        if display.key_down(Key::Q) {
-            c.roll += ROLL_SPEED * dt;
-        }
-        if display.key_down(Key::E) {
-            c.roll -= ROLL_SPEED * dt;
-        }
-        // Mouse look is always on (no button), as in v1, smoothed over time: this frame's
-        // motion (made since the last) is turned evenly over the window from then on.
-        let (mx, my) = display.mouse_delta();
-        let window = MOUSE_SMOOTHING[app.settings.smoothing];
-        let (t0, t1) = (clock, (now - started).as_secs_f64());
-        clock = t1;
-        let (tx, ty) = if window > 0.0 {
-            if (mx, my) != (0.0, 0.0) {
-                look.push((t0, (mx, my)));
-            }
-            let mut turn = (0.0f32, 0.0f32);
-            for &(start, (x, y)) in &look {
-                let share = ((t1.min(start + window) - t0.max(start)).max(0.0) / window) as f32;
-                turn = (turn.0 + x * share, turn.1 + y * share);
-            }
-            look.retain(|&(start, _)| start + window > t1);
-            turn
-        } else {
+        if menu.open {
+            // The menu has the keys; the view holds still (the pointer's motion is dropped).
+            display.mouse_delta();
             look.clear();
-            (mx, my)
-        };
-        c.yaw -= tx * MOUSE_TURN;
-        c.pitch -= ty * MOUSE_TURN;
-        c.pitch = c.pitch.clamp(-1.55, 1.55);
-
-        // Move: WASD along the view, Space/C straight up and down.
-        let mut local = Vec3::ZERO;
-        let key = |k| if display.key_down(k) { 1.0 } else { 0.0 };
-        local.z -= key(Key::W) - key(Key::S);
-        local.x += key(Key::D) - key(Key::A);
-        let up = key(Key::Space) - key(Key::C);
-        let speed = MOVE_SPEED
-            * dt
-            * if display.key_down(Key::LeftShift) {
-                FAST
+            let items = app.items(menu.page);
+            if display.key_repeated(Key::Up) {
+                menu.selected = (menu.selected + items.len() - 1) % items.len();
+            }
+            if display.key_repeated(Key::Down) {
+                menu.selected = (menu.selected + 1) % items.len();
+            }
+            let item = items[menu.selected];
+            let dir = if display.key_repeated(Key::Left) {
+                -1
+            } else if display.key_repeated(Key::Right) {
+                1
             } else {
-                1.0
+                0
             };
-        let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
-        if delta != Vec3::ZERO {
-            app.fly(delta);
+            if let (Item::Set(setting), true) = (item, dir != 0) {
+                app.change(setting, dir);
+            }
+            if display.key_pressed(Key::Enter) {
+                match item {
+                    Item::Resume => menu.open = false,
+                    Item::Respawn => {
+                        app.reset();
+                        menu.open = false;
+                    }
+                    Item::Quit => break 'frames,
+                    Item::Open(page) => {
+                        menu.back.push((menu.page, menu.selected));
+                        (menu.page, menu.selected) = (page, 0);
+                    }
+                    Item::Set(setting) => app.change(setting, 1),
+                    Item::Load(i) => {
+                        // A new app on the level, with this one's settings.
+                        let mut next = options.clone();
+                        next.level = app.levels[i as usize].clone();
+                        (next.at, next.lock_flashlight, next.flashlight_at) = (None, None, None);
+                        match App::new(&next) {
+                            Ok(mut loaded) => {
+                                loaded.settings = Settings {
+                                    flashlight_lock: None,
+                                    ..app.settings
+                                };
+                                loaded.renderer.config = app.renderer.config;
+                                loaded.geometry.config = app.geometry.config;
+                                app = loaded;
+                                options = next;
+                                display.set_title(&format!("Moose - {}", app.world.name));
+                                menu.open = false;
+                                look.clear();
+                            }
+                            Err(e) => eprintln!("cannot load {}: {e}", next.level),
+                        }
+                    }
+                }
+            }
+            if display.key_pressed(Key::Backspace) {
+                match menu.back.pop() {
+                    Some((page, selected)) => (menu.page, menu.selected) = (page, selected),
+                    None => menu.open = false,
+                }
+            }
+        } else {
+            // Look.
+            let turn = TURN_SPEED * dt;
+            let c = &mut app.camera;
+            if display.key_down(Key::Left) {
+                c.yaw += turn;
+            }
+            if display.key_down(Key::Right) {
+                c.yaw -= turn;
+            }
+            if display.key_down(Key::Up) {
+                c.pitch += turn;
+            }
+            if display.key_down(Key::Down) {
+                c.pitch -= turn;
+            }
+            if display.key_down(Key::Q) {
+                c.roll += ROLL_SPEED * dt;
+            }
+            if display.key_down(Key::E) {
+                c.roll -= ROLL_SPEED * dt;
+            }
+            // Mouse look is always on (no button), as in v1, smoothed over time: this
+            // frame's motion (made since the last) is turned evenly over the window from
+            // then on.
+            let (mx, my) = display.mouse_delta();
+            let window = MOUSE_SMOOTHING[app.settings.smoothing];
+            let (t0, t1) = (clock, (now - started).as_secs_f64());
+            let (tx, ty) = if window > 0.0 {
+                if (mx, my) != (0.0, 0.0) {
+                    look.push((t0, (mx, my)));
+                }
+                let mut turn = (0.0f32, 0.0f32);
+                for &(start, (x, y)) in &look {
+                    let share = ((t1.min(start + window) - t0.max(start)).max(0.0) / window) as f32;
+                    turn = (turn.0 + x * share, turn.1 + y * share);
+                }
+                look.retain(|&(start, _)| start + window > t1);
+                turn
+            } else {
+                look.clear();
+                (mx, my)
+            };
+            c.yaw -= tx * MOUSE_TURN;
+            c.pitch -= ty * MOUSE_TURN;
+            c.pitch = c.pitch.clamp(-1.55, 1.55);
+
+            // Move: WASD along the view, Space/C straight up and down.
+            let mut local = Vec3::ZERO;
+            let key = |k| if display.key_down(k) { 1.0 } else { 0.0 };
+            local.z -= key(Key::W) - key(Key::S);
+            local.x += key(Key::D) - key(Key::A);
+            let up = key(Key::Space) - key(Key::C);
+            let fast = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
+            let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
+            let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
+            if delta != Vec3::ZERO {
+                app.fly(delta);
+            }
+        }
+        // (While the menu is open too, so closing it doesn't turn by the time it was open.)
+        clock = (now - started).as_secs_f64();
+        if display.key_pressed(Key::F3) {
+            app.settings.hud = !app.settings.hud;
+        }
+        if !menu.open && display.key_pressed(Key::U) {
+            app.change(Setting::FlashlightMount, 1);
+        }
+        if app.settings.capped != capped {
+            capped = app.settings.capped;
+            display.set_max_fps(if capped { app.settings.cap } else { 0 });
         }
 
-        // Settings.
-        if display.key_pressed(Key::R) {
-            app.reset();
-            look.clear();
+        let time = started.elapsed().as_secs_f32();
+        if display.key_pressed(Key::F1) {
+            println!("{}", app.command_line(&options, time));
         }
-        if display.key_pressed(Key::LeftBracket) {
-            app.renderer.config.min_step = (app.renderer.config.min_step / 2).max(1);
-        }
-        if display.key_pressed(Key::RightBracket) {
-            app.renderer.config.min_step = (app.renderer.config.min_step * 2).min(32);
-        }
-        if display.key_pressed(Key::J) {
-            // The next penumbra threshold down, wrapping around.
-            let t = &mut app.renderer.config.penumbra_threshold;
-            *t = PENUMBRA_THRESHOLDS
-                .into_iter()
-                .find(|&x| x < *t)
-                .unwrap_or(PENUMBRA_THRESHOLDS[0]);
-        }
-        if display.key_pressed(Key::Semicolon) {
-            // The next limit up, wrapping around.
-            let limit = &mut app.renderer.config.steep_limit;
-            *limit = STEEP_LIMITS
-                .into_iter()
-                .find(|&l| l > *limit)
-                .unwrap_or(STEEP_LIMITS[0]);
-        }
-        if display.key_pressed(Key::Comma) {
-            let t = &mut app.renderer.config.step_threshold;
-            *t = (*t / 2.0).max(1.0 / 256.0);
-        }
-        if display.key_pressed(Key::Period) {
-            let t = &mut app.renderer.config.step_threshold;
-            *t = (*t * 2.0).min(1.0);
-        }
-        if display.key_pressed(Key::Minus) {
-            let s = &mut app.renderer.config.light_spacing;
-            *s = (*s / 2).max(1);
-        }
-        if display.key_pressed(Key::Equal) {
-            let s = &mut app.renderer.config.light_spacing;
-            *s = (*s * 2).min(32);
-        }
-        if display.key_pressed(Key::F) {
-            // The next preset up, wrapping around.
-            let r = &mut app.settings.reflectance;
-            *r = REFLECTANCE
-                .into_iter()
-                .find(|&f| f > *r)
-                .unwrap_or(REFLECTANCE[0]);
-        }
-        if display.key_pressed(Key::L) {
-            // The next sampler, or with Shift the one before, wrapping around.
-            let n = filter::ALL.len();
-            let back = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
-            let f = &mut app.settings.filter;
-            *f = if back { (*f + n - 1) % n } else { (*f + 1) % n };
-        }
-        if display.key_pressed(Key::K) {
-            app.settings.lit = !app.settings.lit;
-        }
-        if display.key_pressed(Key::Key9) {
-            app.settings.penumbra = (app.settings.penumbra / PENUMBRA_STEP).max(1.0 / 64.0);
-        }
-        if display.key_pressed(Key::Key0) {
-            app.settings.penumbra = (app.settings.penumbra * PENUMBRA_STEP).min(64.0);
-        }
-        if display.key_pressed(Key::H) {
-            app.settings.flashlight = !app.settings.flashlight;
-        }
-        if display.key_pressed(Key::U) {
-            app.settings.flashlight_lock = match app.settings.flashlight_lock {
-                Some(_) => None,
-                None => Some(app.mount()),
-            };
-        }
-        if display.key_pressed(Key::Z) {
-            app.settings.shadows = !app.settings.shadows;
-        }
-        if display.key_pressed(Key::X) {
-            // The next size up, wrapping around.
-            let r = app.settings.light_radius;
-            app.settings.light_radius = FLASHLIGHT_RADII
-                .iter()
-                .copied()
-                .find(|&x| x > r + 1e-6)
-                .unwrap_or(FLASHLIGHT_RADII[0]);
-        }
-        if display.key_pressed(Key::N) {
-            app.settings.level_lights = !app.settings.level_lights;
-        }
-        if display.key_pressed(Key::M) {
-            app.settings.smoothing = (app.settings.smoothing + 1) % MOUSE_SMOOTHING.len();
-        }
-        if display.key_pressed(Key::G) {
-            // The next preset up, wrapping around.
-            let r = &mut app.settings.fade_range;
-            *r = FADE_RANGE
-                .into_iter()
-                .find(|&f| f > *r)
-                .unwrap_or(FADE_RANGE[0]);
-        }
-        if display.key_pressed(Key::B) {
-            let bounces = &mut app.geometry.config.max_reflections;
-            *bounces = (*bounces + 1) % 5;
-        }
-        if display.key_pressed(Key::V) {
-            app.settings.water = !app.settings.water;
-        }
-        if display.key_pressed(Key::T) {
-            app.settings.translucent_crates = !app.settings.translucent_crates;
-        }
-        if display.key_pressed(Key::P) {
-            app.settings.per_pixel_crates = !app.settings.per_pixel_crates;
-        }
-        if display.key_pressed(Key::O) {
-            let config = &mut app.renderer.config;
-            config.show_samples = !config.show_samples;
-        }
-        if display.key_pressed(Key::Tab) {
-            capped = !capped;
-            display.set_max_fps(if capped { cap } else { 0 });
-        }
-
-        app.set_time(started.elapsed().as_secs_f32());
+        app.set_time(time);
         let (view_ms, raster_ms) = app.render()?;
         if display.key_pressed(Key::F12) {
             shots += 1;
@@ -1058,57 +1705,61 @@ fn run() -> Result<(), String> {
             app.save_png(Path::new(&path))?;
             println!("saved {path}");
         }
-        display.present(&app.pixels)?;
 
         frames += 1;
         view_sum += view_ms;
         raster_sum += raster_ms;
-        let elapsed = title_at.elapsed().as_secs_f64();
+        let elapsed = stats_at.elapsed().as_secs_f64();
         if elapsed >= 0.5 {
-            let p = app.camera.position;
-            let sector = &app.world.sectors[app.camera.sector as usize].name;
-            let cfg = &app.renderer.config;
-            display.set_title(&format!(
-                "Moose | {:.0} fps{} | view {:.2} ms, raster {:.2} ms | {sector} ({:.1}, {:.1}, {:.1}) | bounces {} mirrors {} F0 {} fade {} m | {}{} | min_step {} light {} steep {} threshold 1/{} | crates {}{} | smoothing {} ms | {} level lights {}{}, flashlight {}{}{} | penumbra x{:.2}, fade/cell {}",
-                frames as f64 / elapsed,
-                if capped { format!(" (cap {cap})") } else { String::new() },
-                view_sum / frames as f64,
-                raster_sum / frames as f64,
-                p.x,
-                p.y,
-                p.z,
-                app.geometry.config.max_reflections,
-                app.geometry.mirrors.len(),
-                app.settings.reflectance,
-                app.settings.fade_range,
-                filter::name(filter::ALL[app.settings.filter]),
-                if app.settings.water { " | water" } else { "" },
-                cfg.min_step,
-                cfg.light_spacing,
-                if cfg.steep_limit.is_finite() {
-                    format!("{}", cfg.steep_limit)
-                } else {
-                    "off".to_string()
-                },
-                (1.0 / cfg.step_threshold).round(),
-                if app.settings.translucent_crates { "translucent" } else { "opaque" },
-                if app.settings.per_pixel_crates { ", per-pixel" } else { "" },
-                MOUSE_SMOOTHING[app.settings.smoothing] * 1000.0,
-                app.lights.0.len(),
-                if app.settings.level_lights { "on" } else { "off" },
-                if app.settings.lit { "" } else { " (all off)" },
-                if app.settings.flashlight { "on" } else { "off" },
-                if app.settings.flashlight_lock.is_some() { " (locked)" } else { "" },
-                if app.settings.flashlight && app.settings.shadows {
-                    format!(", shadows (radius {} m)", app.settings.light_radius)
-                } else {
-                    String::new()
-                },
-                app.settings.penumbra,
-                cfg.penumbra_threshold,
-            ));
-            (title_at, frames, view_sum, raster_sum) = (Instant::now(), 0, 0.0, 0.0);
+            let n = frames as f64;
+            stats = (n / elapsed, view_sum / n, raster_sum / n);
+            (stats_at, frames, view_sum, raster_sum) = (Instant::now(), 0, 0.0, 0.0);
         }
+        let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2));
+        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), hud);
+        display.present(&app.pixels)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_values_step_and_wrap() {
+        let list = [0.0, 0.5, 1.0, 2.0];
+        assert_eq!(cycle(&list, 0.5, 1), 1.0);
+        assert_eq!(cycle(&list, 0.5, -1), 0.0);
+        assert_eq!(cycle(&list, 2.0, 1), 0.0);
+        assert_eq!(cycle(&list, 0.0, -1), 2.0);
+        // A value not in the list goes to the nearest one that way.
+        assert_eq!(cycle(&list, 0.7, 1), 1.0);
+        assert_eq!(cycle(&list, 0.7, -1), 0.5);
+        assert_eq!(cycle(&list, 5.0, 1), 0.0);
+        // Infinity (the steep limit's "off") is found too.
+        assert_eq!(cycle(&STEEP_LIMITS, f32::INFINITY, 1), STEEP_LIMITS[0]);
+        assert_eq!(cycle(&STEEP_LIMITS, f32::INFINITY, -1), 1.0);
+    }
+
+    #[test]
+    fn the_level_list_finds_the_levels() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
+        let levels = level_files(root);
+        for name in ["shiny_rooms.mmp", "sunny_rooms.mmp", "two_rooms.mmp"] {
+            assert!(levels.iter().any(|l| l == name), "{name} in {levels:?}");
+        }
+        assert!(levels.is_sorted());
+    }
+
+    #[test]
+    fn every_page_is_reachable_and_named() {
+        for page in Page::ALL {
+            assert_eq!(Page::named(page.name()), Some(page));
+            assert!(page == Page::Levels || !page.items().is_empty());
+            if page != Page::Main {
+                assert!(Page::Main.items().contains(&Item::Open(page)), "{page:?}");
+            }
+        }
+    }
 }

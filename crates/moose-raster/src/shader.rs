@@ -12,6 +12,7 @@
 //! crate: NEON on ARM, SSE/AVX on x86): every value holds one sample point or pixel per
 //! lane.
 
+use std::cell::Cell;
 use std::ops::Range;
 
 use glam::Vec3;
@@ -1092,15 +1093,39 @@ pub struct SampleContext<'a> {
     /// the light that reaches everything (linear RGB).
     pub lights: &'a [Light],
     pub ambient: Vec3,
-    /// Per light, where the polygon is in its soft shadow, which of `fractions` is how much
-    /// of it reaches the points ([`NO_FRACTION`]: all of it). The engine interpolates those
-    /// from the polygon's vertices, like the material's values.
-    pub light_fractions: &'a [u8],
-    pub fractions: &'a [F32s],
+    /// Per light, [`NO_SPLIT`], or for a light whose shadow covers part of the polygon,
+    /// which of `split` gets its light instead of the total: the engine adds it back pixel
+    /// by pixel, as much as the shadow there lets through (see [`PixelContext::light`]).
+    pub light_split: &'a [u8],
+    pub split: &'a [Cell<[F32s; 3]>],
+    /// Where there are split lights: all the light, theirs included (linear), for pixels
+    /// all of theirs reaches.
+    pub total: &'a Cell<[F32s; 3]>,
 }
 
-/// In `SampleContext::light_fractions`: all of the light reaches the points.
-pub const NO_FRACTION: u8 = u8::MAX;
+/// Outputs the engine adds to a polygon's sample points for its `splits` split lights:
+/// each one's light, then all the light.
+pub const fn split_outputs(splits: usize) -> usize {
+    if splits == 0 { 0 } else { 3 * splits + 3 }
+}
+
+/// In `SampleContext::light_split`: the light is added to the total.
+pub const NO_SPLIT: u8 = u8::MAX;
+
+/// Most lights of one polygon whose shadows are applied pixel by pixel (lights whose
+/// shadow covers part of it; each adds three values to its sample points' outputs).
+pub const MAX_SPLIT: usize = 4;
+
+/// The lights whose shadows cover part of a polygon, at [`LANES`] pixels: each one's light
+/// (linear) and how much of it reaches each pixel (0 to 1).
+#[derive(Clone, Copy, Default)]
+pub struct Split {
+    pub count: usize,
+    pub light: [[F32s; 3]; MAX_SPLIT],
+    pub reaches: [F32s; MAX_SPLIT],
+    /// All the light, theirs included, encoded like a `light` output (1 being 1).
+    pub total: [F32s; 3],
+}
 
 /// What `shade_pixel` sees besides its interpolated values.
 pub struct PixelContext<'a> {
@@ -1109,6 +1134,36 @@ pub struct PixelContext<'a> {
     pub textures: &'a TextureSet<'a>,
     pub params: &'a Params,
     pub focal: f32,
+    /// Lights whose shadows cover part of the polygon; see [`PixelContext::light`].
+    pub split: Split,
+}
+
+impl PixelContext<'_> {
+    /// The light at the pixels: a `light` output (16.16, gamma-encoded, from the lights
+    /// the sample stage added up) with the lights whose shadows cover part of the polygon
+    /// added back, each as much as its shadow lets through at each pixel. Added in linear
+    /// terms: decoded, summed with them, and encoded again.
+    #[inline(always)]
+    pub fn light(&self, light: &[I32s; 3]) -> [I32s; 3] {
+        if self.split.count == 0 {
+            return *light;
+        }
+        // Where all of every split light reaches, all the light, as worked out at the
+        // sample points.
+        let all = (0..self.split.count)
+            .fold(F32s::fill(1.0), |m, j| m.min(self.split.reaches[j]));
+        if all.simd_ge(F32s::fill(1.0)).all() {
+            return self.split.total.map(|t| (t * F32s::fill(65536.0)).round_int());
+        }
+        let scale = F32s::fill(1.0 / 65536.0);
+        std::array::from_fn(|c| {
+            let mut sum = crate::shaders::decode_light(light[c].round_float() * scale);
+            for j in 0..self.split.count {
+                sum += self.split.reaches[j] * self.split.light[j][c];
+            }
+            (crate::shaders::encode_light(sum) * F32s::fill(65536.0)).round_int()
+        })
+    }
 }
 
 /// What a translucent pixel is drawn over, for `shade_over`: `w` is the surface's
@@ -1197,6 +1252,13 @@ pub struct SpanJob<'a> {
     pub outs: &'a [f32],
     /// First pixel of the run; the run covers `x0..x0 + color.len()`, inside the row.
     pub x0: i32,
+    /// Lights whose shadows cover part of the polygon: their light (3 values each, linear)
+    /// follows the material's outputs at every point in `outs`, then all the light (3
+    /// values, encoded, theirs included), and how much of
+    /// each reaches every pixel of the run is in `reaches` (run by run: `reaches[j * len
+    /// + i]` for light `j` at pixel `x0 + i`).
+    pub splits: usize,
+    pub reaches: &'a [f32],
     /// The framebuffer row.
     pub row: i32,
     /// Shade every other pixel and repeat it in the next: set for polygons seen in a mirror.
@@ -1382,7 +1444,8 @@ pub fn span<M: Material, const STRIDE: i32>(
     draw: &Draw,
 ) {
     let (x0, x1) = (job.x0, job.x0 + color.len() as i32);
-    let n_out = M::Interp::LEN;
+    let n_material = M::Interp::LEN;
+    let n_out = n_material + split_outputs(job.splits);
     let n = job.xs.len();
     debug_assert_eq!(job.outs.len(), n * n_out);
     let mut run = Run {
@@ -1430,8 +1493,9 @@ pub fn span<M: Material, const STRIDE: i32>(
             };
             base[k] = a + step[k] * offset;
         }
-        let lines = lines::<M>(&base[..n_out], &step[..n_out]);
-        run.interval::<M, STRIDE>(&lines, start, from, to);
+        let lines = lines::<M>(&base[..n_material], &step[..n_material]);
+        let split = (&base[n_material..n_out], &step[n_material..n_out]);
+        run.interval::<M, STRIDE>(&lines, split, start, from, to);
     }
 }
 
@@ -1485,6 +1549,7 @@ impl Run<'_> {
     fn interval<M: Material, const STRIDE: i32>(
         &mut self,
         lines: &Lines<M>,
+        split: (&[f32], &[f32]),
         start: i32,
         from: i32,
         to: i32,
@@ -1493,7 +1558,7 @@ impl Run<'_> {
         let mut block = from - (from - self.job.vx).rem_euclid(STRIDE);
         while block < to {
             let pixels = block.max(from)..(block + width).min(to);
-            self.block::<M, STRIDE>(lines, block - start, block, pixels);
+            self.block::<M, STRIDE>(lines, split, block - start, block, pixels);
             block += width;
         }
     }
@@ -1505,6 +1570,7 @@ impl Run<'_> {
     fn block<M: Material, const STRIDE: i32>(
         &mut self,
         lines: &Lines<M>,
+        (split_base, split_step): (&[f32], &[f32]),
         offset: i32,
         first: i32,
         pixels: Range<i32>,
@@ -1512,6 +1578,31 @@ impl Run<'_> {
         let ga = M::Fixed32::lanes(&lines.0, offset, STRIDE);
         let gb = M::Fixed16::lanes(&lines.1, offset, STRIDE);
         let gc = M::Floats::lanes(&lines.2, offset, STRIDE);
+        // The split lights at the pixels, and how much of each reaches them (each lane's
+        // pixel, clamped to the run).
+        let mut split = Split {
+            count: self.job.splits,
+            ..Split::default()
+        };
+        let len = self.color.len();
+        for j in 0..split.count {
+            for c in 0..3 {
+                let k = 3 * j + c;
+                split.light[j][c] =
+                    f32::lanes(F32s::fill(split_base[k]), F32s::fill(split_step[k]), offset, STRIDE);
+            }
+            let reaches = &self.job.reaches[j * len..(j + 1) * len];
+            split.reaches[j] = F32s::from(std::array::from_fn::<f32, LANES, _>(|i| {
+                let px = first + i as i32 * STRIDE - self.x0;
+                reaches[px.clamp(0, len as i32 - 1) as usize]
+            }));
+        }
+        if split.count > 0 {
+            let t = 3 * split.count;
+            split.total = std::array::from_fn(|c| {
+                f32::lanes(F32s::fill(split_base[t + c]), F32s::fill(split_step[t + c]), offset, STRIDE)
+            });
+        }
         let ctx = PixelContext {
             at: Pixels {
                 x: first,
@@ -1521,6 +1612,7 @@ impl Run<'_> {
             textures: self.draw.textures,
             params: self.draw.params,
             focal: self.draw.focal,
+            split,
         };
         let out = if M::READS_BEHIND {
             // w is linear in screen x.
@@ -1792,6 +1884,8 @@ mod tests {
                     xs: &xs[i0..=i1],
                     outs: &window_outs,
                     x0: x,
+                    splits: 0,
+                    reaches: &[],
                     row: 0,
                     half_rate,
                     vx: 0,

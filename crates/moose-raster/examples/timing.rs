@@ -10,6 +10,7 @@
 //! MIN_STEP and LIGHT_SPACING set `RasterConfig`'s spacing limits (in pixels), and
 //! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
 //! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
+//! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -39,6 +40,12 @@ fn main() {
     let mut world = World::new(level, &assets);
     if std::env::var("LIGHTS").is_ok_and(|l| l == "0") {
         world.set_lights(Vec::new(), Vec3::ONE);
+    } else if std::env::var("SHADOWS").is_ok_and(|l| l == "1") {
+        let mut lights = world.lights().to_vec();
+        for (i, l) in lights.iter_mut().enumerate() {
+            l.shadow = Some(i as u8 + 1);
+        }
+        world.set_lights(lights, world.ambient);
     }
     let vp = Viewport {
         x: 0,
@@ -84,6 +91,11 @@ fn main() {
     let geometry = assets.mesh(world.geometry);
     let mut out = ViewGeometry::new();
     out.config.max_reflections = bounces;
+    if std::env::var("SHADOWS").is_ok_and(|l| l == "1") {
+        let t = Instant::now();
+        let baked = out.bake_shadows(&world, &assets);
+        println!("baked {baked} shadows in {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
     let mut pixels = vec![0u32; (width * height) as usize];
     let mut seed = 1u64;
     let mut rnd = |lo: f32, hi: f32| {

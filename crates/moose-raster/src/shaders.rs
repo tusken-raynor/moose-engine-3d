@@ -35,23 +35,37 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
             .max(zero)
             .min(one);
         let cone = c * c * (F32s::fill(3.0) - c - c);
-        let mut k = t * t * cos * cone;
-        // In its soft shadow, the part of it that gets past the occluders.
-        if let Some(&f) = ctx.light_fractions.get(i)
-            && let Some(fraction) = ctx.fractions.get(f as usize)
+        let k = t * t * cos * cone;
+        // A light whose shadow covers part of the polygon goes to the engine on its own,
+        // to be added back pixel by pixel as the shadow lets it through.
+        if let Some(&j) = ctx.light_split.get(i)
+            && let Some(split) = ctx.split.get(j as usize)
         {
-            k *= fraction.max(zero).min(one);
+            let c = |v: f32| F32s::fill(v) * k;
+            split.set([c(l.color.x), c(l.color.y), c(l.color.z)]);
+            continue;
         }
         light[0] += F32s::fill(l.color.x) * k;
         light[1] += F32s::fill(l.color.y) * k;
         light[2] += F32s::fill(l.color.z) * k;
+    }
+    // With split lights, all the light too, for pixels all of theirs reaches.
+    if !ctx.split.is_empty() {
+        let mut total = light;
+        for split in ctx.split {
+            let l = split.get();
+            for c in 0..3 {
+                total[c] += l[c];
+            }
+        }
+        ctx.total.set(total);
     }
     light
 }
 
 /// The display's gamma: textures, vertex colors and the framebuffer hold gamma-encoded
 /// values, `linear^(1 / GAMMA)`.
-const GAMMA: f32 = 2.2;
+pub(crate) const GAMMA: f32 = 2.2;
 
 /// [`GAMMA_LUT`] entries per unit of the square root of the light.
 const LUT_SCALE: f32 = 256.0;
@@ -70,16 +84,53 @@ static GAMMA_LUT: std::sync::LazyLock<[f32; 1025]> = std::sync::LazyLock::new(||
 /// its steps are even to the eye.
 #[inline(always)]
 fn light_output(light: [F32s; 3]) -> [F32s; 3] {
+    light.map(encode_light)
+}
+
+/// Linear light gamma-encoded (see [`light_output`]), as plain values (1 being 1).
+#[inline(always)]
+pub(crate) fn encode_lights(light: [F32s; 3]) -> [F32s; 3] {
+    light.map(encode_light)
+}
+
+/// Linear light gamma-encoded (see [`light_output`]), one channel.
+#[inline(always)]
+pub(crate) fn encode_light(l: F32s) -> F32s {
     use crate::shader::LANES;
     let lut = &*GAMMA_LUT;
     let last = (lut.len() - 1) as f32;
-    light.map(|l| {
-        let i = (l.max(F32s::fill(0.0)).sqrt() * F32s::fill(LUT_SCALE) + F32s::fill(0.5))
-            .min(F32s::fill(last))
-            .trunc_int()
-            .to_array();
-        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize]))
-    })
+    let i = (l.max(F32s::fill(0.0)).sqrt() * F32s::fill(LUT_SCALE) + F32s::fill(0.5))
+        .min(F32s::fill(last))
+        .trunc_int()
+        .to_array();
+    F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize]))
+}
+
+/// [`DECODE_LUT`] entries per unit of encoded light.
+const DECODE_SCALE: f32 = 256.0;
+
+/// `e^GAMMA` at `e = i / DECODE_SCALE`: encoded light (0 to 4) back to linear, for
+/// [`decode_light`] to blend between neighboring entries.
+static DECODE_LUT: std::sync::LazyLock<[f32; 1026]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|i| (i as f32 / DECODE_SCALE).powf(GAMMA))
+});
+
+/// Encoded light (as a `light` output holds it, 1 being 1) back to linear, by
+/// [`DECODE_LUT`], blended between entries.
+#[inline(always)]
+pub(crate) fn decode_light(e: F32s) -> F32s {
+    use crate::shader::LANES;
+    let lut = &*DECODE_LUT;
+    let x = (e * F32s::fill(DECODE_SCALE))
+        .max(F32s::fill(0.0))
+        .min(F32s::fill((lut.len() - 2) as f32));
+    let i = x.trunc_int().to_array();
+    let f = x - x.floor();
+    let (a, b) = (
+        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize])),
+        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize + 1])),
+    );
+    a + (b - a) * f
 }
 
 /// XRGB from a `color` output (three 8.8 channels, 0-255) under the 16.16 `light` (see
@@ -165,13 +216,50 @@ pub mod vertex_color {
         }
 
         #[inline(always)]
-        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
-            super::lit_rgb(&b.color, &a.light)
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+            super::lit_rgb(&b.color, &ctx.light(&a.light))
         }
     }
 }
 
 pub use vertex_color::VertexColor;
+
+/// Per-vertex color (the mesh attribute `color`, three 0-255 values), unlit: shown as it
+/// is, whatever lights there are (a sky, say).
+pub mod unlit_color {
+    use crate::shader::{Material, PixelContext, SampleContext, U32s, VertexContext, high_byte};
+
+    crate::material_io! {
+        vertex { color: 3 }
+        sampled { color: 3 }
+        fixed32 {}
+        fixed16 { color: 3 }
+        float {}
+    }
+
+    pub struct UnlitColor;
+
+    impl Material for UnlitColor {
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled { color: v.color }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
+            Interp { color: s.color }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(_: &Fixed32, b: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
+            high_byte(b.color[0]) << 16 | high_byte(b.color[1]) << 8 | high_byte(b.color[2])
+        }
+    }
+}
+
+pub use unlit_color::UnlitColor;
 
 /// Per-vertex color (the mesh attribute `color`, three 0-255 values, lit as
 /// [`VertexColor`]) drawn translucent, with one opacity for the whole surface:
@@ -214,7 +302,7 @@ pub mod vertex_color_translucent {
         #[inline(always)]
         fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
             let alpha = (ctx.params.values[0].clamp(0.0, 1.0) * 255.0).round() as u32;
-            U32s::fill(alpha << 24) | super::lit_rgb(&b.color, &a.light)
+            U32s::fill(alpha << 24) | super::lit_rgb(&b.color, &ctx.light(&a.light))
         }
     }
 }
@@ -311,7 +399,7 @@ pub mod vertex_color_fresnel {
             let scale = ((1.0 - f0) * 255.0 * 64.0).round() as i16;
             let alpha = keep(b.facing[0]).mul_scale_round(I16s::fill(scale));
             let alpha = widen(alpha + I16s::fill(32)) >> 6;
-            (alpha << 24) | super::lit_rgb(&b.color, &a.light)
+            (alpha << 24) | super::lit_rgb(&b.color, &ctx.light(&a.light))
         }
     }
 }
@@ -420,7 +508,7 @@ pub mod vertex_color_fresnel_disperse {
             };
             let alpha = ((one - faded) * F32s::fill(255.0) + F32s::fill(0.5)).trunc_int();
             let alpha: U32s = wide::bytemuck::cast(alpha);
-            (alpha << 24) | super::lit_rgb(&b.color, &a.light)
+            (alpha << 24) | super::lit_rgb(&b.color, &ctx.light(&a.light))
         }
     }
 }
@@ -582,7 +670,7 @@ pub mod textured {
             let texel = super::texel::<FILTER>(tex, &a.uv, b.lod[0], ctx.at);
             let strength = ctx.params.values[0];
             let detailed = super::detail(texel, tex, &a.uv, b.lod[0], strength, texel >> 24_u32);
-            super::lit_texel(detailed, &a.light) & U32s::fill(0xFF_FFFF)
+            super::lit_texel(detailed, &ctx.light(&a.light)) & U32s::fill(0xFF_FFFF)
         }
     }
 }
@@ -636,7 +724,7 @@ pub mod textured_translucent {
             let alpha = (ctx.params.values[0].clamp(0.0, 1.0) * 255.0).round() as u32;
             let texel = super::lit_texel(
                 super::texel::<FILTER>(ctx.textures[0], &a.uv, b.lod[0], ctx.at),
-                &a.light,
+                &ctx.light(&a.light),
             );
             (texel & U32s::fill(0xFF_FFFF)) | U32s::fill(alpha << 24)
         }
@@ -722,7 +810,7 @@ pub mod textured_fresnel {
         ) -> U32s {
             let texel = super::lit_texel(
                 super::texel::<FILTER>(ctx.textures[0], &a.uv, b.lod[0], ctx.at),
-                &a.light,
+                &ctx.light(&a.light),
             );
             self::over(texel, b, c, ctx.params, over.w, over.behind_w)
         }
@@ -854,7 +942,7 @@ pub mod water {
             let tex = ctx.textures;
             let texel = super::lit_texel(
                 super::texel::<FILTER>(tex[0], &a.uv, b.lod[0], ctx.at),
-                &a.light,
+                &ctx.light(&a.light),
             );
             // Pixels one meter away per texel of shift.
             let ripple = ctx.params.values[2] * ctx.focal;
@@ -986,6 +1074,7 @@ mod tests {
             textures,
             params,
             focal,
+            split: Default::default(),
         }
     }
 
@@ -1123,8 +1212,9 @@ mod tests {
             params: &params,
             lights: &[],
             ambient: Vec3::ONE,
-            light_fractions: &[],
-            fractions: &[],
+            light_split: &[],
+            split: &[],
+            total: &Default::default(),
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -1270,5 +1360,34 @@ mod tests {
 
     fn textured_fresnel_facing(cos: f32) -> f32 {
         super::vertex_color_fresnel::facing(cos)
+    }
+
+    #[test]
+    fn split_lights_add_back_as_their_shadow_lets_through() {
+        use crate::shader::{Fill, Split};
+        let blank = Texture::solid("t", 0);
+        let (textures, params) = ([&blank; 2], Params::new(&[]));
+        let mut ctx = pixel_ctx(&textures, &params, 0, 1.0);
+        let rest = [I32s::fill(0); 3];
+        // No split lights: the light as it is.
+        assert_eq!(ctx.light(&full_light()), full_light());
+        // A split light of 1 (linear) over nothing: all, half and none of it, encoded (as
+        // light outputs are: to the power 1 / GAMMA).
+        let mut split = Split {
+            count: 1,
+            ..Split::default()
+        };
+        split.light[0] = [F32s::fill(1.0); 3];
+        split.reaches[0] = F32s::from([1.0, 0.5, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        ctx.split = split;
+        let close = |got: i32, want: f32| (got as f32 - want * 65536.0).abs() <= 65536.0 * 1e-3;
+        let lit = ctx.light(&rest)[0].to_array();
+        assert!(close(lit[0], 1.0), "{}", lit[0]);
+        assert!(close(lit[1], 0.5f32.powf(1.0 / super::GAMMA)), "{}", lit[1]);
+        assert!(lit[2] < 10, "{}", lit[2]);
+        // Over a light of its own strength (encoded 1): the two add in linear terms.
+        let both = ctx.light(&full_light())[0].to_array();
+        assert!(close(both[0], 2.0f32.powf(1.0 / super::GAMMA)), "{}", both[0]);
+        assert!(close(both[2], 1.0), "{}", both[2]);
     }
 }

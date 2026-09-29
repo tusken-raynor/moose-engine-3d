@@ -412,3 +412,123 @@ fn rejects_light_errors() {
     reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  5  0 0 0  10 20", "direction cannot be zero");
     reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  5  0 -1 0  30 20", "cone angles");
 }
+
+#[test]
+fn loads_entity_options() {
+    use moose_assets::Occluder;
+    // Without options: moving, casting shadows as its own model.
+    let level = assets().parse_level("two_rooms.mmp", LEVEL).unwrap();
+    let a1 = &level.spawns[1];
+    assert_eq!((a1.is_static, a1.occluder), (false, Occluder::Mesh));
+    let row = "1.00   crate_a1";
+    let with = |options: &str| {
+        let src = LEVEL.replacen(row, &format!("{row} {options}"), 1);
+        assets().parse_level("two_rooms.mmp", &src).unwrap().spawns[1].clone()
+    };
+    let e = with("static");
+    assert_eq!((e.is_static, e.occluder), (true, Occluder::Mesh));
+    assert_eq!(with("occluder=none").occluder, Occluder::None);
+    assert_eq!(with("static occluder=lod:2").occluder, Occluder::Lod(2));
+    assert_eq!(
+        with("occluder=facing:12:0.5").occluder,
+        Occluder::Facing { sides: 12, radius: 0.5, center: Vec3::ZERO }
+    );
+    assert_eq!(
+        with("occluder=facing:8:0.3:0:0.5:0").occluder,
+        Occluder::Facing { sides: 8, radius: 0.3, center: Vec3::new(0.0, 0.5, 0.0) }
+    );
+    // A proxy model is loaded like the entity's own.
+    let mut a = assets();
+    let src = LEVEL.replacen(row, &format!("{row} occluder=model:ball.obj"), 1);
+    let level = a.parse_level("two_rooms.mmp", &src).unwrap();
+    assert_eq!(level.spawns[1].occluder, Occluder::Model(a.mesh_id("ball.obj").unwrap()));
+}
+
+#[test]
+fn rejects_entity_option_errors() {
+    let row = "1.00   crate_a1";
+    let options = |o: &str| format!("{row} {o}");
+    assert_rejects(row, &options("glowing"), "unknown option 'glowing'");
+    assert_rejects(row, &options("occluder=blob"), "unknown occluder 'blob'");
+    assert_rejects(row, &options("occluder=facing:2:0.5"), "3 to 64 sides");
+    assert_rejects(row, &options("occluder=facing:8:0"), "radius must be positive");
+    assert_rejects(row, &options("occluder=facing:8:0.5:1"), "unknown occluder");
+    assert_rejects(row, &options("occluder=model:missing.obj"), "occluder");
+    assert_rejects("1.00   player_start", "1.00   player_start static", "spawn points take no options");
+    let actor = LEVEL.replacen("   1   prop   0", "   1   actor  0", 1).replacen(row, &options("static"), 1);
+    let msg = assets().parse_level("two_rooms.mmp", &actor).err().unwrap().to_string();
+    assert!(msg.contains("only props can be static"), "{msg}");
+}
+
+#[test]
+fn loads_light_options_sky_and_directional_lights() {
+    let src = with_lights(
+        "ambient 0 0 0",
+        &["0  -2.0  3.0  5.0   1 1 1  6.0  radius=0.05", "0  -2.0  3.0  5.0   1 1 1  6.0  shadows=off"],
+    );
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    assert_eq!((level.lights[0].radius, level.lights[0].shadows), (0.05, true));
+    assert_eq!((level.lights[1].radius, level.lights[1].shadows), (0.0, false));
+    assert!(level.directional.is_empty());
+    // Directional lights: direction (normalized), color, angle, shadows.
+    let src = format!("{src}\ndirectional 2\n   0   0 -2 0   1.0 0.9 0.8   0.53\n   1   1 -1 0   0.2 0.2 0.3   0   shadows=off\n");
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    let d = level.directional[0];
+    assert_eq!((d.direction, d.color, d.angle, d.shadows), (Vec3::NEG_Y, Vec3::new(1.0, 0.9, 0.8), 0.53, true));
+    assert!(!level.directional[1].shadows);
+    // A sky surface (0x2): room_a's ceiling.
+    let sky = LEVEL.replacen("   1   0       -1      0x0 ", "   1   0       -1      0x2 ", 1);
+    assert_ne!(sky, LEVEL);
+    let mut a = assets();
+    let level = a.parse_level("two_rooms.mmp", &sky).unwrap();
+    let mesh = a.mesh(level.geometry);
+    assert_eq!(mesh.polygons.iter().filter(|p| p.flags.sky()).count(), 1);
+}
+
+#[test]
+fn rejects_light_option_and_directional_errors() {
+    let reject = |src: String, expected: &str| {
+        let msg = match assets().parse_level("two_rooms.mmp", &src) {
+            Ok(_) => panic!("loaded despite {expected:?}"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains(expected), "expected '{expected}' in: {msg}");
+    };
+    let light = |o: &str| with_lights("ambient 1 1 1", &[&format!("0  0.0 2.0 4.0  1 1 1  5  {o}")]);
+    reject(light("radius=-1"), "must be 0 or more");
+    reject(light("shadows=maybe"), "unknown option");
+    reject(light("glow=1"), "unknown option");
+    let directional = |row: &str| format!("{}\ndirectional 1\n   0   {row}\n", with_lights("ambient 1 1 1", &[]));
+    reject(directional("0 0 0  1 1 1  0.5"), "direction cannot be zero");
+    reject(directional("0 -1 0  1 -1 1  0.5"), "color cannot be negative");
+    reject(directional("0 -1 0  1 1 1  60"), "angle must be from 0 to 45");
+    reject(directional("0 -1 0  1 1 1"), "needs 7 fields");
+    reject(directional("0 -1 0  1 1 1  0.5  bright=on"), "unknown option");
+    reject(
+        LEVEL.replacen("   1   0       -1      0x0 ", "   1   0       -1      0x3 ", 1),
+        "both reflective and sky",
+    );
+}
+
+#[test]
+fn loads_and_checks_moving_lights() {
+    let src = with_lights("ambient 0 0 0", &["1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:4:5"]);
+    let l = assets().parse_level("two_rooms.mmp", &src).unwrap().lights[0];
+    let m = l.motion.unwrap();
+    assert_eq!((m.offset, m.period), (Vec3::new(0.0, 0.0, 4.0), 5.0));
+    assert!(!l.is_static, "a moving light isn't baked");
+    // A sine through its position: a quarter period in, at the offset's end.
+    assert!((l.at_time(1.25) - Vec3::new(0.0, 2.0, -2.0)).length() < 1e-4);
+    assert!((l.at_time(3.75) - Vec3::new(0.0, 2.0, -10.0)).length() < 1e-4);
+    let reject = |row: &str, expected: &str| {
+        let msg = assets()
+            .parse_level("two_rooms.mmp", &with_lights("ambient 0 0 0", &[row]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(msg.contains(expected), "expected '{expected}' in: {msg}");
+    };
+    reject("1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:4", "oscillate is DX:DY:DZ:PERIOD");
+    reject("1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:4:0", "period must be positive");
+    reject("1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:40:5", "swings outside the level");
+}

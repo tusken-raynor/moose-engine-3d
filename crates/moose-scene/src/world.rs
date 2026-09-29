@@ -1,8 +1,15 @@
 use glam::{Affine3A, Quat, Vec3};
-use moose_assets::{Aabb, Assets, EntityKind, Level, MeshId, Plane, Light, Portal, Sector};
+use moose_assets::{
+    Aabb, Assets, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, Plane, Portal,
+    Sector,
+};
 
 /// Distance tolerance for containment and crossing tests, in meters.
 const EPSILON: f32 = 1e-4;
+/// How far past an opening's edge, in meters, light still counts as getting through.
+const ON_OPENING: f32 = 1e-4;
+/// Limit on openings a light is followed through.
+const MAX_LIGHT_DEPTH: u16 = 16;
 /// Upper bound on portal crossings in one trace; guards against degenerate loops.
 const MAX_CROSSINGS: usize = 64;
 /// Moves never end closer than this to a portal's plane while inside its outline, in
@@ -20,6 +27,8 @@ pub struct World {
     pub spawn_points: Vec<SpawnPoint>,
     /// Light that reaches everything (linear RGB; 1 is a surface's full color).
     pub ambient: Vec3,
+    /// Lights from far away, entering through sky surfaces.
+    pub directional: Vec<DirectionalLight>,
     /// The level's lights. Set them with [`World::set_lights`], which finds where each
     /// reaches.
     lights: Vec<Light>,
@@ -48,23 +57,12 @@ pub struct Entity {
     /// Every sector `bounds` overlaps, starting with `sector`. An entity poking through a
     /// portal lists both sides, so it can be tested from either. Derived like `bounds`.
     pub sectors: Vec<u32>,
-    /// The shape it casts shadows with, if any.
+    /// What it casts shadows with (see [`Occluder`]).
     pub occluder: Occluder,
+    /// It never moves: static lights' shadows from it (and on it) can be worked out once.
+    pub is_static: bool,
 }
 
-/// The shape an entity blocks light with, for lights that cast shadows: something simple,
-/// standing in for its model.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum Occluder {
-    /// It casts no shadows.
-    #[default]
-    None,
-    /// Its own model, which must be convex (a box, say): its faces toward the light.
-    Mesh,
-    /// A sphere, in model coordinates: seen from a light its outline is always a circle, so
-    /// it casts shadows as a disk facing the light.
-    Sphere { center: Vec3, radius: f32 },
-}
 
 impl Entity {
     /// Model-to-world transform.
@@ -102,6 +100,8 @@ struct Boundary {
     points: Vec<Vec3>,
     /// The portal this polygon is, if it is one.
     portal: Option<u32>,
+    /// Directional lights enter the sector through it.
+    sky: bool,
 }
 
 impl World {
@@ -119,6 +119,7 @@ impl World {
                         plane: polygon.plane,
                         points: geometry.polygon_points(polygon).collect(),
                         portal: None,
+                        sky: polygon.flags.sky(),
                     }
                 });
                 let portals = s.portals.clone().map(|i| {
@@ -131,6 +132,7 @@ impl World {
                             .map(|&p| geometry.positions[p as usize])
                             .collect(),
                         portal: Some(i),
+                        sky: false,
                     }
                 });
                 solids.chain(portals).collect()
@@ -157,7 +159,8 @@ impl World {
                     scale: spawn.scale,
                     bounds: Aabb::from_points([]),
                     sectors: Vec::new(),
-                    occluder: Occluder::None,
+                    occluder: spawn.occluder,
+                    is_static: spawn.is_static,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }
@@ -171,6 +174,7 @@ impl World {
             entities,
             spawn_points,
             ambient: level.ambient,
+            directional: level.directional,
             lights: Vec::new(),
             sector_lights: Vec::new(),
             boundaries,
@@ -178,7 +182,10 @@ impl World {
         for i in 0..world.entities.len() {
             world.place_entity(i, assets);
         }
-        world.set_lights(level.lights, level.ambient);
+        // Directional lights light like the rest (see `Light::directional`).
+        let mut lights = level.lights;
+        lights.extend(world.directional.iter().map(Light::from));
+        world.set_lights(lights, level.ambient);
         world
     }
 
@@ -192,40 +199,81 @@ impl World {
         &self.sector_lights[sector as usize]
     }
 
-    /// Replaces the lights and the ambient light, and finds the sectors each light reaches:
-    /// its own, then through every open portal (one that can be seen through) that its
-    /// range (and a spot light's cone) reaches, and on from there. Light never passes through walls. It does pass
-    /// through the whole of an opening, not only the part the light can see through
-    /// earlier openings.
+    /// Replaces the lights and the ambient light, and finds the sectors each light reaches.
+    /// A light reaches its own sector (a directional light, every sector with a sky surface
+    /// it shines in through), then goes on through the open portals (ones that can be seen
+    /// through) it shines out through, within its range (and a spot light's cone). Each
+    /// opening is clipped to the window it is seen through (what the openings before it
+    /// let through, as the light sees them), and the light stops where that is empty. So
+    /// light that falls through a doorway onto the floor beyond doesn't carry on through
+    /// the next doorway. Light never passes through walls. Within a sector it reaches, all
+    /// of it is lit (shadows are what keep parts of it dark).
     pub fn set_lights(&mut self, lights: Vec<Light>, ambient: Vec3) {
         self.ambient = ambient;
         self.sector_lights = vec![Vec::new(); self.sectors.len()];
-        let mut reached = vec![false; self.sectors.len()];
-        let mut stack = Vec::new();
+        let mut listed = vec![false; self.sectors.len()];
+        // Sectors to visit: the sector, the window into it (planes, each keeping the side
+        // where `normal · p + d >= 0`; none for the light's own sector), and the depth.
+        let mut stack: Vec<(u32, Window, u16)> = Vec::new();
         for (i, light) in lights.iter().enumerate() {
-            reached.fill(false);
-            reached[light.sector as usize] = true;
-            stack.push(light.sector);
-            while let Some(sector) = stack.pop() {
-                self.sector_lights[sector as usize].push(i as u32);
+            listed.fill(false);
+            if light.directional {
+                // A sky surface faces into its sector, away from the light coming in: a
+                // window into it.
+                for (s, bounds) in self.boundaries.iter().enumerate() {
+                    for b in bounds {
+                        if b.sky && b.plane.normal.dot(light.direction) > 0.0 {
+                            stack.push((s as u32, window(light, &b.points), 0));
+                        }
+                    }
+                }
+            } else {
+                stack.push((light.sector, Vec::new(), 0));
+            }
+            while let Some((sector, seen_through, depth)) = stack.pop() {
+                if !listed[sector as usize] {
+                    listed[sector as usize] = true;
+                    self.sector_lights[sector as usize].push(i as u32);
+                }
+                if depth >= MAX_LIGHT_DEPTH {
+                    continue;
+                }
                 for b in &self.boundaries[sector as usize] {
                     let Some(portal) = b.portal.map(|p| &self.portals[p as usize]) else {
                         continue;
                     };
-                    let target = portal.target as usize;
-                    if reached[target] || !portal.flags.render_through() {
+                    // Out through it: the portal faces into this sector.
+                    let out = if light.directional {
+                        b.plane.normal.dot(light.direction) < 0.0
+                    } else {
+                        b.plane.distance(light.position) > ON_OPENING
+                    };
+                    if !portal.flags.render_through() || !out {
                         continue;
                     }
-                    let nearest = closest_point_on_polygon(&b.points, b.plane.normal, light.position);
-                    // A spot light's cone must reach the opening too.
-                    let center = b.points.iter().copied().sum::<Vec3>() / b.points.len() as f32;
-                    let radius = b.points.iter().map(|q| q.distance(center)).fold(0.0, f32::max);
-                    if nearest.distance(light.position) < light.range
-                        && light.cone_reaches(center, radius)
-                    {
-                        reached[target] = true;
-                        stack.push(portal.target);
+                    // What of the opening the light sees through the window it came in by.
+                    let mut points = b.points.clone();
+                    for &(normal, d) in &seen_through {
+                        points = clip_polygon(&points, normal, d);
+                        if points.len() < 3 {
+                            break;
+                        }
                     }
+                    if points.len() < 3 {
+                        continue;
+                    }
+                    if !light.directional {
+                        let nearest = closest_point_on_polygon(&points, b.plane.normal, light.position);
+                        // A spot light's cone must reach the opening too.
+                        let center = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+                        let radius = points.iter().map(|q| q.distance(center)).fold(0.0, f32::max);
+                        if nearest.distance(light.position) >= light.range
+                            || !light.cone_reaches(center, radius)
+                        {
+                            continue;
+                        }
+                    }
+                    stack.push((portal.target, window(light, &points), depth + 1));
                 }
             }
         }
@@ -403,6 +451,53 @@ impl World {
 }
 
 /// The point of a convex polygon nearest to `p`.
+/// Planes bounding what a light sees through an opening, each `(normal, d)` keeping the
+/// side where `normal · p + d >= 0`.
+type Window = Vec<(Vec3, f32)>;
+
+/// The window a light sees through a convex opening: planes through the light (for a
+/// directional light, along its direction) and each of the opening's edges, each keeping
+/// the side the opening is on.
+fn window(light: &Light, points: &[Vec3]) -> Window {
+    let n = points.len();
+    let center = points.iter().copied().sum::<Vec3>() / n as f32;
+    (0..n)
+        .filter_map(|k| {
+            let (a, b) = (points[k], points[(k + 1) % n]);
+            let normal = if light.directional {
+                (b - a).cross(light.direction)
+            } else {
+                (a - light.position).cross(b - light.position)
+            };
+            let len = normal.length();
+            (len > 1e-9).then(|| {
+                let normal = normal / len;
+                let normal = if normal.dot(center - a) < 0.0 { -normal } else { normal };
+                (normal, -normal.dot(a))
+            })
+        })
+        .collect()
+}
+
+/// A convex polygon clipped to the side of a plane where `normal · p + d >= 0` (points
+/// within [`ON_OPENING`] of it count as on it, so openings that meet at an edge still let
+/// light through).
+fn clip_polygon(points: &[Vec3], normal: Vec3, d: f32) -> Vec<Vec3> {
+    let n = points.len();
+    let mut out = Vec::with_capacity(n + 1);
+    for k in 0..n {
+        let (a, b) = (points[k], points[(k + 1) % n]);
+        let (da, db) = (normal.dot(a) + d + ON_OPENING, normal.dot(b) + d + ON_OPENING);
+        if da >= 0.0 {
+            out.push(a);
+        }
+        if (da > 0.0 && db < 0.0) || (da < 0.0 && db > 0.0) {
+            out.push(a + (b - a) * (da / (da - db)));
+        }
+    }
+    out
+}
+
 fn closest_point_on_polygon(points: &[Vec3], normal: Vec3, p: Vec3) -> Vec3 {
     let on_plane = p - normal * normal.dot(p - points[0]);
     if contains_on_plane(points, normal, on_plane) {

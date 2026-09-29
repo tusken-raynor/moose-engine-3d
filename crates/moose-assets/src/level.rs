@@ -18,15 +18,35 @@ pub struct Level {
     /// Light that reaches everything, in linear RGB (1 is a surface's full color).
     pub ambient: Vec3,
     pub lights: Vec<Light>,
+    /// Lights from far away (a sun), entering sectors through their sky surfaces.
+    pub directional: Vec<DirectionalLight>,
 }
 
-/// A static light: it lights surfaces facing it within `range` of it, fading smoothly to
-/// nothing there, and within its cone. A point light's cone is whole: it shines every way.
-/// A spot light's shines along `direction`, at full strength within the inner half-angle
-/// and fading smoothly to nothing at the outer one.
+/// Light from so far away that it arrives along one direction everywhere, like sunlight. It
+/// enters the level only through sky surfaces (`PolyFlags::SKY`), and from there through
+/// open portals like any light.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectionalLight {
+    /// The way the light travels (unit length): the sun's direction reversed.
+    pub direction: Vec3,
+    /// Linear RGB, like a light's.
+    pub color: Vec3,
+    /// The source's angular diameter in degrees (the sun is about 0.53): its shadows
+    /// soften over the part of it an occluder covers. 0 casts hard shadows.
+    pub angle: f32,
+    /// Whether it casts shadows.
+    pub shadows: bool,
+}
+
+/// A light: it lights surfaces facing it within `range` of it, fading smoothly to nothing
+/// there, and within its cone. A point light's cone is whole: it shines every way. A spot
+/// light's shines along `direction`, at full strength within the inner half-angle and fading
+/// smoothly to nothing at the outer one. A directional light ([`Light::directional`]) is a
+/// point light so far away that its light arrives along one direction.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Light {
-    /// The sector containing it.
+    /// The sector containing it; [`NO_SECTOR`] for a directional light, which enters through
+    /// sky surfaces instead.
     pub sector: u32,
     pub position: Vec3,
     /// Linear RGB at full strength (up close, facing it); 1 is a surface's full color, and
@@ -43,11 +63,79 @@ pub struct Light {
     /// in its shadow set in their shadow mask (a runtime choice; levels don't set it).
     pub shadow: Option<u8>,
     /// The radius of the light's source, in meters: the shadows it casts soften over the
-    /// part of it an occluder covers. 0 casts hard shadows.
+    /// part of it an occluder covers. 0 casts hard shadows. For a directional light, the
+    /// sine of the source's angular radius (its radius per meter of distance).
     pub radius: f32,
+    /// Whether it casts shadows (when the renderer gives it a shadow slot).
+    pub shadows: bool,
+    /// Whether it is a directional light: `direction` is the way its light travels.
+    pub directional: bool,
+    /// It never moves or changes (the level's lights): shadows it casts from static
+    /// occluders on static surfaces can be worked out once and kept.
+    pub is_static: bool,
+    /// How it moves, if it does (a level's moving light; see [`Light::at_time`]).
+    pub motion: Option<Oscillation>,
+}
+
+/// A light swinging back and forth through its position: `offset` either way, smoothly (a
+/// sine), once every `period` seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Oscillation {
+    pub offset: Vec3,
+    pub period: f32,
+}
+
+/// `Light::sector` of a directional light.
+pub const NO_SECTOR: u32 = u32::MAX;
+
+/// How far away a directional light is placed, in meters, so the standard lighting (for
+/// point lights) lights with it: far enough that its light arrives along one direction
+/// anywhere in a level, and its range far beyond that, so it doesn't fade.
+const DIRECTIONAL_DISTANCE: f32 = 1.0e4;
+const DIRECTIONAL_RANGE: f32 = 1.0e6;
+
+impl From<&DirectionalLight> for Light {
+    fn from(d: &DirectionalLight) -> Light {
+        let mut light = Light::directional(d.direction, d.color, d.angle);
+        light.shadows = d.shadows;
+        light.is_static = true;
+        light
+    }
 }
 
 impl Light {
+    /// Where a moving light is `time` seconds in (a light that doesn't move stays put).
+    pub fn at_time(&self, time: f32) -> Vec3 {
+        match self.motion {
+            Some(m) => {
+                let phase = std::f32::consts::TAU * (time / m.period).fract();
+                self.position + m.offset * phase.sin()
+            }
+            None => self.position,
+        }
+    }
+
+    /// A directional light: light traveling along `direction` (any length), from a source
+    /// `angle` degrees across (its shadows soften over the part of it an occluder covers).
+    pub fn directional(direction: Vec3, color: Vec3, angle: f32) -> Light {
+        let direction = direction.normalize();
+        Light {
+            sector: NO_SECTOR,
+            position: -direction * DIRECTIONAL_DISTANCE,
+            color,
+            range: DIRECTIONAL_RANGE,
+            direction,
+            cos_inner: -1.0,
+            cos_outer: -1.0,
+            shadow: None,
+            radius: (angle.to_radians() / 2.0).sin(),
+            shadows: true,
+            directional: true,
+            is_static: false,
+            motion: None,
+        }
+    }
+
     /// A point light.
     pub fn point(sector: u32, position: Vec3, color: Vec3, range: f32) -> Light {
         Light {
@@ -60,6 +148,10 @@ impl Light {
             cos_outer: -1.0,
             shadow: None,
             radius: 0.0,
+            shadows: true,
+            directional: false,
+            is_static: false,
+            motion: None,
         }
     }
 
@@ -84,6 +176,10 @@ impl Light {
             cos_outer: outer.to_radians().cos(),
             shadow: None,
             radius: 0.0,
+            shadows: true,
+            directional: false,
+            is_static: false,
+            motion: None,
         }
     }
 
@@ -186,4 +282,27 @@ pub struct EntitySpawn {
     /// Pitch/yaw/roll applied roll, then pitch, then yaw (R = Ry * Rx * Rz).
     pub rotation: Quat,
     pub scale: f32,
+    /// A prop that never moves: lighting from static lights can be worked out for it once.
+    pub is_static: bool,
+    /// What it casts shadows with.
+    pub occluder: Occluder,
+}
+
+/// The shape an entity blocks light with, for lights that cast shadows: its model unless
+/// the artist gives it something simpler. Any shape works; complex ones only cost more.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Occluder {
+    /// It casts no shadows.
+    None,
+    /// Its own model.
+    #[default]
+    Mesh,
+    /// One of its model's levels of detail (its own model until models have them).
+    Lod(u8),
+    /// A separate proxy model, placed like the entity.
+    Model(MeshId),
+    /// A polygon that always faces the light: `sides` points on the outline, seen from the
+    /// light, of a ball of `radius` around `center` (in model space). A round shape's
+    /// shadow with no silhouette to find.
+    Facing { sides: u8, radius: f32, center: Vec3 },
 }

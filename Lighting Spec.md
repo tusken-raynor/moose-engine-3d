@@ -9,12 +9,12 @@ Lights are evaluated only at sample points, by each material's `shade_sample`, e
 **Built:**
 
 - static point and spot lights with a range, and an ambient light, read from the level
+- directional lights (a sun), entering through sky surfaces, with carved soft shadows
 - light lists narrowed from sector to polygon
 - diffuse (Lambert) lighting in every standard material except the mirror ball's
 
 **Next (in rough order):**
 
-- directional lights (with authored sector scopes), if wanted
 - dynamic lights
 - row-level light lists
 - specular
@@ -24,10 +24,12 @@ Lights are evaluated only at sample points, by each material's `shade_sample`, e
 ## Lights and where they reach
 
 - **Source:** the level's `ambient` line and `lights` section (see the Level Format Spec). A level without them has ambient 1 and no lights, so it looks as before.
-- **Sector lists (at load):** each light floods out from its sector. It crosses an open portal (a render-through adjoin) when the portal polygon is within its range, then continues from the sector beyond. `World::sector_lights(sector)` lists the lights reaching each sector. Light never passes through walls.
-  - It does pass through a whole opening, not only the part the light can see through the openings before it. Clipping floods to portal windows, as the view does from the eye, is a later refinement.
-- **Changing lights:** `World::set_lights` replaces them and floods again. This is how the app's K key switches lighting off and on.
-- **The flashlight:** the app gives the player a spot light mounted on the right shoulder (0.25 m right of and 0.2 m below the eye), aimed where they look. It uses the fixed spot light's old settings (color 3.4/3.5/3.9, range 16 m, cone 6°→20°) and replaces that light in shiny_rooms. The app rebuilds the lights and floods them again every frame, which costs next to nothing for a handful of lights and sectors. The mount is traced from the eye, so a wall stops it inside the level. H toggles it, and mirror ball cube maps are baked without it.
+- **Sector lists (when lights are set):** each light floods out from its sector (a directional light from every sector with a sky surface it shines in through). `World::sector_lights(sector)` lists the lights reaching each sector. Light never passes through walls.
+  - It crosses an open portal (a render-through adjoin) that it shines out through, and that is within its range and, for a spot light, its cone.
+  - Each opening is clipped to the window the light sees it through: planes through the light (along a directional light's direction) and the edges of the openings before it. The light stops where that is empty. Until Sep 29 it passed whole openings. In sunny_rooms the sun then reached room_a through the hallway, though it lands on the hallway floor 2 m past the doorway. With shadows off, room_a's sun-facing walls were lit; with them on, carving had hidden it.
+  - Within a sector it reaches, all of a light reaches; keeping parts of it dark is the job of shadows.
+- **Changing lights:** `World::set_lights` replaces them and floods again. This is how the app switches lighting off and on (options menu, Lighting page).
+- **The flashlight:** the app gives the player a spot light mounted on the right shoulder (0.25 m right of and 0.2 m below the eye), aimed where they look. It uses the fixed spot light's old settings (color 3.4/3.5/3.9, range 16 m, cone 6°→20°) and replaces that light in shiny_rooms. The app rebuilds the lights and floods them again every frame, which costs next to nothing for a handful of lights and sectors. The mount is traced from the eye, so a wall stops it inside the level. The options menu's Flashlight page switches it on and off, and mirror ball cube maps are baked without it.
 - **Per frame (view):** `ViewGeometry` copies the lights, the ambient light and the sector lists. It also lists each drawn entity's candidates: the lights of every sector it touches. `ViewGeometry::polygon_lights(p)` gives a polygon's candidates.
 - **Per polygon (raster setup):** a candidate is kept if it is in front of the polygon's plane, closer to that plane than its range, within range of the polygon's bounding box, and (for a spot light) its cone reaches the polygon's bounding sphere. The survivors go into the polygon's `SampleContext::lights`.
 - **Spot lights in the flood:** a spot light's cone must also reach a portal's bounding sphere to pass through it. A spot aimed away from a doorway stays in its room.
@@ -94,84 +96,180 @@ The per-pixel versions had two further costs:
 - **Why the padding:** the rule treats the measured change as spread evenly across the tile. When a sharp edge clips only a tile's corner, the unpadded corners saw a small change, so the tile kept 16 px cells, and one lit point smeared light across a whole cell. The padded rectangle reaches into the penumbra beside the tile, so such tiles go dense. On 40 random views near the spot, pixels off by more than 8 levels dropped from 0.52% to 0.38%, and cost was within timing noise of the unpadded rule. A per-tile fade-rate bound was equally accurate but cost about 7% more.
 - **Spacing:** the tile then spaces its points so the cone fades by at most `RasterConfig::penumbra_threshold` (1/8) per cell, and no closer than `penumbra_spacing` (4 px).
 - **Result:** a narrow penumbra, or one seen close up, gets close points, while a wide soft one keeps wide cells.
-- **In the app:** J cycles the threshold (1/4, 1/8, 1/16, off), and 9 and 0 shrink and grow every spot light's penumbra angle for art direction.
+- **In the app:** the options menu sets the threshold (Sampling page: 1/4, 1/8, 1/16, off) and every spot light's penumbra angle (Lighting page: spot cone edge), for art direction.
 
 **Measurements:**
 - **Accuracy:** on the lighting test with a narrow spot (10°→16°), pixels off by more than 2 levels drop from 2.5% to 1.8%, and that is the default now.
 - **Cost:** on shiny_rooms with its soft spot (6°→20°), about +7% over random views (4.3–4.6 ms → 4.7–5.0 ms, 1 thread).
 
+## Directional lights
+
+Sep 29. Light from far away, like the sun, arriving along one direction everywhere (the level's `directional` section; see the Level Format Spec).
+
+- **Lighting:** a directional light is a point light 10 km away with a range of 1000 km and a whole cone (`Light::directional`, `Light::directional == true`). The standard lighting lights with it unchanged: its light arrives along one direction anywhere in a level, and it doesn't fade. Shaders don't know it's different.
+- **Where it reaches:** it enters the level only through **sky surfaces** (surface flag `0x2`), which it shines in through. From there it passes on through open portals it shines out through, each clipped to the window it is seen through (see Lights and where they reach). The world's flood starts in every sector with such a sky surface.
+- **Carving:** the carver sees every light as a `Source`, a point or a direction. For a direction, the planes through an edge run along the light's direction, not through a point, so nothing 10 km away enters the math and precision stays exact.
+  - A sky surface is a window into its sector, like an opening seen from a point light. A courtyard's floor is lit only where rays through its sky reach it, so its walls cast shadows on it.
+  - The window flood continues through portals. Sunlight falls through a doorway as a patch cut to the doorway's shape. The world's flood clips the same way, so the sun is listed only for sectors it can really reach.
+  - Occluders cast parallel shadows. A facing polygon from a directional light is a great circle of its ball.
+- **Softness:** the source's angular size (`angle`, in degrees; the sun is about 0.53). Wedge planes through an edge are turned by the source's angular radius either way.
+- **Shadow slots:** the flashlight has slot 0, and the level's directional lights that cast shadows take slots from 1.
+- **In the app:**
+  - The options menu's Lighting page switches the level's directional lights on and off and sets their size (0, 0.53, 2, 5, 10 degrees; `--sun-angle`, `--no-sun`).
+  - Sky surfaces are drawn unlit in their vertex color (`UnlitColor`).
+  - Non-reflective floors get the floor texture too.
+- **Test level:** `sunny_rooms.mmp` is two_rooms with room_b's ceiling open to the sky, a sun from the south-west, and a dim sky-blue ambient.
+- **Cost:** in a courtyard view, the view takes about 0.07 ms against 0.02 ms without the sun, and the raster about 0.25 ms more.
+
 ## Flashlight shadows
 
-Shadows are carved into polygons: the view splits each polygon a shadow-casting light reaches into pieces wholly lit and pieces wholly in shadow. A shadow's edge is an edge between polygons, exact at any resolution, and each piece is lit by sampling as usual. Only the flashlight casts shadows so far.
+Shadows are drawn per pixel from a **shadow buffer**. The view works out where each shadow falls on each polygon as convex shadow pieces. The rasterizer fills them in, row by row, as it shades the polygon, and the polygon's pixels add back the light the shadow lets through. A shadow's edge is exact at any resolution, whatever the spacing of the polygon's sample points, and polygons are never split. Only the flashlight casts shadows so far.
 
-**How it evolved (Sep 28):**
-- **Shadow maps came first.** They worked but were rejected on quality. They're kept in commit 06d4997 (branch flashlight-shadow-map, `ShadowMap` in moose-raster).
-  - Lookups at sample points leave 4 px stair-steps along diagonal edges.
-  - Denser sampling at edges would mean per-pixel lighting along every edge, and would still be limited by the map's texels.
-- **Shadow volumes with a stencil were set aside.** They work per pixel, which doesn't fit sample-point lighting and costs CPU fill rate.
+**How it evolved (Sep 28–29):** each earlier version is kept in a commit on branch flashlight-shadow-map.
+- **06d4997, shadow maps:** rejected on quality. Lookups at sample points left stair-steps along edges.
+- **1e24f4c, carving:** each polygon split into pieces wholly lit or wholly shadowed. The edges were exact, but polygon counts doubled or tripled, and a crate's faces cut each other's pieces.
+- **918933f, soft carving:** light-sized penumbras, with per-vertex light values interpolated at sample points. It needed the ring carved in sectors and a density rule, and it split polygons even more.
+- **Shadow buffer (now):** the shadow pieces are drawn into a per-row buffer instead of splitting the polygon.
 
-**What blocks a light (`moose-view` carve module):**
-- **Portals.** Light reaches a sector beyond its own only through the openings between them. From the light, each opening seen through the ones before it is a window: planes through the light and the window's edges. A polygon in another sector is lit only where some window into its sectors reaches. This replaces the flood's looser rule, where light passed a whole opening, for shadow-casting lights.
-- **Occluders.** An entity's `Occluder` shape stands in for its model:
-  - `Mesh`: its own model, which must be convex. Crates use this.
-  - `Sphere`: center and radius. The ball uses this.
-  - A convex shape casts one convex shadow volume. It is the points inside the planes through the light and the shape's outline, and behind every one of its faces toward the light (by 1 mm, so those faces stay lit).
-    - The outline is the edges of those faces that no other face toward the light shares.
-    - Along any ray from the light, the faces toward the light all come before the point where the ray enters the shape. So a point behind all their planes is past the shape.
-    - A crate seen off a corner carves with 6 outline planes and 3 face planes. An earlier version gave each face toward the light its own volume, and the volumes kept cutting each other's pieces. In a crate view, carving dropped from 303 polygons to 151, from 44 before carving.
-  - A sphere's outline seen from a light is always the circle where rays graze it, so a sphere casts its shadow as a 16-sided disk on that circle, facing the light.
-  - An occluder's shape stands in for its model, so it never carves that model. The ball's own facets were being cut by its disk: 137 became 207.
-- **Which lights cast shadows:** those with `Light::shadow` set to a slot (0–31). A piece records the slots whose shadow it is in (`ViewPolygon::shadowed`), and the rasterizer leaves those lights out of its light list. Shaders don't change.
+**What blocks a light** (`moose-view` carve module; `Light::shadow` gives a light a shadow slot, 0–31):
+- **Portals.** Light reaches a sector beyond its own only through the openings between them. From the light, each opening seen through the ones before it is a window, and only what lies within some window into a polygon's sectors is lit.
+- **Occluders.** Each entity's occluder comes from the level (`occluder=` in the Level Format Spec), and by default it's the entity's own model. The artist can instead give it a proxy model, a level of detail (its model until levels of detail exist), a polygon that always faces the light, or none.
+  - Convex shapes are found once per model and cast one volume (below). Crates use this.
+  - Any other shape casts one volume per face toward the light. Together they are exactly its shadow, so complex proxies work and only cost more. Their shadows are hard-edged for now; soft edges need wedges on the silhouette's edges only.
+  - A facing polygon sits on the outline, seen from the light, of a ball of its radius, so a round shape's shadow needs no silhouette search. shiny_rooms' mirror ball uses a 16-sided one.
+  - A shape never shadows its own model.
+- **One volume per occluder.** A convex shape casts one convex shadow volume: inside the planes through the light and its outline (the edges of its faces toward the light that no other such face shares), and behind every one of those faces, by 1 mm.
+- **Soft shadows.** A light with a size (`Light::radius`, in meters) casts a core and a soft edge.
+  - For each outline edge, two planes through the edge graze the light's sphere on opposite sides. The outer one bounds the shadow's region.
+  - The soft ring is carved sector by sector, between planes through the light and the outline's corners, and each sector is split by its edge's inner plane. Past it, within every inner plane, lies the core.
+  - Each soft piece's vertices get how much of the light reaches them. Each wedge covers part of the light, from 0 on its outer plane to 1 on its inner, eased with a smoothstep. An occluder covers the product of its wedges' parts.
+  - **Occluders' parts add up**, capped at all of the light. This is exact for occluders side by side as seen from the light, and too dark where one is behind another. Multiplying what each leaves uncovered (the first version) left a lit line where stacked crates meet: each covers half of the light at their seam, and 0.5 × 0.5 let a quarter through. Smoothstep is symmetric, so the two edges' parts sum to exactly 1.
+  - **Full shadow wins.** A piece in one occluder's core and another's soft edge is dark. Before this fix, the shadow buffer used the soft value there, which drew the thin fully lit line along the seam.
+  - **A value along each edge at a contact corner.** Where an occluder's edge touches the surface its shadow falls on (a doorway jamb or a crate's corner on the floor), a soft piece has a corner on the edge's line. There both of the wedge's planes meet, and how much of the light reaches has no one value: it is the same all along each ray out from the line, from none to all. Plain Gouraud gave that corner an arbitrary 0 or 1 and spread it over the whole soft edge, which looked hard: shiny_rooms' doorway lit by the flashlight near the jamb, and a crate's shadow from a 10° sun. So each vertex has two values, along the edge arriving and along the one leaving, and a corner whose two differ is drawn as two vertices in the same place (a zero-length edge between them). Only the wedge whose line the corner is on is taken along the edge (at the edge's other end, or the piece's center if that is on the line too); every other soft edge the piece is in keeps its value at the corner. A corner counts as on a line when the wedge's width there is under 1% of its width at the piece's center: carved pieces stop 1 mm short of an occluder (`CAP_BIAS`), so the corner is near the line, not on it.
+    - The first fix weighted each vertex by the wedge's width (0 on the line) and interpolated projectively. That was exact inside one soft edge, but a corner of weight 0 also dropped the other soft edges' values there: in a crate's soft edge within a wall's, the wall's penumbra vanished inside the crate's.
+- **Windows are soft too.** A portal window seen from a light with a size is the same outline in reverse. Its region reaches the plane where it starts to let the light through, its core is where it lets all of it through, and its ring is carved in sectors like an occluder's. Windows' parts multiply with each other and with what occluders leave. Level geometry's shadow edges (doorways, a room seen through a hallway) are soft for the same reason. One routine, `add_outline`, builds both kinds.
 
-**Soft shadows:** a light with a size (`Light::radius`, in meters) casts a full-shadow core (umbra) and a soft edge (penumbra), both carved.
-- **Wedges:** for each outline edge, two planes through the edge graze the light's sphere on opposite sides. On the outer plane the edge starts to cover the light, and on the inner plane it covers all of it. The shadow region uses the outer planes in place of the hard ones.
-- **Carving:** inside the shadow region, the ring around the core is carved sector by sector.
-  - Each outline edge's sector lies between planes through the light and its two ends. Those planes halve the angle to the neighboring edges, so each sector holds that edge's wedge.
-  - The edge's inner plane splits its sector. Past it, whatever lies within every inner plane is the core, which drops the light. The rest is in the soft shadow.
-  - Without an outline loop (not expected for convex occluders), the ring is carved around the core in one piece.
-- **Light at the vertices:** each soft piece's vertices get a value for how much of the light reaches them (`ViewPolygon::soft`, `ViewGeometry::soft_values`).
-  - Each wedge covers part of the light: none on its outer plane, all on its inner, eased with a smoothstep between by the ratio of distances to the two planes.
-  - An occluder covers the product of what its wedges cover; near a corner, two wedges multiply.
-  - What gets past is the product over occluders of what each leaves uncovered.
-  - The rasterizer adds these to the polygon's own vertex values and interpolates them to sample points like the rest. `diffuse()` scales each light by its value (`SampleContext::light_fractions`), and shaders don't know about it.
-  - The values are exact at every piece's edges (1 where the soft edge starts, 0 where the core starts), so neighboring pieces match. Within a sector piece, the fade runs straight across one wedge, which interpolation follows.
-- **Sample density:** the penumbra rule also measures how much each soft value changes across a padded tile, and spaces that tile's points so it changes by at most the threshold per cell, as for a spot light's cone.
-- **How it evolved (Sep 28):**
-  - First, the fade was computed per sample from the wedges. Thin soft pieces then took their light from lattice points up to 32 px away: the ball's core showed a hard polygon edge and a light leak, 0.16% of pixels off by more than 8 levels.
-  - Next, per-vertex values with the ring carved in slabs by the inner planes one after another. Each slab spanned several wedges, so the blend across it showed facets and a hard-looking core.
-  - Now, sectors plus the density rule: 0.03% off, the same shape as the every-pixel render.
-- **Approximations:**
-  - The outline and faces are the ones seen from the light's center.
-  - When the core vanishes (a small occluder far from a big light), the wedges' product gives a faint blob.
-- **In the app:** the flashlight's radius defaults to 5 cm. X cycles 0, 2, 5, 10 and 20 cm, and `--light-radius` sets it at startup.
-- **Cost (Sep 28, shiny_rooms):**
-  - Polygons: the crate view has 284 at 5 cm and 304 at 20 cm, against 151 hard. The ball view has 564 and 576, against 465.
-  - The view takes about 0.1 ms more.
-  - The magenta check over 5 views at 2 radii found no gaps.
-
-**Carving:**
-- **When:** after a polygon is clipped to its portal window, in world space, on the same clip records the view already carries. Pieces keep correct attributes (uvs, colors) as weights over the source vertices.
-- **No cracks:**
-  - A cut's points are computed once and shared by the pieces on both sides.
-  - An edge that is part of a longer one is walked along the longer one's line, as its neighbor walks it.
-  - A cut edge carries the line through its two endpoints, which both sides share.
-  - A magenta-background check over six views found no gaps.
-- **Skipped:** polygons facing away from the light or out of its range.
+**The shadow buffer:**
+- **Surfaces out of a light's reach aren't carved:** those facing away from it, or with their bounding sphere wholly beyond its range or outside a spot light's cone. These are the rasterizer's tests; it would drop the light from them anyway. With this, shiny_rooms bakes 24 real shadows out of its 1,720 (light, surface) pairs.
+- **View:** every polygon is emitted whole.
+  - It is carved (in world space, after window clipping) only to find its shadow pieces: the parts in a light's full or soft shadow, each for one shadow slot, with screen vertices, the lines their edges walk (shared with the polygon's, so they meet it exactly), and a light value per vertex (0 in full shadow; two at a contact corner, below). These are `ViewPolygon::split`, `first_shadow` and `shadow_count`, over `ViewGeometry::shadow_pieces` and `shadow_vertices`.
+  - A light whose shadow covers the whole polygon is simply dropped from it (`ViewPolygon::shadowed`).
+- **Sample points:** for each light whose shadow covers part of a polygon (up to `MAX_SPLIT`, 2), `diffuse()` leaves that light out of the total and hands its light to the engine (`SampleContext::light_split`, `split`). The engine encodes it like the `light` output and carries it as 3 more outputs of each sample point, interpolated with the material's.
+- **Row pass:** when a run of the polygon's row is shaded, `shadow_run` fills how much of each split light reaches each pixel. The buffer starts at 1, and each shadow piece crossing the row writes its values Gouraud-style: along its edges to the row, then across it, perspective-correct, keeping the smaller value where pieces meet.
+- **Pixels:** lit materials read their light through `PixelContext::light`, which adds each split light back as much as the buffer lets through. It adds in linear terms: the encoding is close to a square root, so it takes the root of the sum of squares. Shaders only pass their `light` through it, and know nothing of shadows.
 
 **In the app:**
-- Crates cast shadows as themselves, and the mirror ball as a sphere.
-- Z toggles shadows (`--no-shadows`).
-- U locks the flashlight where it is, and U again puts it back on the shoulder. `--lock-flashlight X,Y,Z,YAW,PITCH` locks it for screenshots.
+- Crates cast as themselves, and the mirror ball as a sphere.
+- The options menu's Lighting page switches shadows on and off (`--no-shadows`).
+- The options menu's Flashlight page sets its radius: 0, 2, 5 (default), 10 and 20 cm (`--light-radius`).
+- Its Mount setting locks the flashlight in place, or puts it back on the shoulder (`--lock-flashlight X,Y,Z,YAW,PITCH`, `--flashlight-at X,Y,Z,DX,DY,DZ`).
 
-**Cost:** measured on single frames of shiny_rooms, so rough.
-- The view takes 0.07–0.13 ms with shadows, against about 0.03 ms without.
-- The raster takes 0.1–0.5 ms more, from the extra pieces.
+**Cost** (Sep 29, averages over 200 frames, on a noisy machine):
 
-**Not yet:**
-- Soft edges.
+| View | Carving (hard / 20 cm) | Shadow buffer | Shadow pieces (hard / 20 cm) |
+|---|---|---|---|
+| Crate view | 140 / 304 polygons | 47 polygons | 18 / 175 |
+| Ball view | 453 / 576 | 301 | 7 / 123 |
+| Doorway view | 379 / 423 | 284 | 42 / 89 |
+
+- **Raster time:** about the same as carving, within noise, and a little lower in some soft views.
+- **View time:** 0.06–0.17 ms against 0.03–0.05 ms without shadows.
+- **Rendered images:** the same as carving's, within 0.02% of pixels.
+
+**Next:**
+- RGB visibility for colored shadows from translucent occluders.
 - Shadows from other lights.
-- Occluder shapes read from assets (the app assigns them for now).
-- Cheaper handling of detailed occluders.
+- Occluder shapes read from assets.
+
+## Cached shadows
+
+Sep 29. Static lights' shadows on static surfaces are carved once and kept.
+
+- **What's static:**
+  - Lights from the level are static (`Light::is_static`), as are the level's directional lights; the flashlight isn't.
+  - Level surfaces are static, and so are props marked `static`.
+  - Occluders are static when their entity is.
+- **The cache** (`Carver::cache`):
+  - The first time a static surface is seen, each static light's shadow on it from the parts that never change (its windows and static occluders) is carved in world space, over the whole unclipped surface.
+  - The result is kept as world-space pieces: fully shadowed ones, and soft ones with the soft edges they're in (their wedges).
+  - A surface wholly in the full shadow is marked so, and simply drops the light.
+- **Each frame:**
+  - Only moving occluders are carved for a static surface (`Parts::Cached`). Everything is carved for dynamic lights and moving surfaces, as before.
+  - The cached pieces are clipped to the planes the surface was clipped to, and projected.
+  - How much of the light reaches each clipped corner is worked out from the cached soft edges at that point, as carving does. Interpolating stored values along long pieces instead made visible differences at the screen edges.
+- **Edges still meet exactly:**
+  - A piece's edge along the surface's own edge walks the line the clipped surface walks.
+  - Along a clip plane, it walks that plane's line.
+  - Along a cut, it walks the line through the cut's world points, trimmed to the view frustum and projected without clamping. Projecting those points with the clamp to the viewport bent lines whose ends were off screen.
+- **When it's rebuilt:** a light's cache is dropped when the light changes (position, direction, size, range, cone), for example when Y changes the sun's angle. Toggling a light or shadows off and on keeps it.
+- **Checking it:** `ViewConfig::cache_shadows` (the app's `--no-shadow-cache`) carves every frame instead.
+  - Over 12 random sunny_rooms views, cached and uncached match within a few levels.
+  - The exceptions are 1-pixel shifts along hard edges (the same line computed from different points) and soft bands at large sun angles. There the per-frame carve's pieces, cut at the screen's edges, blend the smoothstep fade differently. The cached pieces don't depend on the view, so their soft bands don't change as the view moves.
+- **Cost** (sunny_rooms, 200-frame averages, sun at 2°):
+  - The view takes 0.026–0.041 ms cached against 0.035–0.079 ms carving every frame, and about 0.02 ms without the sun.
+  - A surface's first frame costs about 0.1 ms more while its cache is built.
+  - The saving grows with the number of static lights and surfaces.
+- **Not yet:** moving occluders' shadows combine with cached ones by taking the darker value per pixel, not by adding coverage.
+
+## Baked level light shadows
+
+Sep 29. Every level light that casts shadows (point, spot and directional; `shadows=off` opts out) has one, baked at load.
+
+- **Shadow slots:** the flashlight has slot 0, and level light `i` has slot `i + 1`. Slots are fixed, so switching lights on and off (N, I) never hands a light another's cached shadows.
+- **Baking:** `ViewGeometry::bake_shadows` carves every static light's shadow on every static surface (level polygons and static props) when the level loads, instead of when each surface is first seen. shiny_rooms bakes 1,720 (light, surface) shadows in about 1 ms.
+- **Up to 4 partly shadowing lights per surface** (`MAX_SPLIT`, raised from 2). Each carries its light to pixels on its own, as 3 extra values per sample point. Past the limit (or past 32 values in all), a light is lit unshadowed on that surface.
+- **Adding split lights back at pixels:**
+  - Split lights are carried linear. The rest of the light is decoded from its gamma encoding with a 1,025-entry table (blended), each split light is added as its shadow lets it through, and the sum is encoded with the sample points' table.
+  - Squaring encoded values instead (treating gamma as 2.0 rather than 2.2) left lit areas about 3% brighter with shadows on than off.
+  - Vector `ln` and `exp` per pixel were exact but more than doubled raster time.
+  - A fast path uses the total light, all split lights included, worked out at the sample points, for any block of 8 pixels all of every split light reaches. Only blocks in shadow or penumbra combine. Most of a partly shadowed surface is fully lit.
+- **shiny_rooms' lamps** are 5 cm across (`radius=0.05`), for soft-edged shadows.
+- **In the app:** the options menu's Lighting page sets a multiple of every level point and spot light's size (level light size: ×0 for hard shadows, ×0.5, ×1 as authored, ×2, ×4; `--light-scale`). The sun and the flashlight have their own size settings. A change rebuilds those lights' cached shadows.
+- **Cost** (shiny_rooms, all 5 lamps with shadows, random views, one thread): 7.1–7.6 ms against 6.1 ms without shadows (+17–25%). The view part is 0.085 ms against 0.016 ms.
+
+
+## Moving lights
+
+Sep 29. A level light can move: `oscillate=DX:DY:DZ:PERIOD` (Level Format Spec) swings it through its position, once every period.
+
+- **Each frame:** the app places it where it is at that moment (`Light::at_time`), in the sector it's then in.
+- **Shadows:** a moving light isn't static (`Light::is_static` is false), so it isn't baked. Its shadows (windows and occluders) are carved every frame, like the flashlight's, while static lights keep their baked shadows.
+- **sunny_rooms:** a light-blue lamp 2.3 m up in the middle of room_a swings 2 m toward each of the two corners without crates, every 5 seconds, with soft shadows (`radius=0.05`). The crates' shadows swing around them.
+- **Cost there:** the view takes about 0.09 ms with the lamp and the sun, against about 0.03 ms for the sun alone.
+
+## Dynamic shadows setting
+
+Sep 29. `ViewConfig::dynamic_shadows` (the options menu's Lighting page, and `--no-dynamic-shadows`), a performance option.
+
+- **Off:** only baked (cached) shadows are drawn, and nothing is carved per frame.
+  - Dynamic lights (the flashlight, moving lamps) cast no shadows, and their windows and volumes aren't even gathered.
+  - Moving occluders cast none, and moving surfaces receive none.
+- **Cost saved:** in a sunny_rooms view with the flashlight, the moving lamp and the sun, the view takes about 0.054 ms off against 0.33 ms on.
+- **Lighting stays correct:** a light's reach is still clipped to the openings it passes through (see Lights and where they reach); only occlusion inside the sectors it reaches is lost.
+
+## Future optimization options
+
+Noted Sep 29. A long surface that a static light reaches only in part pays for its shadow everywhere. For example, the hallway floor in sunny_rooms is one 12 m polygon, and the sun lights only a patch of it through the doorway. Every pixel of such a surface gets the shadow buffer fill and carries the light as a split light, though most of it is simply in full shadow.
+
+- **Fully shadowed pixel blocks** (*very likely worth it; do first*): where every split light is fully blocked across a block of 8 pixels, use the pre-summed light directly, with no decode, add and encode. This mirrors the fully lit fast path in `PixelContext::light`. It's a few lines, and makes the dark majority of such surfaces nearly free per pixel (the buffer fill remains).
+- **Authors cut faces** (*worth it, as an authoring guideline; no engine work*): a level author splits long faces just past where a static light's penumbra ends. The far parts are then wholly in shadow and simply drop the light: no shadow pieces, no per-pixel cost. This works today.
+- **The baker cuts faces** (*maybe; measure after the fully shadowed fast path*): what it would still save is the shadow buffer fill and the split light's extra values. New vertices on edges shared with neighboring faces need the whole edge's line, as carving does, to stay crack-free. the same split done automatically for static geometry. The bake already knows, in world space, where each static light's full shadow falls on each surface. When the full-shadow part is a large share of a surface, split it off as its own polygon at load, without the light. It costs a few extra polygons, only where that's worth it, and authors can still cut by hand for control.
+- **Hard edges where the penumbra is too thin to see** (*probably not worth it*): a thin penumbra's per-pixel cost is small because it covers few pixels. Splitting a wedge along its length adds carving, and a view-dependent switch would pop as the view moves and couldn't use baked shadows. Revisit only for many dynamic soft lights on huge distant surfaces. if a soft edge would be under about 2 pixels wide on screen, draw only the full shadow (the umbra) there, with a hard edge between the wedge's two planes, and skip that wedge's soft pieces.
+  - **Per edge, along its length:** a wedge widens with distance from its occluder and narrows with distance from the eye. A long shadow can be thin on screen at its far end and wide close up, so a wedge can be split along its length, by a plane through the light where its projected width crosses the threshold. The far part goes hard; the near part keeps its fade.
+  - **It depends on the view:** it applies where shadows are carved every frame, as a view-time choice. Baked (cached) shadows are carved without a view, so their soft pieces could instead be split on screen, or snapped to hard where their projected width is under the threshold, when they are clipped and projected.
+  - **Saves** soft pieces, the shadow buffer fill, and split lights on distant surfaces, where the fade isn't visible anyway.
+
+## Planned: articulated shadow proxies
+
+Noted Sep 29, for when actors animate. An animated actor casts its shadow with several simple proxies, one per articulating segment, instead of one occluder.
+
+- **Limbs:** capsules (a bone segment and a radius). Seen from a light, a capsule's outline is two half-circles joined by straight sides. It is built like the facing polygon's tangent circle, at each end, so it faces the light, turns with its bone, and needs no silhouette search. That's about 12 to 16 edges each.
+- **Head, torso, feet:** small convex hulls attached to bones, carved on the convex fast path.
+- **Data:** an entity's occluder becomes a list. Each entry is bound to a bone, with a local offset, and is a capsule or a convex hull, placed each frame by the bone's transform.
+- **Soft shadows hide the approximation:** at a few centimeters of light radius, seams between parts and the simplified shapes fall inside the penumbra.
+- **Overlaps:** occluders' coverage adds up, so joints where segments meet close up, like the stacked crates' seam. Parts overlapping as seen from the light (an arm in front of the torso) make their shared penumbra a little too dark; cores are unaffected, since full shadow wins.
+- **Self-shadowing, later:** a proxy doesn't shadow its own model today. For an arm to shadow the torso, ownership would go per bone: a part skips only the surfaces it stands in for.
+- **Cost:** actors move, so their shadows are carved every frame. That's about 15 small volumes per actor per shadow-casting light reaching it, on nearby surfaces only, on top of the level's baked shadows.
 
 ## Accuracy and cost
 

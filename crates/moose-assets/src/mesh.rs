@@ -167,11 +167,17 @@ impl PolyFlags {
     /// The surface reflects its sector like a mirror (level surfaces only). It is drawn
     /// over its reflection, typically translucent with a Fresnel falloff.
     pub const REFLECTIVE: u32 = 0x1;
+    /// Directional lights (the sun) enter its sector through it (level surfaces only).
+    pub const SKY: u32 = 0x2;
     /// Every flag the level format defines.
-    pub const ALL: u32 = Self::REFLECTIVE;
+    pub const ALL: u32 = Self::REFLECTIVE | Self::SKY;
 
     pub fn reflective(self) -> bool {
         self.0 & Self::REFLECTIVE != 0
+    }
+
+    pub fn sky(self) -> bool {
+        self.0 & Self::SKY != 0
     }
 }
 

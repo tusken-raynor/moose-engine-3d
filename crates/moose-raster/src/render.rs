@@ -1,6 +1,7 @@
 //! The two-phase frame: polygon setup and band binning (phase 1), then per-row span
 //! resolution and shading (phase 2). See the span buffer module spec.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
@@ -12,12 +13,13 @@ use moose_assets::{Assets, MeshId, Light, Texture, TextureId};
 use moose_scene::Viewport;
 use moose_view::{
     EdgeLine, Object, PolygonKind, ScreenVertex, ViewGeometry, ViewPolygon, pixel_edge,
+    ShadowPiece,
 };
 use rayon::prelude::*;
 
 use crate::shader::{
     F32s, Fill,
-    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, NO_FRACTION,
+    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, MAX_SPLIT, NO_SPLIT, split_outputs,
     Material, MaterialEntry, MaterialId, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
@@ -212,10 +214,14 @@ struct SetupVertex {
 struct PolygonSetup {
     first_vertex: u32,
     vertex_count: u16,
-    /// Values per vertex (and per sample point): its material's `sampled` values, then
-    /// `n_soft` soft shadow values (see `ViewPolygon::soft`).
     n_vals: u16,
-    n_soft: u16,
+    /// Lights whose shadows cover part of it (see `ViewPolygon::split`): each one's light
+    /// follows the material's outputs at its sample points (3 values; counted in `n_out`),
+    /// and its shadow pieces (`shadows` from `first_shadow` in `ThreadBins::shadows`) say
+    /// how much of it reaches each pixel.
+    splits: u8,
+    first_shadow: u32,
+    shadows: u16,
     /// Its material's outputs per sample point.
     n_out: u16,
     /// Its plane functions in `ThreadBins::planes` (see [`fan_planes`]), and its fan's
@@ -268,13 +274,17 @@ struct ThreadBins {
     vertex_out: Vec<f32>,
     /// Every polygon's plane functions (see [`fan_planes`]).
     planes: Vec<f32>,
-    /// Scratch for `values` with soft shadow values added.
-    spare_values: Vec<f32>,
-    /// Each polygon's lights (see `PolygonSetup::first_light`), and per light, which of the
-    /// polygon's soft shadow values is how much of it reaches there ([`NO_FRACTION`] for
-    /// all of it).
+
+    /// Each polygon's lights (see `PolygonSetup::first_light`), and per light, its split
+    /// index ([`NO_SPLIT`] for none; see `SampleContext::light_split`).
     lights: Vec<Light>,
-    light_fractions: Vec<u8>,
+    light_split: Vec<u8>,
+    /// Polygons' shadow pieces: (first vertex, vertex count, split index); their vertices,
+    /// edge lines, and how much of the light reaches each vertex.
+    shadows: Vec<(u32, u16, u8)>,
+    shadow_vertices: Vec<SetupVertex>,
+    shadow_lines: Vec<Option<EdgeLine>>,
+    shadow_light: Vec<f32>,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -315,6 +325,9 @@ struct RowState {
 /// One thread's phase 2 scratchpad, sized from the viewport width.
 #[derive(Default)]
 struct RowScratch {
+    /// How much of each split light reaches each pixel of the run being shaded (see
+    /// `SpanJob::reaches`).
+    reaches: Vec<f32>,
     /// The framebuffer row being drawn.
     row: i32,
     color: Vec<u32>,
@@ -486,7 +499,11 @@ impl Renderer {
             bins.values.clear();
             bins.planes.clear();
             bins.lights.clear();
-            bins.light_fractions.clear();
+            bins.light_split.clear();
+            bins.shadows.clear();
+            bins.shadow_vertices.clear();
+            bins.shadow_lines.clear();
+            bins.shadow_light.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -767,23 +784,6 @@ fn setup_polygon(
             bins.values[v * n_vals + lod] = l;
         }
     }
-    // How much of each light whose soft shadow it is in reaches each vertex, after the
-    // material's values: interpolated like them, for its sample points.
-    let n_soft = p.soft.count_ones() as usize;
-    let n_soft = if n_vals + n_soft <= MAX_VARYINGS { n_soft } else { 0 };
-    let n_vals = if n_soft > 0 {
-        let soft = &geometry.soft_values[p.first_soft as usize..][..verts.len() * n_soft];
-        let mut both = std::mem::take(&mut bins.spare_values);
-        both.clear();
-        for (v, own) in bins.values.chunks_exact(n_vals).zip(soft.chunks_exact(n_soft)) {
-            both.extend_from_slice(v);
-            both.extend_from_slice(own);
-        }
-        bins.spare_values = std::mem::replace(&mut bins.values, both);
-        n_vals + n_soft
-    } else {
-        n_vals
-    };
     let first_plane = bins.planes.len() as u32;
     let fans = fan_planes(verts, &bins.values, n_vals, &mut bins.planes);
     // Its lights: those that can reach its sector (or its entity's sectors), in range of it,
@@ -791,6 +791,7 @@ fn setup_polygon(
     // (the view carves polygons into pieces wholly in or out of each shadow). Mirrored
     // polygons are lit where they really are.
     let first_light = bins.lights.len() as u32;
+    let (mut splits, mut split_slots) = (0usize, [0u8; MAX_SPLIT]);
     let positions = &geometry.world_positions[p.vertices()];
     let normal = Vec3::from_array(face_normal);
     let (lo, hi) = positions
@@ -811,11 +812,37 @@ fn setup_polygon(
             && light.cone_reaches(center, radius)
         {
             bins.lights.push(light);
-            // In its soft shadow, the polygon's value for how much of it reaches.
-            bins.light_fractions.push(match light.shadow {
-                Some(k) if p.soft >> k & 1 != 0 => (p.soft & ((1 << k) - 1)).count_ones() as u8,
-                _ => NO_FRACTION,
-            });
+            // A light whose shadow covers part of it is split off (see `SampleContext`).
+            let split = match light.shadow {
+                Some(k)
+                    if p.split >> k & 1 != 0
+                        && splits < MAX_SPLIT
+                        && layout_len(entry.io.interp) + split_outputs(splits + 1) <= MAX_VARYINGS =>
+                {
+                    split_slots[splits] = k;
+                    splits += 1;
+                    (splits - 1) as u8
+                }
+                _ => NO_SPLIT,
+            };
+            bins.light_split.push(split);
+        }
+    }
+    // The shadow pieces of its split lights.
+    let first_shadow = bins.shadows.len() as u32;
+    let pieces: &[ShadowPiece] =
+        &geometry.shadow_pieces[p.first_shadow as usize..][..p.shadow_count as usize];
+    for piece in pieces {
+        let Some(j) = split_slots[..splits].iter().position(|&k| k == piece.slot) else {
+            continue;
+        };
+        let vertices = &geometry.shadow_vertices[piece.first_vertex as usize..][..piece.vertex_count as usize];
+        bins.shadows
+            .push((bins.shadow_vertices.len() as u32, piece.vertex_count, j as u8));
+        for v in vertices {
+            bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
+            bins.shadow_lines.push(v.line);
+            bins.shadow_light.push(v.light);
         }
     }
     let first_vertex = bins.vertices.len() as u32;
@@ -831,8 +858,10 @@ fn setup_polygon(
         first_vertex,
         vertex_count: verts.len() as u16,
         n_vals: n_vals as u16,
-        n_soft: n_soft as u16,
-        n_out: layout_len(entry.io.interp) as u16,
+        splits: splits as u8,
+        first_shadow,
+        shadows: (bins.shadows.len() as u32 - first_shadow) as u16,
+        n_out: (layout_len(entry.io.interp) + split_outputs(splits)) as u16,
         first_plane,
         fans: fans as u16,
         row_top,
@@ -1332,6 +1361,8 @@ fn sample_context<'a>(
     p: &'a PolygonSetup,
     bins: &'a ThreadBins,
     textures: &Textures<'a>,
+    split: &'a [Cell<[F32s; 3]>],
+    total: &'a Cell<[F32s; 3]>,
 ) -> SampleContext<'a> {
     let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
     SampleContext {
@@ -1339,8 +1370,9 @@ fn sample_context<'a>(
         object: &p.object,
         params: &p.params,
         lights: &bins.lights[lights.clone()],
-        light_fractions: &bins.light_fractions[lights],
-        fractions: &[],
+        light_split: &bins.light_split[lights],
+        split,
+        total,
         ambient: textures.ambient,
         focal: textures.focal,
     }
@@ -1491,39 +1523,6 @@ fn build_tiles(
             })
             .fold(0.0, f32::max)
     };
-    // How far any soft shadow value (how much of a light reaches) changes across the
-    // rectangle, at its corners and middle: like a spot light's cone, it fades across its
-    // soft shadow's edge, and cells there are spaced to follow it the same way.
-    let soft = match config.penumbra_threshold > 0.0 {
-        true => (n_in - p.n_soft as usize)..n_in,
-        false => n_in..n_in,
-    };
-    let value_at = |k: usize, x: f32, y: f32, w: f32| {
-        let (dx, dy) = (x - planes.ox, y - planes.oy);
-        let t = planes
-            .diagonals
-            .chunks_exact(2)
-            .filter(|d| d[0] * dy - d[1] * dx > 0.0)
-            .count();
-        let c = &planes.fans[(t * n_in + k) * 3..][..3];
-        (c[0] + c[1] * dx + c[2] * dy) / w
-    };
-    let soft_fade = |xa: f32, xb: f32, ya: f32, yb: f32, w_min: f32| {
-        let points = [(xa, ya), (xb, ya), (xa, yb), (xb, yb), ((xa + xb) / 2.0, (ya + yb) / 2.0)];
-        soft.clone()
-            .map(|k| {
-                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-                for &(x, y) in &points {
-                    let w = w_at(x, y);
-                    if w > w_min * 0.25 {
-                        let f = value_at(k, x, y, w).clamp(0.0, 1.0);
-                        (lo, hi) = (lo.min(f), hi.max(f));
-                    }
-                }
-                (hi - lo).max(0.0)
-            })
-            .fold(0.0, f32::max)
-    };
     s.pending.clear();
     // Each strip's spacing first, so runs of strips with the same one can share grid rows.
     s.spacings.clear();
@@ -1543,13 +1542,11 @@ fn build_tiles(
         // measured past the tile by `penumbra_padding` on every side, as the fade needn't be
         // spread across the tile: a penumbra crossing just its corner fades fast there, which
         // the corners alone would take for a slow fade across all of it.
-        let fade = if spots.is_empty() && soft.is_empty() {
+        let fade = if spots.is_empty() {
             0.0
         } else {
             let pad = config.penumbra_padding as f32;
-            let rect = (xa - pad, xb + pad, ya - pad, yb + pad);
-            penumbra(rect.0, rect.1, rect.2, rect.3, w_min)
-                .max(soft_fade(rect.0, rect.1, rect.2, rect.3, w_min))
+            penumbra(xa - pad, xb + pad, ya - pad, yb + pad, w_min)
         };
         let spacing = if fade > 0.0 {
             spacing.min(
@@ -1676,8 +1673,10 @@ fn build_tiles(
     }
 
     // Every tile's grid points, LANES at a time.
-    // The material's values, then the soft shadow values (see `sample_context`).
-    let n_material = n_in - p.n_soft as usize;
+    // The material's outputs, then the split lights' (see `SampleContext::light_split`).
+    let (splits, n_material) = (p.splits as usize, n_out - split_outputs(p.splits as usize));
+    let split: [Cell<[F32s; 3]>; MAX_SPLIT] = Default::default();
+    let total: Cell<[F32s; 3]> = Default::default();
     let mut inputs = [F32s::default(); MAX_VARYINGS];
     let mut outputs = [F32s::default(); MAX_VARYINGS];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
@@ -1712,11 +1711,15 @@ fn build_tiles(
             }
             *input = q * inv;
         }
-        let ctx = SampleContext {
-            fractions: &inputs[n_material..n_in],
-            ..sample_context(p, b, textures)
-        };
-        (entry.sample)(&inputs[..n_material], &ctx, &mut outputs[..n_out]);
+        let ctx = sample_context(p, b, textures, &split[..splits], &total);
+        (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_material]);
+        for (j, light) in split[..splits].iter().enumerate() {
+            outputs[n_material + 3 * j..n_material + 3 * j + 3].copy_from_slice(&light.take());
+        }
+        if splits > 0 {
+            let t = n_material + 3 * splits;
+            outputs[t..t + 3].copy_from_slice(&crate::shaders::encode_lights(total.take()));
+        }
         for (k, out) in outputs[..n_out].iter().enumerate() {
             let out = out.to_array();
             for (j, q) in chunk.iter().enumerate() {
@@ -1836,6 +1839,48 @@ struct Segment {
     fy: f32,
 }
 
+/// Fills `s.reaches` with how much of each of the polygon's split lights reaches each pixel
+/// `x0..x1` of the current row: all of it, except where its shadow pieces cover the row,
+/// which each give their vertices' values interpolated along their edges to the row, then
+/// across it (perspective-correct, like Gouraud shading).
+fn shadow_run(s: &mut RowScratch, bins: &ThreadBins, p: &PolygonSetup, x0: i32, x1: i32) {
+    let len = (x1 - x0).max(0) as usize;
+    s.reaches.clear();
+    s.reaches.resize(p.splits as usize * len, 1.0);
+    let row = s.row;
+    for &(first, count, j) in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
+        let range = first as usize..first as usize + count as usize;
+        let (verts, lines, light) = (
+            &bins.shadow_vertices[range.clone()],
+            &bins.shadow_lines[range.clone()],
+            &bins.shadow_light[range],
+        );
+        let Some(((il, xl), (ir, xr))) = crossings(verts, lines, row) else {
+            continue;
+        };
+        let (from, to) = (pixel_edge(xl).max(x0), pixel_edge(xr).min(x1));
+        if from >= to {
+            continue;
+        }
+        // At each crossing: w, and the light times w (both linear across the row).
+        let at = |i: usize| {
+            let (w, alpha) = edge_at_row(verts, i, row);
+            let l = light[i] + (light[(i + 1) % verts.len()] - light[i]) * alpha;
+            (w, l * w)
+        };
+        let ((wl, ql), (wr, qr)) = (at(il), at(ir));
+        let out = &mut s.reaches[j as usize * len..(j as usize + 1) * len];
+        let span = (xr - xl).max(1e-6);
+        for x in from..to {
+            let t = (x as f32 + 0.5 - xl) / span;
+            let (w, q) = (wl + (wr - wl) * t, ql + (qr - ql) * t);
+            let reach = if w > 0.0 { (q / w).clamp(0.0, 1.0) } else { 0.0 };
+            let o = &mut out[(x - x0) as usize];
+            *o = o.min(reach);
+        }
+    }
+}
+
 /// Shades pixels `x0..x1` of a polygon's row into `out` (the row's colors, or the blend
 /// buffer), over `behind`.
 #[allow(clippy::too_many_arguments)]
@@ -1873,6 +1918,8 @@ fn shade_points(
         x0
     };
     row_points(s, index, p.n_out as usize, shown, x1);
+    // The shadow buffer for the run: how much of each split light reaches each pixel.
+    shadow_run(s, &bins[t], p, x0, x1);
     let job = SpanJob {
         x_left,
         x_right,
@@ -1881,6 +1928,8 @@ fn shade_points(
         xs: &s.points_x,
         outs: &s.points_v,
         x0,
+        splits: p.splits as usize,
+        reaches: &s.reaches,
         row: s.row,
         half_rate: p.half_rate,
         vx,

@@ -339,3 +339,23 @@ fn lights_reach_sectors_through_openings_in_range() {
     assert_eq!(world.sector_lights(1), [0, 2, 3, 5]);
     assert_eq!(world.sector_lights(2), [3]); // room_b's doorway is 14 m from the spot
 }
+
+#[test]
+fn the_sun_reaches_sectors_through_sky_and_on_through_openings() {
+    let mut assets = moose_assets::Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    let level = assets.load_level("sunny_rooms.mmp").unwrap();
+    let mut world = World::new(level, &assets);
+    // The level's sun: in room_b (2) through its sky, then out through its doorway into the
+    // hallway (1), heading into it (+z). Not on into room_a (0): through the doorway it only
+    // reaches the hallway floor a couple of meters in, so the window it sees room_a's
+    // doorway through is empty.
+    let sun = world.lights().iter().position(|l| l.directional).unwrap() as u32;
+    assert!(world.sector_lights(2).contains(&sun));
+    assert!(world.sector_lights(1).contains(&sun));
+    assert!(!world.sector_lights(0).contains(&sun));
+    // Shining the other way (-z), it doesn't leave room_b toward the hallway.
+    let away = moose_assets::Light::directional(Vec3::new(0.45, -0.8, -0.55), Vec3::ONE, 0.5);
+    world.set_lights(vec![away], Vec3::ZERO);
+    assert_eq!(world.sector_lights(2), [0]);
+    assert!(world.sector_lights(1).is_empty() && world.sector_lights(0).is_empty());
+}

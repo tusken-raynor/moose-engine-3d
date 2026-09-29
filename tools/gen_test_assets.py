@@ -305,14 +305,20 @@ def planar_uv(p, normal):
     return (round(u / UV_TILE, 4), round(v / UV_TILE, 4))
 
 
-def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=None, lights=()):
+def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=None, lights=(),
+               options=None, sky=(), sky_color=(112, 158, 214), directional=(),
+               light_options=""):
     """The level as .mmp text. Surfaces listed in `shiny` get the reflective flag (0x1).
     Surfaces listed in `darker` get their vertex colors at half brightness (as new color
     rows, so other surfaces sharing a color keep it). With `uv`, every drawn surface also
     gets texture coordinates (`uv f32 2`, see planar_uv). `props` are extra entities, after
     the shared ones. `ambient` (r, g, b) and `lights` ((sector, position, color, range) for
     a point light, plus (direction, inner, outer) in degrees for a spot light) light it;
-    without them it shows its full colors."""
+    without them it shows its full colors. `options` maps entity names to their options
+    (for example "static occluder=facing:16:0.25"). Surfaces listed in `sky` get the sky flag
+    (0x2) and `sky_color` (0-255): directional lights ((direction, color, angle in degrees))
+    enter through them. `light_options` follow every light's row (for example "radius=0.05")."""
+    options = options or {}
     table = list(colors)
     index = dict(cindex)
     attributes = ATTRIBUTES + ([("uv", "f32", 2)] if uv else [])
@@ -323,6 +329,13 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=No
             uv_index[key] = len(uvs)
             uvs.append(key)
         return uv_index[key]
+
+    def sky_row():
+        key = tuple(sky_color)
+        if key not in index:
+            index[key] = len(table)
+            table.append(key)
+        return index[key]
 
     def darker_row(c):
         key = tuple(int(round(x * 0.5)) for x in colors[c])
@@ -356,7 +369,7 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=No
             if c is None:
                 row.append((v,))  # portal: vertex index only
                 continue
-            refs = (darker_row(c) if i in darker else c,)
+            refs = (sky_row() if i in sky else darker_row(c) if i in darker else c,)
             if uv:
                 refs += (uv_row(planar_uv(verts[v], normal)),)
             row.append((v,) + refs)
@@ -372,15 +385,15 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=No
     for i, (n, f, c) in enumerate(sectors):
         o.append(f"   {i:<3} {n:<9} {f:<14} {c}")
     o += ["", f"surfaces {len(surfaces)}",
-          "#  id  sector  adjoin  flags  nverts  vert[:attr ...] ...   (flags: 0x1 = reflective; attr = row in each values table, in declaration order; portals list verts only)"]
+          "#  id  sector  adjoin  flags  nverts  vert[:attr ...] ...   (flags: 0x1 = reflective, 0x2 = sky; attr = row in each values table, in declaration order; portals list verts only)"]
     last_sector = None
     for i, s in enumerate(surfaces):
         if s["sector"] != last_sector:
             o.append(f"   # --- sector {s['sector']}: {sectors[s['sector']][0]}")
             last_sector = s["sector"]
         vs = " ".join(":".join(str(r) for r in refs) for refs in rows[i])
-        flags = s['flags'] | (0x1 if i in shiny else 0)
-        comment = s['comment'] + (" (reflective)" if i in shiny else "")
+        flags = s['flags'] | (0x1 if i in shiny else 0) | (0x2 if i in sky else 0)
+        comment = s['comment'] + (" (reflective)" if i in shiny else "") + (" (sky)" if i in sky else "")
         o.append(f"   {i:<3} {s['sector']:<7} {s['adjoin']:<7} 0x{flags:<4x} {len(s['verts']):<7} {vs:<34} # {comment}")
     o += ["", f"adjoins {len(adjoins)}",
           "#  id  surface  mirror  flags    (0x1 = render through, 0x2 = passable)"]
@@ -388,10 +401,13 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=No
         o.append(f"   {i:<3} {s:<8} {m:<7} 0x{f:x}")
     all_entities = entities + list(props)
     o += ["", f"entities {len(all_entities)}",
-          "#  id  kind   sector  model      x       y       z       pitch  yaw   roll  scale  name"]
+          "#  id  kind   sector  model      x       y       z       pitch  yaw   roll  scale  name  [options]"]
     for i, (k, sec, m, p, r, sc, n) in enumerate(all_entities):
-        o.append(f"   {i:<3} {k:<6} {sec:<7} {m:<10} " + " ".join(f"{fmt(x):<7}" for x in p)
-                 + f" {r[0]:<6} {r[1]:<5} {r[2]:<5} {fmt(sc):<6} {n}")
+        row = (f"   {i:<3} {k:<6} {sec:<7} {m:<10} " + " ".join(f"{fmt(x):<7}" for x in p)
+               + f" {r[0]:<6} {r[1]:<5} {r[2]:<5} {fmt(sc):<6} {n}")
+        if n in options:
+            row = f"{row:<92} {options[n]}"
+        o.append(row)
     if ambient is not None:
         o += ["", "ambient " + " ".join(fmt(c) for c in ambient)]
     if lights:
@@ -404,7 +420,14 @@ def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=No
             if spot:
                 (d, inner, outer) = spot
                 row += " " + " ".join(f"{fmt(x):<6}" for x in d) + f" {fmt(inner):<6} {fmt(outer)}"
-            o.append(row.rstrip())
+            o.append((row + " " + light_options).rstrip())
+    if directional:
+        o += ["", f"directional {len(directional)}",
+              "#  id  dx     dy     dz     r      g      b      angle   (the way the light travels; "
+              "angle: the source's size in degrees)"]
+        for i, (d, c, angle) in enumerate(directional):
+            o.append(f"   {i:<3} " + " ".join(f"{fmt(x):<6}" for x in d)
+                     + " " + " ".join(f"{fmt(x):<6}" for x in c) + f" {fmt(angle)}")
     return "\n".join(o) + "\n"
 
 
@@ -615,8 +638,14 @@ with open(os.path.join(ROOT, "assets/levels/shiny_rooms.mmp"), "w") as f:
                        "lit by five point lights.",
                        shiny=shiny_floors, darker=room_floors, uv=True,
                        ambient=(0.01, 0.01, 0.013), lights=shiny_lights,
+                       # Lamps a few centimeters across: soft-edged shadows.
+                       light_options="radius=0.05",
                        props=[("prop", room_b, "ball.obj", (-1.5, 1.5, -15.0), (0, 0, 0), 1.0,
-                               "mirror_ball")]))
+                               "mirror_ball")],
+                       # The crates never move and cast shadows as themselves; the ball casts
+                       # a polygon facing the light, on its outline.
+                       options={**{n: "static" for (k, _, m, *_, n) in entities if m == "crate.obj"},
+                                "mirror_ball": "static occluder=facing:16:0.25"}))
 # The shiny floors with room_a's ceiling reflective too: two facing mirrors, for
 # reflections of reflections.
 with open(os.path.join(ROOT, "assets/levels/mirror_rooms.mmp"), "w") as f:
@@ -624,4 +653,20 @@ with open(os.path.join(ROOT, "assets/levels/mirror_rooms.mmp"), "w") as f:
                        "shiny floors throughout, darker in the rooms, and room_a's ceiling "
                        "reflective too.",
                        shiny=shiny_floors | {room_a_ceiling}, darker=room_floors, uv=True))
+# room_b open to the sky: a courtyard. The sun comes in over its walls from the south-west,
+# low enough to cast long shadows and to shine through its doorway down the hallway.
+# Lit by the sun, a moving lamp in room_a (and the player's flashlight) and a dim
+# sky-blue ambient.
+room_b_ceiling = sectors[room_b][1] + 1
+with open(os.path.join(ROOT, "assets/levels/sunny_rooms.mmp"), "w") as f:
+    f.write(level_text("Sunny Rooms",
+                       "two_rooms.mmp with room_b open to the sky, lit by the sun and a moving lamp.",
+                       uv=True, ambient=(0.05, 0.06, 0.09), sky={room_b_ceiling},
+                       directional=[((0.45, -0.8, 0.55), (2.0, 1.85, 1.6), 0.53)],
+                       # A light-blue lamp in room_a's middle, swinging 2 m toward each of
+                       # the two corners without crates (+x -z and -x +z): moving shadows
+                       # (it's carved every frame, not baked).
+                       lights=[(room_a, (0.0, 2.3, 4.0), (0.45, 0.75, 1.5), 6.0)],
+                       light_options="radius=0.05 oscillate=1.4142:0:-1.4142:5",
+                       options={n: "static" for (k, _, m, *_, n) in entities if m == "crate.obj"}))
 print(f"verts={len(verts)} color_values={len(colors)} surfaces={len(surfaces)} adjoins={len(adjoins)}")

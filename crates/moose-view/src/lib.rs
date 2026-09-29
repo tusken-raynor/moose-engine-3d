@@ -10,5 +10,6 @@ mod frame;
 pub use carve::MAX_SHADOW_SLOTS;
 pub use frame::{
     EdgeLine, MAX_REFLECTIONS, Mirror, Object, PolygonKind, PolygonSource, ScreenVertex,
-    SectorVisit, ViewConfig, ViewGeometry, ViewPolygon, ViewStats, pixel_edge,
+    SectorVisit, ShadowPiece, ShadowVertex, ViewConfig, ViewGeometry, ViewPolygon, ViewStats,
+    pixel_edge,
 };
