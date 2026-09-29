@@ -1,6 +1,6 @@
 # Lighting Spec
 
-Sep 28, 2026 · Built: static point and spot lights, diffuse only, and a shadow-mapped flashlight
+Sep 28, 2026 · Built: static point and spot lights, diffuse only, and a flashlight whose shadows are carved into polygons
 
 ## Overview
 
@@ -102,23 +102,50 @@ The per-pixel versions had two further costs:
 
 ## Flashlight shadows
 
-Sep 28, a first test of shadow mapping, on the flashlight only. Shadow volumes were set aside: they work per pixel with a stencil pass per light, which costs CPU fill rate and doesn't fit lighting evaluated at sample points.
+Shadows are carved into polygons: the view splits each polygon a shadow-casting light reaches into pieces wholly lit and pieces wholly in shadow. A shadow's edge is an edge between polygons, exact at any resolution, and each piece is lit by sampling as usual. Only the flashlight casts shadows so far.
 
-- **The map:** `ShadowMap` (moose-raster) holds, per texel, 1 / the distance along the light's direction to the nearest surface, over a square covering the cone (512 texels by default, `--shadow-size`). `Renderer::shadow_maps` holds the maps, and a light names its map with `Light::shadow`.
-- **Rendering it:** before the frame, the level's polygons in the sectors the light reaches (the portal flood) and the entities touching them are drawn from the light, depth only.
-  - Polygons are clipped to a near plane, and those facing away from the light are skipped: sectors and models are closed.
-  - 1 / depth is affine in the map, so each texel is a single max with no division.
-  - The map is redrawn only when the light moves.
-- **Looking it up:** inside `diffuse()`, for each light with a map, wherever the light reaches any of the 8 points.
-  - Each point moves off its surface by 1.5 texels along its normal (normal offset) and gets a bias of 1 texel, both scaled to texel size at its depth. No acne showed in the test views.
-  - The four nearest texels' tests blend bilinearly (PCF), giving a one-texel soft edge.
-  - Shaders are unchanged: the shadow is one more factor on the light, like the cone.
-- **In the app:**
-  - Z toggles shadows (`--no-shadows`).
-  - U locks the flashlight where it is so its shadows can be seen from elsewhere, and U again puts it back on the shoulder (`--lock-flashlight X,Y,Z,YAW,PITCH` locks it for screenshots).
-  - The title shows the map's render time.
-- **Cost (one thread):** 0.13–0.26 ms per redraw at 512 texels, 0.06–0.09 ms at 256, over four views of shiny_rooms. The first version, which divided per texel and drew back faces, took 0.3–0.8 ms. Lookups barely show in raster time.
-- **Quality:** rendering at every pixel gives crisp edges. At the normal sample spacing, edges show small stair-steps along diagonals, as cells blend a hard edge. Where the spot's penumbra rule already tightens tiles to 4 px, 32, 16 and 8 px spacing look alike. Sample placement doesn't yet account for shadow edges.
+**How it evolved (Sep 28):**
+- **Shadow maps came first.** They worked but were rejected on quality. They're kept in commit 06d4997 (branch flashlight-shadow-map, `ShadowMap` in moose-raster).
+  - Lookups at sample points leave 4 px stair-steps along diagonal edges.
+  - Denser sampling at edges would mean per-pixel lighting along every edge, and would still be limited by the map's texels.
+- **Shadow volumes with a stencil were set aside.** They work per pixel, which doesn't fit sample-point lighting and costs CPU fill rate.
+
+**What blocks a light (`moose-view` carve module):**
+- **Portals.** Light reaches a sector beyond its own only through the openings between them. From the light, each opening seen through the ones before it is a window: planes through the light and the window's edges. A polygon in another sector is lit only where some window into its sectors reaches. This replaces the flood's looser rule, where light passed a whole opening, for shadow-casting lights.
+- **Occluders.** An entity's `Occluder` shape stands in for its model:
+  - `Mesh`: its own model, which must be convex. Crates use this.
+  - `Sphere`: center and radius. The ball uses this.
+  - A convex shape casts one convex shadow volume. It is the points inside the planes through the light and the shape's outline, and behind every one of its faces toward the light (by 1 mm, so those faces stay lit).
+    - The outline is the edges of those faces that no other face toward the light shares.
+    - Along any ray from the light, the faces toward the light all come before the point where the ray enters the shape. So a point behind all their planes is past the shape.
+    - A crate seen off a corner carves with 6 outline planes and 3 face planes. An earlier version gave each face toward the light its own volume, and the volumes kept cutting each other's pieces. In a crate view, carving dropped from 303 polygons to 151, from 44 before carving.
+  - A sphere's outline seen from a light is always the circle where rays graze it, so a sphere casts its shadow as a 16-sided disk on that circle, facing the light.
+  - An occluder's shape stands in for its model, so it never carves that model. The ball's own facets were being cut by its disk: 137 became 207.
+- **Which lights cast shadows:** those with `Light::shadow` set to a slot (0–31). A piece records the slots whose shadow it is in (`ViewPolygon::shadowed`), and the rasterizer leaves those lights out of its light list. Shaders don't change.
+
+**Carving:**
+- **When:** after a polygon is clipped to its portal window, in world space, on the same clip records the view already carries. Pieces keep correct attributes (uvs, colors) as weights over the source vertices.
+- **No cracks:**
+  - A cut's points are computed once and shared by the pieces on both sides.
+  - An edge that is part of a longer one is walked along the longer one's line, as its neighbor walks it.
+  - A cut edge carries the line through its two endpoints, which both sides share.
+  - A magenta-background check over six views found no gaps.
+- **Skipped:** polygons facing away from the light or out of its range.
+
+**In the app:**
+- Crates cast shadows as themselves, and the mirror ball as a sphere.
+- Z toggles shadows (`--no-shadows`).
+- U locks the flashlight where it is, and U again puts it back on the shoulder. `--lock-flashlight X,Y,Z,YAW,PITCH` locks it for screenshots.
+
+**Cost:** measured on single frames of shiny_rooms, so rough.
+- The view takes 0.07–0.13 ms with shadows, against about 0.03 ms without.
+- The raster takes 0.1–0.5 ms more, from the extra pieces.
+
+**Not yet:**
+- Soft edges.
+- Shadows from other lights.
+- Occluder shapes read from assets (the app assigns them for now).
+- Cheaper handling of detailed occluders.
 
 ## Accuracy and cost
 

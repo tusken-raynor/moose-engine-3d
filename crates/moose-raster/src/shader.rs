@@ -18,8 +18,6 @@ use glam::Vec3;
 use moose_assets::{MipLevel, Light, Texture};
 use moose_view::Object;
 
-use crate::shadow::ShadowMap;
-
 use wide::{f32x4, f32x8, i16x8, i32x4, i32x8, u16x8, u32x4, u32x8};
 
 /// Pixels shaded at once.
@@ -1094,8 +1092,6 @@ pub struct SampleContext<'a> {
     /// the light that reaches everything (linear RGB).
     pub lights: &'a [Light],
     pub ambient: Vec3,
-    /// The shadow maps lights name (`Light::shadow`).
-    pub shadow_maps: &'a [ShadowMap],
 }
 
 /// What `shade_pixel` sees besides its interpolated values.

@@ -39,9 +39,9 @@ pub struct Light {
     /// Cosines of the cone's inner and outer half-angles; -1 for a point light (whole).
     pub cos_inner: f32,
     pub cos_outer: f32,
-    /// Its shadow map, if it casts shadows: an index into the renderer's shadow maps (a
-    /// runtime choice; levels don't set it).
-    pub shadow: Option<u16>,
+    /// Whether it casts shadows, and its shadow slot if so (below 32): the bit polygons
+    /// in its shadow set in their shadow mask (a runtime choice; levels don't set it).
+    pub shadow: Option<u8>,
 }
 
 impl Light {

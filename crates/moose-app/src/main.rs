@@ -25,7 +25,6 @@
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off (H toggles)
 //!   --no-shadows          start with the flashlight's shadows off (Z toggles)
-//!   --shadow-size N       the flashlight's shadow map size, in texels (default 512)
 //!   --level-lights        start with the level's own lights on (N toggles; off by default,
 //!                         leaving the flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
@@ -68,9 +67,9 @@ use moose_raster::shaders::{
     VertexColorFresnel, VertexColorTranslucent, Water, filter,
 };
 use moose_raster::{
-    MaterialId, ShadowMap, Params, RasterConfig, RasterPath, Renderer, Surface, Target, register_per_filter,
+    MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target, register_per_filter,
 };
-use moose_scene::{Camera, Viewport, World};
+use moose_scene::{Camera, Occluder, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
 
 const EYE_HEIGHT: f32 = 1.7;
@@ -126,8 +125,6 @@ const FLASHLIGHT_COLOR: Vec3 = Vec3::new(3.4, 3.5, 3.9);
 const FLASHLIGHT_RANGE: f32 = 16.0;
 /// Its cone's inner and outer half-angles, in degrees.
 const FLASHLIGHT_CONE: (f32, f32) = (6.0, 20.0);
-/// Its shadow map's default size, in texels (`--shadow-size`; Z toggles its shadows).
-const SHADOW_SIZE: u32 = 512;
 
 /// Steep surface limits `;` cycles through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
@@ -163,7 +160,6 @@ struct Options {
     no_flashlight: bool,
     level_lights: bool,
     no_shadows: bool,
-    shadow_size: u32,
     time: f32,
     show_samples: bool,
     /// `RasterConfig` spacing limits, if given.
@@ -202,7 +198,6 @@ fn parse_args() -> Result<Options, String> {
         water: false,
         no_flashlight: false,
         no_shadows: false,
-        shadow_size: SHADOW_SIZE,
         level_lights: false,
         time: 0.0,
         show_samples: false,
@@ -242,9 +237,6 @@ fn parse_args() -> Result<Options, String> {
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--no-shadows" => o.no_shadows = true,
-            "--shadow-size" => {
-                o.shadow_size = value()?.parse().map_err(|_| "bad --shadow-size")?
-            }
             "--level-lights" => o.level_lights = true,
             "--show-samples" => o.show_samples = true,
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
@@ -347,11 +339,6 @@ struct App {
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
     settings: Settings,
-    /// How long the flashlight's shadow map last took to render, in ms (0 when it was
-    /// unchanged).
-    shadow_ms: f64,
-    /// The flashlight's shadow map size, in texels.
-    shadow_size: u32,
     pixels: Vec<u32>,
     width: u32,
     height: u32,
@@ -406,6 +393,20 @@ impl App {
             )),
             None => None,
         };
+        // What casts shadows: crates as themselves (boxes), mirror balls as spheres.
+        let mut world = world;
+        let ball = assets.mesh_id(BALL_MODEL);
+        for entity in &mut world.entities {
+            if crate_texture.is_some_and(|(mesh, _)| mesh == entity.mesh) {
+                entity.occluder = Occluder::Mesh;
+            } else if Some(entity.mesh) == ball {
+                let b = assets.mesh(entity.mesh).bounds;
+                entity.occluder = Occluder::Sphere {
+                    center: (b.min + b.max) * 0.5,
+                    radius: (b.max.x - b.min.x) * 0.5,
+                };
+            }
+        }
         let has_uvs = assets
             .mesh(world.geometry)
             .attribs
@@ -484,8 +485,6 @@ impl App {
                 flashlight_lock: None,
                 smoothing: 2,
             },
-            shadow_ms: 0.0,
-            shadow_size: options.shadow_size.clamp(16, 4096),
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -579,22 +578,13 @@ impl App {
             true => self.lights.0.iter().map(|&l| scaled(l)).collect(),
             false => Vec::new(),
         };
-        let shadowed = flashlight && self.settings.flashlight && self.settings.shadows;
         if flashlight && self.settings.flashlight {
             let mut light = scaled(self.flashlight());
-            light.shadow = shadowed.then_some(0);
+            // Shadow slot 0: the view carves its shadows into polygons.
+            light.shadow = self.settings.shadows.then_some(0);
             lights.push(light);
         }
-        let index = lights.len() as u32 - 1;
         self.world.set_lights(lights, self.lights.1);
-        if shadowed {
-            let started = Instant::now();
-            if self.renderer.shadow_maps.is_empty() {
-                self.renderer.shadow_maps.push(ShadowMap::new(self.shadow_size));
-            }
-            self.renderer.shadow_maps[0].render(&self.world, &self.assets, index, false);
-            self.shadow_ms = started.elapsed().as_secs_f64() * 1000.0;
-        }
     }
 
     /// The player's flashlight: where U locked it, or on their shoulder.
@@ -829,8 +819,8 @@ fn run() -> Result<(), String> {
         let (view_ms, raster_ms) = app.render()?;
         app.save_png(Path::new(path))?;
         println!(
-            "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms, shadow map {:.3} ms",
-            app.width, app.height, app.shadow_ms
+            "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
+            app.width, app.height
         );
         return Ok(());
     }
@@ -1085,11 +1075,7 @@ fn run() -> Result<(), String> {
                 if app.settings.lit { "" } else { " (all off)" },
                 if app.settings.flashlight { "on" } else { "off" },
                 if app.settings.flashlight_lock.is_some() { " (locked)" } else { "" },
-                if app.settings.flashlight && app.settings.shadows {
-                    format!(", shadows ({:.2} ms)", app.shadow_ms)
-                } else {
-                    String::new()
-                },
+                if app.settings.flashlight && app.settings.shadows { ", shadows" } else { "" },
                 app.settings.penumbra,
                 cfg.penumbra_threshold,
             ));

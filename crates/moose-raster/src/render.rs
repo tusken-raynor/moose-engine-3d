@@ -15,7 +15,6 @@ use moose_view::{
 };
 use rayon::prelude::*;
 
-use crate::shadow::ShadowMap;
 use crate::shader::{
     F32s, Fill,
     Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS,
@@ -382,9 +381,6 @@ pub struct Renderer {
     scratch: Vec<Mutex<RowScratch>>,
     /// What untextured polygons sample: 1x1 opaque white.
     blank: Texture,
-    /// Shadow maps, for lights that name one (`Light::shadow`); render them before the
-    /// frame.
-    pub shadow_maps: Vec<ShadowMap>,
 }
 
 /// The textures polygons sample, and the frame's focal length and ambient light.
@@ -393,7 +389,6 @@ struct Textures<'a> {
     blank: &'a Texture,
     focal: f32,
     ambient: Vec3,
-    shadow_maps: &'a [ShadowMap],
 }
 
 impl Textures<'_> {
@@ -416,7 +411,6 @@ impl Renderer {
             bins: Vec::new(),
             scratch: Vec::new(),
             blank: Texture::solid("blank", 0xFFFF_FFFF),
-            shadow_maps: Vec::new(),
         }
     }
 
@@ -464,7 +458,6 @@ impl Renderer {
             blank: &self.blank,
             focal: geometry.focal,
             ambient: geometry.ambient,
-            shadow_maps: &self.shadow_maps,
         };
         let setup_started = Instant::now();
         // ---- Phase 1: polygon setup and binning, split by polygon. Each thread writes only
@@ -768,7 +761,9 @@ fn setup_polygon(
     let first_plane = bins.planes.len() as u32;
     let fans = fan_planes(verts, &bins.values, n_vals, &mut bins.planes);
     // Its lights: those that can reach its sector (or its entity's sectors), in range of it,
-    // in front of it, and (spot lights) with it in their cone. Mirrored polygons are lit where they really are.
+    // in front of it, (spot lights) with it in their cone, and not casting a shadow over it
+    // (the view carves polygons into pieces wholly in or out of each shadow). Mirrored
+    // polygons are lit where they really are.
     let first_light = bins.lights.len() as u32;
     let positions = &geometry.world_positions[p.vertices()];
     let normal = Vec3::from_array(face_normal);
@@ -782,7 +777,9 @@ fn setup_polygon(
         let light = geometry.lights[li as usize];
         let height = normal.dot(light.position - positions[0]);
         let near = light.position.clamp(lo, hi).distance(light.position);
-        if height > 0.0
+        let in_shadow = light.shadow.is_some_and(|k| p.shadowed >> k & 1 != 0);
+        if !in_shadow
+            && height > 0.0
             && height < light.range
             && near < light.range
             && light.cone_reaches(center, radius)
@@ -1312,7 +1309,6 @@ fn sample_context<'a>(
         lights: &bins.lights[lights],
         ambient: textures.ambient,
         focal: textures.focal,
-        shadow_maps: textures.shadow_maps,
     }
 }
 

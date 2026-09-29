@@ -48,6 +48,22 @@ pub struct Entity {
     /// Every sector `bounds` overlaps, starting with `sector`. An entity poking through a
     /// portal lists both sides, so it can be tested from either. Derived like `bounds`.
     pub sectors: Vec<u32>,
+    /// The shape it casts shadows with, if any.
+    pub occluder: Occluder,
+}
+
+/// The shape an entity blocks light with, for lights that cast shadows: something simple,
+/// standing in for its model.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Occluder {
+    /// It casts no shadows.
+    #[default]
+    None,
+    /// Its own model, which must be convex (a box, say): its faces toward the light.
+    Mesh,
+    /// A sphere, in model coordinates: seen from a light its outline is always a circle, so
+    /// it casts shadows as a disk facing the light.
+    Sphere { center: Vec3, radius: f32 },
 }
 
 impl Entity {
@@ -141,6 +157,7 @@ impl World {
                     scale: spawn.scale,
                     bounds: Aabb::from_points([]),
                     sectors: Vec::new(),
+                    occluder: Occluder::None,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }

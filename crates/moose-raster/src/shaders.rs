@@ -6,8 +6,7 @@ use crate::shader::{F32s, Fill, I16s, I32s, SampleContext, U32s};
 /// `normal` (unit length), in linear RGB (1 shows a surface's full color): the ambient light,
 /// plus each light that reaches the polygon, by Lambert's cosine law, a smooth falloff to
 /// nothing at its range, `(1 - d^2 / range^2)^2`, and a spot light's cone (smoothstep from
-/// its outer half-angle to its inner; a point light's cone is whole), and its shadow map
-/// if it has one.
+/// its outer half-angle to its inner; a point light's cone is whole).
 ///
 /// Evaluated at sample points only, and interpolated to pixels in between.
 #[inline(always)]
@@ -36,13 +35,7 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
             .max(zero)
             .min(one);
         let cone = c * c * (F32s::fill(3.0) - c - c);
-        let mut k = t * t * cos * cone;
-        // Its shadow map, if it has one, where any of the points gets some of its light.
-        if let Some(map) = l.shadow.and_then(|i| ctx.shadow_maps.get(i as usize))
-            && k.simd_gt(zero).to_bitmask() != 0
-        {
-            k *= map.visibility(position, normal);
-        }
+        let k = t * t * cos * cone;
         light[0] += F32s::fill(l.color.x) * k;
         light[1] += F32s::fill(l.color.y) * k;
         light[2] += F32s::fill(l.color.z) * k;
@@ -1124,7 +1117,6 @@ mod tests {
             params: &params,
             lights: &[],
             ambient: Vec3::ONE,
-            shadow_maps: &[],
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();

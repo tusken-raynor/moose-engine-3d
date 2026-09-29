@@ -10,9 +10,7 @@ pub mod shader;
 pub mod shaders;
 
 mod render;
-mod shadow;
 
-pub use shadow::ShadowMap;
 pub use render::{
     LayoutError, RasterConfig, RasterPath, RenderStats, Renderer, Surface, Target,
 };

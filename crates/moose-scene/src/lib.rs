@@ -9,4 +9,4 @@ mod camera;
 mod world;
 
 pub use camera::{Camera, View, Viewport};
-pub use world::{Entity, PORTAL_CLEARANCE, SpawnPoint, Trace, World};
+pub use world::{Entity, Occluder, PORTAL_CLEARANCE, SpawnPoint, Trace, World};

@@ -6,6 +6,7 @@ use moose_assets::{
 };
 use moose_scene::{View, World};
 
+use crate::carve::{Carver, PieceEdge, Receiver};
 use crate::clip::{ClipPlane, Clipper, Edge};
 
 /// Tolerance for treating the eye as lying exactly on a portal's plane, in meters. Camera
@@ -142,6 +143,9 @@ pub struct ViewPolygon {
     /// The mirror this polygon is seen in (index in `ViewGeometry::mirrors`), or `None` if
     /// it is seen directly.
     pub mirror: Option<u32>,
+    /// The shadow slots (`Light::shadow`) of the lights it is in the shadow of: each is a
+    /// bit. Polygons are carved into pieces wholly in or out of each such light's shadow.
+    pub shadowed: u32,
     /// For a reflective polygon, the mirror seen through it, if its reflection was drawn:
     /// then its reflection fills its outline behind it, and it must be drawn in the
     /// translucent pass. `None` for every other polygon, which is drawn opaque.
@@ -318,8 +322,10 @@ struct Scratch {
     pending: Vec<Pending>,
     /// Visits into mirrors, waiting for the traversal they were found in to finish.
     reflected: Vec<Pending>,
-    /// Reflective polygons drawn in the current visit: source index, output index.
-    mirror_polygons: Vec<(u32, usize)>,
+    /// Reflective polygons drawn in the current visit: source index, output indices (its
+    /// pieces, when shadows carve it).
+    mirror_polygons: Vec<(u32, Range<usize>)>,
+    carver: Carver,
     window: WindowScratch,
 }
 
@@ -564,6 +570,7 @@ impl ViewGeometry {
         }
         self.object_lights.clear();
         self.object_lights.push(0..0); // the level: per sector instead
+        self.scratch.carver.prepare(world, assets, &self.lights);
         self.visits.clear();
         self.mirrors.clear();
         self.window_planes.clear();
@@ -691,8 +698,9 @@ impl ViewGeometry {
                         self.stats.world_outside += 1;
                         continue;
                     }
-                    emit(
+                    let drawn = emit_pieces(
                         &mut out,
+                        &mut s.carver,
                         view,
                         clipped,
                         edges,
@@ -707,17 +715,20 @@ impl ViewGeometry {
                         },
                         polygon.flags,
                         group,
+                        &[visit.sector],
+                        polygon.plane.normal,
                     );
                     self.stats.world_drawn += 1;
                     if polygon.flags.reflective() && depth < max_reflections {
-                        s.mirror_polygons.push((pi, out.polygons.len() - 1));
+                        s.mirror_polygons.push((pi, drawn));
                     }
                 }
 
                 if visit.depth < MAX_PORTAL_DEPTH {
                     // Mirrors: each opens a window into this sector, reflected. Seen from here
                     // they are front-facing convex outlines, just like portals.
-                    for &(pi, drawn) in &s.mirror_polygons {
+                    for (pi, drawn) in &s.mirror_polygons {
+                        let pi = *pi;
                         let polygon = &geometry.polygons[pi as usize];
                         let w = &mut s.window;
                         w.points.clear();
@@ -754,7 +765,9 @@ impl ViewGeometry {
                                 self.mirrors.len() - 1
                             }
                         };
-                        out.polygons[drawn].reflection = Some(m as u32);
+                        for piece in drawn.clone() {
+                            out.polygons[piece].reflection = Some(m as u32);
+                        }
                         s.reflected.push(Pending {
                             sector: visit.sector,
                             window,
@@ -918,8 +931,9 @@ impl ViewGeometry {
                         self.stats.entity_polygons_outside += 1;
                         continue;
                     }
-                    emit(
+                    emit_pieces(
                         &mut out,
+                        &mut s.carver,
                         view,
                         clipped,
                         edges,
@@ -934,6 +948,8 @@ impl ViewGeometry {
                         },
                         polygon.flags,
                         group,
+                        &entity.sectors,
+                        entity.rotation * polygon.plane.normal,
                     );
                 }
                 self.stats.entities_drawn += 1;
@@ -1116,12 +1132,13 @@ fn border_lines(view: &View) -> [EdgeLine; 4] {
     ]
 }
 
-/// Projects clipped records (exactly, no rounding) and appends them as one output polygon.
-/// An edge that lies on one of the clip planes with a line in `plane_lines` (portal edges
-/// and viewport borders, indexed like the planes) carries that line; see [`EdgeLine`].
+/// Carves a clipped polygon for the lights that cast shadows (see the carve module) and
+/// emits each piece; `sectors` are the sectors it is in, and `normal` its world-space
+/// normal. Returns the output indices of its pieces.
 #[allow(clippy::too_many_arguments)]
-fn emit(
+fn emit_pieces(
     out: &mut Out,
+    carver: &mut Carver,
     view: &View,
     records: &[f32],
     edges: &[Edge],
@@ -1133,6 +1150,63 @@ fn emit(
     source: PolygonSource,
     flags: PolyFlags,
     mirror: Option<u32>,
+    sectors: &[u32],
+    normal: Vec3,
+) -> Range<usize> {
+    let first = out.polygons.len();
+    let stride = RECORD + source_vertices;
+    let receiver = Receiver {
+        sectors,
+        entity: match source {
+            PolygonSource::Entity { entity, .. } => Some(entity),
+            PolygonSource::World { .. } => None,
+        },
+        normal,
+        point: Vec3::from_slice(&records[3..6]),
+    };
+    let pieces = carver
+        .carve(records, edges, stride, plane_lines.len(), &receiver)
+        .len();
+    for i in 0..pieces {
+        let piece = carver.piece(i);
+        emit(
+            out,
+            view,
+            carver.records(&piece),
+            carver.edges(&piece),
+            plane_lines,
+            source_vertices,
+            id,
+            object,
+            kind,
+            source,
+            flags,
+            mirror,
+            piece.shadowed,
+        );
+    }
+    first..out.polygons.len()
+}
+
+/// Projects clipped records (exactly, no rounding) and appends them as one output polygon.
+/// An edge that lies on one of the clip planes with a line in `plane_lines` (portal edges
+/// and viewport borders, indexed like the planes), or that is part of a longer edge or a
+/// shadow's cut ([`PieceEdge::Line`]), carries that line; see [`EdgeLine`].
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    out: &mut Out,
+    view: &View,
+    records: &[f32],
+    edges: &[PieceEdge],
+    plane_lines: &[EdgeLine],
+    source_vertices: usize,
+    id: MeshId,
+    object: u32,
+    kind: PolygonKind,
+    source: PolygonSource,
+    flags: PolyFlags,
+    mirror: Option<u32>,
+    shadowed: u32,
 ) {
     let stride = RECORD + source_vertices;
     let first_vertex = out.vertices.len() as u32;
@@ -1145,8 +1219,9 @@ fn emit(
             w: 1.0 / r[2],
         });
         out.edge_lines.push(match *edge {
-            Edge::Plane(k) => plane_lines.get(k as usize).copied(),
-            Edge::Input(_) => None,
+            PieceEdge::Clip(Edge::Plane(k)) => plane_lines.get(k as usize).copied(),
+            PieceEdge::Clip(Edge::Input(_)) => None,
+            PieceEdge::Line(a, b) => Some(line_between(view, a, b)),
         });
         out.world_positions.push(Vec3::from_slice(&r[3..6]));
         out.weights.extend_from_slice(&r[RECORD..]);
@@ -1162,6 +1237,7 @@ fn emit(
         source,
         flags,
         mirror,
+        shadowed,
         reflection: None,
     });
 }
