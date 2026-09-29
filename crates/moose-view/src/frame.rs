@@ -143,9 +143,16 @@ pub struct ViewPolygon {
     /// The mirror this polygon is seen in (index in `ViewGeometry::mirrors`), or `None` if
     /// it is seen directly.
     pub mirror: Option<u32>,
-    /// The shadow slots (`Light::shadow`) of the lights it is in the shadow of: each is a
-    /// bit. Polygons are carved into pieces wholly in or out of each such light's shadow.
+    /// The shadow slots (`Light::shadow`) of the lights it is in the full shadow of: each is
+    /// a bit. Polygons are carved into pieces wholly in or out of each such light's shadow,
+    /// and of each soft edge of it.
     pub shadowed: u32,
+    /// The shadow slots of the lights whose soft shadow (from a light with a size) it is in:
+    /// there a light is partly covered. For each vertex, one value per such light (in slot
+    /// order) from `first_soft` in `ViewGeometry::soft_values`: how much of it reaches the
+    /// vertex, to interpolate across the polygon like any vertex value.
+    pub soft: u32,
+    pub first_soft: u32,
     /// For a reflective polygon, the mirror seen through it, if its reflection was drawn:
     /// then its reflection fills its outline behind it, and it must be drawn in the
     /// translucent pass. `None` for every other polygon, which is drawn opaque.
@@ -280,6 +287,9 @@ pub struct ViewGeometry {
     /// [`ViewPolygon::first_weight`].
     pub weights: Vec<f32>,
     pub polygons: Vec<ViewPolygon>,
+    /// How much of each light whose soft shadow they are in reaches polygons' vertices; see
+    /// [`ViewPolygon::soft`].
+    pub soft_values: Vec<f32>,
     /// Where each polygon's mesh is: `[0]` is the level ([`Object::IDENTITY`]), then one per
     /// entity drawn.
     pub objects: Vec<Object>,
@@ -461,6 +471,7 @@ struct Out<'a> {
     world_positions: &'a mut Vec<Vec3>,
     weights: &'a mut Vec<f32>,
     polygons: &'a mut Vec<ViewPolygon>,
+    soft_values: &'a mut Vec<f32>,
 }
 
 impl ViewGeometry {
@@ -555,6 +566,7 @@ impl ViewGeometry {
         self.world_positions.clear();
         self.weights.clear();
         self.polygons.clear();
+        self.soft_values.clear();
         self.objects.clear();
         self.objects.push(Object::IDENTITY);
         (self.eye, self.focal) = (view.position, view.focal);
@@ -584,6 +596,7 @@ impl ViewGeometry {
             world_positions: &mut self.world_positions,
             weights: &mut self.weights,
             polygons: &mut self.polygons,
+            soft_values: &mut self.soft_values,
         };
         s.entity_objects.clear();
         s.entity_objects.resize(world.entities.len(), u32::MAX);
@@ -1169,6 +1182,8 @@ fn emit_pieces(
         .len();
     for i in 0..pieces {
         let piece = carver.piece(i);
+        let first_soft = out.soft_values.len() as u32;
+        let soft = carver.soft_values(&piece, out.soft_values);
         emit(
             out,
             view,
@@ -1183,6 +1198,7 @@ fn emit_pieces(
             flags,
             mirror,
             piece.shadowed,
+            (soft, first_soft),
         );
     }
     first..out.polygons.len()
@@ -1207,6 +1223,7 @@ fn emit(
     flags: PolyFlags,
     mirror: Option<u32>,
     shadowed: u32,
+    (soft, first_soft): (u32, u32),
 ) {
     let stride = RECORD + source_vertices;
     let first_vertex = out.vertices.len() as u32;
@@ -1238,6 +1255,8 @@ fn emit(
         flags,
         mirror,
         shadowed,
+        soft,
+        first_soft,
         reflection: None,
     });
 }

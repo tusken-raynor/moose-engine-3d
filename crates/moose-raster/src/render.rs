@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::shader::{
     F32s, Fill,
-    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS,
+    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, NO_FRACTION,
     Material, MaterialEntry, MaterialId, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
@@ -212,7 +212,10 @@ struct SetupVertex {
 struct PolygonSetup {
     first_vertex: u32,
     vertex_count: u16,
+    /// Values per vertex (and per sample point): its material's `sampled` values, then
+    /// `n_soft` soft shadow values (see `ViewPolygon::soft`).
     n_vals: u16,
+    n_soft: u16,
     /// Its material's outputs per sample point.
     n_out: u16,
     /// Its plane functions in `ThreadBins::planes` (see [`fan_planes`]), and its fan's
@@ -265,8 +268,13 @@ struct ThreadBins {
     vertex_out: Vec<f32>,
     /// Every polygon's plane functions (see [`fan_planes`]).
     planes: Vec<f32>,
-    /// Each polygon's lights (see `PolygonSetup::first_light`).
+    /// Scratch for `values` with soft shadow values added.
+    spare_values: Vec<f32>,
+    /// Each polygon's lights (see `PolygonSetup::first_light`), and per light, which of the
+    /// polygon's soft shadow values is how much of it reaches there ([`NO_FRACTION`] for
+    /// all of it).
     lights: Vec<Light>,
+    light_fractions: Vec<u8>,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -478,6 +486,7 @@ impl Renderer {
             bins.values.clear();
             bins.planes.clear();
             bins.lights.clear();
+            bins.light_fractions.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -758,6 +767,23 @@ fn setup_polygon(
             bins.values[v * n_vals + lod] = l;
         }
     }
+    // How much of each light whose soft shadow it is in reaches each vertex, after the
+    // material's values: interpolated like them, for its sample points.
+    let n_soft = p.soft.count_ones() as usize;
+    let n_soft = if n_vals + n_soft <= MAX_VARYINGS { n_soft } else { 0 };
+    let n_vals = if n_soft > 0 {
+        let soft = &geometry.soft_values[p.first_soft as usize..][..verts.len() * n_soft];
+        let mut both = std::mem::take(&mut bins.spare_values);
+        both.clear();
+        for (v, own) in bins.values.chunks_exact(n_vals).zip(soft.chunks_exact(n_soft)) {
+            both.extend_from_slice(v);
+            both.extend_from_slice(own);
+        }
+        bins.spare_values = std::mem::replace(&mut bins.values, both);
+        n_vals + n_soft
+    } else {
+        n_vals
+    };
     let first_plane = bins.planes.len() as u32;
     let fans = fan_planes(verts, &bins.values, n_vals, &mut bins.planes);
     // Its lights: those that can reach its sector (or its entity's sectors), in range of it,
@@ -785,6 +811,11 @@ fn setup_polygon(
             && light.cone_reaches(center, radius)
         {
             bins.lights.push(light);
+            // In its soft shadow, the polygon's value for how much of it reaches.
+            bins.light_fractions.push(match light.shadow {
+                Some(k) if p.soft >> k & 1 != 0 => (p.soft & ((1 << k) - 1)).count_ones() as u8,
+                _ => NO_FRACTION,
+            });
         }
     }
     let first_vertex = bins.vertices.len() as u32;
@@ -800,6 +831,7 @@ fn setup_polygon(
         first_vertex,
         vertex_count: verts.len() as u16,
         n_vals: n_vals as u16,
+        n_soft: n_soft as u16,
         n_out: layout_len(entry.io.interp) as u16,
         first_plane,
         fans: fans as u16,
@@ -1306,7 +1338,9 @@ fn sample_context<'a>(
         eye: p.eye,
         object: &p.object,
         params: &p.params,
-        lights: &bins.lights[lights],
+        lights: &bins.lights[lights.clone()],
+        light_fractions: &bins.light_fractions[lights],
+        fractions: &[],
         ambient: textures.ambient,
         focal: textures.focal,
     }
@@ -1457,6 +1491,39 @@ fn build_tiles(
             })
             .fold(0.0, f32::max)
     };
+    // How far any soft shadow value (how much of a light reaches) changes across the
+    // rectangle, at its corners and middle: like a spot light's cone, it fades across its
+    // soft shadow's edge, and cells there are spaced to follow it the same way.
+    let soft = match config.penumbra_threshold > 0.0 {
+        true => (n_in - p.n_soft as usize)..n_in,
+        false => n_in..n_in,
+    };
+    let value_at = |k: usize, x: f32, y: f32, w: f32| {
+        let (dx, dy) = (x - planes.ox, y - planes.oy);
+        let t = planes
+            .diagonals
+            .chunks_exact(2)
+            .filter(|d| d[0] * dy - d[1] * dx > 0.0)
+            .count();
+        let c = &planes.fans[(t * n_in + k) * 3..][..3];
+        (c[0] + c[1] * dx + c[2] * dy) / w
+    };
+    let soft_fade = |xa: f32, xb: f32, ya: f32, yb: f32, w_min: f32| {
+        let points = [(xa, ya), (xb, ya), (xa, yb), (xb, yb), ((xa + xb) / 2.0, (ya + yb) / 2.0)];
+        soft.clone()
+            .map(|k| {
+                let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                for &(x, y) in &points {
+                    let w = w_at(x, y);
+                    if w > w_min * 0.25 {
+                        let f = value_at(k, x, y, w).clamp(0.0, 1.0);
+                        (lo, hi) = (lo.min(f), hi.max(f));
+                    }
+                }
+                (hi - lo).max(0.0)
+            })
+            .fold(0.0, f32::max)
+    };
     s.pending.clear();
     // Each strip's spacing first, so runs of strips with the same one can share grid rows.
     s.spacings.clear();
@@ -1476,11 +1543,13 @@ fn build_tiles(
         // measured past the tile by `penumbra_padding` on every side, as the fade needn't be
         // spread across the tile: a penumbra crossing just its corner fades fast there, which
         // the corners alone would take for a slow fade across all of it.
-        let fade = if spots.is_empty() {
+        let fade = if spots.is_empty() && soft.is_empty() {
             0.0
         } else {
             let pad = config.penumbra_padding as f32;
-            penumbra(xa - pad, xb + pad, ya - pad, yb + pad, w_min)
+            let rect = (xa - pad, xb + pad, ya - pad, yb + pad);
+            penumbra(rect.0, rect.1, rect.2, rect.3, w_min)
+                .max(soft_fade(rect.0, rect.1, rect.2, rect.3, w_min))
         };
         let spacing = if fade > 0.0 {
             spacing.min(
@@ -1607,7 +1676,8 @@ fn build_tiles(
     }
 
     // Every tile's grid points, LANES at a time.
-    let ctx = sample_context(p, b, textures);
+    // The material's values, then the soft shadow values (see `sample_context`).
+    let n_material = n_in - p.n_soft as usize;
     let mut inputs = [F32s::default(); MAX_VARYINGS];
     let mut outputs = [F32s::default(); MAX_VARYINGS];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
@@ -1642,7 +1712,11 @@ fn build_tiles(
             }
             *input = q * inv;
         }
-        (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_out]);
+        let ctx = SampleContext {
+            fractions: &inputs[n_material..n_in],
+            ..sample_context(p, b, textures)
+        };
+        (entry.sample)(&inputs[..n_material], &ctx, &mut outputs[..n_out]);
         for (k, out) in outputs[..n_out].iter().enumerate() {
             let out = out.to_array();
             for (j, q) in chunk.iter().enumerate() {

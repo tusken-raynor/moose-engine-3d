@@ -14,7 +14,7 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
     let a = ctx.ambient;
     let mut light = [F32s::fill(a.x), F32s::fill(a.y), F32s::fill(a.z)];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
-    for l in ctx.lights {
+    for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
             F32s::fill(l.position.x) - position[0],
             F32s::fill(l.position.y) - position[1],
@@ -35,7 +35,13 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
             .max(zero)
             .min(one);
         let cone = c * c * (F32s::fill(3.0) - c - c);
-        let k = t * t * cos * cone;
+        let mut k = t * t * cos * cone;
+        // In its soft shadow, the part of it that gets past the occluders.
+        if let Some(&f) = ctx.light_fractions.get(i)
+            && let Some(fraction) = ctx.fractions.get(f as usize)
+        {
+            k *= fraction.max(zero).min(one);
+        }
         light[0] += F32s::fill(l.color.x) * k;
         light[1] += F32s::fill(l.color.y) * k;
         light[2] += F32s::fill(l.color.z) * k;
@@ -1117,6 +1123,8 @@ mod tests {
             params: &params,
             lights: &[],
             ambient: Vec3::ONE,
+            light_fractions: &[],
+            fractions: &[],
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();

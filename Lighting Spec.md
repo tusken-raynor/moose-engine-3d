@@ -123,6 +123,32 @@ Shadows are carved into polygons: the view splits each polygon a shadow-casting 
   - An occluder's shape stands in for its model, so it never carves that model. The ball's own facets were being cut by its disk: 137 became 207.
 - **Which lights cast shadows:** those with `Light::shadow` set to a slot (0–31). A piece records the slots whose shadow it is in (`ViewPolygon::shadowed`), and the rasterizer leaves those lights out of its light list. Shaders don't change.
 
+**Soft shadows:** a light with a size (`Light::radius`, in meters) casts a full-shadow core (umbra) and a soft edge (penumbra), both carved.
+- **Wedges:** for each outline edge, two planes through the edge graze the light's sphere on opposite sides. On the outer plane the edge starts to cover the light, and on the inner plane it covers all of it. The shadow region uses the outer planes in place of the hard ones.
+- **Carving:** inside the shadow region, the ring around the core is carved sector by sector.
+  - Each outline edge's sector lies between planes through the light and its two ends. Those planes halve the angle to the neighboring edges, so each sector holds that edge's wedge.
+  - The edge's inner plane splits its sector. Past it, whatever lies within every inner plane is the core, which drops the light. The rest is in the soft shadow.
+  - Without an outline loop (not expected for convex occluders), the ring is carved around the core in one piece.
+- **Light at the vertices:** each soft piece's vertices get a value for how much of the light reaches them (`ViewPolygon::soft`, `ViewGeometry::soft_values`).
+  - Each wedge covers part of the light: none on its outer plane, all on its inner, eased with a smoothstep between by the ratio of distances to the two planes.
+  - An occluder covers the product of what its wedges cover; near a corner, two wedges multiply.
+  - What gets past is the product over occluders of what each leaves uncovered.
+  - The rasterizer adds these to the polygon's own vertex values and interpolates them to sample points like the rest. `diffuse()` scales each light by its value (`SampleContext::light_fractions`), and shaders don't know about it.
+  - The values are exact at every piece's edges (1 where the soft edge starts, 0 where the core starts), so neighboring pieces match. Within a sector piece, the fade runs straight across one wedge, which interpolation follows.
+- **Sample density:** the penumbra rule also measures how much each soft value changes across a padded tile, and spaces that tile's points so it changes by at most the threshold per cell, as for a spot light's cone.
+- **How it evolved (Sep 28):**
+  - First, the fade was computed per sample from the wedges. Thin soft pieces then took their light from lattice points up to 32 px away: the ball's core showed a hard polygon edge and a light leak, 0.16% of pixels off by more than 8 levels.
+  - Next, per-vertex values with the ring carved in slabs by the inner planes one after another. Each slab spanned several wedges, so the blend across it showed facets and a hard-looking core.
+  - Now, sectors plus the density rule: 0.03% off, the same shape as the every-pixel render.
+- **Approximations:**
+  - The outline and faces are the ones seen from the light's center.
+  - When the core vanishes (a small occluder far from a big light), the wedges' product gives a faint blob.
+- **In the app:** the flashlight's radius defaults to 5 cm. X cycles 0, 2, 5, 10 and 20 cm, and `--light-radius` sets it at startup.
+- **Cost (Sep 28, shiny_rooms):**
+  - Polygons: the crate view has 284 at 5 cm and 304 at 20 cm, against 151 hard. The ball view has 564 and 576, against 465.
+  - The view takes about 0.1 ms more.
+  - The magenta check over 5 views at 2 radii found no gaps.
+
 **Carving:**
 - **When:** after a polygon is clipped to its portal window, in world space, on the same clip records the view already carries. Pieces keep correct attributes (uvs, colors) as weights over the source vertices.
 - **No cracks:**

@@ -25,6 +25,9 @@
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off (H toggles)
 //!   --no-shadows          start with the flashlight's shadows off (Z toggles)
+//!   --light-radius R      radius of the flashlight's source in meters: its shadows soften
+//!                         over the part of it an occluder covers (default 0.05; 0 is hard;
+//!                         X cycles 0, 0.02, 0.05, 0.1, 0.2)
 //!   --level-lights        start with the level's own lights on (N toggles; off by default,
 //!                         leaving the flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
@@ -52,7 +55,7 @@
 //! water floors on/off, T
 //! translucent crates, P per-pixel crates, O sample lattice overlay, Tab frame cap on/off, F12
 //! screenshot, M mouse smoothing (off, 50, 100, 150 ms), K lights on/off, H flashlight on/off, U lock the
-//! flashlight where it is (again: back on the shoulder), Z flashlight shadows on/off, N level
+//! flashlight where it is (again: back on the shoulder), Z flashlight shadows on/off, X flashlight size (shadow softness), N level
 //! lights on/off,
 //! 9 0 spot light penumbra narrower and wider, Esc quit.
 
@@ -125,6 +128,9 @@ const FLASHLIGHT_COLOR: Vec3 = Vec3::new(3.4, 3.5, 3.9);
 const FLASHLIGHT_RANGE: f32 = 16.0;
 /// Its cone's inner and outer half-angles, in degrees.
 const FLASHLIGHT_CONE: (f32, f32) = (6.0, 20.0);
+/// Sizes of its source X cycles through (radius in meters, `--light-radius`): its shadows
+/// soften over the part of it an occluder covers; 0 casts hard shadows.
+const FLASHLIGHT_RADII: [f32; 5] = [0.0, 0.02, 0.05, 0.1, 0.2];
 
 /// Steep surface limits `;` cycles through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
@@ -160,6 +166,7 @@ struct Options {
     no_flashlight: bool,
     level_lights: bool,
     no_shadows: bool,
+    light_radius: f32,
     time: f32,
     show_samples: bool,
     /// `RasterConfig` spacing limits, if given.
@@ -198,6 +205,7 @@ fn parse_args() -> Result<Options, String> {
         water: false,
         no_flashlight: false,
         no_shadows: false,
+        light_radius: FLASHLIGHT_RADII[2],
         level_lights: false,
         time: 0.0,
         show_samples: false,
@@ -237,6 +245,9 @@ fn parse_args() -> Result<Options, String> {
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--no-shadows" => o.no_shadows = true,
+            "--light-radius" => {
+                o.light_radius = value()?.parse().map_err(|_| "bad --light-radius")?
+            }
             "--level-lights" => o.level_lights = true,
             "--show-samples" => o.show_samples = true,
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
@@ -289,6 +300,8 @@ struct Settings {
     level_lights: bool,
     /// The flashlight casts shadows; Z toggles.
     shadows: bool,
+    /// The radius of the flashlight's source, in meters (X cycles `FLASHLIGHT_RADII`).
+    light_radius: f32,
     /// Where the flashlight was left when U locked it in place (sector, position, direction);
     /// `None` while it is on the player's shoulder. U again remounts it.
     flashlight_lock: Option<(u32, Vec3, Vec3)>,
@@ -482,6 +495,7 @@ impl App {
                 flashlight: !options.no_flashlight,
                 level_lights: true,
                 shadows: !options.no_shadows,
+                light_radius: options.light_radius.max(0.0),
                 flashlight_lock: None,
                 smoothing: 2,
             },
@@ -582,6 +596,7 @@ impl App {
             let mut light = scaled(self.flashlight());
             // Shadow slot 0: the view carves its shadows into polygons.
             light.shadow = self.settings.shadows.then_some(0);
+            light.radius = self.settings.light_radius;
             lights.push(light);
         }
         self.world.set_lights(lights, self.lights.1);
@@ -990,6 +1005,15 @@ fn run() -> Result<(), String> {
         if display.key_pressed(Key::Z) {
             app.settings.shadows = !app.settings.shadows;
         }
+        if display.key_pressed(Key::X) {
+            // The next size up, wrapping around.
+            let r = app.settings.light_radius;
+            app.settings.light_radius = FLASHLIGHT_RADII
+                .iter()
+                .copied()
+                .find(|&x| x > r + 1e-6)
+                .unwrap_or(FLASHLIGHT_RADII[0]);
+        }
         if display.key_pressed(Key::N) {
             app.settings.level_lights = !app.settings.level_lights;
         }
@@ -1075,7 +1099,11 @@ fn run() -> Result<(), String> {
                 if app.settings.lit { "" } else { " (all off)" },
                 if app.settings.flashlight { "on" } else { "off" },
                 if app.settings.flashlight_lock.is_some() { " (locked)" } else { "" },
-                if app.settings.flashlight && app.settings.shadows { ", shadows" } else { "" },
+                if app.settings.flashlight && app.settings.shadows {
+                    format!(", shadows (radius {} m)", app.settings.light_radius)
+                } else {
+                    String::new()
+                },
                 app.settings.penumbra,
                 cfg.penumbra_threshold,
             ));

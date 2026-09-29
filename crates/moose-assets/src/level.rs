@@ -42,6 +42,9 @@ pub struct Light {
     /// Whether it casts shadows, and its shadow slot if so (below 32): the bit polygons
     /// in its shadow set in their shadow mask (a runtime choice; levels don't set it).
     pub shadow: Option<u8>,
+    /// The radius of the light's source, in meters: the shadows it casts soften over the
+    /// part of it an occluder covers. 0 casts hard shadows.
+    pub radius: f32,
 }
 
 impl Light {
@@ -56,6 +59,7 @@ impl Light {
             cos_inner: -1.0,
             cos_outer: -1.0,
             shadow: None,
+            radius: 0.0,
         }
     }
 
@@ -79,6 +83,7 @@ impl Light {
             cos_inner: inner.to_radians().cos(),
             cos_outer: outer.to_radians().cos(),
             shadow: None,
+            radius: 0.0,
         }
     }
 

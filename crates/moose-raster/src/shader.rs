@@ -1092,7 +1092,15 @@ pub struct SampleContext<'a> {
     /// the light that reaches everything (linear RGB).
     pub lights: &'a [Light],
     pub ambient: Vec3,
+    /// Per light, where the polygon is in its soft shadow, which of `fractions` is how much
+    /// of it reaches the points ([`NO_FRACTION`]: all of it). The engine interpolates those
+    /// from the polygon's vertices, like the material's values.
+    pub light_fractions: &'a [u8],
+    pub fractions: &'a [F32s],
 }
+
+/// In `SampleContext::light_fractions`: all of the light reaches the points.
+pub const NO_FRACTION: u8 = u8::MAX;
 
 /// What `shade_pixel` sees besides its interpolated values.
 pub struct PixelContext<'a> {

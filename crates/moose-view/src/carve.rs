@@ -81,13 +81,46 @@ pub(crate) enum PieceEdge {
     Line(Vec3, Vec3),
 }
 
-/// A piece of a carved polygon: `count` records from `start` in the carver's buffer, and the
-/// shadow slots of the lights it is in the shadow of.
+/// A piece of a carved polygon: `count` records from `start` in the carver's buffer, the
+/// shadow slots of the lights it is in the full shadow of, and the soft shadows it is in
+/// (`volume_count` volume indices from `first_volume` in the carver's list): there a light
+/// is partly covered.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Piece {
     start: u32,
     count: u32,
     pub shadowed: u32,
+    first_volume: u32,
+    volume_count: u32,
+}
+
+/// The soft edge of a shadow along one outline edge of an occluder, from a light with a
+/// size: the region between two planes through the edge that graze the light's sphere on
+/// opposite sides. On the outer one (distance 0) the edge starts to cover the light; on the
+/// inner one it covers all of it. Points past the inner plane, on the shadow's side, have
+/// positive distances to both.
+#[derive(Clone, Copy, Debug)]
+struct Wedge {
+    outer: Half,
+    inner: Half,
+}
+
+impl Wedge {
+    /// How much of the light the edge covers at `p`: none on the outer plane (and outside
+    /// it), all on the inner one (and past it), eased (smoothstep) between, by where `p` is
+    /// between them.
+    fn covers(&self, p: Vec3) -> f32 {
+        let (outer, inner) = (self.outer.distance(p), self.inner.distance(p));
+        let span = outer - inner;
+        let c = if span > 1e-6 {
+            (outer / span).clamp(0.0, 1.0)
+        } else if outer > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        c * c * (3.0 - 2.0 * c)
+    }
 }
 
 /// A polygon being carved: the sectors it is in (an entity's may be several), the entity
@@ -109,8 +142,27 @@ struct Caster {
     whole: u32,
     /// The windows it lights other sectors through: (sector, planes).
     windows: Range<u32>,
-    /// Its occluders' shadow volumes: ranges of `Carver::planes`.
+    /// Its occluders' shadow volumes (ranges of `Carver::volumes`).
     volumes: Range<u32>,
+}
+
+/// An occluder's shadow from one light: the region where it covers the light (all of it,
+/// for a light with no size; some of it, otherwise), its soft edges, and the entity
+/// casting it.
+struct Volume {
+    /// Ranges of `Carver::planes`.
+    planes: Range<u32>,
+    /// Ranges of `Carver::planes`: the wedges' inner planes, which bound the full shadow
+    /// within the region; empty for a light with no size.
+    inner: Range<u32>,
+    /// Ranges of `Carver::planes`: two per wedge (in its order), bounding the sector of the
+    /// ring around the full shadow it is carved in; empty if there are none.
+    sectors: Range<u32>,
+    /// Ranges of `Carver::wedges`; empty for a light with no size.
+    wedges: Range<u32>,
+    /// The light's shadow slot.
+    slot: u8,
+    owner: Option<u32>,
 }
 
 /// Carves polygons for every shadow-casting light. Reuse one; buffers keep their capacity.
@@ -119,8 +171,10 @@ pub(crate) struct Carver {
     casters: Vec<Caster>,
     planes: Vec<Half>,
     windows: Vec<(u32, Range<u32>)>,
-    /// Shadow volumes (ranges of `planes`) and the entity casting each.
-    volumes: Vec<(Range<u32>, Option<u32>)>,
+    volumes: Vec<Volume>,
+    wedges: Vec<Wedge>,
+    // Per polygon: each piece's soft shadows, as indices into `volumes`.
+    volume_lists: Vec<u32>,
     // Per polygon.
     stride: usize,
     records: Vec<f32>,
@@ -147,6 +201,7 @@ impl Carver {
         self.planes.clear();
         self.windows.clear();
         self.volumes.clear();
+        self.wedges.clear();
         let geometry = assets.mesh(world.geometry);
         for light in lights {
             let Some(slot) = light.shadow.filter(|&s| s < MAX_SHADOW_SLOTS) else {
@@ -233,7 +288,7 @@ impl Carver {
                             );
                             self.faces.push(start..self.points.len());
                         }
-                        self.add_volume(l, owner);
+                        self.add_volume(light, slot, owner);
                     }
                     Occluder::Sphere { center, radius } => {
                         // Seen from the light, a sphere's outline is the circle where rays
@@ -259,7 +314,7 @@ impl Carver {
                         }));
                         self.faces.clear();
                         self.faces.push(0..DISK_SIDES);
-                        self.add_volume(l, owner);
+                        self.add_volume(light, slot, owner);
                     }
                 }
             }
@@ -282,7 +337,14 @@ impl Carver {
     /// and behind every face toward the light (by [`CAP_BIAS`]). Along any ray from the
     /// light through it, the faces toward the light all lie before the point where the ray
     /// enters it, so a point behind all their planes is past the occluder.
-    fn add_volume(&mut self, light: Vec3, owner: Option<u32>) {
+    ///
+    /// For a light with a size (`Light::radius`), the region is where the occluder covers
+    /// any of the light: each outline plane is turned about its edge to graze the light's
+    /// sphere on the far side, and each edge gets a wedge (see [`Wedge`]) out to the
+    /// plane grazing the near side, past which the edge covers all of it. The outline and
+    /// faces seen from the light's center stand for those seen from all of it.
+    fn add_volume(&mut self, light: &Light, slot: u8, owner: Option<u32>) {
+        let (radius, light) = (light.radius, light.position);
         // Its faces toward the light, and each one's plane.
         let mut front: Vec<(Range<usize>, Vec3)> = Vec::new();
         for face in &self.faces {
@@ -306,7 +368,9 @@ impl Carver {
         let center = front.iter().flat_map(|(f, _)| &points[f.clone()]).copied().sum::<Vec3>()
             / front.iter().map(|(f, _)| f.len()).sum::<usize>() as f32;
         let start = self.planes.len() as u32;
+        let first_wedge = self.wedges.len() as u32;
         // The outline's planes first: cuts outside the shadow happen there, once.
+        let mut outline: Vec<(Vec3, Vec3)> = Vec::new();
         for (face, _) in &front {
             let p = &points[face.clone()];
             for i in 0..p.len() {
@@ -315,10 +379,37 @@ impl Carver {
                     let q = &points[other.clone()];
                     (0..q.len()).any(|k| q[k] == b && q[(k + 1) % q.len()] == a)
                 });
-                if !shared && let Some(h) = Half::through(light, a, b, center) {
-                    self.planes.push(h);
+                if !shared {
+                    outline.push((a, b));
                 }
             }
+        }
+        // In order around, each edge starting where the last ends, if they close a loop.
+        let mut ordered = outline.len() >= 3;
+        for i in 1..outline.len() {
+            match (i..outline.len()).find(|&j| outline[j].0 == outline[i - 1].1) {
+                Some(j) => outline.swap(i, j),
+                None => ordered = false,
+            }
+        }
+        ordered &= outline.last().zip(outline.first()).is_some_and(|(l, f)| l.1 == f.0);
+        let mut hards: Vec<Half> = Vec::with_capacity(outline.len());
+        for &(a, b) in &outline {
+            let Some(hard) = Half::through(light, a, b, center) else {
+                ordered = false;
+                continue;
+            };
+            match (radius > 0.0).then(|| grazing(light, radius, a, b, hard)).flatten() {
+                Some((outer, inner)) => {
+                    self.planes.push(outer);
+                    self.wedges.push(Wedge { outer, inner });
+                }
+                None => {
+                    self.planes.push(hard);
+                    ordered = false;
+                }
+            }
+            hards.push(hard);
         }
         for (face, normal) in &front {
             self.planes.push(Half {
@@ -326,7 +417,48 @@ impl Carver {
                 offset: normal.dot(points[face.start]) - CAP_BIAS,
             });
         }
-        self.volumes.push((start..self.planes.len() as u32, owner));
+        let end = self.planes.len() as u32;
+        // The inner planes, after the region's.
+        for w in first_wedge..self.wedges.len() as u32 {
+            let inner = self.wedges[w as usize].inner;
+            self.planes.push(inner);
+        }
+        let inner_end = self.planes.len() as u32;
+        // Each wedge's sector: between the planes through the light and its edge's ends
+        // that halve the angle to the neighboring edges, so the ring around the full
+        // shadow is carved edge by edge. Two per edge: at its start, then at its end, each
+        // facing the edge.
+        let soft = self.wedges.len() as u32 > first_wedge;
+        if soft && ordered && hards.len() == outline.len() {
+            let n = outline.len();
+            let halving = |at: Vec3, before: Half, after: Half, toward: Vec3| {
+                let out = -(before.normal + after.normal);
+                let m = (at - light).cross(out);
+                let len = m.length();
+                (len > 1e-9).then(|| {
+                    let m = if m.dot(toward - at) < 0.0 { -m / len } else { m / len };
+                    Half { normal: m, offset: -m.dot(at) }
+                })
+            };
+            let mut sectors = Vec::with_capacity(2 * n);
+            for k in 0..n {
+                let (a, b) = outline[k];
+                let (prev, next) = (hards[(k + n - 1) % n], hards[(k + 1) % n]);
+                sectors.push(halving(a, prev, hards[k], b));
+                sectors.push(halving(b, hards[k], next, a));
+            }
+            if sectors.iter().all(Option::is_some) {
+                self.planes.extend(sectors.into_iter().flatten());
+            }
+        }
+        self.volumes.push(Volume {
+            planes: start..end,
+            inner: end..inner_end,
+            sectors: inner_end..self.planes.len() as u32,
+            wedges: first_wedge..self.wedges.len() as u32,
+            slot,
+            owner,
+        });
     }
 
     /// The `i`-th piece of the last polygon carved.
@@ -364,10 +496,13 @@ impl Carver {
         self.records.extend_from_slice(records);
         self.edges.extend(edges.iter().map(|&e| PieceEdge::Clip(e)));
         self.pieces.clear();
+        self.volume_lists.clear();
         self.pieces.push(Piece {
             start: 0,
             count: edges.len() as u32,
             shadowed: 0,
+            first_volume: 0,
+            volume_count: 0,
         });
         for c in 0..self.casters.len() {
             let (bit, position, range) = {
@@ -408,7 +543,8 @@ impl Carver {
             }
             // Occluders: each lit piece is split by each shadow volume.
             for v in self.casters[c].volumes.clone() {
-                let (planes, owner) = self.volumes[v as usize].clone();
+                let volume = &self.volumes[v as usize];
+                let (planes, inner, owner) = (volume.planes.clone(), volume.inner.clone(), volume.owner);
                 // An occluder's shape stands in for its model, so it doesn't shadow it.
                 if owner.is_some() && owner == receiver.entity {
                     continue;
@@ -424,17 +560,119 @@ impl Carver {
                         continue;
                     }
                     self.rest.clear();
-                    if let Some(mut inside) = self.split_region(piece, planes.clone(), lined) {
-                        inside.shadowed |= bit;
-                        self.pieces.push(inside);
-                    }
+                    let inside = self.split_region(piece, planes.clone(), lined);
                     let rest = std::mem::take(&mut self.rest);
                     self.pieces.extend_from_slice(&rest);
                     self.rest = rest;
+                    let Some(mut inside) = inside else {
+                        continue;
+                    };
+                    if inner.is_empty() {
+                        inside.shadowed |= bit;
+                        self.pieces.push(inside);
+                        continue;
+                    }
+                    // A soft shadow: carved sector by sector, each split by its wedge's inner
+                    // plane (see `soft_sector`); what no sector holds, around the core.
+                    let sectors = self.volumes[v as usize].sectors.clone();
+                    let mut work = vec![inside];
+                    for k in 0..sectors.len() / 2 {
+                        let planes = sectors.start + 2 * k as u32..sectors.start + 2 * k as u32 + 2;
+                        let mut next = Vec::new();
+                        for part in work {
+                            self.rest.clear();
+                            let held = self.split_region(part, planes.clone(), lined);
+                            next.append(&mut self.rest);
+                            if let Some(held) = held {
+                                let inner_k = self.planes[(inner.start + k as u32) as usize];
+                                let (past, before) = self.split(held, inner_k, lined);
+                                if let Some(before) = before {
+                                    let before = self.with_volume(before, v);
+                                    self.pieces.push(before);
+                                }
+                                if let Some(past) = past {
+                                    self.soft_core(past, inner.clone(), v, bit, lined);
+                                }
+                            }
+                        }
+                        work = next;
+                    }
+                    for part in work {
+                        self.soft_core(part, inner.clone(), v, bit, lined);
+                    }
                 }
             }
         }
         &self.pieces
+    }
+
+    /// Carves the full shadow of soft shadow volume `v` (within its `inner` planes) out of
+    /// `piece`, marking it with `bit`; the rest of `piece` is in the soft shadow.
+    fn soft_core(&mut self, piece: Piece, inner: Range<u32>, v: u32, bit: u32, lined: usize) {
+        let saved = std::mem::take(&mut self.rest);
+        if let Some(mut core) = self.split_region(piece, inner, lined) {
+            core.shadowed |= bit;
+            self.pieces.push(core);
+        }
+        let ring = std::mem::replace(&mut self.rest, saved);
+        for part in ring {
+            let part = self.with_volume(part, v);
+            self.pieces.push(part);
+        }
+    }
+
+    /// `piece` with soft shadow volume `v` added to its list.
+    fn with_volume(&mut self, piece: Piece, v: u32) -> Piece {
+        let first = self.volume_lists.len() as u32;
+        self.volume_lists.extend_from_within(
+            piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize,
+        );
+        self.volume_lists.push(v);
+        Piece {
+            first_volume: first,
+            volume_count: piece.volume_count + 1,
+            ..piece
+        }
+    }
+
+    /// How much of each light whose soft shadows a piece is in reaches each of its
+    /// vertices: appends, vertex by vertex, one value per such light (in shadow slot
+    /// order), and returns their shadow slots as bits. Interpolated across the piece, the
+    /// values are exact on its edges: 1 where a shadow's soft edge starts, 0 where its full
+    /// shadow does. An occluder covers the product of what its wedges cover (near its
+    /// corners, two at once), and what reaches a point is the product over occluders of
+    /// what each leaves uncovered.
+    pub fn soft_values(&self, piece: &Piece, out: &mut Vec<f32>) -> u32 {
+        let volumes = &self.volume_lists
+            [piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
+        let slots = volumes
+            .iter()
+            .fold(0u32, |bits, &v| bits | 1 << self.volumes[v as usize].slot);
+        if slots == 0 {
+            return 0;
+        }
+        let s = self.stride;
+        for r in self.records(piece).chunks_exact(s) {
+            let p = Vec3::new(r[3], r[4], r[5]);
+            let mut bits = slots;
+            while bits != 0 {
+                let slot = bits.trailing_zeros() as u8;
+                bits &= bits - 1;
+                let mut reaches = 1.0;
+                for &v in volumes {
+                    let volume = &self.volumes[v as usize];
+                    if volume.slot == slot {
+                        let covered: f32 = self.wedges[volume.wedges.start as usize..volume.wedges.end as usize]
+                            .iter()
+                            .map(|w| w.covers(p))
+                            .product();
+                        reaches *= 1.0 - covered;
+                    }
+                }
+                out.push(reaches);
+            }
+        }
+        slots
     }
 
     /// Splits `piece` by the region inside every plane of `planes` (in `self.planes`):
@@ -506,9 +744,14 @@ impl Carver {
                 back.push((at, to_back));
             }
         }
-        let shadowed = piece.shadowed;
-        let f = self.append(&front).map(|p| Piece { shadowed, ..p });
-        let b = self.append(&back).map(|p| Piece { shadowed, ..p });
+        let keep = |p: Piece| Piece {
+            shadowed: piece.shadowed,
+            first_volume: piece.first_volume,
+            volume_count: piece.volume_count,
+            ..p
+        };
+        let f = self.append(&front).map(keep);
+        let b = self.append(&back).map(keep);
         self.front = front;
         self.back = back;
         (f, b)
@@ -558,6 +801,8 @@ impl Carver {
             start: start as u32,
             count: n as u32,
             shadowed: 0,
+            first_volume: 0,
+            volume_count: 0,
         })
     }
 }
@@ -568,6 +813,33 @@ enum Tag {
     Edge(PieceEdge),
     /// Along the cutting plane.
     Cut,
+}
+
+/// The planes through the edge `a`-`b` that graze a light's sphere (at `light`, of
+/// `radius`) on either side, turned about the edge from `hard` (the plane through the edge
+/// and the light's center, facing into the shadow): the outer one with the light's center
+/// `radius` outside it, the inner one with it `radius` inside, both facing into the shadow.
+/// `None` if the edge's line passes through the light.
+fn grazing(light: Vec3, radius: f32, a: Vec3, b: Vec3, hard: Half) -> Option<(Half, Half)> {
+    let u = (b - a).normalize();
+    // From the edge's line to the light, square to it.
+    let c = (light - a) - u * u.dot(light - a);
+    let d = c.length();
+    if d <= radius * 1.001 {
+        return None;
+    }
+    let w = u.cross(hard.normal);
+    let side = w.dot(c).signum();
+    // Turned by the angle whose sine is `t / d`: the light's center is then `t` from it.
+    let plane = |t: f32| {
+        let sin = t / (side * d);
+        let m = hard.normal * (1.0 - sin * sin).sqrt() + w * sin;
+        Half {
+            normal: m,
+            offset: -m.dot(a),
+        }
+    };
+    Some((plane(-radius), plane(radius)))
 }
 
 /// Clips a convex outline to the half-space of `plane` (keeping points on it).
@@ -603,7 +875,7 @@ mod tests {
                 c.points.extend_from_slice(face);
                 c.faces.push(start..c.points.len());
             }
-            c.add_volume(light, None);
+            c.add_volume(&Light::point(0, light, Vec3::ONE, 100.0), 0, None);
         }
         c.casters.push(Caster {
             bit: 1,
@@ -749,7 +1021,7 @@ mod tests {
         let refs: Vec<&[Vec3]> = faces.iter().map(|f| f.as_slice()).collect();
         let mut c = carver(light, &[&refs]);
         assert_eq!(c.volumes.len(), 1);
-        assert_eq!(c.volumes[0].0.len(), 6 + 3, "six outline planes, three faces'");
+        assert_eq!(c.volumes[0].planes.len(), 6 + 3, "six outline planes, three faces'");
 
         // Its shadow on the floor: the convex hull of its corners projected from the light.
         let corners: Vec<Vec3> = faces.iter().flatten().copied().collect();
@@ -811,5 +1083,89 @@ mod tests {
             let n = c.carve(&records(face), &edges, RECORD_FLOATS + 4, 0, &at(normal, face[0])).len();
             assert!((0..n).all(|i| c.piece(i).shadowed == 0));
         }
+    }
+
+    #[test]
+    fn a_light_with_a_size_casts_a_core_and_a_soft_edge() {
+        // A 1 m square 2 m below a light of radius 0.2, over a floor 1 m below it. Seen in
+        // section, the core's edge runs from the light's far side past the square's edge
+        // (x = 0.5 + 0.3 / 2 = 0.65 on the floor) and the soft edge's outer side from its
+        // near side (0.5 + 0.7 / 2 = 0.85); tangent planes differ from those a little.
+        let center = Vec3::new(0.0, 3.0, 0.0);
+        let mut light = Light::point(0, center, Vec3::ONE, 100.0);
+        light.radius = 0.2;
+        let square = [
+            Vec3::new(-0.5, 1.0, -0.5),
+            Vec3::new(-0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, -0.5),
+        ];
+        let mut c = Carver::default();
+        c.points.extend_from_slice(&square);
+        c.faces.push(0..4);
+        c.add_volume(&light, 0, None);
+        c.casters.push(Caster {
+            bit: 1,
+            position: center,
+            range: 100.0,
+            whole: 0,
+            windows: 0..0,
+            volumes: 0..1,
+        });
+        assert_eq!(c.wedges.len(), 4, "a wedge per outline edge");
+        let floor = [
+            Vec3::new(-3.0, 0.0, -3.0),
+            Vec3::new(-3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, -3.0),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let n = c.carve(&records(&floor), &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
+        let (mut core, mut soft, mut total) = (0.0, 0.0, 0.0);
+        let mut reach: f32 = 0.0;
+        for i in 0..n {
+            let p = c.piece(i);
+            let a = area(c.records(&p), stride);
+            total += a;
+            if p.shadowed != 0 {
+                core += a;
+            } else if p.volume_count > 0 {
+                soft += a;
+                for r in c.records(&p).chunks(stride) {
+                    reach = reach.max(r[3].abs()).max(r[5].abs());
+                }
+            }
+        }
+        assert!((total - 36.0).abs() < 1e-3, "pieces cover the floor: {total}");
+        assert!((core - 1.3 * 1.3).abs() < 0.1, "core {core}");
+        assert!((core + soft - 1.7 * 1.7).abs() < 0.15, "core and soft edge {}", core + soft);
+        assert!((reach - 0.85).abs() < 0.02, "soft edge reaches {reach}");
+
+        // The light reaching the soft pieces' vertices: all of it where the soft edge
+        // starts, none where the core does, and between on the way.
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for i in 0..n {
+            let p = c.piece(i);
+            let mut values = Vec::new();
+            let slots = c.soft_values(&p, &mut values);
+            if p.volume_count == 0 {
+                assert_eq!(slots, 0);
+                continue;
+            }
+            assert_eq!(slots, 1);
+            for (r, &v) in c.records(&p).chunks(stride).zip(&values) {
+                assert!((0.0..=1.0).contains(&v), "{v}");
+                let (x, z) = (r[3].abs(), r[5].abs());
+                if x.max(z) > 0.84 && x.min(z) < 0.5 {
+                    assert!(v > 0.99, "outer edge {v} at {x}, {z}");
+                }
+                if x.max(z) < 0.66 && x.min(z) < 0.5 && x.max(z) > 0.6 {
+                    assert!(v < 0.01, "core's edge {v} at {x}, {z}");
+                }
+                (lo, hi) = (lo.min(v), hi.max(v));
+            }
+        }
+        assert!(lo < 0.01 && hi > 0.99, "{lo}..{hi}");
     }
 }
