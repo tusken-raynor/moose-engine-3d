@@ -56,6 +56,15 @@ impl Assets {
         self.by_name.get(name).copied()
     }
 
+    /// The file name a mesh was loaded from (see [`load_mesh`](Self::load_mesh)), if it
+    /// was loaded from one.
+    pub fn mesh_name(&self, id: MeshId) -> Option<&str> {
+        self.by_name
+            .iter()
+            .find(|&(_, &m)| m == id)
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Loads `root/models/<name>`, or returns the existing handle if it is already loaded.
     pub fn load_mesh(&mut self, name: &str) -> Result<MeshId, LoadError> {
         if let Some(id) = self.mesh_id(name) {

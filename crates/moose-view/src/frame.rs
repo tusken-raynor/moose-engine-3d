@@ -559,6 +559,57 @@ impl ViewGeometry {
         p
     }
 
+    /// Forgets every baked and cached shadow, for after the world changes (an editor moved
+    /// a static entity or changed a surface): bake again, or they are carved as surfaces
+    /// are seen.
+    pub fn clear_shadows(&mut self) {
+        self.scratch.carver.clear_cache();
+    }
+
+    /// The polygon drawn nearest the eye at screen point `(x, y)` (pixels), among those
+    /// seen directly (not in a mirror): its source, and its depth there as `w` (1 over
+    /// the distance along the view). For picking with the mouse.
+    pub fn pick(&self, x: f32, y: f32) -> Option<(PolygonSource, f32)> {
+        let mut best: Option<(PolygonSource, f32)> = None;
+        for p in &self.polygons {
+            if p.mirror.is_some() || p.vertex_count < 3 {
+                continue;
+            }
+            let v = &self.vertices[p.vertices()];
+            // Inside: on the same side of every edge (either winding).
+            let side = |a: &ScreenVertex, b: &ScreenVertex| {
+                (b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)
+            };
+            let n = v.len();
+            let (mut pos, mut neg) = (false, false);
+            for i in 0..n {
+                let s = side(&v[i], &v[(i + 1) % n]);
+                pos |= s > 0.0;
+                neg |= s < 0.0;
+            }
+            if pos && neg {
+                continue;
+            }
+            // w is affine on screen: from the widest triangle of the fan.
+            let (mut area, mut tri) = (0.0f32, None);
+            for i in 1..n - 1 {
+                let (a, b, c) = (&v[0], &v[i], &v[i + 1]);
+                let d = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+                if d.abs() > area.abs() {
+                    (area, tri) = (d, Some((a, b, c)));
+                }
+            }
+            let Some((a, b, c)) = tri else { continue };
+            let l1 = ((x - a.x) * (c.y - a.y) - (y - a.y) * (c.x - a.x)) / area;
+            let l2 = ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x)) / area;
+            let w = a.w + (b.w - a.w) * l1 + (c.w - a.w) * l2;
+            if best.is_none_or(|(_, bw)| w > bw) {
+                best = Some((p.source, w));
+            }
+        }
+        best
+    }
+
     /// Bakes the shadows of the world's static lights (those with shadow slots) on every
     /// static surface: level polygons and static entities' polygons, from their windows
     /// and static occluders (see the carve module). Views then only clip and project them;

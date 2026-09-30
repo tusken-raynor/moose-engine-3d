@@ -13,6 +13,7 @@ mod half;
 mod level;
 mod mesh;
 mod mmp;
+mod mmp_doc;
 mod obj;
 mod ripples;
 mod store;
@@ -24,6 +25,10 @@ pub use geom::{Aabb, Plane};
 pub use level::{
     DirectionalLight, EntityKind, EntitySpawn, Level, Light, NO_SECTOR, Occluder, Oscillation,
     Portal, PortalFlags, Sector,
+};
+pub use mmp_doc::{
+    AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,
+    number, occluder_value,
 };
 pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;

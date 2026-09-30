@@ -736,3 +736,28 @@ fn entities_are_seen_in_the_floor() {
     assert!(out.mirrors.is_empty());
     assert!(out.polygons.iter().all(|p| p.mirror.is_none()));
 }
+
+#[test]
+fn picking_finds_the_nearest_polygon_under_the_cursor() {
+    // In front of room_a's crate at (-2.5, 0, 2) (a 1 m box standing on the floor), looking
+    // at it (yaw 0 faces -Z): the middle of the screen is the crate, not the wall behind.
+    let (world, assets) = world();
+    let cam = camera(&world, Vec3::new(-2.5, 0.5, 4.5), 0.0, 0.0, 0.0, SMALL);
+    let mut out = ViewGeometry::new();
+    out.build(&world, &assets, &cam.view());
+    let crate_index = world
+        .entities
+        .iter()
+        .position(|e| (e.position - Vec3::new(-2.5, 0.0, 2.0)).length() < 1e-3)
+        .unwrap() as u32;
+    let (source, w) = out.pick(160.0, 90.0).expect("something under the middle");
+    assert!(
+        matches!(source, PolygonSource::Entity { entity, .. } if entity == crate_index),
+        "{source:?}"
+    );
+    // The crate's front face is 2 m away (it spans z 1.5..2.5).
+    assert!((1.0 / w - 2.0).abs() < 0.01, "at {}", 1.0 / w);
+    // High up in the corner, past the crate: the level.
+    let (source, _) = out.pick(5.0, 5.0).expect("something in the corner");
+    assert!(matches!(source, PolygonSource::World { .. }), "{source:?}");
+}

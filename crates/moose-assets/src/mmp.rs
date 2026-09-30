@@ -102,19 +102,19 @@ fn occluder_option(value: &str) -> Result<OccluderRec, String> {
     })
 }
 
-struct Cursor<'a> {
-    path: &'a Path,
-    lines: Vec<Line>,
-    pos: usize,
+pub(crate) struct Cursor<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) lines: Vec<Line>,
+    pub(crate) pos: usize,
 }
 
 impl Cursor<'_> {
-    fn err(&self, line: usize, msg: impl Into<String>) -> LoadError {
+    pub(crate) fn err(&self, line: usize, msg: impl Into<String>) -> LoadError {
         LoadError::new(self.path, Some(line), msg)
     }
 
     /// Reads a header line `keyword arg...`, returning its line number and arguments.
-    fn header(&mut self, keyword: &str, args: usize) -> Result<(usize, Vec<String>), LoadError> {
+    pub(crate) fn header(&mut self, keyword: &str, args: usize) -> Result<(usize, Vec<String>), LoadError> {
         let Some(line) = self.lines.get(self.pos) else {
             return Err(LoadError::new(
                 self.path,
@@ -137,7 +137,7 @@ impl Cursor<'_> {
 
     /// Reads a section header `keyword [name] count` and its rows. Each row must
     /// start with its sequential id; rows are returned without it.
-    fn section(
+    pub(crate) fn section(
         &mut self,
         keyword: &str,
         named: bool,
@@ -187,14 +187,14 @@ impl Cursor<'_> {
         })
     }
 
-    fn parse<T: FromStr>(&self, row: &Line, i: usize, what: &str) -> Result<T, LoadError> {
+    pub(crate) fn parse<T: FromStr>(&self, row: &Line, i: usize, what: &str) -> Result<T, LoadError> {
         let token = &row.tokens[i];
         token
             .parse()
             .map_err(|_| self.err(row.no, format!("'{token}' is not a valid {what}")))
     }
 
-    fn float(&self, row: &Line, i: usize) -> Result<f32, LoadError> {
+    pub(crate) fn float(&self, row: &Line, i: usize) -> Result<f32, LoadError> {
         let x: f32 = self.parse(row, i, "number")?;
         if x.is_finite() {
             Ok(x)
@@ -206,7 +206,7 @@ impl Cursor<'_> {
         }
     }
 
-    fn hex(&self, row: &Line, i: usize) -> Result<u32, LoadError> {
+    pub(crate) fn hex(&self, row: &Line, i: usize) -> Result<u32, LoadError> {
         let token = &row.tokens[i];
         token
             .strip_prefix("0x")
@@ -220,10 +220,10 @@ impl Cursor<'_> {
     }
 }
 
-struct Section {
-    line: usize,
-    name: Option<String>,
-    rows: Vec<Line>,
+pub(crate) struct Section {
+    pub(crate) line: usize,
+    pub(crate) name: Option<String>,
+    pub(crate) rows: Vec<Line>,
 }
 
 pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<Level, LoadError> {

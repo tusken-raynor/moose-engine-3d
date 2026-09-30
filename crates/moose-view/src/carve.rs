@@ -724,6 +724,13 @@ impl Carver {
         }
     }
 
+    /// Forgets every cached shadow (see [`Carver::cache`]): for after the world changes
+    /// (a static entity moved, a surface edited), when they may no longer hold.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cache_keys = [None; MAX_SHADOW_SLOTS as usize];
+    }
+
     /// Whether any light this frame is a beam (see [`Light::beam`]).
     pub fn has_beams(&self) -> bool {
         self.casters.iter().any(|c| c.beam.is_some())

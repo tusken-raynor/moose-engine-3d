@@ -178,6 +178,23 @@ impl Canvas<'_> {
         }
     }
 
+    /// Draws a one-pixel line from `(x0, y0)` to `(x1, y1)` (pixel coordinates, clipped to
+    /// the canvas).
+    pub fn line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: u32) {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let steps = dx.abs().max(dy.abs()).ceil().max(1.0);
+        if !steps.is_finite() || steps > 100_000.0 {
+            return;
+        }
+        let (sx, sy) = (dx / steps, dy / steps);
+        for i in 0..=steps as usize {
+            let (x, y) = (x0 + sx * i as f32, y0 + sy * i as f32);
+            if x >= 0.0 && y >= 0.0 && (x as usize) < self.width && (y as usize) < self.height {
+                self.pixels[y as usize * self.width + x as usize] = color;
+            }
+        }
+    }
+
     /// Darkens a rectangle (clipped to the canvas) to `keep` 256ths of its brightness.
     pub fn shade(&mut self, x: usize, y: usize, w: usize, h: usize, keep: u32) {
         for row in y.min(self.height)..(y + h).min(self.height) {

@@ -532,3 +532,36 @@ fn loads_and_checks_moving_lights() {
     reject("1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:4:0", "period must be positive");
     reject("1  0.0 2.0 -6.0  1 1 1  5  oscillate=0:0:40:5", "swings outside the level");
 }
+
+#[test]
+fn levels_written_back_load_the_same() {
+    use moose_assets::LevelDoc;
+    for file in ["two_rooms.mmp", "shiny_rooms.mmp", "sunny_rooms.mmp", "mirror_rooms.mmp"] {
+        let path = format!("{}/../../assets/levels/{file}", env!("CARGO_MANIFEST_DIR"));
+        let src = std::fs::read_to_string(&path).unwrap();
+        let mut assets = assets();
+        let level = assets.parse_level(file, &src).unwrap();
+        let doc = LevelDoc::parse(std::path::Path::new(&path), &src).unwrap();
+        let written = doc.to_text();
+        // Reading what was written gives the same document, and the same level.
+        let again = LevelDoc::parse(std::path::Path::new(&path), &written).unwrap();
+        assert_eq!(again.surfaces, doc.surfaces, "{file}");
+        assert_eq!(again.vertices, doc.vertices, "{file}");
+        let level_again = assets.parse_level(file, &written).unwrap();
+        assert_eq!(level_again.sectors, level.sectors, "{file}");
+        assert_eq!(level_again.portals, level.portals, "{file}");
+        assert_eq!(level_again.lights, level.lights, "{file}");
+        assert_eq!(level_again.directional, level.directional, "{file}");
+        assert_eq!(level_again.ambient, level.ambient, "{file}");
+        let (g0, g1) = (assets.mesh(level.geometry), assets.mesh(level_again.geometry));
+        assert_eq!(g0.positions, g1.positions, "{file}");
+        assert_eq!(g0.polygons.len(), g1.polygons.len(), "{file}");
+        for (a, b) in level.spawns.iter().zip(&level_again.spawns) {
+            assert_eq!((a.kind, a.sector, a.mesh, &a.name), (b.kind, b.sector, b.mesh, &b.name));
+            assert!(a.position.distance(b.position) < 1e-4, "{} moved", a.name);
+            // (angle_between takes an acos, imprecise near 0.)
+            assert!(a.rotation.angle_between(b.rotation) < 1e-3, "{} turned", a.name);
+            assert_eq!((a.scale, a.is_static, a.occluder), (b.scale, b.is_static, b.occluder));
+        }
+    }
+}

@@ -12,6 +12,9 @@
 //!   --screenshot FILE     render one frame from the spawn point to a PNG and exit,
 //!                         without opening a window
 //!   --at X,Y,Z,YAW,PITCH[,ROLL]  camera for --screenshot (degrees)
+//!   --edit                start in the level editor (Tab switches)
+//!   --select NAME         in the editor, start with the entity NAME (or surface:N)
+//!                         selected
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
 //!                         on a player standing there
 //!   --flashlight-at X,Y,Z,DX,DY,DZ  start with the flashlight locked at X,Y,Z, aimed along
@@ -73,14 +76,15 @@
 //! is in the menu. While playing, the cursor is locked (hidden) for mouse look; in the menu
 //! it is free.
 
+mod editor;
 mod ui;
 
 use std::path::Path;
 use std::time::Instant;
 
 use glam::Vec3;
-use moose_assets::{Assets, Light, MeshId, RIPPLE_SIZE, Ripples, Texture, TextureId};
-use moose_present::{Display, Key};
+use moose_assets::{Assets, LevelDoc, Light, MeshId, RIPPLE_SIZE, Ripples, Texture, TextureId};
+use moose_present::{Display, Key, MouseButton};
 use moose_raster::shaders::{
     CubeReflection, Textured, TexturedFresnel, TexturedTranslucent, UnlitColor, VertexColor,
     VertexColorFresnel, VertexColorTranslucent, Water, filter,
@@ -189,6 +193,9 @@ struct Options {
     width: u32,
     height: u32,
     screenshot: Option<String>,
+    /// Start in the editor, with an entity (by name) or a surface (`surface:N`) selected.
+    edit: bool,
+    select: Option<String>,
     at: Option<[f32; 6]>,
     lock_flashlight: Option<[f32; 6]>,
     /// The flashlight locked at this position, aimed this way.
@@ -249,11 +256,18 @@ fn numbers(text: &str, option: &str) -> Result<Vec<f32>, String> {
 }
 
 fn parse_args() -> Result<Options, String> {
+    parse_options(std::env::args().skip(1))
+}
+
+/// Options from command-line arguments (without the program's name).
+fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut o = Options {
         level: "shiny_rooms.mmp".into(),
         width: 1280,
         height: 720,
         screenshot: None,
+        edit: false,
+        select: None,
         at: None,
         lock_flashlight: None,
         flashlight_at: None,
@@ -291,7 +305,7 @@ fn parse_args() -> Result<Options, String> {
         penumbra_threshold: None,
         penumbra: 1.0,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
         match arg.as_str() {
@@ -303,6 +317,8 @@ fn parse_args() -> Result<Options, String> {
                 o.height = h.parse().map_err(|_| "bad height")?;
             }
             "--screenshot" => o.screenshot = Some(value()?),
+            "--edit" => o.edit = true,
+            "--select" => o.select = Some(value()?),
             "--at" => o.at = Some(pose(&value()?, "--at")?),
             "--lock-flashlight" => o.lock_flashlight = Some(pose(&value()?, "--lock-flashlight")?),
             "--flashlight-at" => {
@@ -481,6 +497,12 @@ struct App {
     cube_reflection: [MaterialId; 12],
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
+    /// Cube map textures no longer used (the level was rebuilt), to draw the next ones in.
+    spare_cubes: Vec<TextureId>,
+    /// The level editor (Tab), with the level's tables.
+    editor: editor::Editor,
+    /// The model files in assets/models, for the editor.
+    models: Vec<String>,
     settings: Settings,
     /// The levels in assets/levels (file names, sorted), and the one loaded.
     levels: Vec<String>,
@@ -580,6 +602,9 @@ impl App {
             ]
         });
         let cube_maps = vec![None; world.entities.len()];
+        let level_path = Path::new(root).join("levels").join(&options.level);
+        let level_src = std::fs::read_to_string(&level_path).map_err(|e| e.to_string())?;
+        let doc = LevelDoc::parse(&level_path, &level_src).map_err(|e| e.to_string())?;
         let mut app = App {
             assets,
             lights: (world.lights().to_vec(), world.ambient),
@@ -609,6 +634,9 @@ impl App {
             textured_translucent,
             cube_reflection,
             cube_maps,
+            spare_cubes: Vec::new(),
+            editor: editor::Editor::new(doc, level_path),
+            models: model_files(root),
             settings: Settings {
                 translucent_crates: options.translucent_crates,
                 per_pixel_crates: options.per_pixel_crates,
@@ -656,6 +684,86 @@ impl App {
         Ok(app)
     }
 
+    /// Rebuilds the level from the editor's tables: loads their text (which checks it),
+    /// and redoes what depends on the level (its lights, baked shadows and cube maps).
+    /// The camera stays where it is. On an error the level is left as it was.
+    fn rebuild(&mut self) -> Result<(), String> {
+        let text = self.editor.doc.to_text();
+        let level = self
+            .assets
+            .parse_level(&self.level, &text)
+            .map_err(|e| e.to_string())?;
+        let world = World::new(level, &self.assets);
+        self.camera.sector = world
+            .find_sector(self.camera.position)
+            .or_else(|| world.spawn_points.first().map(|s| s.sector))
+            .unwrap_or(0);
+        self.world = world;
+        self.lights = (self.world.lights().to_vec(), self.world.ambient);
+        while self.wall_textures.len() < self.world.sectors.len() {
+            let i = self.wall_textures.len();
+            let texture = match self.floor_texture {
+                Some(_) => Some(
+                    self.assets
+                        .load_texture(WALL_TEXTURES[i % WALL_TEXTURES.len()])
+                        .map_err(|e| e.to_string())?,
+                ),
+                None => None,
+            };
+            self.wall_textures.push(texture);
+        }
+        self.spare_cubes
+            .extend(self.cube_maps.drain(..).flatten().map(|c| c.texture));
+        self.cube_maps = vec![None; self.world.entities.len()];
+        // Baked as at load: with the level's lights, and no flashlight.
+        let level_lights = self.settings.level_lights;
+        self.settings.level_lights = true;
+        self.apply_lights(false);
+        self.geometry.clear_shadows();
+        self.geometry.bake_shadows(&self.world, &self.assets);
+        let baked = self.bake_cube_maps();
+        self.settings.level_lights = level_lights;
+        baked
+    }
+
+    /// An edit of the editor's selection (see `editor::Editor::change`): made in the
+    /// tables and the level rebuilt, or undone with the reason if the level rejects it.
+    fn edit(&mut self, field: editor::Field, dir: f32) {
+        let before = self.editor.begin();
+        let result = self
+            .editor
+            .change(field, dir, &self.world, &self.models)
+            .and_then(|what| self.rebuild().map(|()| what));
+        match result {
+            Ok(what) => self.editor.commit(before, &what),
+            Err(why) => self.editor.revert(before, &why),
+        }
+    }
+
+    /// Undoes (or redoes) the last edit.
+    fn travel(&mut self, redo: bool) {
+        if !self.editor.travel(redo) {
+            self.editor.say(if redo { "nothing to redo" } else { "nothing to undo" });
+            return;
+        }
+        match self.rebuild() {
+            Ok(()) => self.editor.say(if redo { "redone" } else { "undone" }),
+            Err(e) => self.editor.say(e),
+        }
+    }
+
+    /// Writes the editor's tables to the level's file.
+    fn save_level(&mut self) {
+        let path = self.editor.path.clone();
+        match std::fs::write(&path, self.editor.doc.to_text()) {
+            Ok(()) => {
+                self.editor.mark_saved();
+                self.editor.say(format!("saved {}", path.display()));
+            }
+            Err(e) => self.editor.say(format!("cannot save {}: {e}", path.display())),
+        }
+    }
+
     /// Moves the water's animation to `time` seconds, redrawing its textures if the ripples
     /// moved.
     fn set_time(&mut self, time: f32) {
@@ -693,10 +801,14 @@ impl App {
                 self.draw(&camera, pixels, CUBE_SIZE, CUBE_SIZE)?;
             }
             let texture = Texture::cube(&name, CUBE_SIZE, faces)?;
-            self.cube_maps[i] = Some(CubeMap {
-                texture: self.assets.add_texture(texture),
-                radius,
-            });
+            let texture = match self.spare_cubes.pop() {
+                Some(id) => {
+                    *self.assets.texture_mut(id) = texture;
+                    id
+                }
+                None => self.assets.add_texture(texture),
+            };
+            self.cube_maps[i] = Some(CubeMap { texture, radius });
             println!(
                 "baked a {CUBE_SIZE}x{CUBE_SIZE} cube map for {name} in {:.1} ms",
                 t0.elapsed().as_secs_f64() * 1000.0
@@ -1284,6 +1396,19 @@ impl App {
 }
 
 /// The level files (`.mmp`) in the assets' levels folder, sorted.
+/// The model files in assets/models (sorted).
+fn model_files(assets: &str) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(Path::new(assets).join("models"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".obj"))
+        .collect();
+    names.sort();
+    names
+}
+
 fn level_files(assets: &str) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(Path::new(assets).join("levels"))
         .into_iter()
@@ -1569,6 +1694,9 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
         width: app.width as usize,
         height: app.height as usize,
     };
+    if app.editor.on && menu.is_none() {
+        app.editor.draw(&mut canvas, &app.geometry);
+    }
     if let Some(lines) = hud {
         ui::draw_hud(&mut canvas, &lines);
     }
@@ -1580,6 +1708,96 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
         };
         ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), hint);
     }
+}
+
+/// The editor's mouse and keys, while it is on and the menu is closed: picking and the
+/// panel with the mouse, and the keys for edits, undo and saving. Returns whether the
+/// arrows (and PageUp/PageDown) move the selection, rather than turn the view.
+fn edit_input(app: &mut App, display: &Display) -> bool {
+    use editor::{Field, Selection};
+    let (w, h) = (app.width as usize, app.height as usize);
+    let down = |keys: &[Key]| keys.iter().any(|&k| display.key_down(k));
+    let ctrl = down(&[Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]);
+    let shift = down(&[Key::LeftShift, Key::RightShift]);
+    let cursor = display.cursor_position();
+    let over_panel = cursor.is_some_and(|(x, _)| app.editor.over_panel(x, w, h));
+    app.editor.hover = match cursor {
+        Some((x, y)) if !over_panel => app
+            .geometry
+            .pick(x, y)
+            .and_then(|(source, _)| app.editor.selection_of(source)),
+        _ => None,
+    };
+    // The panel row under the pointer, and what it changes.
+    let row_field = cursor
+        .filter(|_| over_panel)
+        .and_then(|(x, y)| app.editor.row_at(x, y, w, h))
+        .and_then(|k| app.editor.panel()[k].field);
+    if display.mouse_clicked(MouseButton::Left) {
+        if over_panel {
+            if let Some(field) = row_field {
+                app.edit(field, 1.0);
+            }
+        } else if cursor.is_some() {
+            app.editor.selection = app.editor.hover;
+        }
+    }
+    let scroll = display.scroll();
+    if scroll != 0.0
+        && let Some(field) = row_field
+        && !matches!(field, Field::Duplicate | Field::Delete)
+    {
+        app.edit(field, scroll.signum());
+    }
+    if ctrl {
+        if display.key_pressed(Key::Z) {
+            app.travel(shift);
+        }
+        if display.key_pressed(Key::Y) {
+            app.travel(true);
+        }
+        if display.key_pressed(Key::S) {
+            app.save_level();
+        }
+        if display.key_pressed(Key::D) {
+            app.edit(Field::Duplicate, 1.0);
+        }
+        return false;
+    }
+    if display.key_pressed(Key::G) {
+        app.editor.step = (app.editor.step + 1) % editor::STEPS.len();
+        let step = app.editor.step();
+        app.editor.say(format!("grid {} m", moose_assets::number(step)));
+    }
+    if display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
+        app.edit(Field::Delete, 1.0);
+    }
+    if !matches!(app.editor.selection, Some(Selection::Entity(_))) {
+        return false;
+    }
+    // Along the world axes nearest the view's forward and right.
+    let f = app.camera.forward();
+    let (forward, right) = if f.x.abs() > f.z.abs() {
+        ((Field::X, f.x.signum()), (Field::Z, f.x.signum()))
+    } else {
+        ((Field::Z, f.z.signum()), (Field::X, -f.z.signum()))
+    };
+    let moves = [
+        (Key::Up, forward),
+        (Key::Down, (forward.0, -forward.1)),
+        (Key::Right, right),
+        (Key::Left, (right.0, -right.1)),
+        (Key::PageUp, (Field::Y, 1.0)),
+        (Key::PageDown, (Field::Y, -1.0)),
+        (Key::LeftBracket, (Field::Yaw, 1.0)),
+        (Key::RightBracket, (Field::Yaw, -1.0)),
+    ];
+    for (key, (field, dir)) in moves {
+        if display.key_repeated(key) {
+            app.edit(field, dir);
+        }
+    }
+    true
 }
 
 fn main() {
@@ -1608,6 +1826,20 @@ fn run() -> Result<(), String> {
         app.settings.flashlight_lock = Some((sector, position, Vec3::new(dx, dy, dz).normalize()));
     }
 
+    app.editor.on = options.edit;
+    if let Some(name) = &options.select {
+        app.editor.selection = Some(match name.strip_prefix("surface:") {
+            Some(n) => editor::Selection::Surface(n.parse().map_err(|_| "bad --select")?),
+            None => editor::Selection::Entity(
+                app.editor
+                    .doc
+                    .entities
+                    .iter()
+                    .position(|e| &e.name == name)
+                    .ok_or(format!("--select: no entity '{name}'"))?,
+            ),
+        });
+    }
     if let Some(path) = &options.screenshot {
         if let Some(at) = options.at {
             app.place_camera(at, "--at")?;
@@ -1624,8 +1856,8 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    // Tab switches between the cap and uncapped; `--fps 0` starts uncapped with the default
-    // cap to switch to.
+    // The frame cap (the Rendering page's setting); `--fps 0` starts uncapped with the
+    // default cap to switch to.
     let title = format!("Moose - {}", app.world.name);
     let s = &app.settings;
     let mut display =
@@ -1654,15 +1886,26 @@ fn run() -> Result<(), String> {
         last = now;
 
         if display.key_pressed(Key::Escape) {
-            menu.open = !menu.open;
-            (menu.page, menu.selected) = (Page::Main, 0);
-            menu.back.clear();
+            // In the editor, Esc drops the selection first.
+            if app.editor.on && !menu.open && app.editor.selection.is_some() {
+                app.editor.selection = None;
+            } else {
+                menu.open = !menu.open;
+                (menu.page, menu.selected) = (Page::Main, 0);
+                menu.back.clear();
+            }
+        }
+        if !menu.open && display.key_pressed(Key::Tab) {
+            app.editor.on = !app.editor.on;
+            app.editor.hover = None;
         }
         if display.key_pressed(Key::F11) {
             display.set_fullscreen(!display.is_fullscreen());
         }
-        // Mouse look while playing; a free pointer in the menu.
-        display.set_cursor_locked(!menu.open);
+        // Mouse look while playing, and in the editor while the right button is held; a
+        // free pointer otherwise.
+        let looking = !menu.open && (!app.editor.on || display.mouse_down(MouseButton::Right));
+        display.set_cursor_locked(looking);
         if menu.open {
             // The menu has the keys; the view holds still (the pointer's motion is dropped).
             display.mouse_delta();
@@ -1729,20 +1972,24 @@ fn run() -> Result<(), String> {
                 }
             }
         } else {
+            // The editor's mouse and keys; the arrows move its selection, if it has one.
+            let editing = app.editor.on && edit_input(&mut app, &display);
             // Look.
             let turn = TURN_SPEED * dt;
             let c = &mut app.camera;
-            if display.key_down(Key::Left) {
-                c.yaw += turn;
-            }
-            if display.key_down(Key::Right) {
-                c.yaw -= turn;
-            }
-            if display.key_down(Key::Up) {
-                c.pitch += turn;
-            }
-            if display.key_down(Key::Down) {
-                c.pitch -= turn;
+            if !editing {
+                if display.key_down(Key::Left) {
+                    c.yaw += turn;
+                }
+                if display.key_down(Key::Right) {
+                    c.yaw -= turn;
+                }
+                if display.key_down(Key::Up) {
+                    c.pitch += turn;
+                }
+                if display.key_down(Key::Down) {
+                    c.pitch -= turn;
+                }
             }
             if display.key_down(Key::Q) {
                 c.roll += ROLL_SPEED * dt;
@@ -1754,6 +2001,7 @@ fn run() -> Result<(), String> {
             // frame's motion (made since the last) is turned evenly over the window from
             // then on.
             let (mx, my) = display.mouse_delta();
+            let (mx, my) = if looking { (mx, my) } else { (0.0, 0.0) };
             let window = MOUSE_SMOOTHING[app.settings.smoothing];
             let (t0, t1) = (clock, (now - started).as_secs_f64());
             let (tx, ty) = if window > 0.0 {
@@ -1777,7 +2025,11 @@ fn run() -> Result<(), String> {
 
             // Move: WASD along the view, Space/C straight up and down.
             let mut local = Vec3::ZERO;
-            let key = |k| if display.key_down(k) { 1.0 } else { 0.0 };
+            // (Not with Ctrl: Ctrl+S saves in the editor.)
+            let ctrl = [Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]
+                .into_iter()
+                .any(|k| display.key_down(k));
+            let key = |k| if display.key_down(k) && !ctrl { 1.0 } else { 0.0 };
             local.z -= key(Key::W) - key(Key::S);
             local.x += key(Key::D) - key(Key::A);
             let up = key(Key::Space) - key(Key::C);
@@ -1833,6 +2085,71 @@ fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small app on `level`, for tests.
+    fn test_app(level: &str) -> App {
+        let args = ["--level", level, "--size", "64x36"].map(String::from);
+        App::new(&parse_options(args).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn editing_moves_an_entity_and_undo_brings_it_back() {
+        use editor::{Field, Selection};
+        let mut app = test_app("shiny_rooms.mmp");
+        let row = app.editor.doc.entities.iter().position(|e| e.name == "crate_a3").unwrap();
+        app.editor.selection = Some(Selection::Entity(row));
+        let world_index = |app: &App| app.world.entities.iter().position(|e| e.name == "crate_a3").unwrap();
+        let start = app.world.entities[world_index(&app)].position;
+        // One grid step (0.25 m) along x: the level is rebuilt with it there.
+        app.edit(Field::X, 1.0);
+        let moved = app.world.entities[world_index(&app)].position;
+        assert_eq!(moved, start + Vec3::X * 0.25);
+        assert_eq!(app.editor.doc.entities[row].position, moved);
+        assert!(app.editor.dirty());
+        // Past the room's wall (x = 4; an origin on it counts as inside): refused, and
+        // nothing changes.
+        app.editor.step = editor::STEPS.len() - 1;
+        for _ in 0..3 {
+            app.edit(Field::X, 1.0);
+        }
+        let stopped = app.world.entities[world_index(&app)].position.x;
+        assert!(stopped <= 4.0, "left the level at {stopped}");
+        assert_eq!(app.editor.doc.entities[row].position.x, stopped);
+        // Undo all the way back, then redo one.
+        while app.editor.dirty() {
+            app.travel(false);
+        }
+        assert_eq!(app.world.entities[world_index(&app)].position, start);
+        app.travel(true);
+        assert_eq!(app.world.entities[world_index(&app)].position, moved);
+    }
+
+    #[test]
+    fn a_level_needs_a_spawn_point() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        let spawn = app.editor.doc.entities.iter().position(|e| e.kind == moose_assets::EntityKind::Spawn).unwrap();
+        app.editor.selection = Some(Selection::Entity(spawn));
+        app.edit(Field::Delete, 1.0);
+        assert!(app.editor.doc.entities.iter().any(|e| e.kind == moose_assets::EntityKind::Spawn));
+        assert!(!app.editor.dirty());
+    }
+
+    #[test]
+    fn duplicates_get_their_own_names() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        let row = app.editor.doc.entities.iter().position(|e| e.kind != moose_assets::EntityKind::Spawn).unwrap();
+        let name = app.editor.doc.entities[row].name.clone();
+        let count = app.world.entities.len();
+        app.editor.selection = Some(Selection::Entity(row));
+        app.edit(Field::Duplicate, 1.0);
+        app.edit(Field::Duplicate, 1.0);
+        assert_eq!(app.world.entities.len(), count + 2);
+        let names: std::collections::HashSet<_> = app.editor.doc.entities.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names.len(), app.editor.doc.entities.len(), "names are unique");
+        assert!(names.contains(&format!("{}_2", name.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('_'))));
+    }
 
     #[test]
     fn menu_values_step_and_wrap() {
