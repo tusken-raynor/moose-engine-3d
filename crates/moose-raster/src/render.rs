@@ -2007,7 +2007,7 @@ fn shadow_run(
                     (r1, f64::INFINITY)
                 }
             };
-            // Only ahead of the light (a piece not cut by the pyramid may reach behind it).
+            // Only ahead of the light (a beam too wide for a pyramid may reach behind it).
             let (lo, hi) = if q.x > 0.0 {
                 (lo.max(-p.x / q.x), hi)
             } else if q.x < 0.0 {

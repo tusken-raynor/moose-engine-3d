@@ -11,10 +11,9 @@
 //! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
 //! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
 //! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
-//! FLASHLIGHT=beam, screen or sampled adds the app's flashlight at the camera (shadow slot
+//! FLASHLIGHT=beam or FLASHLIGHT=sampled adds the app's flashlight at the camera (shadow slot
 //! 0, 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
-//! beam (cut by its pyramid, or for screen, found row by row on whole polygons) or lit at
-//! sample points. DITHER=1 dithers beams' fades.
+//! beam or lit at sample points. DITHER=1 dithers beams' fades.
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -96,7 +95,6 @@ fn main() {
     let geometry = assets.mesh(world.geometry);
     let mut out = ViewGeometry::new();
     out.config.max_reflections = bounces;
-    out.config.beam_pyramid = std::env::var("FLASHLIGHT").map_or(true, |f| f != "screen");
     if std::env::var("SHADOWS").is_ok_and(|l| l == "1") {
         let t = Instant::now();
         let baked = out.bake_shadows(&world, &assets);
@@ -112,9 +110,9 @@ fn main() {
     };
     let frames: usize = std::env::var("FRAMES").map_or(500, |f| f.parse().unwrap());
     let flashlight = std::env::var("FLASHLIGHT").ok().map(|f| match f.as_str() {
-        "beam" | "screen" => true,
+        "beam" => true,
         "sampled" => false,
-        _ => panic!("FLASHLIGHT is beam, screen or sampled"),
+        _ => panic!("FLASHLIGHT is beam or sampled"),
     });
     let level_lights = world.lights().to_vec();
     let (mut view_s, mut raster_s) = (0.0f64, 0.0f64);

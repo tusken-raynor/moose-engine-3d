@@ -250,9 +250,6 @@ pub struct ViewConfig {
     /// occluders', and those on moving surfaces. Off, only cached (baked) shadows are drawn:
     /// no carving per frame at all.
     pub dynamic_shadows: bool,
-    /// Cut polygons by beams' pyramids (see `Light::beam`). Off, each polygon a beam reaches
-    /// is one beam piece, and the renderer finds the cone on it row by row.
-    pub beam_pyramid: bool,
 }
 
 impl Default for ViewConfig {
@@ -261,7 +258,6 @@ impl Default for ViewConfig {
             max_reflections: 1,
             cache_shadows: true,
             dynamic_shadows: true,
-            beam_pyramid: true,
         }
     }
 }
@@ -658,7 +654,6 @@ impl ViewGeometry {
         }
         self.object_lights.clear();
         self.object_lights.push(0..0); // the level: per sector instead
-        self.scratch.carver.whole_beams = !self.config.beam_pyramid;
         self.scratch
             .carver
             .prepare(world, assets, &self.lights, self.config.dynamic_shadows);

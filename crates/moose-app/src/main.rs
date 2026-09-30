@@ -29,9 +29,7 @@
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
 //!   --cone MODE           how the flashlight's cone is drawn: beam (faded pixel by pixel
-//!                         with its shadow, inside a pyramid cut around it; the default),
-//!                         screen (the same, found row by row on whole polygons, with no
-//!                         pyramid) or sampled (lit at sample points)
+//!                         with its shadow; the default) or sampled (lit at sample points)
 //!   --no-shadows          start with shadows off
 //!   --no-sun              start with the level's directional lights off
 //!   --light-scale K       the level's point and spot lights' source sizes (their shadows'
@@ -193,7 +191,6 @@ struct Options {
     water: bool,
     no_flashlight: bool,
     beam: bool,
-    beam_pyramid: bool,
     level_lights: bool,
     no_shadows: bool,
     no_sun: bool,
@@ -256,7 +253,6 @@ fn parse_args() -> Result<Options, String> {
         water: false,
         no_flashlight: false,
         beam: true,
-        beam_pyramid: true,
         no_shadows: false,
         no_sun: false,
         light_scale: 1.0,
@@ -315,11 +311,10 @@ fn parse_args() -> Result<Options, String> {
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--cone" => {
-                (o.beam, o.beam_pyramid) = match value()?.as_str() {
-                    "beam" => (true, true),
-                    "screen" => (true, false),
-                    "sampled" => (false, true),
-                    _ => return Err("--cone is beam, screen or sampled".into()),
+                o.beam = match value()?.as_str() {
+                    "beam" => true,
+                    "sampled" => false,
+                    _ => return Err("--cone is beam or sampled".into()),
                 }
             }
             "--no-shadows" => o.no_shadows = true,
@@ -577,7 +572,6 @@ impl App {
                 g.config.max_reflections = options.bounces;
                 g.config.cache_shadows = !options.no_shadow_cache;
                 g.config.dynamic_shadows = !options.no_dynamic_shadows;
-                g.config.beam_pyramid = options.beam_pyramid;
                 g
             },
             renderer,
@@ -775,11 +769,7 @@ impl App {
 
     /// How the flashlight's cone is drawn, as `--cone` names it.
     fn cone_name(&self) -> &'static str {
-        match (self.settings.beam, self.geometry.config.beam_pyramid) {
-            (false, _) => "sampled",
-            (true, true) => "beam",
-            (true, false) => "screen",
-        }
+        if self.settings.beam { "beam" } else { "sampled" }
     }
 
     /// Puts the camera at `[x, y, z, yaw, pitch]` (degrees); `option` names it in errors.
@@ -931,15 +921,7 @@ impl App {
             Setting::FlashlightFade => {
                 s.flashlight_fade = cycle(&FLASHLIGHT_FADES, s.flashlight_fade, dir)
             }
-            Setting::FlashlightBeam => {
-                // Beam, screen, sampled.
-                let pyramid = &mut self.geometry.config.beam_pyramid;
-                (s.beam, *pyramid) = match (s.beam, *pyramid, dir > 0) {
-                    (true, true, true) | (false, _, false) => (true, false),
-                    (true, false, true) | (true, true, false) => (false, true),
-                    _ => (true, true),
-                };
-            }
+            Setting::FlashlightBeam => s.beam = !s.beam,
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
             Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
             Setting::Water => s.water = !s.water,

@@ -474,9 +474,6 @@ pub(crate) struct Carver {
     stack: Vec<(u32, Option<Window>, u16)>,
     /// While building a cache: edges along the polygon's own keep that label.
     keep_polygon_edges: bool,
-    /// Beams aren't cut by their pyramid (see [`Light::beam`]): each polygon one reaches is
-    /// one beam piece, and the renderer finds the cone on it row by row.
-    pub whole_beams: bool,
     /// Cached shadows: per (shadow slot, polygon key), and per slot what they were carved for.
     cache: HashMap<(u8, (u8, u32, u32)), Cached>,
     cache_keys: [Option<CacheKey>; MAX_SHADOW_SLOTS as usize],
@@ -712,7 +709,7 @@ impl Carver {
         let start = self.planes.len() as u32;
         let cos = light.cos_outer;
         let sin = (1.0 - cos * cos).max(0.0).sqrt();
-        if cos > 0.05 && !self.whole_beams {
+        if cos > 0.05 {
             for side in [u, -u, v, -v] {
                 let normal = axis * sin - side * cos;
                 self.planes.push(Half {
