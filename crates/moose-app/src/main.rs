@@ -82,8 +82,8 @@ mod editor;
 mod ui;
 mod wire;
 
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use glam::Vec3;
 use moose_assets::{Assets, LevelDoc, Light, MeshId, RIPPLE_SIZE, Ripples, Texture, TextureId};
@@ -524,6 +524,9 @@ struct App {
     editor: editor::Editor,
     /// The model files in assets/models, for the editor.
     models: Vec<String>,
+    /// Files to reload when they change (the level, loaded models and textures), and when
+    /// each was last changed as far as the app knows.
+    watched: std::collections::HashMap<PathBuf, std::time::SystemTime>,
     settings: Settings,
     /// The levels in assets/levels (file names, sorted), and the one loaded.
     levels: Vec<String>,
@@ -658,6 +661,7 @@ impl App {
             spare_cubes: Vec::new(),
             editor: editor::Editor::new(doc, level_path),
             models: model_files(root),
+            watched: std::collections::HashMap::new(),
             settings: Settings {
                 translucent_crates: options.translucent_crates,
                 per_pixel_crates: options.per_pixel_crates,
@@ -779,7 +783,10 @@ impl App {
             .and_then(|what| self.rebuild().map(|()| what));
         match result {
             Ok(what) => self.editor.commit(before, &what),
-            Err(why) => self.editor.revert(before, &why),
+            Err(why) => {
+                self.editor.find_problem(&why);
+                self.editor.revert(before, &why);
+            }
         }
     }
 
@@ -795,11 +802,72 @@ impl App {
         }
     }
 
+    /// Reloads what changed on disk since the last look: models and textures (then
+    /// rebuilds the level, as entities' shapes may have changed), and the level's own file
+    /// unless the editor has changes of its own.
+    fn hot_reload(&mut self) {
+        let root = self.assets.root().to_path_buf();
+        let (models, textures) = self.assets.loaded_files();
+        let files = models
+            .iter()
+            .map(|m| (root.join("models").join(m), Some((m.clone(), true))))
+            .chain(textures.iter().map(|t| (root.join("textures").join(t), Some((t.clone(), false)))))
+            .chain(std::iter::once((self.editor.path.clone(), None)));
+        let mut changed = Vec::new();
+        for (path, what) in files {
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            match self.watched.insert(path.clone(), modified) {
+                Some(before) if before != modified => changed.push((path, what)),
+                _ => {}
+            }
+        }
+        let mut rebuild = false;
+        for (path, what) in changed {
+            let result = match what {
+                Some((name, true)) => self.assets.reload_mesh(&name).map(|_| rebuild = true),
+                Some((name, false)) => self.assets.reload_texture(&name).map(|_| ()),
+                None if self.editor.dirty() => {
+                    self.editor.say("the level's file changed on disk; your edits here are kept");
+                    continue;
+                }
+                None => match std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|src| LevelDoc::parse(&path, &src).map_err(|e| e.to_string()))
+                {
+                    Ok(doc) => {
+                        self.editor.doc = doc;
+                        self.editor.mark_saved();
+                        self.editor.selection = None;
+                        rebuild = true;
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.editor.say(e);
+                        continue;
+                    }
+                },
+            };
+            match result {
+                Ok(()) => self.editor.say(format!("reloaded {}", path.display())),
+                Err(e) => self.editor.say(e.to_string()),
+            }
+        }
+        if rebuild && let Err(e) = self.rebuild() {
+            self.editor.say(e);
+        }
+    }
+
     /// Writes the editor's tables to the level's file.
     fn save_level(&mut self) {
         let path = self.editor.path.clone();
         match std::fs::write(&path, self.editor.doc.to_text()) {
             Ok(()) => {
+                // Not a change to reload.
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                    self.watched.insert(path.clone(), modified);
+                }
                 self.editor.mark_saved();
                 self.editor.say(format!("saved {}", path.display()));
             }
@@ -1775,7 +1843,7 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         app.editor.view = app.editor.view.next();
         app.editor.hover = None;
     }
-    if display.key_pressed(Key::V) {
+    if !ctrl && display.key_pressed(Key::V) {
         app.editor.vertices = !app.editor.vertices;
         app.editor.hover = None;
     }
@@ -1863,7 +1931,30 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         if display.key_pressed(Key::D) {
             app.edit(Field::Duplicate, 1.0);
         }
+        if display.key_pressed(Key::C) {
+            app.editor.copy();
+        }
+        if display.key_pressed(Key::V) {
+            app.edit(Field::Paste, 1.0);
+        }
+        for (k, key) in [Key::Key1, Key::Key2, Key::Key3, Key::Key4].into_iter().enumerate() {
+            if display.key_pressed(key) {
+                let c = &app.camera;
+                app.editor.bookmarks[k] = Some((c.position, c.yaw, c.pitch));
+                app.editor.say(format!("bookmark {}: here", k + 1));
+            }
+        }
         return false;
+    }
+    for (k, key) in [Key::Key1, Key::Key2, Key::Key3, Key::Key4].into_iter().enumerate() {
+        if display.key_pressed(key)
+            && let Some((position, yaw, pitch)) = app.editor.bookmarks[k]
+            && let Some(sector) = app.world.find_sector(position)
+        {
+            let c = &mut app.camera;
+            (c.position, c.sector, c.yaw, c.pitch) = (position, sector, yaw, pitch);
+            app.editor.ortho_center = position;
+        }
     }
     if display.key_pressed(Key::G) {
         app.editor.step = (app.editor.step + 1) % editor::STEPS.len();
@@ -2014,6 +2105,9 @@ fn run() -> Result<(), String> {
     // Pointer motion still being turned (see `MOUSE_SMOOTHING`): when its window starts,
     // and the motion, in pixels. And the time of this frame's start, in seconds.
     let mut look: Vec<(f64, (f32, f32))> = Vec::new();
+    // When files were last looked at for changes (see `App::hot_reload`).
+    let mut reload_at = Instant::now();
+    app.hot_reload();
     let mut clock = 0.0f64;
     'frames: while display.is_open() {
         let now = Instant::now();
@@ -2199,6 +2293,10 @@ fn run() -> Result<(), String> {
                     app.fly(delta);
                 }
             }
+        }
+        if reload_at.elapsed() >= Duration::from_secs(1) {
+            reload_at = Instant::now();
+            app.hot_reload();
         }
         // (While the menu is open too, so closing it doesn't turn by the time it was open.)
         clock = (now - started).as_secs_f64();
@@ -2387,6 +2485,75 @@ mod tests {
         let after = app.editor.doc.directional[0].direction;
         assert!(before.normalize().angle_between(after.normalize()) > 0.1);
         assert!(app.lights.0.iter().any(|l| l.directional && l.direction.angle_between(after.normalize()) < 1e-3));
+    }
+
+    #[test]
+    fn textures_move_on_a_surface_and_map_flat_again() {
+        use editor::{Field, Selection};
+        let mut app = test_app("shiny_rooms.mmp");
+        let uv = app.editor.doc.attributes.iter().position(|a| a.name == "uv").unwrap();
+        let wall = app
+            .editor
+            .doc
+            .surfaces
+            .iter()
+            .position(|s| s.adjoin.is_none() && s.corners.len() == 4)
+            .unwrap();
+        let uvs = |app: &App| -> Vec<Vec<String>> {
+            app.editor.doc.surfaces[wall]
+                .corners
+                .iter()
+                .map(|(_, rows)| app.editor.doc.attributes[uv].values[rows[uv]].clone())
+                .collect()
+        };
+        let original = uvs(&app);
+        app.editor.selection = Some(Selection::Surface(wall));
+        app.edit(Field::TextureU, 1.0);
+        let shifted = uvs(&app);
+        assert_ne!(shifted, original);
+        // Mapped flat again: as the level was made.
+        app.edit(Field::TextureProject, 1.0);
+        let flat: Vec<Vec<f32>> = uvs(&app)
+            .iter()
+            .map(|row| row.iter().map(|t| t.parse().unwrap()).collect())
+            .collect();
+        let made: Vec<Vec<f32>> = original
+            .iter()
+            .map(|row| row.iter().map(|t| t.parse().unwrap()).collect())
+            .collect();
+        assert_eq!(flat, made);
+    }
+
+    #[test]
+    fn copies_paste_where_the_view_is() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        let crate_row = app
+            .editor
+            .doc
+            .entities
+            .iter()
+            .position(|e| e.kind == moose_assets::EntityKind::Prop)
+            .unwrap();
+        app.editor.selection = Some(Selection::Entity(crate_row));
+        app.editor.copy();
+        let count = app.world.entities.len();
+        app.editor.anchor = Vec3::new(1.0, 0.0, 5.0);
+        app.edit(Field::Paste, 1.0);
+        assert_eq!(app.world.entities.len(), count + 1);
+        assert!(app.world.entities.iter().any(|e| e.position == Vec3::new(1.0, 0.0, 5.0)));
+    }
+
+    #[test]
+    fn a_refused_edit_points_at_the_problem() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        // Raising a floor corner bends the floor: the loader names a surface.
+        app.editor.selection = Some(Selection::Vertex(0));
+        app.editor.find_problem("");
+        app.edit(Field::Y, 1.0);
+        let why = format!("{:?}", app.editor.problem_for_tests());
+        assert!(why.contains("Surface"), "{why}");
     }
 
     #[test]

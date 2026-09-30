@@ -107,6 +107,22 @@ pub enum Field {
     SunAngle,
     SunYaw,
     SunPitch,
+    /// A surface's texture: shifted across, shifted down, scaled, turned a quarter, or
+    /// mapped flat from its corners' positions.
+    TextureU,
+    TextureV,
+    TextureScale,
+    TextureTurn,
+    TextureProject,
+    /// Puts what was copied (Ctrl+C) where the view is.
+    Paste,
+}
+
+/// What Ctrl+C copied.
+#[derive(Clone, Debug)]
+pub enum Clip {
+    Entity(EntityDoc),
+    Light(LightDoc),
 }
 
 impl Field {
@@ -170,6 +186,11 @@ pub struct Editor {
     pub anchor: Vec3,
     /// The world point under the pointer in a 2D view (for the cut's preview).
     pub pointer: Option<Vec3>,
+    pub clipboard: Option<Clip>,
+    /// Camera places (Ctrl+1 to 4 keep one, 1 to 4 go back to it): position, yaw, pitch.
+    pub bookmarks: [Option<(Vec3, f32, f32)>; 4],
+    /// What the level loader last refused an edit over, and when (drawn in red a while).
+    problem: Option<(Selection, Instant)>,
 }
 
 impl Editor {
@@ -194,7 +215,49 @@ impl Editor {
             cutting: None,
             anchor: Vec3::ZERO,
             pointer: None,
+            clipboard: None,
+            bookmarks: [None; 4],
+            problem: None,
         }
+    }
+
+    /// Before an edit that failed is undone: finds what the loader's message (`why`, with
+    /// a line of the tables' text) is about, to show it.
+    pub fn find_problem(&mut self, why: &str) {
+        // Messages read "path:line: what".
+        let line = why
+            .split(':')
+            .find_map(|part| part.trim().parse::<usize>().ok());
+        let Some((section, row)) = line.and_then(|l| self.doc.row_at_line(l)) else {
+            return;
+        };
+        let selection = match section.as_str() {
+            "surfaces" => Selection::Surface(row),
+            "sectors" => Selection::Sector(row),
+            "vertices" => Selection::Vertex(row),
+            "entities" => Selection::Entity(row),
+            "lights" => Selection::Light(row),
+            _ => return,
+        };
+        self.problem = Some((selection, Instant::now()));
+    }
+
+    #[cfg(test)]
+    pub fn problem_for_tests(&self) -> Option<Selection> {
+        self.problem.map(|(selection, _)| selection)
+    }
+
+    /// Copies the selected entity or light (Ctrl+C).
+    pub fn copy(&mut self) {
+        self.clipboard = match self.selection {
+            Some(Selection::Entity(i)) => Some(Clip::Entity(self.doc.entities[i].clone())),
+            Some(Selection::Light(i)) => Some(Clip::Light(self.doc.lights[i].clone())),
+            _ => {
+                self.say("select an entity or a light to copy");
+                return;
+            }
+        };
+        self.say("copied: Ctrl+V puts it where the view is");
     }
 
     pub fn dirty(&self) -> bool {
@@ -473,6 +536,13 @@ impl Editor {
                         rows.push(row("Extrude", String::new(), Some(Field::Extrude)));
                         rows.push(row("Push/pull", "scroll".into(), Some(Field::Push)));
                         rows.push(row("Open to a match", String::new(), Some(Field::Adjoin)));
+                        if self.doc.attributes.iter().any(|a| a.name == "uv") {
+                            rows.push(row("Texture across", "scroll".into(), Some(Field::TextureU)));
+                            rows.push(row("Texture down", "scroll".into(), Some(Field::TextureV)));
+                            rows.push(row("Texture scale", "scroll".into(), Some(Field::TextureScale)));
+                            rows.push(row("Texture turn", String::new(), Some(Field::TextureTurn)));
+                            rows.push(row("Texture flat", String::new(), Some(Field::TextureProject)));
+                        }
                     }
                 }
                 rows
@@ -569,6 +639,50 @@ impl Editor {
                 let sector = self.doc.add_box(min, min + ROOM, "room")?;
                 self.selection = Some(Selection::Sector(sector));
                 Ok(format!("added {}: extrude a wall into it, or open matching walls", self.doc.sectors[sector].name))
+            }
+            (_, Field::Paste) => {
+                let at = self.anchor.map(|v| snap(v, step));
+                let sector = sector_of(world, at)?;
+                match self.clipboard.clone() {
+                    Some(Clip::Entity(mut e)) => {
+                        e.name = self.unique_name(&e.name);
+                        (e.position, e.sector) = (at, sector);
+                        let name = e.name.clone();
+                        self.doc.entities.push(e);
+                        self.selection = Some(Selection::Entity(self.doc.entities.len() - 1));
+                        Ok(format!("pasted {name}"))
+                    }
+                    Some(Clip::Light(mut l)) => {
+                        (l.position, l.sector) = (at, sector);
+                        self.doc.lights.push(l);
+                        self.selection = Some(Selection::Light(self.doc.lights.len() - 1));
+                        Ok("pasted a light".into())
+                    }
+                    None => Err("nothing copied (Ctrl+C)".into()),
+                }
+            }
+            (
+                Some(Selection::Surface(i)),
+                Field::TextureU | Field::TextureV | Field::TextureScale | Field::TextureTurn | Field::TextureProject,
+            ) => {
+                let normal = self.doc.surface_normal(i);
+                let uvs = self.corner_values(i, "uv");
+                if uvs.is_empty() {
+                    return Err("this level has no texture coordinates".into());
+                }
+                let center = uvs.iter().fold(Vec2::ZERO, |c, uv| c + Vec2::new(uv[0], uv[1])) / uvs.len() as f32;
+                self.doc.set_corner_values(i, "uv", |_, p, uv| {
+                    let t = Vec2::new(uv[0], uv[1]);
+                    let t = match field {
+                        Field::TextureU => t + Vec2::X * 0.125 * dir,
+                        Field::TextureV => t + Vec2::Y * 0.125 * dir,
+                        Field::TextureScale => center + (t - center) * 1.25f32.powf(-dir),
+                        Field::TextureTurn => center + (t - center).perp(),
+                        _ => planar_uv(p, normal),
+                    };
+                    vec![t.x, t.y]
+                });
+                Ok(format!("surface {i}'s texture moved"))
             }
             (Some(Selection::Surface(i)), Field::Reflective | Field::Sky) => {
                 let bit = if field == Field::Reflective { 0x1 } else { 0x2 };
@@ -857,6 +971,20 @@ impl Editor {
         points.len() == 2
     }
 
+    /// Surface `surface`'s corners' values of attribute `name` (none if the level has no
+    /// such attribute).
+    fn corner_values(&self, surface: usize, name: &str) -> Vec<Vec<f32>> {
+        let Some(k) = self.doc.attributes.iter().position(|a| a.name == name) else {
+            return Vec::new();
+        };
+        self.doc.surfaces[surface]
+            .corners
+            .iter()
+            .filter_map(|(_, rows)| rows.get(k))
+            .map(|&row| self.doc.attributes[k].values[row].iter().map(|t| t.parse().unwrap_or(0.0)).collect())
+            .collect()
+    }
+
     /// `name` with a number after it that no entity has.
     fn unique_name(&self, name: &str) -> String {
         let base = name.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end_matches('_');
@@ -948,7 +1076,11 @@ impl Editor {
                 }
             }
         }
-        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
+        let problem = self
+            .problem
+            .filter(|(_, at)| at.elapsed() < STATUS_TIME)
+            .map(|(selection, _)| selection);
+        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED), (problem, PROBLEM)] {
             match selection {
                 Some(Selection::Surface(i)) => {
                     wire::outline(canvas, projection, &self.doc.surface_points(i), color);
@@ -1031,7 +1163,7 @@ impl Editor {
     }
 
     /// The key hints at the bottom of the panel.
-    fn hints(&self) -> [String; 8] {
+    fn hints(&self) -> [String; 10] {
         [
             format!("Grid {} m (G)", moose_assets::number(self.step())),
             "F6: 3D/top/front/side. F5: wire".to_string(),
@@ -1040,7 +1172,9 @@ impl Editor {
             "Scroll or click a row to change it".to_string(),
             "Arrows, PgUp/Dn, [ ]: move, turn".to_string(),
             "Ctrl Z/Y: undo/redo. Ctrl S: save".to_string(),
-            "Ctrl D: copy. Del: delete. Tab: play".to_string(),
+            "Ctrl D: duplicate. Ctrl C/V: copy, paste".to_string(),
+            "Del: delete. Ctrl 1-4, 1-4: bookmarks".to_string(),
+            "Tab: play".to_string(),
         ]
     }
 
@@ -1118,6 +1252,21 @@ fn sector_of(world: &World, p: Vec3) -> Result<usize, String> {
         .ok_or_else(|| "that's outside the level".to_string())
 }
 
+/// Texture coordinates for point `p` on a surface facing `normal`, as the test levels are
+/// made (tools/gen_test_assets.py): along the normal's strongest axis, a tile every 2 m, v
+/// growing down on walls.
+fn planar_uv(p: Vec3, normal: Vec3) -> Vec2 {
+    let a = normal.abs();
+    let (u, v) = if a.y >= a.x && a.y >= a.z {
+        (p.x, p.z)
+    } else if a.x >= a.z {
+        (p.z, -p.y)
+    } else {
+        (p.x, -p.y)
+    };
+    Vec2::new(u, v) / 2.0
+}
+
 /// A light's option `key` (`key=value`), if it has one.
 fn light_option<'a>(l: &'a LightDoc, key: &str) -> Option<&'a str> {
     l.options.iter().find_map(|o| o.strip_prefix(key)?.strip_prefix('='))
@@ -1161,3 +1310,4 @@ const LIGHT: u32 = 0xFF_B0_40;
 const SPAWN: u32 = 0x40_E0_E0;
 const RANGE: u32 = 0x80_60_20;
 const CUT: u32 = 0xFF_50_50;
+const PROBLEM: u32 = 0xFF_20_20;

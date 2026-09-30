@@ -70,21 +70,41 @@ impl Assets {
         if let Some(id) = self.mesh_id(name) {
             return Ok(id);
         }
-        let path = self.root.join("models").join(name);
-        let src = read(&path)?;
-        let mesh = match path.extension().and_then(|e| e.to_str()) {
-            Some("obj") => obj::parse_obj(&path, name, &src)?,
-            _ => {
-                return Err(LoadError::new(
-                    &path,
-                    None,
-                    "unsupported model format (expected .obj)",
-                ));
-            }
-        };
+        let mesh = self.read_mesh(name)?;
         let id = self.add_mesh(mesh);
         self.by_name.insert(name.to_string(), id);
         Ok(id)
+    }
+
+    fn read_mesh(&self, name: &str) -> Result<Mesh, LoadError> {
+        let path = self.root.join("models").join(name);
+        let src = read(&path)?;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("obj") => obj::parse_obj(&path, name, &src),
+            _ => Err(LoadError::new(
+                &path,
+                None,
+                "unsupported model format (expected .obj)",
+            )),
+        }
+    }
+
+    /// Reads a loaded model's file again, into the same handle (for a file changed on
+    /// disk). Returns whether it was loaded.
+    pub fn reload_mesh(&mut self, name: &str) -> Result<bool, LoadError> {
+        let Some(id) = self.mesh_id(name) else {
+            return Ok(false);
+        };
+        self.meshes[id.0 as usize] = self.read_mesh(name)?;
+        Ok(true)
+    }
+
+    /// The names of the models and textures loaded from files.
+    pub fn loaded_files(&self) -> (Vec<String>, Vec<String>) {
+        (
+            self.by_name.keys().cloned().collect(),
+            self.textures_by_name.keys().cloned().collect(),
+        )
     }
 
     /// Adds a mesh without a name; it can only be reached through the returned handle.
@@ -116,22 +136,34 @@ impl Assets {
         if let Some(id) = self.texture_id(name) {
             return Ok(id);
         }
-        let path = self.root.join("textures").join(name);
-        let bytes = std::fs::read(&path)
-            .map_err(|e| LoadError::new(&path, None, format!("cannot read file: {e}")))?;
-        let texture = match path.extension().and_then(|e| e.to_str()) {
-            Some("png") => decode_png(&path, name, &bytes)?,
-            _ => {
-                return Err(LoadError::new(
-                    &path,
-                    None,
-                    "unsupported texture format (expected .png)",
-                ));
-            }
-        };
+        let texture = self.read_texture(name)?;
         let id = self.add_texture(texture);
         self.textures_by_name.insert(name.to_string(), id);
         Ok(id)
+    }
+
+    /// Reads a loaded texture's file again, into the same handle. Returns whether it was
+    /// loaded.
+    pub fn reload_texture(&mut self, name: &str) -> Result<bool, LoadError> {
+        let Some(id) = self.texture_id(name) else {
+            return Ok(false);
+        };
+        self.textures[id.0 as usize] = self.read_texture(name)?;
+        Ok(true)
+    }
+
+    fn read_texture(&self, name: &str) -> Result<Texture, LoadError> {
+        let path = self.root.join("textures").join(name);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| LoadError::new(&path, None, format!("cannot read file: {e}")))?;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("png") => decode_png(&path, name, &bytes),
+            _ => Err(LoadError::new(
+                &path,
+                None,
+                "unsupported texture format (expected .png)",
+            )),
+        }
     }
 
     /// Adds a texture without a name; it can only be reached through the returned handle.

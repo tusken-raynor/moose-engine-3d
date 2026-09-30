@@ -434,6 +434,64 @@ impl LevelDoc {
         out
     }
 
+    /// Which table row line `line` (1-based) of [`to_text`](Self::to_text)'s text is: its
+    /// section's keyword and the row. For pointing at what a load error names.
+    pub fn row_at_line(&self, line: usize) -> Option<(String, usize)> {
+        let text = self.to_text();
+        let mut section: Option<(String, usize)> = None;
+        for (i, l) in text.lines().enumerate() {
+            let code = l.split('#').next().unwrap_or("");
+            let mut words = code.split_whitespace();
+            let Some(first) = words.next() else { continue };
+            match first.parse::<usize>() {
+                Ok(row) if section.is_some() => {
+                    if i + 1 == line {
+                        return section.map(|(keyword, _)| (keyword, row));
+                    }
+                }
+                _ => section = Some((first.to_string(), i + 1)),
+            }
+            if i + 1 == line {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Gives surface `surface`'s corners new values of attribute `name` (`f` from each
+    /// corner's position and its values now), in new rows, so other surfaces sharing its
+    /// rows keep theirs. Returns whether the level has that attribute.
+    pub fn set_corner_values(
+        &mut self,
+        surface: usize,
+        name: &str,
+        f: impl Fn(usize, Vec3, &[f32]) -> Vec<f32>,
+    ) -> bool {
+        let Some(k) = self.attributes.iter().position(|a| a.name == name) else {
+            return false;
+        };
+        let corners = self.surfaces[surface].corners.clone();
+        for (c, (v, rows)) in corners.iter().enumerate() {
+            let Some(&row) = rows.get(k) else { continue };
+            let now: Vec<f32> = self.attributes[k].values[row]
+                .iter()
+                .map(|t| t.parse().unwrap_or(0.0))
+                .collect();
+            let values = f(c, self.vertices[*v], &now);
+            let attribute = &mut self.attributes[k];
+            let integer = matches!(attribute.format.as_str(), "u8" | "i8" | "i16");
+            attribute.values.push(
+                values
+                    .iter()
+                    .map(|&x| if integer { format!("{}", x.round() as i64) } else { number(x) })
+                    .collect(),
+            );
+            let new = attribute.values.len() - 1;
+            self.surfaces[surface].corners[c].1[k] = new;
+        }
+        true
+    }
+
     /// The surfaces of sector `s`, as a range of `surfaces`.
     pub fn sector_surfaces(&self, s: usize) -> std::ops::Range<usize> {
         let sector = &self.sectors[s];
