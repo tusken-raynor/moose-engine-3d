@@ -14,6 +14,7 @@ mod level;
 mod mesh;
 mod mmp;
 mod mmp_doc;
+mod mmp_edit;
 mod obj;
 mod ripples;
 mod store;

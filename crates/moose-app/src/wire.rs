@@ -107,6 +107,14 @@ impl Projection<'_> {
         }
     }
 
+    /// Point `p` on screen, if it is in front of the eye.
+    pub fn point(&self, p: Vec3) -> Option<Vec2> {
+        match self {
+            Projection::Ortho(o) => Some(o.to_screen(p)),
+            Projection::Perspective(view) => view.project(p).map(|(s, _)| s),
+        }
+    }
+
     pub fn line(&self, canvas: &mut Canvas, a: Vec3, b: Vec3, color: u32) {
         if let Some((a, b)) = self.segment(a, b) {
             canvas.line(a.x, a.y, b.x, b.y, color);

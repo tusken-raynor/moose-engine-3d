@@ -15,8 +15,8 @@
 //!   --edit                start in the level editor (Tab switches)
 //!   --view V, --wire, --zoom S  the editor's view (3d, top, front or side; F6), wireframe
 //!                         over the 3D view (F5), and 2D views' pixels per meter
-//!   --select NAME         in the editor, start with the entity NAME (or surface:N)
-//!                         selected
+//!   --select NAME         in the editor, start with the entity NAME (or surface:N,
+//!                         sector:N, vertex:N) selected
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
 //!                         on a player standing there
 //!   --flashlight-at X,Y,Z,DX,DY,DZ  start with the flashlight locked at X,Y,Z, aimed along
@@ -768,6 +768,10 @@ impl App {
     /// An edit of the editor's selection (see `editor::Editor::change`): made in the
     /// tables and the level rebuilt, or undone with the reason if the level rejects it.
     fn edit(&mut self, field: editor::Field, dir: f32) {
+        if !field.is_edit() {
+            self.editor.command(field, dir);
+            return;
+        }
         let before = self.editor.begin();
         let result = self
             .editor
@@ -1735,7 +1739,7 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
     };
     if app.editor.on && menu.is_none() {
         let camera = app.camera.view();
-        app.editor.draw(&mut canvas, &app.geometry, &camera, &app.world, &app.assets);
+        app.editor.draw(&mut canvas, &camera, &app.world, &app.assets);
     }
     if let Some(lines) = hud {
         ui::draw_hud(&mut canvas, &lines);
@@ -1771,15 +1775,37 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         app.editor.view = app.editor.view.next();
         app.editor.hover = None;
     }
+    if display.key_pressed(Key::V) {
+        app.editor.vertices = !app.editor.vertices;
+        app.editor.hover = None;
+    }
     let ortho = app.editor.ortho(w, h);
-    app.editor.hover = match (cursor, &ortho) {
-        (Some((x, y)), Some(o)) if !over_panel => {
-            app.editor.pick_2d(o, &app.world, &app.assets, x, y)
+    let camera = app.camera.view();
+    let projection = match &ortho {
+        Some(o) => wire::Projection::Ortho(o),
+        None => wire::Projection::Perspective(&camera),
+    };
+    app.editor.anchor = match &ortho {
+        Some(o) => o.center,
+        None => app.camera.position + app.camera.forward() * 3.0,
+    };
+    app.editor.pointer = match (&ortho, cursor) {
+        (Some(o), Some((x, y))) => Some(o.to_world(x, y)),
+        _ => None,
+    };
+    app.editor.hover = match cursor {
+        Some((x, y)) if !over_panel => {
+            let at = glam::Vec2::new(x, y);
+            if app.editor.vertices {
+                app.editor.pick_vertex(&projection, at)
+            } else if let Some(o) = &ortho {
+                app.editor.pick_2d(o, &app.world, at)
+            } else {
+                app.geometry
+                    .pick(x, y)
+                    .and_then(|(source, _)| app.editor.selection_of(source))
+            }
         }
-        (Some((x, y)), None) if !over_panel => app
-            .geometry
-            .pick(x, y)
-            .and_then(|(source, _)| app.editor.selection_of(source)),
         _ => None,
     };
     // The panel row under the pointer, and what it changes.
@@ -1791,6 +1817,15 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         if over_panel {
             if let Some(field) = row_field {
                 app.edit(field, 1.0);
+            }
+        } else if app.editor.cutting.is_some() {
+            match (app.editor.pointer, cursor) {
+                (Some(p), Some(_)) => {
+                    if app.editor.cut_point(p) {
+                        app.edit(Field::Cut, 1.0);
+                    }
+                }
+                _ => app.editor.say("cut in a 2D view (F6)"),
             }
         } else if cursor.is_some() {
             app.editor.selection = app.editor.hover;
@@ -1836,7 +1871,14 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     if display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
         app.edit(Field::Delete, 1.0);
     }
-    if !matches!(app.editor.selection, Some(Selection::Entity(_))) {
+    if let Some(Selection::Surface(_)) = app.editor.selection {
+        for (key, dir) in [(Key::PageUp, 1.0), (Key::PageDown, -1.0)] {
+            if display.key_repeated(key) {
+                app.edit(Field::Push, dir);
+            }
+        }
+    }
+    if !matches!(app.editor.selection, Some(Selection::Entity(_) | Selection::Vertex(_))) {
         return false;
     }
     // Along the screen's axes in a 2D view; in the 3D view, along the world axes nearest
@@ -1911,9 +1953,12 @@ fn run() -> Result<(), String> {
         app.editor.ortho_scale = zoom;
     }
     if let Some(name) = &options.select {
-        app.editor.selection = Some(match name.strip_prefix("surface:") {
-            Some(n) => editor::Selection::Surface(n.parse().map_err(|_| "bad --select")?),
-            None => editor::Selection::Entity(
+        let index = |n: &str| n.parse::<usize>().map_err(|_| "bad --select".to_string());
+        app.editor.selection = Some(match name.split_once(':') {
+            Some(("surface", n)) => editor::Selection::Surface(index(n)?),
+            Some(("sector", n)) => editor::Selection::Sector(index(n)?),
+            Some(("vertex", n)) => editor::Selection::Vertex(index(n)?),
+            _ => editor::Selection::Entity(
                 app.editor
                     .doc
                     .entities
@@ -1970,8 +2015,11 @@ fn run() -> Result<(), String> {
         last = now;
 
         if display.key_pressed(Key::Escape) {
-            // In the editor, Esc drops the selection first.
-            if app.editor.on && !menu.open && app.editor.selection.is_some() {
+            // In the editor, Esc stops a cut, then drops the selection, first.
+            if app.editor.on && !menu.open && app.editor.cutting.is_some() {
+                app.editor.cutting = None;
+                app.editor.say("cut stopped");
+            } else if app.editor.on && !menu.open && app.editor.selection.is_some() {
                 app.editor.selection = None;
             } else {
                 menu.open = !menu.open;
@@ -2228,6 +2276,58 @@ mod tests {
         assert_eq!(app.world.entities[world_index(&app)].position, start);
         app.travel(true);
         assert_eq!(app.world.entities[world_index(&app)].position, moved);
+    }
+
+    #[test]
+    fn sector_tools_grow_cut_and_add_rooms() {
+        use editor::{Field, Selection, ViewMode};
+        let mut app = test_app("two_rooms.mmp");
+        let sectors = app.world.sectors.len();
+        // room_a's back wall (z = 8, facing into the room) extruded 2 m: a new sector,
+        // with its far end selected.
+        let back = app
+            .editor
+            .doc
+            .sector_surfaces(0)
+            .find(|&i| {
+                app.editor.doc.surfaces[i].adjoin.is_none()
+                    && app.editor.doc.surface_normal(i).dot(Vec3::NEG_Z) > 0.99
+            })
+            .unwrap();
+        app.editor.selection = Some(Selection::Surface(back));
+        app.edit(Field::Extrude, 1.0);
+        assert_eq!(app.world.sectors.len(), sectors + 1);
+        assert!(matches!(app.editor.selection, Some(Selection::Surface(i)) if i != back));
+        // Cut room_a in two in the top view, along x = 0.
+        app.editor.selection = Some(Selection::Sector(0));
+        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.edit(Field::Cleave, 1.0);
+        assert!(!app.editor.cut_point(Vec3::new(0.0, 1.0, -5.0)));
+        assert!(app.editor.cut_point(Vec3::new(0.0, 1.0, 20.0)));
+        app.edit(Field::Cut, 1.0);
+        assert_eq!(app.world.sectors.len(), sectors + 2);
+        // A room of its own, away from the level.
+        app.editor.selection = None;
+        app.editor.anchor = Vec3::new(30.0, 1.7, 30.0);
+        app.edit(Field::NewRoom, 1.0);
+        assert_eq!(app.world.sectors.len(), sectors + 3);
+        assert!(matches!(app.editor.selection, Some(Selection::Sector(_))));
+        // All undone.
+        while app.editor.dirty() {
+            app.travel(false);
+        }
+        assert_eq!(app.world.sectors.len(), sectors);
+    }
+
+    #[test]
+    fn a_vertex_that_would_bend_a_surface_stays() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        // Vertex 0 is a corner of room_a's floor (-4, 0, 8): raised, the floor bends.
+        app.editor.selection = Some(Selection::Vertex(0));
+        let before = app.editor.doc.clone();
+        app.edit(Field::Y, 1.0);
+        assert_eq!(app.editor.doc, before, "refused: the floor isn't flat any more");
     }
 
     #[test]

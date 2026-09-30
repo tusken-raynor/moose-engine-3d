@@ -5,6 +5,12 @@
 //! and the app then rebuilds the level from them, through the level loader, which checks
 //! the edit (an edit it rejects is undone, with the loader's reason). Undo and redo are
 //! snapshots of the tables; saving writes them to the level's file.
+//!
+//! Things are picked in the 3D view or in 2D views (top, front, side; see [`crate::wire`]):
+//! entities and surfaces, or with vertex picking on (V) vertices. A surface's panel selects
+//! its sector. Sector tools: extrude a surface into a new sector, push or pull it, join
+//! or part sectors with openings, cleave a sector along a line drawn in a 2D view, add a
+//! room, delete a sector; vertices move on the grid.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +18,7 @@ use std::time::{Duration, Instant};
 use glam::{EulerRot, Quat, Vec2, Vec3};
 use moose_assets::{Assets, EntityKind, LevelDoc};
 use moose_scene::World;
-use moose_view::{PolygonSource, ViewGeometry};
+use moose_view::PolygonSource;
 
 use crate::ui::Canvas;
 use crate::wire::{self, Axis, Ortho, Projection};
@@ -36,11 +42,13 @@ impl ViewMode {
     }
 }
 
-/// What is selected: a surface or an entity, by its row in the level's tables (so it
-/// survives rebuilding the level).
+/// What is selected, by its row in the level's tables (so it survives rebuilding the
+/// level).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     Surface(usize),
+    Sector(usize),
+    Vertex(usize),
     Entity(usize),
 }
 
@@ -62,6 +70,27 @@ pub enum Field {
     Sky,
     Duplicate,
     Delete,
+    /// Selects a surface's sector.
+    SelectSector,
+    /// How far to extrude (not an edit).
+    ExtrudeBy,
+    Extrude,
+    /// Pushes a surface out (or pulls it in) on the grid.
+    Push,
+    Adjoin,
+    Unadjoin,
+    /// Starts cutting the selected sector: two clicks in a 2D view (not an edit).
+    Cleave,
+    /// Cuts along the line clicked (see [`Editor::cut`]).
+    Cut,
+    NewRoom,
+}
+
+impl Field {
+    /// Whether it changes the level (rather than what the editor is doing).
+    pub fn is_edit(self) -> bool {
+        !matches!(self, Field::SelectSector | Field::ExtrudeBy | Field::Cleave)
+    }
 }
 
 /// A row of the properties panel: its label, its value, and what clicking it (or
@@ -78,6 +107,12 @@ pub const STEPS: [f32; 5] = [0.0625, 0.125, 0.25, 0.5, 1.0];
 pub const TURN: f32 = 15.0;
 /// How long a status message shows.
 const STATUS_TIME: Duration = Duration::from_secs(4);
+/// How near the pointer must be to a vertex or an edge to pick it, in pixels.
+const PICK_RADIUS: f32 = 7.0;
+/// A new room's size, in meters.
+const ROOM: Vec3 = Vec3::new(4.0, 3.0, 4.0);
+
+type Snapshot = (LevelDoc, Option<Selection>);
 
 pub struct Editor {
     /// Editing (Tab), as opposed to playing.
@@ -88,8 +123,10 @@ pub struct Editor {
     pub selection: Option<Selection>,
     /// What the pointer is over.
     pub hover: Option<Selection>,
-    undo: Vec<(LevelDoc, Option<Selection>)>,
-    redo: Vec<(LevelDoc, Option<Selection>)>,
+    /// Clicks pick vertices (V), not things.
+    pub vertices: bool,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
     /// The tables as last saved (or loaded), to tell if there are unsaved changes.
     saved: LevelDoc,
     status: Option<(String, Instant)>,
@@ -101,6 +138,15 @@ pub struct Editor {
     /// The 2D views' center and scale (pixels per meter), shared by all three.
     pub ortho_center: Vec3,
     pub ortho_scale: f32,
+    /// How far Extrude goes, in meters.
+    pub extrude_by: f32,
+    /// While cutting a sector: the points clicked so far (the cut runs through two).
+    pub cutting: Option<Vec<Vec3>>,
+    /// Where new things go: the middle of the 2D view, or in front of the camera. Set by
+    /// the app each frame.
+    pub anchor: Vec3,
+    /// The world point under the pointer in a 2D view (for the cut's preview).
+    pub pointer: Option<Vec3>,
 }
 
 impl Editor {
@@ -112,6 +158,7 @@ impl Editor {
             path,
             selection: None,
             hover: None,
+            vertices: false,
             undo: Vec::new(),
             redo: Vec::new(),
             status: None,
@@ -120,7 +167,23 @@ impl Editor {
             wire: false,
             ortho_center: Vec3::ZERO,
             ortho_scale: 40.0,
+            extrude_by: 2.0,
+            cutting: None,
+            anchor: Vec3::ZERO,
+            pointer: None,
         }
+    }
+
+    pub fn dirty(&self) -> bool {
+        self.doc != self.saved
+    }
+
+    pub fn say(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), Instant::now()));
+    }
+
+    pub fn step(&self) -> f32 {
+        STEPS[self.step]
     }
 
     /// The 2D view, if one is showing, for a `width` x `height` screen.
@@ -137,130 +200,28 @@ impl Editor {
         }
     }
 
-    /// The level polygon (in the level mesh) drawing surface `surface`, if it is solid.
-    fn mesh_polygon(&self, surface: usize) -> Option<usize> {
-        self.doc.surfaces[surface].adjoin.is_none().then(|| {
-            self.doc.surfaces[..surface].iter().filter(|s| s.adjoin.is_none()).count()
-        })
-    }
+    // ---- History
 
-    /// The world entity row `row` is, if it isn't a spawn point.
-    fn world_entity(&self, row: usize) -> Option<usize> {
-        (self.doc.entities[row].kind != EntityKind::Spawn).then(|| {
-            self.doc.entities[..row].iter().filter(|e| e.kind != EntityKind::Spawn).count()
-        })
-    }
-
-    /// What is under screen point `(x, y)` in a 2D view: an entity whose outline (its box
-    /// on screen) holds it, the smallest; otherwise the surface with an edge nearest it,
-    /// within a few pixels.
-    pub fn pick_2d(&self, ortho: &Ortho, world: &World, assets: &Assets, x: f32, y: f32) -> Option<Selection> {
-        let at = Vec2::new(x, y);
-        let mut best: Option<(f32, Selection)> = None;
-        for (i, e) in world.entities.iter().enumerate() {
-            let corners = (0..8).map(|k| {
-                let pick = |bit: usize, lo: f32, hi: f32| if k & bit == 0 { lo } else { hi };
-                ortho.to_screen(Vec3::new(
-                    pick(1, e.bounds.min.x, e.bounds.max.x),
-                    pick(2, e.bounds.min.y, e.bounds.max.y),
-                    pick(4, e.bounds.min.z, e.bounds.max.z),
-                ))
-            });
-            let (lo, hi) = corners.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), c| (lo.min(c), hi.max(c)));
-            if at.cmpge(lo).all() && at.cmple(hi).all() {
-                let area = (hi - lo).x * (hi - lo).y;
-                let source = PolygonSource::Entity { entity: i as u32, polygon: 0 };
-                if best.is_none_or(|(a, _)| area < a)
-                    && let Some(selection) = self.selection_of(source)
-                {
-                    best = Some((area, selection));
-                }
-            }
-        }
-        if let Some((_, selection)) = best {
-            return Some(selection);
-        }
-        let geometry = assets.mesh(world.geometry);
-        let mut nearest: Option<(f32, usize)> = None;
-        for (i, polygon) in geometry.polygons.iter().enumerate() {
-            let points: Vec<Vec2> = geometry.polygon_points(polygon).map(|p| ortho.to_screen(p)).collect();
-            for k in 0..points.len() {
-                let d = distance_to_segment(at, points[k], points[(k + 1) % points.len()]);
-                if d < 6.0 && nearest.is_none_or(|(n, _)| d < n) {
-                    nearest = Some((d, i));
-                }
-            }
-        }
-        let (_, polygon) = nearest?;
-        self.selection_of(PolygonSource::World { sector: 0, polygon: polygon as u32 })
-    }
-
-    /// Draws a 2D view: the grid, the level's wireframe, and the selection and what the
-    /// pointer is over, outlined.
-    pub fn draw_2d(&self, canvas: &mut Canvas, ortho: &Ortho, world: &World, assets: &Assets) {
-        wire::draw_grid(canvas, ortho, self.step());
-        let projection = Projection::Ortho(ortho);
-        wire::draw_level(canvas, &projection, world, assets);
-        self.draw_selected(canvas, &projection, world, assets);
-    }
-
-    /// Outlines the selection and what the pointer is over, through `projection`.
-    pub fn draw_selected(&self, canvas: &mut Canvas, projection: &Projection, world: &World, assets: &Assets) {
-        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
-            match selection {
-                Some(Selection::Surface(i)) => {
-                    let Some(polygon) = self.mesh_polygon(i) else { continue };
-                    let geometry = assets.mesh(world.geometry);
-                    let points: Vec<Vec3> = geometry.polygon_points(&geometry.polygons[polygon]).collect();
-                    wire::outline(canvas, projection, &points, color);
-                }
-                Some(Selection::Entity(row)) => {
-                    let Some(e) = self.world_entity(row).and_then(|k| world.entities.get(k)) else { continue };
-                    let mesh = assets.mesh(e.mesh);
-                    let transform = e.transform();
-                    for polygon in &mesh.polygons {
-                        let points: Vec<Vec3> = mesh.polygon_points(polygon).map(|p| transform.transform_point3(p)).collect();
-                        wire::outline(canvas, projection, &points, color);
-                    }
-                }
-                None => {}
-            }
-        }
-    }
-
-    pub fn dirty(&self) -> bool {
-        self.doc != self.saved
-    }
-
-    pub fn say(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now()));
-    }
-
-    pub fn step(&self) -> f32 {
-        STEPS[self.step]
-    }
-
-    /// Before an edit: remembers the tables for undo. Returns them, to put back if the
-    /// edit fails.
-    pub fn begin(&mut self) -> (LevelDoc, Option<Selection>) {
+    /// Before an edit: the tables and selection to put back if it fails, or to undo to.
+    pub fn begin(&mut self) -> Snapshot {
         (self.doc.clone(), self.selection)
     }
 
     /// After an edit the level accepted.
-    pub fn commit(&mut self, before: (LevelDoc, Option<Selection>), what: &str) {
+    pub fn commit(&mut self, before: Snapshot, what: &str) {
         self.undo.push(before);
         self.redo.clear();
         self.say(what);
     }
 
     /// After an edit that failed: puts the tables back.
-    pub fn revert(&mut self, before: (LevelDoc, Option<Selection>), why: &str) {
+    pub fn revert(&mut self, before: Snapshot, why: &str) {
         (self.doc, self.selection) = before;
         self.say(why);
     }
 
-    /// Steps back (or forward, `redo`) through the history: the tables to rebuild from, if
-    /// there was a step.
+    /// Steps back (or forward, `redo`) through the history. Returns whether there was a
+    /// step (the level must then be rebuilt from the tables).
     pub fn travel(&mut self, redo: bool) -> bool {
         let (from, to) = if redo {
             (&mut self.redo, &mut self.undo)
@@ -278,6 +239,8 @@ impl Editor {
     pub fn mark_saved(&mut self) {
         self.saved = self.doc.clone();
     }
+
+    // ---- Picking
 
     /// The selection a drawn polygon's source stands for.
     pub fn selection_of(&self, source: PolygonSource) -> Option<Selection> {
@@ -309,10 +272,83 @@ impl Editor {
         }
     }
 
-    /// Whether a drawn polygon is part of `selection`.
-    pub fn shows(&self, selection: Selection, source: PolygonSource) -> bool {
-        self.selection_of(source) == Some(selection)
+    /// The world entity row `row` is, if it isn't a spawn point.
+    fn world_entity(&self, row: usize) -> Option<usize> {
+        (self.doc.entities[row].kind != EntityKind::Spawn).then(|| {
+            self.doc.entities[..row].iter().filter(|e| e.kind != EntityKind::Spawn).count()
+        })
     }
+
+    /// The vertices surfaces use.
+    fn used_vertices(&self) -> Vec<usize> {
+        let mut used: Vec<usize> = self
+            .doc
+            .surfaces
+            .iter()
+            .flat_map(|s| s.corners.iter().map(|&(v, _)| v))
+            .collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    }
+
+    /// The vertex nearest screen point `at` through `projection`, within a few pixels.
+    pub fn pick_vertex(&self, projection: &Projection, at: Vec2) -> Option<Selection> {
+        self.used_vertices()
+            .into_iter()
+            .filter_map(|v| {
+                let p = projection.point(self.doc.vertices[v])?;
+                Some((p.distance(at), v))
+            })
+            .filter(|&(d, _)| d < PICK_RADIUS)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, v)| Selection::Vertex(v))
+    }
+
+    /// What is under screen point `at` in a 2D view: an entity whose outline (its box on
+    /// screen) holds it, the smallest; otherwise the surface (openings too) with an edge
+    /// nearest it, within a few pixels.
+    pub fn pick_2d(&self, ortho: &Ortho, world: &World, at: Vec2) -> Option<Selection> {
+        let mut best: Option<(f32, Selection)> = None;
+        for (i, e) in world.entities.iter().enumerate() {
+            let corners = (0..8).map(|k| {
+                let pick = |bit: usize, lo: f32, hi: f32| if k & bit == 0 { lo } else { hi };
+                ortho.to_screen(Vec3::new(
+                    pick(1, e.bounds.min.x, e.bounds.max.x),
+                    pick(2, e.bounds.min.y, e.bounds.max.y),
+                    pick(4, e.bounds.min.z, e.bounds.max.z),
+                ))
+            });
+            let (lo, hi) = corners.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), c| {
+                (lo.min(c), hi.max(c))
+            });
+            if at.cmpge(lo).all() && at.cmple(hi).all() {
+                let area = (hi - lo).x * (hi - lo).y;
+                let source = PolygonSource::Entity { entity: i as u32, polygon: 0 };
+                if best.is_none_or(|(a, _)| area < a)
+                    && let Some(selection) = self.selection_of(source)
+                {
+                    best = Some((area, selection));
+                }
+            }
+        }
+        if let Some((_, selection)) = best {
+            return Some(selection);
+        }
+        let mut nearest: Option<(f32, usize)> = None;
+        for i in 0..self.doc.surfaces.len() {
+            let points: Vec<Vec2> = self.doc.surface_points(i).into_iter().map(|p| ortho.to_screen(p)).collect();
+            for k in 0..points.len() {
+                let d = distance_to_segment(at, points[k], points[(k + 1) % points.len()]);
+                if d < PICK_RADIUS && nearest.is_none_or(|(n, _)| d < n) {
+                    nearest = Some((d, i));
+                }
+            }
+        }
+        nearest.map(|(_, i)| Selection::Surface(i))
+    }
+
+    // ---- The panel
 
     /// The properties panel's rows for the selection.
     pub fn panel(&self) -> Vec<PanelRow> {
@@ -321,25 +357,56 @@ impl Editor {
             value,
             field,
         };
-        let n = |v: f32| moose_assets::number(v);
+        let n = moose_assets::number;
         match self.selection {
-            None => vec![row("Nothing selected", String::new(), None)],
+            None => vec![
+                row("Nothing selected", String::new(), None),
+                row("New room", format!("{}x{}x{} m", ROOM.x, ROOM.y, ROOM.z), Some(Field::NewRoom)),
+            ],
             Some(Selection::Surface(i)) => {
                 let s = &self.doc.surfaces[i];
-                let sector = &self.doc.sectors[s.sector].name;
                 let mut rows = vec![
                     row("Surface", i.to_string(), None),
-                    row("Sector", sector.clone(), None),
+                    row("Sector", self.doc.sectors[s.sector].name.clone(), Some(Field::SelectSector)),
                     row("Corners", s.corners.len().to_string(), None),
                 ];
-                if s.adjoin.is_some() {
-                    rows.push(row("Portal", String::new(), None));
-                } else {
-                    let on = |bit: u32| if s.flags & bit != 0 { "on" } else { "off" }.to_string();
-                    rows.push(row("Reflective", on(0x1), Some(Field::Reflective)));
-                    rows.push(row("Sky", on(0x2), Some(Field::Sky)));
+                match s.adjoin {
+                    Some(a) => {
+                        let other = self.doc.surfaces[self.doc.adjoins[self.doc.adjoins[a].mirror].surface].sector;
+                        rows.push(row("Opening to", self.doc.sectors[other].name.clone(), None));
+                        rows.push(row("Wall it up", String::new(), Some(Field::Unadjoin)));
+                    }
+                    None => {
+                        let on = |bit: u32| if s.flags & bit != 0 { "on" } else { "off" }.to_string();
+                        rows.push(row("Reflective", on(0x1), Some(Field::Reflective)));
+                        rows.push(row("Sky", on(0x2), Some(Field::Sky)));
+                        rows.push(row("Extrude by", format!("{} m", n(self.extrude_by)), Some(Field::ExtrudeBy)));
+                        rows.push(row("Extrude", String::new(), Some(Field::Extrude)));
+                        rows.push(row("Push/pull", "scroll".into(), Some(Field::Push)));
+                        rows.push(row("Open to a match", String::new(), Some(Field::Adjoin)));
+                    }
                 }
                 rows
+            }
+            Some(Selection::Sector(s)) => {
+                let range = self.doc.sector_surfaces(s);
+                let openings = self.doc.surfaces[range.clone()].iter().filter(|x| x.adjoin.is_some()).count();
+                vec![
+                    row("Sector", self.doc.sectors[s].name.clone(), None),
+                    row("Surfaces", range.len().to_string(), None),
+                    row("Openings", openings.to_string(), None),
+                    row("Cleave", "in 2D".into(), Some(Field::Cleave)),
+                    row("Delete", String::new(), Some(Field::Delete)),
+                ]
+            }
+            Some(Selection::Vertex(v)) => {
+                let p = self.doc.vertices[v];
+                vec![
+                    row("Vertex", v.to_string(), None),
+                    row("X", n(p.x), Some(Field::X)),
+                    row("Y", n(p.y), Some(Field::Y)),
+                    row("Z", n(p.z), Some(Field::Z)),
+                ]
             }
             Some(Selection::Entity(i)) => {
                 let e = &self.doc.entities[i];
@@ -370,11 +437,7 @@ impl Editor {
                     rows.push(row("Static", on.into(), Some(Field::Static)));
                 }
                 if e.kind != EntityKind::Spawn {
-                    let occluder = e
-                        .options
-                        .iter()
-                        .find_map(|o| o.strip_prefix("occluder="))
-                        .unwrap_or("mesh");
+                    let occluder = e.options.iter().find_map(|o| o.strip_prefix("occluder=")).unwrap_or("mesh");
                     rows.push(row("Occluder", occluder.into(), Some(Field::Occluder)));
                 }
                 rows.push(row("Sector", self.doc.sectors[e.sector].name.clone(), None));
@@ -385,12 +448,39 @@ impl Editor {
         }
     }
 
+    // ---- Changes
+
+    /// Carries out `field` when it isn't an edit (see [`Field::is_edit`]).
+    pub fn command(&mut self, field: Field, dir: f32) {
+        match (self.selection, field) {
+            (Some(Selection::Surface(i)), Field::SelectSector) => {
+                self.selection = Some(Selection::Sector(self.doc.surfaces[i].sector));
+            }
+            (_, Field::ExtrudeBy) => {
+                let step = self.step();
+                self.extrude_by = snap((self.extrude_by + step * dir.signum()).max(step), step);
+            }
+            (Some(Selection::Sector(_)), Field::Cleave) => {
+                self.cutting = Some(Vec::new());
+                self.say("cleave: click where the cut starts and ends, in a 2D view (Esc: stop)");
+            }
+            _ => {}
+        }
+    }
+
     /// Changes the selection's `field` (`dir` is the way: +1 or -1, or scroll lines), in
     /// the tables. `world` finds the sector a moved entity is in; `models` are the model
     /// files to cycle through. Returns what was done, or why it can't be.
     pub fn change(&mut self, field: Field, dir: f32, world: &World, models: &[String]) -> Result<String, String> {
         let step = self.step();
+        let n = moose_assets::number;
         match (self.selection, field) {
+            (None, Field::NewRoom) => {
+                let min = (self.anchor - Vec3::new(ROOM.x / 2.0, 1.7, ROOM.z / 2.0)).map(|v| snap(v, step));
+                let sector = self.doc.add_box(min, min + ROOM, "room")?;
+                self.selection = Some(Selection::Sector(sector));
+                Ok(format!("added {}: extrude a wall into it, or open matching walls", self.doc.sectors[sector].name))
+            }
             (Some(Selection::Surface(i)), Field::Reflective | Field::Sky) => {
                 let bit = if field == Field::Reflective { 0x1 } else { 0x2 };
                 let s = &mut self.doc.surfaces[i];
@@ -398,6 +488,57 @@ impl Editor {
                 // A surface can't be both.
                 s.flags &= !(0x3 & !bit);
                 Ok(format!("surface {i}: flags {:#x}", s.flags))
+            }
+            (Some(Selection::Surface(i)), Field::Extrude) => {
+                let (sector, far) = self.doc.extrude(i, self.extrude_by)?;
+                self.selection = Some(Selection::Surface(far));
+                Ok(format!("extruded into {} (its far end is selected)", self.doc.sectors[sector].name))
+            }
+            (Some(Selection::Surface(i)), Field::Push) => {
+                self.doc.push_surface(i, -step * dir.signum());
+                Ok(format!("surface {i} {} {} m", if dir > 0.0 { "pushed out" } else { "pulled in" }, n(step)))
+            }
+            (Some(Selection::Surface(i)), Field::Adjoin) => {
+                let other = self.doc.adjoin(i)?;
+                Ok(format!("opened to {}", self.doc.sectors[self.doc.surfaces[other].sector].name))
+            }
+            (Some(Selection::Surface(i)), Field::Unadjoin) => {
+                self.doc.unadjoin(i)?;
+                Ok("walled up".into())
+            }
+            (Some(Selection::Sector(s)), Field::Delete) => {
+                let name = self.doc.sectors[s].name.clone();
+                self.doc.delete_sector(s)?;
+                self.selection = None;
+                Ok(format!("deleted {name}"))
+            }
+            (Some(Selection::Sector(s)), Field::Cut) => {
+                let points = self.cutting.take().unwrap_or_default();
+                let ViewMode::Ortho(axis) = self.view else {
+                    return Err("cut in a 2D view".into());
+                };
+                let [a, b] = points[..] else {
+                    return Err("a cut runs through two points".into());
+                };
+                let (right, up) = axis.basis();
+                let normal = (b - a).cross(right.cross(up));
+                if normal.length_squared() < 1e-8 {
+                    return Err("the cut's ends are the same point".into());
+                }
+                let new = self.doc.cleave(s, normal, a)?;
+                Ok(format!("cleaved into {} and {}", self.doc.sectors[s].name, self.doc.sectors[new].name))
+            }
+            (Some(Selection::Vertex(v)), Field::X | Field::Y | Field::Z) => {
+                let axis = match field {
+                    Field::X => Vec3::X,
+                    Field::Y => Vec3::Y,
+                    _ => Vec3::Z,
+                };
+                let p = self.doc.vertices[v];
+                let to = snap(p.dot(axis) + step * dir, step);
+                self.doc.move_vertex(v, axis * (to - p.dot(axis)));
+                let p = self.doc.vertices[v];
+                Ok(format!("vertex {v} at {}, {}, {}", n(p.x), n(p.y), n(p.z)))
             }
             (Some(Selection::Entity(i)), Field::Duplicate) => {
                 let mut copy = self.doc.entities[i].clone();
@@ -422,23 +563,23 @@ impl Editor {
             }
             (Some(Selection::Entity(i)), field) => {
                 let e = &mut self.doc.entities[i];
-                let turn = |q: Quat, axis: EulerRot| {
-                    let (yaw, pitch, roll) = q.to_euler(EulerRot::YXZ);
+                let turn = |q: Quat, which: usize| {
+                    let (mut yaw, mut pitch, mut roll) = q.to_euler(EulerRot::YXZ);
                     let t = (TURN * dir).to_radians();
-                    let (yaw, pitch, roll) = match axis {
-                        EulerRot::YXZ => (yaw + t, pitch, roll),
-                        EulerRot::XYZ => (yaw, pitch + t, roll),
-                        _ => (yaw, pitch, roll + t),
-                    };
+                    match which {
+                        0 => yaw += t,
+                        1 => pitch += t,
+                        _ => roll += t,
+                    }
                     Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll)
                 };
                 match field {
                     Field::X => e.position.x = snap(e.position.x + step * dir, step),
                     Field::Y => e.position.y = snap(e.position.y + step * dir, step),
                     Field::Z => e.position.z = snap(e.position.z + step * dir, step),
-                    Field::Yaw => e.rotation = turn(e.rotation, EulerRot::YXZ),
-                    Field::Pitch => e.rotation = turn(e.rotation, EulerRot::XYZ),
-                    Field::Roll => e.rotation = turn(e.rotation, EulerRot::ZYX),
+                    Field::Yaw => e.rotation = turn(e.rotation, 0),
+                    Field::Pitch => e.rotation = turn(e.rotation, 1),
+                    Field::Roll => e.rotation = turn(e.rotation, 2),
                     Field::Scale => e.scale = (e.scale * 1.1f32.powf(dir)).clamp(0.01, 100.0),
                     Field::Kind => {
                         e.kind = match e.kind {
@@ -462,27 +603,36 @@ impl Editor {
                         e.set_option("static", on);
                     }
                     Field::Occluder => {
-                        let now = e.options.iter().position(|o| o.starts_with("occluder="));
-                        let value = now.map(|k| e.options[k].clone());
-                        if let Some(k) = now {
-                            e.options.remove(k);
-                        }
                         // mesh (the default) → none → back.
-                        if value.is_none() {
-                            e.options.push("occluder=none".into());
+                        let now = e.options.iter().position(|o| o.starts_with("occluder="));
+                        match now {
+                            Some(k) => {
+                                e.options.remove(k);
+                            }
+                            None => e.options.push("occluder=none".into()),
                         }
                     }
-                    _ => {}
+                    _ => return Err("that doesn't apply here".into()),
                 }
                 if matches!(field, Field::X | Field::Y | Field::Z) {
                     e.sector = sector_of(world, e.position)?;
                 }
                 let (name, p) = (e.name.clone(), e.position);
-                let n = moose_assets::number;
                 Ok(format!("{name} at {}, {}, {}", n(p.x), n(p.y), n(p.z)))
             }
-            _ => Err("select something first".into()),
+            _ => Err("that doesn't apply here".into()),
         }
+    }
+
+    /// While cutting, a click in a 2D view at world point `p` (on the grid). Returns
+    /// whether the cut now has both its points.
+    pub fn cut_point(&mut self, p: Vec3) -> bool {
+        let step = self.step();
+        let Some(points) = &mut self.cutting else {
+            return false;
+        };
+        points.push(p.map(|v| snap(v, step)));
+        points.len() == 2
     }
 
     /// `name` with a number after it that no entity has.
@@ -494,36 +644,96 @@ impl Editor {
             .unwrap()
     }
 
-    /// Draws the editor over the frame: outlines of the selection and what's under the
-    /// pointer, the properties panel, and the status line.
-    pub fn draw(&self, canvas: &mut Canvas, view: &ViewGeometry, camera: &moose_scene::View, world: &World, assets: &Assets) {
+    // ---- Drawing
+
+    /// Draws a 2D view: the grid, the level's wireframe, and the editor's marks.
+    pub fn draw_2d(&self, canvas: &mut Canvas, ortho: &Ortho, world: &World, assets: &Assets) {
+        wire::draw_grid(canvas, ortho, self.step());
+        let projection = Projection::Ortho(ortho);
+        wire::draw_level(canvas, &projection, world, assets);
+        self.draw_marks(canvas, &projection, world, assets);
+    }
+
+    /// Draws the editor over the frame: in the 3D view its wireframe (F5) and marks, then
+    /// the panel and the status line.
+    pub fn draw(&self, canvas: &mut Canvas, camera: &moose_scene::View, world: &World, assets: &Assets) {
         if self.view == ViewMode::Perspective {
+            let projection = Projection::Perspective(camera);
             if self.wire {
-                wire::draw_level(canvas, &Projection::Perspective(camera), world, assets);
+                wire::draw_level(canvas, &projection, world, assets);
             }
-            for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
-                let Some(selection) = selection else { continue };
-                for p in &view.polygons {
-                    if p.mirror.is_some() || !self.shows(selection, p.source) {
-                        continue;
-                    }
-                    let v = &view.vertices[p.vertices()];
-                    for i in 0..v.len() {
-                        let (a, b) = (v[i], v[(i + 1) % v.len()]);
-                        canvas.line(a.x, a.y, b.x, b.y, color);
-                    }
+            self.draw_marks(canvas, &projection, world, assets);
+        }
+        self.draw_panel(canvas);
+    }
+
+    /// The selection and what the pointer is over, outlined; the vertices, with vertex
+    /// picking on; and a cut being drawn.
+    fn draw_marks(&self, canvas: &mut Canvas, projection: &Projection, world: &World, assets: &Assets) {
+        if self.vertices {
+            for v in self.used_vertices() {
+                if let Some(p) = projection.point(self.doc.vertices[v]) {
+                    canvas.fill_centered(p.x, p.y, 3, VERTEX);
                 }
             }
         }
+        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
+            match selection {
+                Some(Selection::Surface(i)) => {
+                    wire::outline(canvas, projection, &self.doc.surface_points(i), color);
+                }
+                Some(Selection::Sector(s)) => {
+                    for i in self.doc.sector_surfaces(s) {
+                        wire::outline(canvas, projection, &self.doc.surface_points(i), color);
+                    }
+                }
+                Some(Selection::Vertex(v)) => {
+                    if let Some(p) = projection.point(self.doc.vertices[v]) {
+                        canvas.fill_centered(p.x, p.y, 7, color);
+                    }
+                }
+                Some(Selection::Entity(row)) => {
+                    let Some(e) = self.world_entity(row).and_then(|k| world.entities.get(k)) else {
+                        continue;
+                    };
+                    let mesh = assets.mesh(e.mesh);
+                    let transform = e.transform();
+                    for polygon in &mesh.polygons {
+                        let points: Vec<Vec3> =
+                            mesh.polygon_points(polygon).map(|p| transform.transform_point3(p)).collect();
+                        wire::outline(canvas, projection, &points, color);
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(points) = &self.cutting {
+            let mut line: Vec<Vec3> = points.clone();
+            line.extend(self.pointer);
+            for pair in line.windows(2) {
+                projection.line(canvas, pair[0], pair[1], CUT);
+            }
+            for &p in points {
+                if let Some(s) = projection.point(p) {
+                    canvas.fill_centered(s.x, s.y, 5, CUT);
+                }
+            }
+        }
+    }
+
+    fn draw_panel(&self, canvas: &mut Canvas) {
         let layout = self.layout(canvas.width, canvas.height);
         canvas.shade(layout.x, layout.y, layout.width, layout.height, 70);
         let view = match self.view {
             ViewMode::Perspective => "3D",
             ViewMode::Ortho(axis) => axis.name(),
         };
-        let title = format!("EDITOR  {view}{}", if self.dirty() { "  (unsaved)" } else { "" });
-        let title = title.as_str();
-        canvas.text(layout.x + layout.pad, layout.y + layout.pad, title, TITLE, layout.scale);
+        let title = format!(
+            "EDITOR  {view}{}{}",
+            if self.vertices { "  vertices" } else { "" },
+            if self.dirty() { "  (unsaved)" } else { "" }
+        );
+        canvas.text(layout.x + layout.pad, layout.y + layout.pad, &title, TITLE, layout.scale);
         for (k, row) in self.panel().iter().enumerate() {
             let y = layout.row_y(k);
             let color = if row.field.is_some() { TEXT } else { DIM };
@@ -542,17 +752,19 @@ impl Editor {
             && at.elapsed() < STATUS_TIME
         {
             let y = canvas.height - line - layout.pad;
-            canvas.shade(0, y - layout.pad / 2, Canvas::text_width(message, layout.scale) + 2 * layout.pad, line + layout.pad, 90);
+            let w = Canvas::text_width(message, layout.scale) + 2 * layout.pad;
+            canvas.shade(0, y - layout.pad / 2, w, line + layout.pad, 90);
             canvas.text(layout.pad, y, message, TEXT, layout.scale);
         }
     }
 
     /// The key hints at the bottom of the panel.
-    fn hints(&self) -> [String; 7] {
+    fn hints(&self) -> [String; 8] {
         [
             format!("Grid {} m (G)", moose_assets::number(self.step())),
             "F6: 3D/top/front/side. F5: wire".to_string(),
-            "Click: select. Hold right: look".to_string(),
+            "Click: select. V: pick vertices".to_string(),
+            "Hold right: look (or pan in 2D)".to_string(),
             "Scroll or click a row to change it".to_string(),
             "Arrows, PgUp/Dn, [ ]: move, turn".to_string(),
             "Ctrl Z/Y: undo/redo. Ctrl S: save".to_string(),
@@ -566,9 +778,9 @@ impl Editor {
         let pad = 6 * scale;
         let gap = Canvas::text_width("  ", scale);
         let panel = self.panel();
-        let rows = panel.iter().map(|r| {
-            Canvas::text_width(&r.label, scale) + gap + Canvas::text_width(&r.value, scale)
-        });
+        let rows = panel
+            .iter()
+            .map(|r| Canvas::text_width(&r.label, scale) + gap + Canvas::text_width(&r.value, scale));
         let hints = self.hints().map(|h| Canvas::text_width(&h, scale));
         let panel_w = rows.chain(hints).max().unwrap_or(0) + 2 * pad;
         Layout {
@@ -588,12 +800,11 @@ impl Editor {
             return None;
         }
         let line = Canvas::line_height(layout.scale);
-        let top = layout.row_y(0);
-        let k = ((y as usize).checked_sub(top)?) / line;
+        let k = ((y as usize).checked_sub(layout.row_y(0))?) / line;
         (k < self.panel().len()).then_some(k)
     }
 
-    /// Whether framebuffer point `(x, y)` is over the panel.
+    /// Whether framebuffer point `(x, _)` is over the panel.
     pub fn over_panel(&self, x: f32, width: usize, height: usize) -> bool {
         x as usize >= self.layout(width, height).x
     }
@@ -612,15 +823,18 @@ pub struct Layout {
 impl Layout {
     /// The top of panel row `k`.
     pub fn row_y(&self, k: usize) -> usize {
-        let line = Canvas::line_height(self.scale);
-        self.y + self.pad + line * (2 + k)
+        self.y + self.pad + Canvas::line_height(self.scale) * (2 + k)
     }
 }
 
 /// How far `p` is from segment `a`-`b`.
 fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;
-    let t = if ab.length_squared() > 0.0 { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+    let t = if ab.length_squared() > 0.0 {
+        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     p.distance(a + ab * t)
 }
 
@@ -643,3 +857,5 @@ const DIM: u32 = 0x8C_8C_8C;
 /// Outline colors: the selection, and what the pointer is over.
 const SELECTED: u32 = 0xFF_E0_40;
 const HOVER: u32 = 0x60_A0_FF;
+const VERTEX: u32 = 0xB0_B0_C0;
+const CUT: u32 = 0xFF_50_50;

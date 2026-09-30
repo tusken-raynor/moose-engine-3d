@@ -565,3 +565,116 @@ fn levels_written_back_load_the_same() {
         }
     }
 }
+
+/// two_rooms as editable tables, and a check that tables load as a level.
+fn doc(file: &str) -> moose_assets::LevelDoc {
+    let path = format!("{}/../../assets/levels/{file}", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).unwrap();
+    moose_assets::LevelDoc::parse(std::path::Path::new(&path), &src).unwrap()
+}
+
+fn loads(doc: &moose_assets::LevelDoc) -> moose_assets::Level {
+    let mut assets = assets();
+    match assets.parse_level("edited.mmp", &doc.to_text()) {
+        Ok(level) => level,
+        Err(e) => panic!("{e}\n{}", doc.to_text()),
+    }
+}
+
+/// The solid surface of `sector` facing `normal`.
+fn wall(doc: &moose_assets::LevelDoc, sector: usize, normal: Vec3) -> usize {
+    doc.sector_surfaces(sector)
+        .find(|&i| doc.surfaces[i].adjoin.is_none() && doc.surface_normal(i).dot(normal) > 0.99)
+        .unwrap()
+}
+
+#[test]
+fn extruding_a_wall_makes_a_new_sector_behind_it() {
+    let mut d = doc("two_rooms.mmp");
+    let before = loads(&d);
+    // room_a's back wall, at z = 8, faces into the room (-Z).
+    let back = wall(&d, 0, Vec3::NEG_Z);
+    let (sector, far) = d.extrude(back, 2.0).unwrap();
+    let level = loads(&d);
+    assert_eq!(level.sectors.len(), before.sectors.len() + 1);
+    assert_eq!(level.portals.len(), before.portals.len() + 2);
+    // The new sector reaches 2 m past the wall; its far end faces back at the room.
+    assert!((level.sectors[sector].bounds.max.z - 10.0).abs() < 1e-4);
+    assert!(d.surface_normal(far).dot(Vec3::NEG_Z) > 0.99);
+    // And again, from the far end: a corridor.
+    d.extrude(far, 3.0).unwrap();
+    assert_eq!(loads(&d).sectors.len(), before.sectors.len() + 2);
+}
+
+#[test]
+fn pushing_a_wall_stretches_the_room() {
+    let mut d = doc("two_rooms.mmp");
+    let back = wall(&d, 0, Vec3::NEG_Z);
+    d.push_surface(back, -1.5);
+    let level = loads(&d);
+    assert!((level.sectors[0].bounds.max.z - 9.5).abs() < 1e-4);
+}
+
+#[test]
+fn cleaving_a_room_splits_its_doorway_on_both_sides() {
+    let mut d = doc("two_rooms.mmp");
+    let before = loads(&d);
+    // room_a down the middle (x = 0): the plane crosses its doorway to the hallway,
+    // whose side of the opening is split too.
+    let new = d.cleave(0, Vec3::X, Vec3::ZERO).unwrap();
+    let level = loads(&d);
+    assert_eq!(level.sectors.len(), before.sectors.len() + 1);
+    // The cut's opening pair, and the doorway split into two pairs.
+    assert_eq!(level.portals.len(), before.portals.len() + 4);
+    assert!(level.sectors[0].bounds.min.x.abs() < 1e-4, "the front part is x >= 0");
+    assert!(level.sectors[new].bounds.max.x.abs() < 1e-4, "the part behind is x <= 0");
+    // A cut that misses: refused, nothing changed.
+    let same = d.clone();
+    assert!(d.cleave(0, Vec3::X, Vec3::new(100.0, 0.0, 0.0)).is_err());
+    assert_eq!(d, same);
+}
+
+#[test]
+fn a_new_room_joins_the_level_through_a_wall() {
+    let mut d = doc("two_rooms.mmp");
+    let before = loads(&d);
+    // Beside room_a (x from -4 to 4, y 0 to 4, z 0 to 8), sharing its east wall.
+    let room = d.add_box(Vec3::new(4.0, 0.0, 0.0), Vec3::new(8.0, 4.0, 8.0), "annex").unwrap();
+    loads(&d);
+    let west = wall(&d, room, Vec3::X);
+    let east = d.adjoin(west).unwrap();
+    assert_eq!(d.surfaces[east].sector, 0);
+    let level = loads(&d);
+    assert_eq!(level.portals.len(), before.portals.len() + 2);
+    // Walled up again, then gone.
+    d.unadjoin(west).unwrap();
+    assert_eq!(loads(&d).portals.len(), before.portals.len());
+    d.delete_sector(room).unwrap();
+    assert_eq!(loads(&d).sectors.len(), before.sectors.len());
+}
+
+#[test]
+fn a_sector_with_things_in_it_stays() {
+    let mut d = doc("two_rooms.mmp");
+    assert!(d.delete_sector(0).is_err(), "the spawn point is in room_a");
+}
+
+#[test]
+fn cleaving_keeps_attributes_and_splits_every_opening_it_crosses() {
+    // shiny_rooms has colors and uvs: corners made on edges get values between.
+    let mut d = doc("shiny_rooms.mmp");
+    let before = loads(&d);
+    // The hallway (sector 1, x from -1 to 1, z from -12 to 0) lengthwise at x = 0.25: the
+    // cut crosses both its doorways.
+    let hallway = d.sectors.iter().position(|s| s.name == "hallway").unwrap();
+    let new = d.cleave(hallway, Vec3::X, Vec3::new(0.25, 0.0, 0.0)).unwrap();
+    let level = loads(&d);
+    assert_eq!(level.sectors.len(), before.sectors.len() + 1);
+    // Its own opening pair, and each doorway's pair split in two.
+    assert_eq!(level.portals.len(), before.portals.len() + 2 + 2 + 2);
+    assert!((level.sectors[new].bounds.max.x - 0.25).abs() < 1e-4);
+    // And room_b across the middle, with its lights and the ball in it.
+    let room_b = d.sectors.iter().position(|s| s.name == "room_b").unwrap();
+    d.cleave(room_b, Vec3::Z, Vec3::new(0.0, 0.0, -16.5)).unwrap();
+    loads(&d);
+}

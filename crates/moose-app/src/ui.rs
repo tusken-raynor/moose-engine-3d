@@ -195,6 +195,18 @@ impl Canvas<'_> {
         }
     }
 
+    /// Fills a `size` pixel square centered on `(x, y)` (clipped to the canvas).
+    pub fn fill_centered(&mut self, x: f32, y: f32, size: usize, color: u32) {
+        let half = size as f32 / 2.0;
+        let (left, top) = ((x - half).round(), (y - half).round());
+        if left + size as f32 <= 0.0 || top + size as f32 <= 0.0 {
+            return;
+        }
+        let (l, t) = (left.max(0.0) as usize, top.max(0.0) as usize);
+        let (w, h) = ((left + size as f32) as usize - l, (top + size as f32) as usize - t);
+        self.fill(l, t, w, h, color);
+    }
+
     /// Darkens a rectangle (clipped to the canvas) to `keep` 256ths of its brightness.
     pub fn shade(&mut self, x: usize, y: usize, w: usize, h: usize, keep: u32) {
         for row in y.min(self.height)..(y + h).min(self.height) {
