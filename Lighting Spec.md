@@ -146,6 +146,7 @@ Sep 29. The flashlight's cone is drawn pixel by pixel with its shadow, not lit a
 - **With one value per split light** (same, 3 runs): none 6.1 ms, sampled 7.07, hard 7.14, smooth 7.56; the screen-space beam 7.37 hard, 7.79 smooth, 7.55 dithered.
 - **Where the beam's cost went, before them** (1280×720, 1 thread, 6°→20° fade): the split light's extra values and the pieces' fills about 0.3 ms; the cone in the fill about 0.25 ms; the full combine across the fade about 0.37 ms. Without the pieces at all, the split flashlight cost less than the sampled one: the dense sampling cost more than carrying the split light.
 - **Not adopted:** a combine that blends between the two exact ends (the rest, and the total) in gamma-2 terms, with no tables, saved the 0.37 ms but changed the fade by up to 12 levels on about 2% of pixels.
+- **Not adopted: powers in lanes instead of tables.** The full combine's decode and encode as `2^(p log2 x)` worked out in SIMD lanes (log2 from the exponent bits and an atanh series, exp2 by rounding and a series; within 1e-4) was slower than the tables: the smooth beam 8.1 ms against about 7.6, level-light shadows 7.1 against 6.8 (1280×720, 1 thread). The tables fit in cache, and six log2/exp2 pairs per 8 pixels, each log2 with a division, cost more. With the combine made free (a wrong image, as a bound), the most there was to save was about 0.35 ms with the smooth beam and 0.16 ms with level-light shadows.
 
 ## Directional lights
 
