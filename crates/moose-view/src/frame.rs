@@ -250,6 +250,9 @@ pub struct ViewConfig {
     /// occluders', and those on moving surfaces. Off, only cached (baked) shadows are drawn:
     /// no carving per frame at all.
     pub dynamic_shadows: bool,
+    /// Cut polygons by beams' pyramids (see `Light::beam`). Off, each polygon a beam reaches
+    /// is one beam piece, and the renderer finds the cone on it row by row.
+    pub beam_pyramid: bool,
 }
 
 impl Default for ViewConfig {
@@ -258,6 +261,7 @@ impl Default for ViewConfig {
             max_reflections: 1,
             cache_shadows: true,
             dynamic_shadows: true,
+            beam_pyramid: true,
         }
     }
 }
@@ -582,6 +586,7 @@ impl ViewGeometry {
                     normal: polygon.plane.normal,
                     point: points[0],
                     parts: Parts::All,
+                    beams: false,
                 };
                 let bits = carver.cache((0, pi, 0), &points, &receiver);
                 count += shadowed(carver, bits, (0, pi, 0));
@@ -602,6 +607,7 @@ impl ViewGeometry {
                     normal: entity.rotation * polygon.plane.normal,
                     point: points[0],
                     parts: Parts::All,
+                    beams: false,
                 };
                 let key = (1, ei as u32, pi as u32);
                 let bits = carver.cache(key, &points, &receiver);
@@ -652,6 +658,7 @@ impl ViewGeometry {
         }
         self.object_lights.clear();
         self.object_lights.push(0..0); // the level: per sector instead
+        self.scratch.carver.whole_beams = !self.config.beam_pyramid;
         self.scratch
             .carver
             .prepare(world, assets, &self.lights, self.config.dynamic_shadows);
@@ -1317,6 +1324,8 @@ fn emit_pieces(
         normal,
         point: Vec3::from_slice(&records[3..6]),
         parts: Parts::All,
+        // In reflections, beams are lit at sample points: cheaper, and half-rate there.
+        beams: mirror.is_none(),
     };
     // A static polygon's shadows from static lights are cached (carved the first time it
     // is seen); only moving occluders are carved for them every frame.
@@ -1332,8 +1341,9 @@ fn emit_pieces(
     } else {
         0
     };
-    receiver.parts = Parts::Cached(cached);
-    let pieces = if receiving.dynamic {
+    // Without dynamic shadows, only beams are carved every frame (see `Light::beam`).
+    receiver.parts = if receiving.dynamic { Parts::Cached(cached) } else { Parts::Beams };
+    let pieces = if receiving.dynamic || carver.has_beams() {
         carver
             .carve(records, edges, stride, plane_lines.len(), &receiver)
             .len()
@@ -1345,7 +1355,7 @@ fn emit_pieces(
     for i in 0..pieces {
         let piece = carver.piece(i);
         out.values.clear();
-        touched |= piece.shadowed | carver.soft_values(&piece, &mut out.values);
+        touched |= piece.shadowed | piece.beamed | carver.soft_values(&piece, &mut out.values);
         dark &= piece.shadowed;
     }
     // And the cached ones.
@@ -1372,17 +1382,22 @@ fn emit_pieces(
             let piece = carver.piece(i);
             out.values.clear();
             let soft = carver.soft_values(&piece, &mut out.values);
-            let slots = (piece.shadowed | soft) & split;
+            let slots = (piece.shadowed | piece.beamed | soft) & split;
             let per_vertex = soft.count_ones() as usize;
             let (records, edges) = (carver.records(&piece), carver.edges(&piece));
             let mut bits = slots;
             while bits != 0 {
                 let slot = bits.trailing_zeros();
                 bits &= bits - 1;
+                let dark = piece.shadowed >> slot & 1 != 0;
                 // Its value among the vertex's soft values, if soft here and not in the full
                 // shadow of another occluder of the same light.
-                let soft_at = (soft >> slot & 1 != 0 && piece.shadowed >> slot & 1 == 0)
+                let soft_at = (soft >> slot & 1 != 0 && !dark)
                     .then(|| (soft & ((1 << slot) - 1)).count_ones() as usize);
+                // Inside a beam's pyramid, its cone fades the light too.
+                let beam = (piece.beamed >> slot & 1 != 0 && !dark)
+                    .then(|| carver.beam(slot as u8))
+                    .flatten();
                 let first_vertex = out.shadow_vertices.len() as u32;
                 for (v, (r, edge)) in records.chunks_exact(stride).zip(edges).enumerate() {
                     let (x, y) = to_screen(view, Vec3::from_slice(r));
@@ -1392,14 +1407,20 @@ fn emit_pieces(
                         w: 1.0 / r[2],
                         line: edge_line(view, edge, plane_lines),
                         light: 0.0,
+                        ray: beam.map_or(Vec3::ZERO, |b| b.ray(Vec3::from_slice(&r[3..6]))),
                     };
-                    let light = soft_at.map_or((0.0, 0.0), |k| out.values[v * per_vertex + k]);
+                    let light = match soft_at {
+                        Some(k) => out.values[v * per_vertex + k],
+                        None if dark => (0.0, 0.0),
+                        None => (1.0, 1.0),
+                    };
                     push_shadow_vertex(out.shadow_vertices, vertex, light);
                 }
                 out.shadow_pieces.push(ShadowPiece {
                     slot: slot as u8,
                     first_vertex,
                     vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+                    beam: beam.map(|b| b.cone),
                 });
             }
         }
@@ -1536,6 +1557,7 @@ fn emit_cached(
                 w: 1.0 / r[2],
                 line,
                 light: 0.0,
+                ray: Vec3::ZERO,
             };
             let p = Vec3::from_slice(&r[3..6]);
             let light = |along: usize| {
@@ -1549,6 +1571,7 @@ fn emit_cached(
             slot,
             first_vertex,
             vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+            beam: None,
         });
     }
 }
@@ -1626,6 +1649,10 @@ pub struct ShadowPiece {
     pub slot: u8,
     pub first_vertex: u32,
     pub vertex_count: u16,
+    /// Part of a beam (see `Light::beam`): the light's cone as `(scale, offset)` (see
+    /// `Light::cone`), which fades it further at each pixel by the angle between the
+    /// pixel's ray (its vertices' `ray`, interpolated) and the beam's axis (x).
+    pub beam: Option<(f32, f32)>,
 }
 
 /// A vertex of a [`ShadowPiece`]: where it is on screen (exact, like [`ScreenVertex`]), the
@@ -1642,6 +1669,9 @@ pub struct ShadowVertex {
     pub w: f32,
     pub line: Option<EdgeLine>,
     pub light: f32,
+    /// In a beam's piece: the way from the light to it, in the beam's frame (x along its
+    /// axis); zero in others.
+    pub ray: Vec3,
 }
 
 /// Appends a shadow piece's vertex with how much of the light reaches it along the edges

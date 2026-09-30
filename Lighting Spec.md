@@ -102,6 +102,51 @@ The per-pixel versions had two further costs:
 - **Accuracy:** on the lighting test with a narrow spot (10°→16°), pixels off by more than 2 levels drop from 2.5% to 1.8%, and that is the default now.
 - **Cost:** on shiny_rooms with its soft spot (6°→20°), about +7% over random views (4.3–4.6 ms → 4.7–5.0 ms, 1 thread).
 
+## Flashlight beam
+
+Sep 29. The flashlight's cone is drawn pixel by pixel with its shadow, not lit at sample points (`Light::beam`; the options menu's Flashlight page, Cone: beam or sampled; `--cone`). Sampled stays as the lower-quality option. At low resolutions the penumbra rule's dense points still couldn't follow a sharp cone edge, and they cost sample points wherever the cone crossed.
+
+**How it works:**
+- **Pyramid:** the view cuts each surface the flashlight reaches by a square pyramid around its outer cone: 4 planes through the light, each touching the cone on one side (`Carver::add_beam`).
+  - What is outside is dark for the flashlight, like full shadow. A surface wholly outside drops the light; occluders and windows are carved only inside.
+  - What is inside is marked as in the beam (`Piece::beamed`), and its shadow pieces carry the cone (`ShadowPiece::beam`) and each vertex's ray from the light, in the beam's frame (`ShadowVertex::ray`).
+  - A surface wholly within the inner cone isn't cut at all: the cone is 1 all over it.
+- **Shadow buffer:** in a beam's pieces, `shadow_run` fades the light by the angle between each pixel's ray and the axis, eased like the cone at sample points, times the piece's own shadow value (so occluders' shadows multiply with it). Rays scale with w, which the angle ignores, so they interpolate across a row like any value. The circle is exact: no planes are spent on roundness.
+- **Per row, where the row crosses each cone** (a cone is convex, so each row crosses it in one stretch): solved as a quadratic in the ray along the row, `ray.x² = cos² |ray|²`, for the inner and outer cones. Outside the outer cone is a plain fill of 0, inside the inner cone is the piece's own value with no cone math, and only the fade between takes the cone.
+- **In the fade, every 8 pixels** (`BEAM_STEP`): blended between the ends of a stretch where the cone can change by at most 1/8 across it (`BEAM_BLEND`; blending strays by at most about 1%), otherwise pixel by pixel (a sharp fade, as at low resolution).
+  - The first version checked stretches of 8 pixels everywhere, and at first blended every one from the pyramid's edge, which pinned a sharp fade to the pyramid's straight side: a square spot at 320×180 with a narrow penumbra.
+- **Bulk fills:** a piece whose value is the same at every vertex (all dark, all lit) lowers the buffer in bulk, and not at all where it's all lit (the buffer starts there). This helps every shadow, not just beams: the per-pixel loop over whole dark and lit pieces was most of what the beam cost (about 0.45 ms at 1280×720, 1 thread).
+- **Samples:** a split beam is lit at sample points as a point light (`Light::sample_cone` is whole), which varies smoothly, so the penumbra rule leaves it out. Where the renderer can't split it off (no shadow slot, or too many split lights or values for the material), its cone is lit at sample points as before.
+- **Pixels:** outside the cone the buffer is 0, and `PixelContext::light` returns the other lights as they are (the "fully shadowed" fast path, new here); inside the inner cone, the fully lit one. Where each of 8 pixels is all lit or all dark (a hard or dithered beam's edge), it picks the one or the other per pixel, with no tables. Only a smooth fade pays the full combine.
+- **With dynamic shadows off,** only beams are carved per frame (`Parts::Beams`): the cone still draws, without the flashlight's shadows.
+- **Anchoring to sample points isn't needed:** the buffer is per pixel and doesn't depend on the lattice, and the samples see only a smooth point light.
+
+**Split lights carry one value** (not three): a light's color is fixed, so its sample points carry only its strength (Lambert, falloff, and cone where lit there), and pixels multiply by the color (`PolygonSetup::split_colors`). `diffuse` sums the split lights' light into the total itself. This helps every split light, not just beams: about 0.15–0.18 ms off the beam at 1280×720 (1 thread), the same image within rounding (0.00% of pixels off by more than 6 levels).
+
+**Reflections light beams at sample points:** the view carves no beams for polygons seen in a mirror (`Receiver::beams`), and the renderer lights the cone there as before. Reflections are half-rate and usually small on screen, where the sampled cone's softness doesn't show.
+
+**Tested: a screen-space beam** (`ViewConfig::beam_pyramid` off; `--cone screen`). No pyramid: each polygon the beam reaches is one beam piece, and the renderer's per-row solve finds the cone on it, which is the cone worked out from each pixel's screen position and depth (the ray to the light scales with w). The image is identical, but it's slower (about +0.23 ms smooth and hard at 1280×720, 1 thread): without the pyramid, more polygons split the flashlight off across their whole area. The pyramid's scoping pays for its carving.
+
+**Tried and removed: a polygon beam.** Inside the pyramid, a 16-sided window around the cone with soft edges from the inner cone to the outer (like a doorway's), drawn by plain Gouraud with no cone math per pixel. It saved the cone math (about 0.2 ms at 1280×720, 1 thread) but added carving (about +0.1 ms of view time) and more pieces, while the combine across the fade, the larger cost, stayed. Net 0.1–0.2 ms cheaper than the exact beam, with a faint 16-sided outline and a dimmer, linear fade (values exact only at the ring's edges: at the middle of a 6°→20° fade, about 0.5 against 0.69). Not worth keeping.
+
+**Fade setting:** the flashlight's cone fades inside its 20° edge over 0° (hard), 2°, 4°, 8° (the default, from 14° before), 14° or 20° (the Flashlight page's Fade; `--flashlight-fade`). A narrower fade leaves less of the spot paying the full combine.
+
+**Cheap looks, for low settings:**
+- **Hard (0° fade):** a crisp theatrical disc. No fade at all: every pixel takes a fast path.
+- **Dithered** (`RasterConfig::beam_dither`; the Flashlight page's Dither; `--dither-beam`): the fade as a 1-bit stipple, each pixel lit or not by a 4×4 ordered (Bayer) dither (`BEAM_DITHER`), retro like early Mac or Game Boy shading. It's applied where a pixel may be partly lit: the fade, and inside the inner cone when a soft shadow crosses it. The fade is still worked out, but the combine is the per-pixel pick.
+
+**Results:** at full resolution the beam matches the sampled cone (0.04% of pixels differ by more than 6 levels, with crate shadows in it). At 320×180 with a narrow penumbra the spot is round and crisp, where the sampled one is blurred into cells.
+
+**Cost** (timing example, `FLASHLIGHT=beam|sampled`, random views of shiny_rooms, a noisy machine; a 6°→20° fade unless noted):
+- **480×270, all threads:** the same within noise (about 0.85 ms).
+- **1920×1080, all threads:** beam about 4.5–4.8 ms, sampled 3.8–4.3, none 3.1: the beam costs about 0.3–0.7 ms more.
+- **1280×720, 1 thread:** about the same to +0.6 ms over sampled, across runs.
+- **With the 8° fade** (1280×720, 1 thread, medians of 4 runs): none 7.8 ms, sampled 8.7, beam 9.5.
+- **After the bulk fills and per-row cone stretches** (1280×720, 1 thread, 8° fade, medians of 3 runs): none 6.0 ms, sampled 7.2, hard 7.3, dithered 7.5, smooth 7.7. Before them: smooth 8.1, hard 7.8, dithered 7.9.
+- **With one value per split light** (same, 3 runs): none 6.1 ms, sampled 7.07, hard 7.14, smooth 7.56; the screen-space beam 7.37 hard, 7.79 smooth, 7.55 dithered.
+- **Where the beam's cost went, before them** (1280×720, 1 thread, 6°→20° fade): the split light's extra values and the pieces' fills about 0.3 ms; the cone in the fill about 0.25 ms; the full combine across the fade about 0.37 ms. Without the pieces at all, the split flashlight cost less than the sampled one: the dense sampling cost more than carrying the split light.
+- **Not adopted:** a combine that blends between the two exact ends (the rest, and the total) in gamma-2 terms, with no tables, saved the 0.37 ms but changed the fade by up to 12 levels on about 2% of pixels.
+
 ## Directional lights
 
 Sep 29. Light from far away, like the sun, arriving along one direction everywhere (the level's `directional` section; see the Level Format Spec).
@@ -251,7 +296,7 @@ Sep 29. `ViewConfig::dynamic_shadows` (the options menu's Lighting page, and `--
 
 Noted Sep 29. A long surface that a static light reaches only in part pays for its shadow everywhere. For example, the hallway floor in sunny_rooms is one 12 m polygon, and the sun lights only a patch of it through the doorway. Every pixel of such a surface gets the shadow buffer fill and carries the light as a split light, though most of it is simply in full shadow.
 
-- **Fully shadowed pixel blocks** (*very likely worth it; do first*): where every split light is fully blocked across a block of 8 pixels, use the pre-summed light directly, with no decode, add and encode. This mirrors the fully lit fast path in `PixelContext::light`. It's a few lines, and makes the dark majority of such surfaces nearly free per pixel (the buffer fill remains).
+- **Fully shadowed pixel blocks** (*done Sep 29, for the flashlight beam*): where every split light is fully blocked across a block of 8 pixels, `PixelContext::light` returns the other lights as they are, with no decode, add and encode. This mirrors the fully lit fast path, and makes the dark majority of such surfaces nearly free per pixel (the buffer fill remains).
 - **Authors cut faces** (*worth it, as an authoring guideline; no engine work*): a level author splits long faces just past where a static light's penumbra ends. The far parts are then wholly in shadow and simply drop the light: no shadow pieces, no per-pixel cost. This works today.
 - **The baker cuts faces** (*maybe; measure after the fully shadowed fast path*): what it would still save is the shadow buffer fill and the split light's extra values. New vertices on edges shared with neighboring faces need the whole edge's line, as carving does, to stay crack-free. the same split done automatically for static geometry. The bake already knows, in world space, where each static light's full shadow falls on each surface. When the full-shadow part is a large share of a surface, split it off as its own polygon at load, without the light. It costs a few extra polygons, only where that's worth it, and authors can still cut by hand for control.
 - **Hard edges where the penumbra is too thin to see** (*probably not worth it*): a thin penumbra's per-pixel cost is small because it covers few pixels. Splitting a wedge along its length adds carving, and a view-dependent switch would pop as the view moves and couldn't use baked shadows. Revisit only for many dynamic soft lights on huge distant surfaces. if a soft edge would be under about 2 pixels wide on screen, draw only the full shadow (the umbra) there, with a hard edge between the wedge's two planes, and skip that wedge's soft pieces.

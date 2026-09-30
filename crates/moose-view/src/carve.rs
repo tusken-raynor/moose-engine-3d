@@ -186,14 +186,16 @@ pub(crate) enum PieceEdge {
 }
 
 /// A piece of a carved polygon: `count` records from `start` in the carver's buffer, the
-/// shadow slots of the lights it is in the full shadow of, and the soft shadows it is in
-/// (`volume_count` volume indices from `first_volume` in the carver's list): there a light
-/// is partly covered.
+/// shadow slots of the lights it is in the full shadow of, those of the beams it is inside
+/// the pyramid of (see [`Light::beam`]), and the soft shadows it is in (`volume_count`
+/// volume indices from `first_volume` in the carver's list): there a light is partly
+/// covered.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Piece {
     start: u32,
     count: u32,
     pub shadowed: u32,
+    pub beamed: u32,
     first_volume: u32,
     volume_count: u32,
 }
@@ -261,6 +263,9 @@ pub(crate) struct Receiver<'a> {
     pub point: Vec3,
     /// Which parts of the lights' shadows to carve.
     pub parts: Parts,
+    /// Carve beams (see [`Light::beam`]): not in reflections, where they are lit at sample
+    /// points.
+    pub beams: bool,
 }
 
 /// Which parts of the lights' shadows [`Carver::carve`] carves.
@@ -274,6 +279,8 @@ pub(crate) enum Parts {
     /// All of every light's, except the lights with these shadow slot bits, whose static
     /// parts are cached: only their moving occluders.
     Cached(u32),
+    /// Only beams' pyramids (see [`Light::beam`]): no shadows.
+    Beams,
 }
 
 /// The shadow of a static light on a static polygon: its static parts (windows and static
@@ -362,6 +369,49 @@ struct Caster {
     windows: Range<u32>,
     /// Its occluders' shadow volumes (ranges of `Carver::volumes`).
     volumes: Range<u32>,
+    /// Whether it casts shadows (it may be here only for its beam): its windows and
+    /// occluders are carved.
+    shadows: bool,
+    /// A beam (see [`Light::beam`]).
+    beam: Option<BeamCaster>,
+}
+
+/// A beam, for one frame: its pyramid's planes in `Carver::planes` (none if its cone is
+/// too wide for one: all of it is inside), and its frame.
+#[derive(Clone)]
+struct BeamCaster {
+    planes: Range<u32>,
+    frame: BeamFrame,
+}
+
+/// Where a beam's rays are measured (see [`Light::beam`]): from its light, in a frame whose
+/// x axis is the beam's axis, and its cone (see [`Light::cone`]). The renderer's shadow
+/// buffer fades the light by the angle between a pixel's ray and x.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BeamFrame {
+    pub origin: Vec3,
+    /// Rows: the axis, then two ways square to it.
+    pub axes: [Vec3; 3],
+    pub cone: (f32, f32),
+}
+
+impl BeamFrame {
+    fn of(light: &Light) -> BeamFrame {
+        let axis = light.direction;
+        let helper = if axis.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+        let u = axis.cross(helper).normalize();
+        BeamFrame {
+            origin: light.position,
+            axes: [axis, u, u.cross(axis)],
+            cone: light.cone(),
+        }
+    }
+
+    /// The way from the light to `p`, in its frame.
+    pub fn ray(&self, p: Vec3) -> Vec3 {
+        let d = p - self.origin;
+        Vec3::new(self.axes[0].dot(d), self.axes[1].dot(d), self.axes[2].dot(d))
+    }
 }
 
 /// What a convex outline does to a light's reach: an occluder's shadow, or the light let
@@ -424,6 +474,9 @@ pub(crate) struct Carver {
     stack: Vec<(u32, Option<Window>, u16)>,
     /// While building a cache: edges along the polygon's own keep that label.
     keep_polygon_edges: bool,
+    /// Beams aren't cut by their pyramid (see [`Light::beam`]): each polygon one reaches is
+    /// one beam piece, and the renderer finds the cone on it row by row.
+    pub whole_beams: bool,
     /// Cached shadows: per (shadow slot, polygon key), and per slot what they were carved for.
     cache: HashMap<(u8, (u8, u32, u32)), Cached>,
     cache_keys: [Option<CacheKey>; MAX_SHADOW_SLOTS as usize],
@@ -441,12 +494,14 @@ impl Carver {
         self.wedges.clear();
         let geometry = assets.mesh(world.geometry);
         for light in lights {
-            let Some(slot) = light
-                .shadow
-                .filter(|&s| s < MAX_SHADOW_SLOTS && light.shadows && (dynamic || light.is_static))
-            else {
+            let Some(slot) = light.shadow.filter(|&s| s < MAX_SHADOW_SLOTS) else {
                 continue;
             };
+            let shadows = light.shadows && (dynamic || light.is_static);
+            let beamed = light.beam && !light.is_point() && !light.directional;
+            if !shadows && !beamed {
+                continue;
+            }
             let source = Source::of(light);
             // Windows: out through portals, each clipped to the window it was seen through.
             // A directional light starts at the sky surfaces it shines in through: windows
@@ -454,7 +509,9 @@ impl Carver {
             let windows_start = self.windows.len() as u32;
             let mut reached = vec![false; world.sectors.len()];
             self.stack.clear();
-            if light.directional {
+            if !shadows {
+                // Here for its beam only.
+            } else if light.directional {
                 for (s, sector) in world.sectors.iter().enumerate() {
                     for p in sector.polygons.clone() {
                         let polygon = &geometry.polygons[p as usize];
@@ -518,7 +575,8 @@ impl Carver {
             let volumes_start = self.volumes.len() as u32;
             for (index, entity) in world.entities.iter().enumerate() {
                 let owner = Some(index as u32);
-                if entity.occluder == Occluder::None
+                if !shadows
+                    || entity.occluder == Occluder::None
                     || !entity.sectors.iter().any(|&s| reached[s as usize])
                 {
                     continue;
@@ -614,6 +672,7 @@ impl Carver {
                 }
             }
             let volumes_end = self.volumes.len() as u32;
+            let beam = beamed.then(|| self.add_beam(light));
             // A static light's cached shadows hold while it is the same light.
             let key = CacheKey {
                 position: light.position,
@@ -638,8 +697,47 @@ impl Carver {
                 whole: (!light.directional).then_some(light.sector),
                 windows: windows_start..windows_end,
                 volumes: volumes_start..volumes_end,
+                shadows,
+                beam,
             });
         }
+    }
+
+    /// A beam (see [`Light::beam`]): its pyramid, four planes through the light each
+    /// touching its outer cone on one side (facing in); none if the cone is too wide for
+    /// one (near a half-space).
+    fn add_beam(&mut self, light: &Light) -> BeamCaster {
+        let frame = BeamFrame::of(light);
+        let [axis, u, v] = frame.axes;
+        let start = self.planes.len() as u32;
+        let cos = light.cos_outer;
+        let sin = (1.0 - cos * cos).max(0.0).sqrt();
+        if cos > 0.05 && !self.whole_beams {
+            for side in [u, -u, v, -v] {
+                let normal = axis * sin - side * cos;
+                self.planes.push(Half {
+                    normal,
+                    offset: -normal.dot(light.position),
+                });
+            }
+        }
+        BeamCaster {
+            planes: start..self.planes.len() as u32,
+            frame,
+        }
+    }
+
+    /// Whether any light this frame is a beam (see [`Light::beam`]).
+    pub fn has_beams(&self) -> bool {
+        self.casters.iter().any(|c| c.beam.is_some())
+    }
+
+    /// The frame of the beam in shadow slot `slot`, if it is one.
+    pub fn beam(&self, slot: u8) -> Option<BeamFrame> {
+        self.casters
+            .iter()
+            .find(|c| c.bit == 1 << slot)
+            .and_then(|c| c.beam.as_ref().map(|b| b.frame))
     }
 
     /// Adds the window a light sees through the convex outline in `self.points` (a portal,
@@ -989,6 +1087,7 @@ impl Carver {
             start: 0,
             count: edges.len() as u32,
             shadowed: 0,
+            beamed: 0,
             first_volume: 0,
             volume_count: 0,
         });
@@ -1003,6 +1102,8 @@ impl Carver {
                 Parts::Static(mask) if mask & bit != 0 => (true, false),
                 Parts::Static(_) => continue,
                 Parts::Cached(mask) => (mask & bit == 0, true),
+                Parts::Beams if self.casters[c].beam.is_some() => (false, true),
+                Parts::Beams => continue,
             };
             // Facing away from the light, or out of its reach (all of it beyond its range, or
             // outside a spot light's cone): it gets none of it anyway.
@@ -1017,11 +1118,46 @@ impl Carver {
             if !source.faces(normal, point) || out_of_reach {
                 continue;
             }
+            // A beam: outside the pyramid around its cone is dark, and inside it the cone
+            // fades the light (see `Light::beam`), unless all of it is within the inner cone.
+            if moving && receiver.beams && let Some(beam) = self.casters[c].beam.clone() {
+                let within = records.chunks_exact(stride).all(|r| {
+                    let ray = beam.frame.ray(Vec3::new(r[3], r[4], r[5]));
+                    ray.x >= light.cos_inner * ray.length()
+                });
+                if !within {
+                    std::mem::swap(&mut self.work, &mut self.pieces);
+                    self.pieces.clear();
+                    for i in 0..self.work.len() {
+                        self.rest.clear();
+                        let inside = self.split_region(self.work[i], beam.planes.clone(), lined);
+                        for mut outside in self.rest.drain(..) {
+                            outside.shadowed |= bit;
+                            self.pieces.push(outside);
+                        }
+                        if let Some(mut inside) = inside {
+                            inside.beamed |= bit;
+                            self.pieces.push(inside);
+                        }
+                    }
+                }
+            }
+            if receiver.parts == Parts::Beams || !self.casters[c].shadows {
+                continue;
+            }
             // Portals: unless it is in the light's own sector, only what some window into
             // its sectors reaches is lit (softly at its edges, from a light with a size).
+            // What is dark already stays so.
             if statics && !self.casters[c].whole.is_some_and(|w| sectors.contains(&w)) {
                 std::mem::swap(&mut self.work, &mut self.pieces);
                 self.pieces.clear();
+                self.work.retain(|piece| {
+                    let dark = piece.shadowed & bit != 0;
+                    if dark {
+                        self.pieces.push(*piece);
+                    }
+                    !dark
+                });
                 for w in self.casters[c].windows.clone() {
                     let (sector, v) = self.windows[w as usize];
                     if !sectors.contains(&sector) {
@@ -1292,6 +1428,7 @@ impl Carver {
         }
         let keep = |p: Piece| Piece {
             shadowed: piece.shadowed,
+            beamed: piece.beamed,
             first_volume: piece.first_volume,
             volume_count: piece.volume_count,
             ..p
@@ -1348,6 +1485,7 @@ impl Carver {
             start: start as u32,
             count: n as u32,
             shadowed: 0,
+            beamed: 0,
             first_volume: 0,
             volume_count: 0,
         })
@@ -1445,6 +1583,8 @@ mod tests {
             whole: Some(0),
             windows: 0..0,
             volumes: 0..c.volumes.len() as u32,
+            shadows: true,
+            beam: None,
         });
         c
     }
@@ -1466,7 +1606,7 @@ mod tests {
 
     /// A level polygon in sector 0 on the plane through `point` facing `normal`.
     fn at(normal: Vec3, point: Vec3) -> Receiver<'static> {
-        Receiver { sectors: &[0], entity: None, normal, point, parts: Parts::All }
+        Receiver { sectors: &[0], entity: None, normal, point, parts: Parts::All, beams: true }
     }
 
     fn area(records: &[f32], stride: usize) -> f32 {
@@ -1674,6 +1814,8 @@ mod tests {
             whole: Some(0),
             windows: 0..0,
             volumes: 0..1,
+            shadows: true,
+            beam: None,
         });
         assert_eq!(c.wedges.len(), 4, "a wedge per outline edge");
         let floor = [
@@ -1757,6 +1899,8 @@ mod tests {
             whole: Some(0),
             windows: 0..0,
             volumes: 0..1,
+            shadows: true,
+            beam: None,
         });
         let floor = [
             Vec3::new(-3.0, 0.0, -3.0),
@@ -1792,6 +1936,60 @@ mod tests {
             }
         }
         assert!(corners > 0, "soft edges start at the corners");
+    }
+
+    #[test]
+    fn a_beam_darkens_all_outside_its_pyramid() {
+        // A beam 3 m above the floor, pointing down, fading from 10 to 20 degrees off its
+        // axis: its pyramid meets the floor in a square 2 * 3 tan 20 = 2.18 m across.
+        let center = Vec3::new(0.0, 3.0, 0.0);
+        let mut light = Light::spot(0, center, Vec3::ONE, 100.0, Vec3::NEG_Y, 10.0, 20.0);
+        light.beam = true;
+        let mut c = Carver::default();
+        let beam = c.add_beam(&light);
+        assert_eq!(beam.planes.len(), 4);
+        c.casters.push(Caster {
+            bit: 1,
+            is_static: false,
+            source: Source::of(&light),
+            range: 100.0,
+            light,
+            whole: Some(0),
+            windows: 0..0,
+            volumes: 0..0,
+            shadows: false,
+            beam: Some(beam),
+        });
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let floor = [
+            Vec3::new(-3.0, 0.0, -3.0),
+            Vec3::new(-3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, -3.0),
+        ];
+        let n = c.carve(&records(&floor), &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
+        let (mut inside, mut dark) = (0.0, 0.0);
+        for i in 0..n {
+            let p = c.piece(i);
+            let a = area(c.records(&p), stride);
+            assert!((p.beamed == 1) != (p.shadowed == 1), "in the beam or dark: {p:?}");
+            if p.beamed == 1 {
+                inside += a;
+            } else {
+                dark += a;
+            }
+        }
+        let side = 2.0 * 3.0 * 20f32.to_radians().tan();
+        assert!((inside - side * side).abs() < 1e-3, "inside {inside}");
+        assert!((inside + dark - 36.0).abs() < 1e-3);
+
+        // All within the inner cone: whole, and not in the beam.
+        let small = floor.map(|p| p * 0.05);
+        let n = c.carve(&records(&small), &edges, stride, 0, &at(Vec3::Y, small[0])).len();
+        assert_eq!(n, 1);
+        let p = c.piece(0);
+        assert_eq!((p.beamed, p.shadowed), (0, 0));
     }
 
     /// Carves the floor (y = 0, 6 m square) for `c`'s caster and returns the light
@@ -1854,6 +2052,8 @@ mod tests {
             whole: Some(0),
             windows: 0..0,
             volumes: 0..2,
+            shadows: true,
+            beam: None,
         });
         let values = floor_light(&mut c);
         // Around the seam's shadow, well inside both squares' shadow along z.
@@ -1895,6 +2095,8 @@ mod tests {
             whole: Some(0),
             windows: 0..1,
             volumes: 0..0,
+            shadows: true,
+            beam: None,
         });
         let floor = [
             Vec3::new(-3.0, 0.0, -3.0),
@@ -1910,6 +2112,7 @@ mod tests {
             normal: Vec3::Y,
             point: floor[0],
             parts: Parts::All,
+            beams: true,
         };
         let n = c.carve(&records(&floor), &edges, stride, 0, &receiver).len();
         // The opening is 1 m below the light and the floor 3 m. Planes through an edge of it
@@ -1962,6 +2165,8 @@ mod tests {
             whole: None,
             windows: 0..0,
             volumes: 0..1,
+            shadows: true,
+            beam: None,
         });
         assert_eq!(c.wedges.len(), 4);
         let floor = [
@@ -2033,6 +2238,8 @@ mod tests {
             whole: Some(0),
             windows: 0..0,
             volumes: 0..1,
+            shadows: true,
+            beam: None,
         });
         let floor = [
             Vec3::new(-3.0, 0.0, -3.0),
@@ -2116,6 +2323,8 @@ mod tests {
                 whole: Some(0),
                 windows: 0..0,
                 volumes: 0..1,
+                shadows: true,
+                beam: None,
             });
             let floor = floor_at(x);
             let stride = RECORD_FLOATS + 4;

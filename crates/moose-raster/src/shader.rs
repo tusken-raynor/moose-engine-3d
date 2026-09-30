@@ -1094,19 +1094,20 @@ pub struct SampleContext<'a> {
     pub lights: &'a [Light],
     pub ambient: Vec3,
     /// Per light, [`NO_SPLIT`], or for a light whose shadow covers part of the polygon,
-    /// which of `split` gets its light instead of the total: the engine adds it back pixel
-    /// by pixel, as much as the shadow there lets through (see [`PixelContext::light`]).
+    /// which of `split` gets its strength instead of the total getting its light: the
+    /// engine adds its light (its color times that) back pixel by pixel, as much as the
+    /// shadow there lets through (see [`PixelContext::light`]).
     pub light_split: &'a [u8],
-    pub split: &'a [Cell<[F32s; 3]>],
+    pub split: &'a [Cell<F32s>],
     /// Where there are split lights: all the light, theirs included (linear), for pixels
     /// all of theirs reaches.
     pub total: &'a Cell<[F32s; 3]>,
 }
 
 /// Outputs the engine adds to a polygon's sample points for its `splits` split lights:
-/// each one's light, then all the light.
+/// each one's strength (its light is its color times that), then all the light.
 pub const fn split_outputs(splits: usize) -> usize {
-    if splits == 0 { 0 } else { 3 * splits + 3 }
+    if splits == 0 { 0 } else { splits + 3 }
 }
 
 /// In `SampleContext::light_split`: the light is added to the total.
@@ -1154,6 +1155,21 @@ impl PixelContext<'_> {
             .fold(F32s::fill(1.0), |m, j| m.min(self.split.reaches[j]));
         if all.simd_ge(F32s::fill(1.0)).all() {
             return self.split.total.map(|t| (t * F32s::fill(65536.0)).round_int());
+        }
+        // Where none of any reaches (outside a beam), the rest of the light.
+        let any = (0..self.split.count)
+            .fold(F32s::fill(0.0), |m, j| m.max(self.split.reaches[j]));
+        if any.simd_le(F32s::fill(0.0)).all() {
+            return *light;
+        }
+        // Where each pixel gets all of every split light or none of any (at a hard beam's
+        // edge, or a dithered one's fade), all the light or the rest, pixel by pixel.
+        let (full, none) = (all.simd_ge(F32s::fill(1.0)), any.simd_le(F32s::fill(0.0)));
+        if (full | none).all() {
+            return std::array::from_fn(|c| {
+                let total = self.split.total[c] * F32s::fill(65536.0);
+                wide::Select::select(full, total, light[c].round_float()).round_int()
+            });
         }
         let scale = F32s::fill(1.0 / 65536.0);
         std::array::from_fn(|c| {
@@ -1252,12 +1268,13 @@ pub struct SpanJob<'a> {
     pub outs: &'a [f32],
     /// First pixel of the run; the run covers `x0..x0 + color.len()`, inside the row.
     pub x0: i32,
-    /// Lights whose shadows cover part of the polygon: their light (3 values each, linear)
-    /// follows the material's outputs at every point in `outs`, then all the light (3
-    /// values, encoded, theirs included), and how much of
-    /// each reaches every pixel of the run is in `reaches` (run by run: `reaches[j * len
-    /// + i]` for light `j` at pixel `x0 + i`).
+    /// Lights whose shadows cover part of the polygon: their strength (1 value each, their
+    /// light being their color, `split_colors`, times it) follows the material's outputs at
+    /// every point in `outs`, then all the light (3 values, encoded, theirs included), and
+    /// how much of each reaches every pixel of the run is in `reaches` (run by run:
+    /// `reaches[j * len + i]` for light `j` at pixel `x0 + i`).
     pub splits: usize,
+    pub split_colors: [Vec3; MAX_SPLIT],
     pub reaches: &'a [f32],
     /// The framebuffer row.
     pub row: i32,
@@ -1586,11 +1603,9 @@ impl Run<'_> {
         };
         let len = self.color.len();
         for j in 0..split.count {
-            for c in 0..3 {
-                let k = 3 * j + c;
-                split.light[j][c] =
-                    f32::lanes(F32s::fill(split_base[k]), F32s::fill(split_step[k]), offset, STRIDE);
-            }
+            let strength = f32::lanes(F32s::fill(split_base[j]), F32s::fill(split_step[j]), offset, STRIDE);
+            let color = self.job.split_colors[j].to_array();
+            split.light[j] = color.map(|c| F32s::fill(c) * strength);
             let reaches = &self.job.reaches[j * len..(j + 1) * len];
             split.reaches[j] = F32s::from(std::array::from_fn::<f32, LANES, _>(|i| {
                 let px = first + i as i32 * STRIDE - self.x0;
@@ -1598,7 +1613,7 @@ impl Run<'_> {
             }));
         }
         if split.count > 0 {
-            let t = 3 * split.count;
+            let t = split.count;
             split.total = std::array::from_fn(|c| {
                 f32::lanes(F32s::fill(split_base[t + c]), F32s::fill(split_step[t + c]), offset, STRIDE)
             });
@@ -1885,6 +1900,7 @@ mod tests {
                     outs: &window_outs,
                     x0: x,
                     splits: 0,
+                    split_colors: [Vec3::ZERO; MAX_SPLIT],
                     reaches: &[],
                     row: 0,
                     half_rate,

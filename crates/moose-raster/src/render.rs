@@ -78,6 +78,9 @@ pub struct RasterConfig {
     /// Debug overlay of the sample lattice: grid rows tinted red, and the grid points on
     /// them marked green.
     pub show_samples: bool,
+    /// Beams' fades (see `Light::beam`) are drawn as a stipple, each pixel lit or not by a
+    /// 4×4 ordered dither: a retro look, and cheap, as no pixel needs a partial light.
+    pub beam_dither: bool,
 }
 
 impl Default for RasterConfig {
@@ -95,6 +98,7 @@ impl Default for RasterConfig {
             penumbra_spacing: 4,
             penumbra_padding: 16,
             show_samples: false,
+            beam_dither: false,
         }
     }
 }
@@ -215,11 +219,13 @@ struct PolygonSetup {
     first_vertex: u32,
     vertex_count: u16,
     n_vals: u16,
-    /// Lights whose shadows cover part of it (see `ViewPolygon::split`): each one's light
-    /// follows the material's outputs at its sample points (3 values; counted in `n_out`),
-    /// and its shadow pieces (`shadows` from `first_shadow` in `ThreadBins::shadows`) say
-    /// how much of it reaches each pixel.
+    /// Lights whose shadows cover part of it (see `ViewPolygon::split`): each one's
+    /// strength follows the material's outputs at its sample points (1 value; counted in
+    /// `n_out`), its light being its color (`split_colors`) times that, and its shadow
+    /// pieces (`shadows` from `first_shadow` in `ThreadBins::shadows`) say how much of it
+    /// reaches each pixel.
     splits: u8,
+    split_colors: [Vec3; MAX_SPLIT],
     first_shadow: u32,
     shadows: u16,
     /// Its material's outputs per sample point.
@@ -279,12 +285,23 @@ struct ThreadBins {
     /// index ([`NO_SPLIT`] for none; see `SampleContext::light_split`).
     lights: Vec<Light>,
     light_split: Vec<u8>,
-    /// Polygons' shadow pieces: (first vertex, vertex count, split index); their vertices,
-    /// edge lines, and how much of the light reaches each vertex.
-    shadows: Vec<(u32, u16, u8)>,
+    /// Polygons' shadow pieces; their vertices, edge lines, how much of the light reaches
+    /// each vertex, and each vertex's ray (in a beam's pieces; see `ShadowVertex::ray`).
+    shadows: Vec<ShadowSetup>,
     shadow_vertices: Vec<SetupVertex>,
     shadow_lines: Vec<Option<EdgeLine>>,
     shadow_light: Vec<f32>,
+    shadow_rays: Vec<Vec3>,
+}
+
+/// A polygon's shadow piece, binned: its vertices (`count` from `first`), its light's split
+/// index, and its beam's cone, if it is part of one (see `ShadowPiece::beam`).
+#[derive(Clone, Copy)]
+struct ShadowSetup {
+    first: u32,
+    count: u16,
+    split: u8,
+    beam: Option<(f32, f32)>,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -504,6 +521,7 @@ impl Renderer {
             bins.shadow_vertices.clear();
             bins.shadow_lines.clear();
             bins.shadow_light.clear();
+            bins.shadow_rays.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -792,6 +810,7 @@ fn setup_polygon(
     // polygons are lit where they really are.
     let first_light = bins.lights.len() as u32;
     let (mut splits, mut split_slots) = (0usize, [0u8; MAX_SPLIT]);
+    let mut split_colors = [Vec3::ZERO; MAX_SPLIT];
     let positions = &geometry.world_positions[p.vertices()];
     let normal = Vec3::from_array(face_normal);
     let (lo, hi) = positions
@@ -811,7 +830,6 @@ fn setup_polygon(
             && near < light.range
             && light.cone_reaches(center, radius)
         {
-            bins.lights.push(light);
             // A light whose shadow covers part of it is split off (see `SampleContext`).
             let split = match light.shadow {
                 Some(k)
@@ -820,11 +838,19 @@ fn setup_polygon(
                         && layout_len(entry.io.interp) + split_outputs(splits + 1) <= MAX_VARYINGS =>
                 {
                     split_slots[splits] = k;
+                    split_colors[splits] = light.color;
                     splits += 1;
                     (splits - 1) as u8
                 }
                 _ => NO_SPLIT,
             };
+            // A beam's cone is drawn with its shadow only where it is split off, and not in
+            // reflections (the view carves none there); elsewhere it is lit at sample
+            // points like any spot light's.
+            bins.lights.push(Light {
+                beam: light.beam && split != NO_SPLIT && p.mirror.is_none(),
+                ..light
+            });
             bins.light_split.push(split);
         }
     }
@@ -837,10 +863,15 @@ fn setup_polygon(
             continue;
         };
         let vertices = &geometry.shadow_vertices[piece.first_vertex as usize..][..piece.vertex_count as usize];
-        bins.shadows
-            .push((bins.shadow_vertices.len() as u32, piece.vertex_count, j as u8));
+        bins.shadows.push(ShadowSetup {
+            first: bins.shadow_vertices.len() as u32,
+            count: piece.vertex_count,
+            split: j as u8,
+            beam: piece.beam,
+        });
         for v in vertices {
             bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
+            bins.shadow_rays.push(v.ray);
             bins.shadow_lines.push(v.line);
             bins.shadow_light.push(v.light);
         }
@@ -859,6 +890,7 @@ fn setup_polygon(
         vertex_count: verts.len() as u16,
         n_vals: n_vals as u16,
         splits: splits as u8,
+        split_colors,
         first_shadow,
         shadows: (bins.shadows.len() as u32 - first_shadow) as u16,
         n_out: (layout_len(entry.io.interp) + split_outputs(splits)) as u16,
@@ -1361,7 +1393,7 @@ fn sample_context<'a>(
     p: &'a PolygonSetup,
     bins: &'a ThreadBins,
     textures: &Textures<'a>,
-    split: &'a [Cell<[F32s; 3]>],
+    split: &'a [Cell<F32s>],
     total: &'a Cell<[F32s; 3]>,
 ) -> SampleContext<'a> {
     let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
@@ -1502,7 +1534,7 @@ fn build_tiles(
         let points = [(xa, ya), (xb, ya), (xa, yb), (xb, yb), ((xa + xb) / 2.0, (ya + yb) / 2.0)];
         spots
             .iter()
-            .filter(|l| !l.is_point())
+            .filter(|l| !l.is_point() && !l.beam)
             .map(|l| {
                 let (scale, offset) = l.cone();
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -1675,7 +1707,7 @@ fn build_tiles(
     // Every tile's grid points, LANES at a time.
     // The material's outputs, then the split lights' (see `SampleContext::light_split`).
     let (splits, n_material) = (p.splits as usize, n_out - split_outputs(p.splits as usize));
-    let split: [Cell<[F32s; 3]>; MAX_SPLIT] = Default::default();
+    let split: [Cell<F32s>; MAX_SPLIT] = Default::default();
     let total: Cell<[F32s; 3]> = Default::default();
     let mut inputs = [F32s::default(); MAX_VARYINGS];
     let mut outputs = [F32s::default(); MAX_VARYINGS];
@@ -1713,11 +1745,11 @@ fn build_tiles(
         }
         let ctx = sample_context(p, b, textures, &split[..splits], &total);
         (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_material]);
-        for (j, light) in split[..splits].iter().enumerate() {
-            outputs[n_material + 3 * j..n_material + 3 * j + 3].copy_from_slice(&light.take());
+        for (j, strength) in split[..splits].iter().enumerate() {
+            outputs[n_material + j] = strength.take();
         }
         if splits > 0 {
-            let t = n_material + 3 * splits;
+            let t = n_material + splits;
             outputs[t..t + 3].copy_from_slice(&crate::shaders::encode_lights(total.take()));
         }
         for (k, out) in outputs[..n_out].iter().enumerate() {
@@ -1839,21 +1871,44 @@ struct Segment {
     fy: f32,
 }
 
+/// A 4×4 ordered (Bayer) dither: a pixel of a dithered beam is lit where the light reaching
+/// it is over its entry (plus a half, over 16) at its row and column, modulo 4.
+const BEAM_DITHER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+
+/// Pixels between the points where the shadow buffer checks a beam's cone (see
+/// `shadow_run`).
+const BEAM_STEP: i32 = 8;
+
+/// The most a beam's cone may change across a stretch of `BEAM_STEP` pixels to be blended
+/// between its ends (see `shadow_run`). Blending strays from it by at most about 0.75 times
+/// the square of that (the ease's bend): about 1% of the light.
+const BEAM_BLEND: f32 = 1.0 / 8.0;
+
 /// Fills `s.reaches` with how much of each of the polygon's split lights reaches each pixel
 /// `x0..x1` of the current row: all of it, except where its shadow pieces cover the row,
 /// which each give their vertices' values interpolated along their edges to the row, then
-/// across it (perspective-correct, like Gouraud shading).
-fn shadow_run(s: &mut RowScratch, bins: &ThreadBins, p: &PolygonSetup, x0: i32, x1: i32) {
+/// across it (perspective-correct, like Gouraud shading). A beam's piece fades it by its
+/// cone too, and with `dither`, each of its pixels gets all of the light or none, by
+/// `BEAM_DITHER`.
+fn shadow_run(
+    s: &mut RowScratch,
+    bins: &ThreadBins,
+    p: &PolygonSetup,
+    x0: i32,
+    x1: i32,
+    dither: bool,
+) {
     let len = (x1 - x0).max(0) as usize;
     s.reaches.clear();
     s.reaches.resize(p.splits as usize * len, 1.0);
     let row = s.row;
-    for &(first, count, j) in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
-        let range = first as usize..first as usize + count as usize;
-        let (verts, lines, light) = (
+    for piece in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
+        let range = piece.first as usize..piece.first as usize + piece.count as usize;
+        let (verts, lines, light, rays) = (
             &bins.shadow_vertices[range.clone()],
             &bins.shadow_lines[range.clone()],
-            &bins.shadow_light[range],
+            &bins.shadow_light[range.clone()],
+            &bins.shadow_rays[range],
         );
         let Some(((il, xl), (ir, xr))) = crossings(verts, lines, row) else {
             continue;
@@ -1862,22 +1917,170 @@ fn shadow_run(s: &mut RowScratch, bins: &ThreadBins, p: &PolygonSetup, x0: i32, 
         if from >= to {
             continue;
         }
-        // At each crossing: w, and the light times w (both linear across the row).
+        // At each crossing: w, the light times w, and the ray times w (all linear across
+        // the row).
         let at = |i: usize| {
             let (w, alpha) = edge_at_row(verts, i, row);
-            let l = light[i] + (light[(i + 1) % verts.len()] - light[i]) * alpha;
-            (w, l * w)
+            let k = (i + 1) % verts.len();
+            let l = light[i] + (light[k] - light[i]) * alpha;
+            let ray = rays[i] + (rays[k] - rays[i]) * alpha;
+            (w, l * w, ray * w)
         };
-        let ((wl, ql), (wr, qr)) = (at(il), at(ir));
-        let out = &mut s.reaches[j as usize * len..(j as usize + 1) * len];
+        let ((wl, ql, rl), (wr, qr, rr)) = (at(il), at(ir));
+        let out = &mut s.reaches[piece.split as usize * len..(piece.split as usize + 1) * len];
         let span = (xr - xl).max(1e-6);
-        for x in from..to {
-            let t = (x as f32 + 0.5 - xl) / span;
-            let (w, q) = (wl + (wr - wl) * t, ql + (qr - ql) * t);
-            let reach = if w > 0.0 { (q / w).clamp(0.0, 1.0) } else { 0.0 };
-            let o = &mut out[(x - x0) as usize];
-            *o = o.min(reach);
+        let t = |x: i32| (x as f32 + 0.5 - xl) / span;
+        // The same at every vertex (in full shadow, or only in a beam), the same all over.
+        let flat = light.iter().all(|&l| l == light[0]).then_some(light[0]);
+        let reach = |x: i32| match flat {
+            Some(l) => l,
+            None => {
+                let t = t(x);
+                let (w, q) = (wl + (wr - wl) * t, ql + (qr - ql) * t);
+                if w > 0.0 { (q / w).clamp(0.0, 1.0) } else { 0.0 }
+            }
+        };
+        // Lowers the buffer to the piece's value over pixels `a..b`: in bulk where the
+        // piece is the same all over (untouched where that is all of the light).
+        let lower = |out: &mut [f32], a: i32, b: i32| {
+            let run = &mut out[(a - x0) as usize..(b - x0) as usize];
+            match flat {
+                Some(l) if l >= 1.0 => {}
+                Some(l) if l <= 0.0 => run.fill(0.0),
+                Some(l) => run.iter_mut().for_each(|o| *o = o.min(l)),
+                None => {
+                    for (x, o) in (a..b).zip(run) {
+                        *o = o.min(reach(x));
+                    }
+                }
+            }
+        };
+        let Some((scale, offset)) = piece.beam else {
+            lower(out, from, to);
+            continue;
+        };
+        // A beam's cone, by the angle between the pixel's ray and the axis (x), eased like
+        // the cone at sample points. The row crosses each cone in one stretch (a cone is
+        // convex), found where the ray's angle from the axis equals the cone's: outside the
+        // outer cone it is dark, inside the inner one it is all lit, and only between, in
+        // the fade, is the cone taken: every `BEAM_STEP` pixels, blended between where it
+        // can change by at most `BEAM_BLEND` (by the angle between their rays, at its
+        // steepest), otherwise pixel by pixel.
+        let (cos_outer, cos_inner) = (-offset / scale, (1.0 - offset) / scale);
+        // The pixels whose rays are within the cone of cosine `k`: where
+        // `ray.x^2 - k^2 |ray|^2 >= 0`, a quadratic along the row, and `ray.x > 0`. Empty as
+        // `(to, to)`.
+        let within = |k: f32| {
+            let (p, q) = (rl.as_dvec3(), (rr - rl).as_dvec3());
+            let k2 = (k as f64) * (k as f64);
+            let a = q.x * q.x - k2 * q.length_squared();
+            let b = 2.0 * (p.x * q.x - k2 * p.dot(q));
+            let c = p.x * p.x - k2 * p.length_squared();
+            let forward = |t: f64| p.x + q.x * t > 0.0;
+            let disc = b * b - 4.0 * a * c;
+            let (lo, hi) = if a.abs() <= 1e-12 * (b.abs() + c.abs()) {
+                // Along a line parallel to one of the cone's: once across, if at all.
+                if b > 0.0 {
+                    (-c / b, f64::INFINITY)
+                } else if b < 0.0 {
+                    (f64::NEG_INFINITY, -c / b)
+                } else if c >= 0.0 {
+                    (f64::NEG_INFINITY, f64::INFINITY)
+                } else {
+                    return (to, to);
+                }
+            } else if disc < 0.0 {
+                if a < 0.0 {
+                    return (to, to);
+                }
+                (f64::NEG_INFINITY, f64::INFINITY)
+            } else {
+                let root = disc.sqrt();
+                let (r0, r1) = ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a));
+                let (r0, r1) = (r0.min(r1), r0.max(r1));
+                if a < 0.0 {
+                    (r0, r1)
+                } else if forward(r0) {
+                    // The other side is the cone's reflection, behind the light.
+                    (f64::NEG_INFINITY, r0)
+                } else {
+                    (r1, f64::INFINITY)
+                }
+            };
+            // Only ahead of the light (a piece not cut by the pyramid may reach behind it).
+            let (lo, hi) = if q.x > 0.0 {
+                (lo.max(-p.x / q.x), hi)
+            } else if q.x < 0.0 {
+                (lo, hi.min(-p.x / q.x))
+            } else if p.x > 0.0 {
+                (lo, hi)
+            } else {
+                return (to, to);
+            };
+            let x = |t: f64| {
+                let v = xl as f64 + t.clamp(-1e6, 1e6) * span as f64;
+                pixel_edge(v as f32).clamp(from, to)
+            };
+            let (a, b) = (x(lo), x(hi));
+            if a >= b { (to, to) } else { (a, b) }
+        };
+        let (o0, o1) = within(cos_outer);
+        let (i0, i1) = within(cos_inner);
+        let (i0, i1) = if i0 >= i1 { (o0, o0) } else { (i0.max(o0), i1.min(o1)) };
+        // The most the eased cone changes per radian: its steepest (1.5) times the cosine's.
+        let steepest = 1.5 * scale * (1.0 - cos_outer * cos_outer).max(0.0).sqrt();
+        let ray = |x: i32| {
+            let r = rl + (rr - rl) * t(x);
+            r / r.length().max(1e-12)
+        };
+        let cone = |cos: f32| {
+            let c = (cos * scale + offset).clamp(0.0, 1.0);
+            c * c * (3.0 - 2.0 * c)
+        };
+        let fade = |out: &mut [f32], from: i32, to: i32| {
+            let mut a = from;
+            while a < to {
+                let b = (a + BEAM_STEP).min(to - 1).max(a);
+                let end = if b == to - 1 { to } else { b };
+                let (ra, rb) = (ray(a), ray(b));
+                if b > a && (ra - rb).length() * steepest <= BEAM_BLEND {
+                    let (ka, kb) = (cone(ra.x), cone(rb.x));
+                    for x in a..end {
+                        let k = ka + (kb - ka) * (x - a) as f32 / (b - a) as f32;
+                        let o = &mut out[(x - x0) as usize];
+                        *o = o.min(reach(x) * k);
+                    }
+                } else {
+                    for x in a..end {
+                        let o = &mut out[(x - x0) as usize];
+                        *o = o.min(reach(x) * cone(ray(x).x));
+                    }
+                }
+                a = end;
+            }
+        };
+        out[(from - x0) as usize..(o0 - x0) as usize].fill(0.0);
+        // Dithered: each pixel all of the light or none, where it may be partly lit (in the
+        // fade, and within the inner cone unless the piece is all lit or all dark there).
+        let thresholds = &BEAM_DITHER[(row & 3) as usize];
+        let stipple = |out: &mut [f32], a: i32, b: i32| {
+            if dither {
+                for x in a..b {
+                    let o = &mut out[(x - x0) as usize];
+                    let threshold = (thresholds[(x & 3) as usize] as f32 + 0.5) / 16.0;
+                    *o = if *o > threshold { 1.0 } else { 0.0 };
+                }
+            }
+        };
+        fade(out, o0, i0);
+        stipple(out, o0, i0);
+        lower(out, i0, i1.max(i0));
+        if !matches!(flat, Some(l) if l <= 0.0 || l >= 1.0) {
+            stipple(out, i0, i1.max(i0));
         }
+        fade(out, i1.max(o0), o1);
+        stipple(out, i1.max(o0), o1);
+        out[(o1.max(o0) - x0) as usize..(to - x0) as usize].fill(0.0);
     }
 }
 
@@ -1919,7 +2122,7 @@ fn shade_points(
     };
     row_points(s, index, p.n_out as usize, shown, x1);
     // The shadow buffer for the run: how much of each split light reaches each pixel.
-    shadow_run(s, &bins[t], p, x0, x1);
+    shadow_run(s, &bins[t], p, x0, x1, config.beam_dither);
     let job = SpanJob {
         x_left,
         x_right,
@@ -1929,6 +2132,7 @@ fn shade_points(
         outs: &s.points_v,
         x0,
         splits: p.splits as usize,
+        split_colors: p.split_colors,
         reaches: &s.reaches,
         row: s.row,
         half_rate: p.half_rate,

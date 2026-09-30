@@ -11,6 +11,10 @@
 //! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
 //! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
 //! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
+//! FLASHLIGHT=beam, screen or sampled adds the app's flashlight at the camera (shadow slot
+//! 0, 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
+//! beam (cut by its pyramid, or for screen, found row by row on whole polygons) or lit at
+//! sample points. DITHER=1 dithers beams' fades.
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -59,6 +63,7 @@ fn main() {
     let defaults = RasterConfig::default();
     let mut renderer = Renderer::new(RasterConfig {
         min_step: setting("MIN_STEP", defaults.min_step),
+        beam_dither: std::env::var("DITHER").is_ok_and(|d| d == "1"),
         light_spacing: setting("LIGHT_SPACING", defaults.light_spacing),
         penumbra_threshold: std::env::var("PENUMBRA_THRESHOLD")
             .map_or(defaults.penumbra_threshold, |v| v.parse().expect("a number")),
@@ -91,6 +96,7 @@ fn main() {
     let geometry = assets.mesh(world.geometry);
     let mut out = ViewGeometry::new();
     out.config.max_reflections = bounces;
+    out.config.beam_pyramid = std::env::var("FLASHLIGHT").map_or(true, |f| f != "screen");
     if std::env::var("SHADOWS").is_ok_and(|l| l == "1") {
         let t = Instant::now();
         let baked = out.bake_shadows(&world, &assets);
@@ -105,6 +111,12 @@ fn main() {
         lo + (hi - lo) * ((seed >> 40) as f32 / (1u64 << 24) as f32)
     };
     let frames: usize = std::env::var("FRAMES").map_or(500, |f| f.parse().unwrap());
+    let flashlight = std::env::var("FLASHLIGHT").ok().map(|f| match f.as_str() {
+        "beam" | "screen" => true,
+        "sampled" => false,
+        _ => panic!("FLASHLIGHT is beam, screen or sampled"),
+    });
+    let level_lights = world.lights().to_vec();
     let (mut view_s, mut raster_s) = (0.0f64, 0.0f64);
     let mut parts = [0.0f64; 4]; // prepare, setup, rows, rows busy per thread
     for _ in 0..frames {
@@ -112,6 +124,23 @@ fn main() {
         c.position = Vec3::new(rnd(-3.5, 3.5), rnd(0.5, 3.5), rnd(0.5, 7.5));
         c.sector = world.find_sector(c.position).unwrap();
         (c.yaw, c.pitch, c.roll) = (rnd(0.0, TAU), rnd(-1.0, 1.0), rnd(-PI / 8.0, PI / 8.0));
+        if let Some(beam) = flashlight {
+            let fade: f32 = std::env::var("FADE").map_or(8.0, |f| f.parse().expect("degrees"));
+            let (color, range, cone) = (Vec3::new(3.4, 3.5, 3.9), 16.0, (20.0 - fade, 20.0));
+            let mut light = moose_assets::Light::spot(
+                c.sector,
+                c.position,
+                color,
+                range,
+                c.forward(),
+                cone.0,
+                cone.1,
+            );
+            (light.shadow, light.radius, light.beam) = (Some(0), 0.05, beam);
+            let mut lights = level_lights.clone();
+            lights.push(light);
+            world.set_lights(lights, world.ambient);
+        }
         let t0 = Instant::now();
         out.build(&world, &assets, &c.view());
         let t1 = Instant::now();

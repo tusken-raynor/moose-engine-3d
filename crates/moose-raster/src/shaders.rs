@@ -13,6 +13,8 @@ use crate::shader::{F32s, Fill, I16s, I32s, SampleContext, U32s};
 fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F32s; 3] {
     let a = ctx.ambient;
     let mut light = [F32s::fill(a.x), F32s::fill(a.y), F32s::fill(a.z)];
+    // The split lights' light, for the total.
+    let mut split_light = [F32s::fill(0.0); 3];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
@@ -28,7 +30,7 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
         let cos = (n_dot_d * inv_len).max(zero);
         // The cone: 1 within the inner half-angle, easing to 0 at the outer (always 1 for a
         // point light, whose cone is whole). The way from the light to the point is -d.
-        let (scale, offset) = l.cone();
+        let (scale, offset) = l.sample_cone();
         let d_dot_dir =
             d[0] * F32s::fill(l.direction.x) + d[1] * F32s::fill(l.direction.y) + d[2] * F32s::fill(l.direction.z);
         let c = (F32s::fill(offset) - d_dot_dir * inv_len * F32s::fill(scale))
@@ -41,8 +43,10 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
         if let Some(&j) = ctx.light_split.get(i)
             && let Some(split) = ctx.split.get(j as usize)
         {
-            let c = |v: f32| F32s::fill(v) * k;
-            split.set([c(l.color.x), c(l.color.y), c(l.color.z)]);
+            split.set(k);
+            split_light[0] += F32s::fill(l.color.x) * k;
+            split_light[1] += F32s::fill(l.color.y) * k;
+            split_light[2] += F32s::fill(l.color.z) * k;
             continue;
         }
         light[0] += F32s::fill(l.color.x) * k;
@@ -51,14 +55,7 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
     }
     // With split lights, all the light too, for pixels all of theirs reaches.
     if !ctx.split.is_empty() {
-        let mut total = light;
-        for split in ctx.split {
-            let l = split.get();
-            for c in 0..3 {
-                total[c] += l[c];
-            }
-        }
-        ctx.total.set(total);
+        ctx.total.set(std::array::from_fn(|c| light[c] + split_light[c]));
     }
     light
 }
@@ -1389,5 +1386,15 @@ mod tests {
         let both = ctx.light(&full_light())[0].to_array();
         assert!(close(both[0], 2.0f32.powf(1.0 / super::GAMMA)), "{}", both[0]);
         assert!(close(both[2], 1.0), "{}", both[2]);
+        // None of it anywhere (outside a beam): the rest of the light, exactly.
+        ctx.split.reaches[0] = F32s::fill(0.0);
+        assert_eq!(ctx.light(&full_light()), full_light());
+        // All or none of it, pixel by pixel (a hard or dithered beam): all the light or the
+        // rest, each exactly.
+        ctx.split.reaches[0] = F32s::from([1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        ctx.split.total = [F32s::fill(2.0f32.powf(1.0 / super::GAMMA)); 3];
+        let got = ctx.light(&full_light())[0].to_array();
+        let (all, rest) = ((2.0f32.powf(1.0 / super::GAMMA) * 65536.0).round() as i32, 65536);
+        assert_eq!(got, [all, rest, all, rest, rest, all, all, rest]);
     }
 }

@@ -75,6 +75,11 @@ pub struct Light {
     pub is_static: bool,
     /// How it moves, if it does (a level's moving light; see [`Light::at_time`]).
     pub motion: Option<Oscillation>,
+    /// A spot light whose cone is drawn pixel by pixel with its shadow (a beam), not
+    /// lit at sample points: the view cuts polygons by a square pyramid around its cone,
+    /// and the renderer's shadow buffer fades the light across the cone in the part inside
+    /// (see [`Light::sample_cone`]). It needs a shadow slot.
+    pub beam: bool,
 }
 
 /// A light swinging back and forth through its position: `offset` either way, smoothly (a
@@ -133,6 +138,7 @@ impl Light {
             directional: true,
             is_static: false,
             motion: None,
+            beam: false,
         }
     }
 
@@ -152,6 +158,7 @@ impl Light {
             directional: false,
             is_static: false,
             motion: None,
+            beam: false,
         }
     }
 
@@ -180,6 +187,7 @@ impl Light {
             directional: false,
             is_static: false,
             motion: None,
+            beam: false,
         }
     }
 
@@ -202,6 +210,12 @@ impl Light {
         }
         let angle = (to.dot(self.direction) / d).clamp(-1.0, 1.0).acos();
         angle <= self.cos_outer.clamp(-1.0, 1.0).acos() + (radius / d).asin()
+    }
+
+    /// Its cone as lighting at sample points uses it (see [`Light::cone`]): whole for a
+    /// beam, whose cone is drawn with its shadow instead.
+    pub fn sample_cone(&self) -> (f32, f32) {
+        if self.beam { (0.0, 1.0) } else { self.cone() }
     }
 
     /// Its cone as `(scale, offset)`: `clamp(cos * scale + offset, 0, 1)` goes from 0 at

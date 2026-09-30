@@ -28,6 +28,10 @@
 //!   --water               shiny floors start as water, not plain reflective tiles;
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
+//!   --cone MODE           how the flashlight's cone is drawn: beam (faded pixel by pixel
+//!                         with its shadow, inside a pyramid cut around it; the default),
+//!                         screen (the same, found row by row on whole polygons, with no
+//!                         pyramid) or sampled (lit at sample points)
 //!   --no-shadows          start with shadows off
 //!   --no-sun              start with the level's directional lights off
 //!   --light-scale K       the level's point and spot lights' source sizes (their shadows'
@@ -41,6 +45,9 @@
 //!                         level's
 //!   --light-radius R      radius of the flashlight's source in meters: its shadows soften
 //!                         over the part of it an occluder covers (default 0.05; 0 is hard)
+//!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
+//!                         degree edge (default 8; 0 is a hard edge)
+//!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
 //!   --level-lights        start with the level's own lights on (off by default, leaving the
 //!                         flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
@@ -132,8 +139,11 @@ const FLASHLIGHT_OFFSET: Vec3 = Vec3::new(0.25, -0.2, 0.0);
 const FLASHLIGHT_COLOR: Vec3 = Vec3::new(3.4, 3.5, 3.9);
 /// How far it reaches, in meters.
 const FLASHLIGHT_RANGE: f32 = 16.0;
-/// Its cone's inner and outer half-angles, in degrees.
-const FLASHLIGHT_CONE: (f32, f32) = (6.0, 20.0);
+/// Its cone's outer half-angle, in degrees.
+const FLASHLIGHT_OUTER: f32 = 20.0;
+/// How wide its cone fades inside that, in degrees, as the menu steps through them
+/// (`--flashlight-fade`): the inner half-angle is the outer less this. 0 is a hard edge.
+const FLASHLIGHT_FADES: [f32; 6] = [0.0, 2.0, 4.0, 8.0, 14.0, 20.0];
 /// Multiples of the level's point and spot lights' source sizes (their `radius=`) the
 /// menu steps through: 0 casts hard shadows, 1 is as authored.
 const LIGHT_SCALES: [f32; 5] = [0.0, 0.5, 1.0, 2.0, 4.0];
@@ -182,6 +192,8 @@ struct Options {
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
+    beam: bool,
+    beam_pyramid: bool,
     level_lights: bool,
     no_shadows: bool,
     no_sun: bool,
@@ -193,8 +205,10 @@ struct Options {
     no_dynamic_shadows: bool,
     sun_angle: Option<f32>,
     light_radius: f32,
+    flashlight_fade: f32,
     time: f32,
     show_samples: bool,
+    dither_beam: bool,
     /// `RasterConfig` spacing limits, if given.
     min_step: Option<u32>,
     light_spacing: Option<u32>,
@@ -241,6 +255,8 @@ fn parse_args() -> Result<Options, String> {
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
         water: false,
         no_flashlight: false,
+        beam: true,
+        beam_pyramid: true,
         no_shadows: false,
         no_sun: false,
         light_scale: 1.0,
@@ -250,9 +266,11 @@ fn parse_args() -> Result<Options, String> {
         no_dynamic_shadows: false,
         sun_angle: None,
         light_radius: FLASHLIGHT_RADII[2],
+        flashlight_fade: FLASHLIGHT_FADES[3],
         level_lights: false,
         time: 0.0,
         show_samples: false,
+        dither_beam: false,
         min_step: None,
         light_spacing: None,
         steep_limit: None,
@@ -296,6 +314,14 @@ fn parse_args() -> Result<Options, String> {
             "--floor-texture" => o.floor_texture = value()?,
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
+            "--cone" => {
+                (o.beam, o.beam_pyramid) = match value()?.as_str() {
+                    "beam" => (true, true),
+                    "screen" => (true, false),
+                    "sampled" => (false, true),
+                    _ => return Err("--cone is beam, screen or sampled".into()),
+                }
+            }
             "--no-shadows" => o.no_shadows = true,
             "--no-sun" => o.no_sun = true,
             "--hud" => o.hud = true,
@@ -315,8 +341,12 @@ fn parse_args() -> Result<Options, String> {
             "--light-radius" => {
                 o.light_radius = value()?.parse().map_err(|_| "bad --light-radius")?
             }
+            "--flashlight-fade" => {
+                o.flashlight_fade = value()?.parse().map_err(|_| "bad --flashlight-fade")?
+            }
             "--level-lights" => o.level_lights = true,
             "--show-samples" => o.show_samples = true,
+            "--dither-beam" => o.dither_beam = true,
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
             "--light-spacing" => {
                 o.light_spacing = Some(value()?.parse().map_err(|_| "bad --light-spacing")?)
@@ -376,6 +406,12 @@ struct Settings {
     light_scale: f32,
     /// The radius of the flashlight's source, in meters (one of `FLASHLIGHT_RADII`).
     light_radius: f32,
+    /// How wide the flashlight's cone fades inside its edge, in degrees (one of
+    /// `FLASHLIGHT_FADES`).
+    flashlight_fade: f32,
+    /// The flashlight is a beam: its cone is drawn with its shadow, pixel by pixel, not lit
+    /// at sample points (see `Light::beam`).
+    beam: bool,
     /// Where the flashlight was left when it was locked in place (sector, position,
     /// direction); `None` while it is on the player's shoulder.
     flashlight_lock: Option<(u32, Vec3, Vec3)>,
@@ -466,6 +502,7 @@ impl App {
         let defaults = RasterConfig::default();
         let mut renderer = Renderer::new(RasterConfig {
             show_samples: options.show_samples,
+            beam_dither: options.dither_beam,
             min_step: options.min_step.unwrap_or(defaults.min_step),
             light_spacing: options.light_spacing.unwrap_or(defaults.light_spacing),
             steep_limit: options.steep_limit.unwrap_or(defaults.steep_limit),
@@ -540,6 +577,7 @@ impl App {
                 g.config.max_reflections = options.bounces;
                 g.config.cache_shadows = !options.no_shadow_cache;
                 g.config.dynamic_shadows = !options.no_dynamic_shadows;
+                g.config.beam_pyramid = options.beam_pyramid;
                 g
             },
             renderer,
@@ -575,6 +613,8 @@ impl App {
                 light_scale: options.light_scale.max(0.0),
                 sun_angle: options.sun_angle.map(|a| a.clamp(0.0, 45.0)),
                 light_radius: options.light_radius.max(0.0),
+                flashlight_fade: options.flashlight_fade.clamp(0.0, FLASHLIGHT_OUTER),
+                beam: options.beam,
                 flashlight_lock: None,
                 smoothing: 2,
                 capped: options.fps != 0,
@@ -713,6 +753,7 @@ impl App {
             // Shadow slot 0: the view carves its shadows into polygons.
             light.shadow = self.settings.shadows.then_some(0);
             light.radius = self.settings.light_radius;
+            light.beam = self.settings.beam;
             lights.push(light);
         }
         self.world.set_lights(lights, self.lights.1);
@@ -727,9 +768,18 @@ impl App {
             FLASHLIGHT_COLOR,
             FLASHLIGHT_RANGE,
             direction,
-            FLASHLIGHT_CONE.0,
-            FLASHLIGHT_CONE.1,
+            FLASHLIGHT_OUTER - self.settings.flashlight_fade,
+            FLASHLIGHT_OUTER,
         )
+    }
+
+    /// How the flashlight's cone is drawn, as `--cone` names it.
+    fn cone_name(&self) -> &'static str {
+        match (self.settings.beam, self.geometry.config.beam_pyramid) {
+            (false, _) => "sampled",
+            (true, true) => "beam",
+            (true, false) => "screen",
+        }
     }
 
     /// Puts the camera at `[x, y, z, yaw, pitch]` (degrees); `option` names it in errors.
@@ -803,6 +853,12 @@ impl App {
                 if s.flashlight_lock.is_some() { "locked here" } else { "shoulder" }.into()
             }
             Setting::FlashlightSize => format!("{} cm", (s.light_radius * 100.0).round()),
+            Setting::FlashlightFade => match s.flashlight_fade {
+                0.0 => "hard".into(),
+                fade => format!("{fade}°"),
+            },
+            Setting::FlashlightDither => on(cfg.beam_dither),
+            Setting::FlashlightBeam => self.cone_name().into(),
             Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
             Setting::Water => on(s.water),
             Setting::Bounces => self.geometry.config.max_reflections.to_string(),
@@ -872,6 +928,19 @@ impl App {
                 };
             }
             Setting::FlashlightSize => s.light_radius = cycle(&FLASHLIGHT_RADII, s.light_radius, dir),
+            Setting::FlashlightFade => {
+                s.flashlight_fade = cycle(&FLASHLIGHT_FADES, s.flashlight_fade, dir)
+            }
+            Setting::FlashlightBeam => {
+                // Beam, screen, sampled.
+                let pyramid = &mut self.geometry.config.beam_pyramid;
+                (s.beam, *pyramid) = match (s.beam, *pyramid, dir > 0) {
+                    (true, true, true) | (false, _, false) => (true, false),
+                    (true, false, true) | (true, true, false) => (false, true),
+                    _ => (true, true),
+                };
+            }
+            Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
             Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
             Setting::Water => s.water = !s.water,
             Setting::Bounces => {
@@ -969,8 +1038,8 @@ impl App {
         add(format!("--bounces {}", self.geometry.config.max_reflections));
         add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
         add(format!(
-            "--light-radius {} --light-scale {} --penumbra {}",
-            s.light_radius, s.light_scale, s.penumbra
+            "--light-radius {} --flashlight-fade {} --light-scale {} --penumbra {}",
+            s.light_radius, s.flashlight_fade, s.light_scale, s.penumbra
         ));
         if let Some(angle) = s.sun_angle {
             add(format!("--sun-angle {angle}"));
@@ -983,6 +1052,7 @@ impl App {
             cfg.step_threshold,
             cfg.penumbra_threshold,
         ));
+        add(format!("--cone {}", self.cone_name()));
         add(format!("--time {time}"));
         for (on, flag) in [
             (s.water, "--water"),
@@ -995,6 +1065,7 @@ impl App {
             (s.translucent_crates, "--translucent-crates"),
             (s.per_pixel_crates, "--per-pixel-crates"),
             (cfg.show_samples, "--show-samples"),
+            (cfg.beam_dither, "--dither-beam"),
         ] {
             if on {
                 add(flag.to_string());
@@ -1273,6 +1344,9 @@ enum Setting {
     Flashlight,
     FlashlightMount,
     FlashlightSize,
+    FlashlightBeam,
+    FlashlightFade,
+    FlashlightDither,
     Filter,
     Water,
     Bounces,
@@ -1355,7 +1429,14 @@ impl Page {
                 Set(SunSize),
                 Set(SpotPenumbra),
             ],
-            Page::Flashlight => &[Set(Flashlight), Set(FlashlightMount), Set(FlashlightSize)],
+            Page::Flashlight => &[
+                Set(Flashlight),
+                Set(FlashlightMount),
+                Set(FlashlightSize),
+                Set(FlashlightBeam),
+                Set(FlashlightFade),
+                Set(FlashlightDither),
+            ],
             Page::Rendering => &[
                 Set(Filter),
                 Set(Water),
@@ -1429,6 +1510,9 @@ impl Item {
                 Setting::Flashlight => "Flashlight",
                 Setting::FlashlightMount => "Mount",
                 Setting::FlashlightSize => "Size",
+                Setting::FlashlightBeam => "Cone",
+                Setting::FlashlightFade => "Fade",
+                Setting::FlashlightDither => "Dither",
                 Setting::Filter => "Texture filter",
                 Setting::Water => "Water floors",
                 Setting::Bounces => "Reflection bounces",
