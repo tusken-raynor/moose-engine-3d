@@ -142,7 +142,14 @@ impl Source {
     /// facing into the shadow): the outer one with the source wholly outside it, the inner
     /// one with it wholly inside, both facing into the shadow. `None` if the source has no
     /// size, or the edge's line passes through it.
-    fn grazing(&self, a: Vec3, b: Vec3, hard: Half) -> Option<(Half, Half)> {
+    ///
+    /// The outer plane turns no further than keeps the points `keep` (the occluder's) on
+    /// its shadow side. It would pass through the occluder where the source straddles the
+    /// plane of a face next to the edge (a light level with a crate's top, say): from part
+    /// of the source that face is turned away, and its edge is no outline. There the soft
+    /// edge would be all on one side of that plane, and cut through the occluder's own
+    /// shadow; stopped at the face's plane, it fades from there instead.
+    fn grazing(&self, a: Vec3, b: Vec3, hard: Half, keep: &[Vec3]) -> Option<(Half, Half)> {
         let u = (b - a).normalize();
         // Toward the source from the edge's line, square to it; and the sine of the angle
         // the source's radius subtends from the line.
@@ -162,15 +169,25 @@ impl Source {
         let w = u.cross(hard.normal);
         let side = w.dot(c).signum();
         // Turned by that angle, either way: the source's center is then its radius from it.
-        let plane = |t: f32| {
-            let s = t * sin / side;
+        let plane = |s: f32| {
             let m = hard.normal * (1.0 - s * s).sqrt() + w * s;
             Half {
                 normal: m,
                 offset: -m.dot(a),
             }
         };
-        Some((plane(-1.0), plane(1.0)))
+        // The outer plane turns toward `away`: at most as far as the first point of `keep`
+        // it would pass.
+        let away = -w * side;
+        let mut outer = sin.asin();
+        for &p in keep {
+            let q = p - a;
+            let toward = -away.dot(q);
+            if toward > 1e-6 {
+                outer = outer.min(hard.normal.dot(q).max(0.0).atan2(toward));
+            }
+        }
+        Some((plane(-outer.sin() / side), plane(sin / side)))
     }
 }
 
@@ -767,7 +784,7 @@ impl Carver {
         let outline: Vec<(Vec3, Vec3)> =
             (0..n).map(|i| (self.points[i], self.points[(i + 1) % n])).collect();
         let volume = self.volumes.len() as u32;
-        self.add_outline(light, slot, None, &outline, true, center, &[], true);
+        self.add_outline(light, slot, None, &outline, true, center, &[], true, &[]);
         (start..end, volume)
     }
 
@@ -839,7 +856,10 @@ impl Carver {
                 offset: normal.dot(points[face.start]) - CAP_BIAS,
             })
             .collect();
-        self.add_outline(light_ref, slot, owner, &outline, ordered, center, &caps, false);
+        // The occluder's points, which its soft edge's outer side keeps (see
+        // `Source::grazing`).
+        let keep: Vec<Vec3> = self.faces.iter().flat_map(|f| self.points[f.clone()].iter().copied()).collect();
+        self.add_outline(light_ref, slot, owner, &outline, ordered, center, &caps, false, &keep);
     }
 
     /// Adds the volume of a convex outline (its edges, in order around if `ordered`, about
@@ -865,6 +885,7 @@ impl Carver {
         center: Vec3,
         caps: &[Half],
         window: bool,
+        keep: &[Vec3],
     ) {
         let source = Source::of(light);
         let start = self.planes.len() as u32;
@@ -880,7 +901,7 @@ impl Carver {
             };
             // Facing into the shadow: into an occluder's outline, out of a window's.
             let shadow = if window { hard.flip() } else { hard };
-            match source.grazing(a, b, shadow) {
+            match source.grazing(a, b, shadow, keep) {
                 Some((outer, inner)) => {
                     self.planes.push(if window { inner.flip() } else { outer });
                     core.push(if window { outer.flip() } else { inner });
@@ -1911,6 +1932,93 @@ mod tests {
     }
 
     #[test]
+    fn a_light_level_with_a_face_still_softens_the_edge_past_it() {
+        // A crate turned 15 degrees, its top 0.13 m below a light of radius 0.2 some 4 m
+        // away, which shines past it at a wall behind: the light straddles the plane of the
+        // crate's top. Its top edges' soft edges stop at that plane rather than cutting
+        // through the crate, and the shadow on the wall fades at its top.
+        use glam::Quat;
+        let at_light = Vec3::new(-1.22, 2.13, 6.0);
+        let mut light = Light::point(0, at_light, Vec3::ONE, 100.0);
+        light.radius = 0.2;
+        let turn = Quat::from_rotation_y(15f32.to_radians());
+        let corners: Vec<Vec3> =
+            cube(Vec3::ZERO, 0.5).concat().iter().map(|&p| Vec3::new(-2.5, 1.5, 2.0) + turn * p).collect();
+        let mut c = Carver::default();
+        for face in corners.chunks(4) {
+            let start = c.points.len();
+            c.points.extend_from_slice(face);
+            c.faces.push(start..c.points.len());
+        }
+        c.add_volume(&light, 0, None);
+        assert_eq!(c.wedges.len(), 6);
+        for w in &c.wedges {
+            let cut = corners.iter().map(|&p| w.outer.distance(p)).fold(f32::INFINITY, f32::min);
+            assert!(cut > -1e-4, "an outer plane passes {cut} m into the crate");
+        }
+        c.casters.push(Caster {
+            bit: 1,
+            is_static: false,
+            source: Source::Point { at: at_light, radius: 0.0 },
+            range: 100.0,
+            light: Light::point(0, at_light, Vec3::ONE, 100.0),
+            whole: Some(0),
+            windows: 0..0,
+            volumes: 0..1,
+            shadows: true,
+            beam: None,
+        });
+        // The wall at z = 0, facing the light; clip x and y are the wall's.
+        let wall = [
+            Vec3::new(-4.0, 0.0, 0.0),
+            Vec3::new(-1.0, 0.0, 0.0),
+            Vec3::new(-1.0, 4.0, 0.0),
+            Vec3::new(-4.0, 4.0, 0.0),
+        ];
+        let records: Vec<f32> = wall
+            .iter()
+            .enumerate()
+            .flat_map(|(i, p)| {
+                let mut r = vec![p.x, p.y, 10.0, p.x, p.y, p.z];
+                r.extend((0..4).map(|k| if k == i { 1.0 } else { 0.0 }));
+                r
+            })
+            .collect();
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let n = c.carve(&records, &edges, stride, 0, &at(Vec3::Z, wall[0])).len();
+        // Up the wall through the middle of the crate's shadow: full shadow, then its soft
+        // edge (some centimeters of it), then light.
+        // Each piece's outline, and what it is: full shadow, soft, or lit.
+        let pieces: Vec<(Vec<(f32, f32)>, char)> = (0..n)
+            .map(|i| {
+                let p = c.piece(i);
+                let outline = c.records(&p).chunks(stride).map(|r| (r[3], r[4])).collect();
+                let kind = if p.shadowed != 0 { 'F' } else if p.volume_count > 0 { 'S' } else { 'L' };
+                (outline, kind)
+            })
+            .collect();
+        let inside = |outline: &[(f32, f32)], (x, y): (f32, f32)| {
+            let signs = (0..outline.len()).map(|i| {
+                let (a, b) = (outline[i], outline[(i + 1) % outline.len()]);
+                (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0)
+            });
+            let signs: Vec<f32> = signs.filter(|d| d.abs() > 1e-7).collect();
+            signs.iter().all(|&d| d > 0.0) || signs.iter().all(|&d| d < 0.0)
+        };
+        let kinds: Vec<char> = (0..160)
+            .map(|k| {
+                let q = (-3.0, 1.5 + k as f32 * 0.004);
+                pieces.iter().find(|(o, _)| inside(o, q)).map_or('?', |&(_, kind)| kind)
+            })
+            .collect();
+        let line: String = kinds.iter().collect();
+        let (full, lit) = (line.rfind('F').unwrap(), line.find('L').unwrap());
+        assert!(full < lit && line[full + 1..lit].chars().all(|k| k == 'S'), "{line}");
+        assert!(lit - full > 8, "a soft edge over 3 cm: {line}");
+    }
+
+    #[test]
     fn a_corner_touching_the_surface_has_a_value_along_each_edge() {
         // A cube resting on the floor, lit from the side by a light of radius 0.2: its
         // vertical edges' soft edges start at its bottom corners, where how much of the
@@ -2120,7 +2228,7 @@ mod tests {
             (0..4).map(|i| (p[i], p[(i + 1) % 4])).collect()
         };
         let mut c = Carver::default();
-        c.add_outline(&light, 0, None, &opening, true, Vec3::new(0.0, 2.0, 0.0), &[], true);
+        c.add_outline(&light, 0, None, &opening, true, Vec3::new(0.0, 2.0, 0.0), &[], true, &[]);
         c.windows.push((1, 0));
         c.casters.push(Caster {
             bit: 1,
