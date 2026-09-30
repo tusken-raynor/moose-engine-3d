@@ -13,6 +13,8 @@
 //!                         without opening a window
 //!   --at X,Y,Z,YAW,PITCH[,ROLL]  camera for --screenshot (degrees)
 //!   --edit                start in the level editor (Tab switches)
+//!   --view V, --wire, --zoom S  the editor's view (3d, top, front or side; F6), wireframe
+//!                         over the 3D view (F5), and 2D views' pixels per meter
 //!   --select NAME         in the editor, start with the entity NAME (or surface:N)
 //!                         selected
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
@@ -78,6 +80,7 @@
 
 mod editor;
 mod ui;
+mod wire;
 
 use std::path::Path;
 use std::time::Instant;
@@ -196,6 +199,10 @@ struct Options {
     /// Start in the editor, with an entity (by name) or a surface (`surface:N`) selected.
     edit: bool,
     select: Option<String>,
+    /// The editor's view, its wireframe over the 3D view, and its 2D views' scale.
+    view: editor::ViewMode,
+    wire: bool,
+    zoom: Option<f32>,
     at: Option<[f32; 6]>,
     lock_flashlight: Option<[f32; 6]>,
     /// The flashlight locked at this position, aimed this way.
@@ -268,6 +275,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         screenshot: None,
         edit: false,
         select: None,
+        view: editor::ViewMode::Perspective,
+        wire: false,
+        zoom: None,
         at: None,
         lock_flashlight: None,
         flashlight_at: None,
@@ -318,6 +328,17 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--screenshot" => o.screenshot = Some(value()?),
             "--edit" => o.edit = true,
+            "--wire" => o.wire = true,
+            "--view" => {
+                o.view = match value()?.as_str() {
+                    "3d" => editor::ViewMode::Perspective,
+                    "top" => editor::ViewMode::Ortho(wire::Axis::Top),
+                    "front" => editor::ViewMode::Ortho(wire::Axis::Front),
+                    "side" => editor::ViewMode::Ortho(wire::Axis::Side),
+                    _ => return Err("--view is 3d, top, front or side".into()),
+                }
+            }
+            "--zoom" => o.zoom = Some(value()?.parse().map_err(|_| "bad --zoom")?),
             "--select" => o.select = Some(value()?),
             "--at" => o.at = Some(pose(&value()?, "--at")?),
             "--lock-flashlight" => o.lock_flashlight = Some(pose(&value()?, "--lock-flashlight")?),
@@ -682,6 +703,24 @@ impl App {
         app.bake_cube_maps()?;
         app.settings.level_lights = options.level_lights;
         Ok(app)
+    }
+
+    /// Draws the frame: the 3D view, or the editor's 2D view (a wireframe on a grid).
+    /// Returns the view and raster times (none for a 2D view).
+    fn frame(&mut self) -> Result<(f64, f64), String> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if self.editor.on
+            && let Some(ortho) = self.editor.ortho(w, h)
+        {
+            let mut canvas = ui::Canvas {
+                pixels: &mut self.pixels,
+                width: w,
+                height: h,
+            };
+            self.editor.draw_2d(&mut canvas, &ortho, &self.world, &self.assets);
+            return Ok((0.0, 0.0));
+        }
+        self.render()
     }
 
     /// Rebuilds the level from the editor's tables: loads their text (which checks it),
@@ -1695,7 +1734,8 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
         height: app.height as usize,
     };
     if app.editor.on && menu.is_none() {
-        app.editor.draw(&mut canvas, &app.geometry);
+        let camera = app.camera.view();
+        app.editor.draw(&mut canvas, &app.geometry, &camera, &app.world, &app.assets);
     }
     if let Some(lines) = hud {
         ui::draw_hud(&mut canvas, &lines);
@@ -1721,8 +1761,22 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     let shift = down(&[Key::LeftShift, Key::RightShift]);
     let cursor = display.cursor_position();
     let over_panel = cursor.is_some_and(|(x, _)| app.editor.over_panel(x, w, h));
-    app.editor.hover = match cursor {
-        Some((x, y)) if !over_panel => app
+    if display.key_pressed(Key::F5) {
+        app.editor.wire = !app.editor.wire;
+    }
+    if display.key_pressed(Key::F6) {
+        if app.editor.view == editor::ViewMode::Perspective {
+            app.editor.ortho_center = app.camera.position;
+        }
+        app.editor.view = app.editor.view.next();
+        app.editor.hover = None;
+    }
+    let ortho = app.editor.ortho(w, h);
+    app.editor.hover = match (cursor, &ortho) {
+        (Some((x, y)), Some(o)) if !over_panel => {
+            app.editor.pick_2d(o, &app.world, &app.assets, x, y)
+        }
+        (Some((x, y)), None) if !over_panel => app
             .geometry
             .pick(x, y)
             .and_then(|(source, _)| app.editor.selection_of(source)),
@@ -1748,6 +1802,16 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         && !matches!(field, Field::Duplicate | Field::Delete)
     {
         app.edit(field, scroll.signum());
+    }
+    // A 2D view zooms about the pointer.
+    if scroll != 0.0
+        && !over_panel
+        && let (Some(o), Some((x, y))) = (&ortho, cursor)
+    {
+        let before = o.to_world(x, y);
+        app.editor.ortho_scale = (app.editor.ortho_scale * 1.25f32.powf(scroll)).clamp(2.0, 2000.0);
+        let after = app.editor.ortho(w, h).unwrap().to_world(x, y);
+        app.editor.ortho_center += before - after;
     }
     if ctrl {
         if display.key_pressed(Key::Z) {
@@ -1775,12 +1839,27 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     if !matches!(app.editor.selection, Some(Selection::Entity(_))) {
         return false;
     }
-    // Along the world axes nearest the view's forward and right.
-    let f = app.camera.forward();
-    let (forward, right) = if f.x.abs() > f.z.abs() {
-        ((Field::X, f.x.signum()), (Field::Z, f.x.signum()))
-    } else {
-        ((Field::Z, f.z.signum()), (Field::X, -f.z.signum()))
+    // Along the screen's axes in a 2D view; in the 3D view, along the world axes nearest
+    // the view's forward and right.
+    let axis_field = |v: Vec3| {
+        let a = v.abs();
+        if a.x >= a.y && a.x >= a.z {
+            (Field::X, v.x.signum())
+        } else if a.y >= a.z {
+            (Field::Y, v.y.signum())
+        } else {
+            (Field::Z, v.z.signum())
+        }
+    };
+    let (forward, right) = match &ortho {
+        Some(o) => {
+            let (right, up) = o.axis.basis();
+            (axis_field(up), axis_field(right))
+        }
+        None => {
+            let f = app.camera.forward();
+            (axis_field(Vec3::new(f.x, 0.0, f.z)), axis_field(Vec3::new(-f.z, 0.0, f.x)))
+        }
     };
     let moves = [
         (Key::Up, forward),
@@ -1827,6 +1906,10 @@ fn run() -> Result<(), String> {
     }
 
     app.editor.on = options.edit;
+    (app.editor.view, app.editor.wire) = (options.view, options.wire);
+    if let Some(zoom) = options.zoom {
+        app.editor.ortho_scale = zoom;
+    }
     if let Some(name) = &options.select {
         app.editor.selection = Some(match name.strip_prefix("surface:") {
             Some(n) => editor::Selection::Surface(n.parse().map_err(|_| "bad --select")?),
@@ -1844,8 +1927,9 @@ fn run() -> Result<(), String> {
         if let Some(at) = options.at {
             app.place_camera(at, "--at")?;
         }
+        app.editor.ortho_center = app.camera.position;
         app.set_time(options.time);
-        let (view_ms, raster_ms) = app.render()?;
+        let (view_ms, raster_ms) = app.frame()?;
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms));
         draw_ui(&mut app, options.menu.map(|page| (page, 0)), hud);
         app.save_png(Path::new(path))?;
@@ -1974,70 +2058,92 @@ fn run() -> Result<(), String> {
         } else {
             // The editor's mouse and keys; the arrows move its selection, if it has one.
             let editing = app.editor.on && edit_input(&mut app, &display);
-            // Look.
-            let turn = TURN_SPEED * dt;
-            let c = &mut app.camera;
-            if !editing {
-                if display.key_down(Key::Left) {
-                    c.yaw += turn;
+            // A 2D view pans (dragged with the right button, or WASD), and the 3D camera
+            // holds still.
+            let two_d = app.editor.on && app.editor.view != editor::ViewMode::Perspective;
+            if two_d {
+                let (w, h) = (app.width as usize, app.height as usize);
+                let o = app.editor.ortho(w, h).unwrap();
+                let (right, up) = o.axis.basis();
+                let (mx, my) = display.mouse_delta();
+                let mut pan = if looking { (right * -mx + up * my) / o.scale } else { Vec3::ZERO };
+                let key = |k| if display.key_down(k) { 1.0 } else { 0.0 };
+                let ctrl = [Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]
+                    .into_iter()
+                    .any(|k| display.key_down(k));
+                if !ctrl {
+                    let speed = 600.0 * dt / o.scale;
+                    pan += (right * (key(Key::D) - key(Key::A)) + up * (key(Key::W) - key(Key::S))) * speed;
                 }
-                if display.key_down(Key::Right) {
-                    c.yaw -= turn;
-                }
-                if display.key_down(Key::Up) {
-                    c.pitch += turn;
-                }
-                if display.key_down(Key::Down) {
-                    c.pitch -= turn;
-                }
-            }
-            if display.key_down(Key::Q) {
-                c.roll += ROLL_SPEED * dt;
-            }
-            if display.key_down(Key::E) {
-                c.roll -= ROLL_SPEED * dt;
-            }
-            // Mouse look is always on (no button), as in v1, smoothed over time: this
-            // frame's motion (made since the last) is turned evenly over the window from
-            // then on.
-            let (mx, my) = display.mouse_delta();
-            let (mx, my) = if looking { (mx, my) } else { (0.0, 0.0) };
-            let window = MOUSE_SMOOTHING[app.settings.smoothing];
-            let (t0, t1) = (clock, (now - started).as_secs_f64());
-            let (tx, ty) = if window > 0.0 {
-                if (mx, my) != (0.0, 0.0) {
-                    look.push((t0, (mx, my)));
-                }
-                let mut turn = (0.0f32, 0.0f32);
-                for &(start, (x, y)) in &look {
-                    let share = ((t1.min(start + window) - t0.max(start)).max(0.0) / window) as f32;
-                    turn = (turn.0 + x * share, turn.1 + y * share);
-                }
-                look.retain(|&(start, _)| start + window > t1);
-                turn
-            } else {
+                app.editor.ortho_center += pan;
                 look.clear();
-                (mx, my)
-            };
-            c.yaw -= tx * MOUSE_TURN;
-            c.pitch -= ty * MOUSE_TURN;
-            c.pitch = c.pitch.clamp(-1.55, 1.55);
+            }
+            if !two_d {
+                // Look.
+                let turn = TURN_SPEED * dt;
+                let c = &mut app.camera;
+                if !editing {
+                    if display.key_down(Key::Left) {
+                        c.yaw += turn;
+                    }
+                    if display.key_down(Key::Right) {
+                        c.yaw -= turn;
+                    }
+                    if display.key_down(Key::Up) {
+                        c.pitch += turn;
+                    }
+                    if display.key_down(Key::Down) {
+                        c.pitch -= turn;
+                    }
+                }
+                if display.key_down(Key::Q) {
+                    c.roll += ROLL_SPEED * dt;
+                }
+                if display.key_down(Key::E) {
+                    c.roll -= ROLL_SPEED * dt;
+                }
+                // Mouse look is always on (no button), as in v1, smoothed over time: this
+                // frame's motion (made since the last) is turned evenly over the window from
+                // then on.
+                let (mx, my) = display.mouse_delta();
+                let (mx, my) = if looking { (mx, my) } else { (0.0, 0.0) };
+                let window = MOUSE_SMOOTHING[app.settings.smoothing];
+                let (t0, t1) = (clock, (now - started).as_secs_f64());
+                let (tx, ty) = if window > 0.0 {
+                    if (mx, my) != (0.0, 0.0) {
+                        look.push((t0, (mx, my)));
+                    }
+                    let mut turn = (0.0f32, 0.0f32);
+                    for &(start, (x, y)) in &look {
+                        let share = ((t1.min(start + window) - t0.max(start)).max(0.0) / window) as f32;
+                        turn = (turn.0 + x * share, turn.1 + y * share);
+                    }
+                    look.retain(|&(start, _)| start + window > t1);
+                    turn
+                } else {
+                    look.clear();
+                    (mx, my)
+                };
+                c.yaw -= tx * MOUSE_TURN;
+                c.pitch -= ty * MOUSE_TURN;
+                c.pitch = c.pitch.clamp(-1.55, 1.55);
 
-            // Move: WASD along the view, Space/C straight up and down.
-            let mut local = Vec3::ZERO;
-            // (Not with Ctrl: Ctrl+S saves in the editor.)
-            let ctrl = [Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]
-                .into_iter()
-                .any(|k| display.key_down(k));
-            let key = |k| if display.key_down(k) && !ctrl { 1.0 } else { 0.0 };
-            local.z -= key(Key::W) - key(Key::S);
-            local.x += key(Key::D) - key(Key::A);
-            let up = key(Key::Space) - key(Key::C);
-            let fast = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
-            let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
-            let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
-            if delta != Vec3::ZERO {
-                app.fly(delta);
+                // Move: WASD along the view, Space/C straight up and down.
+                let mut local = Vec3::ZERO;
+                // (Not with Ctrl: Ctrl+S saves in the editor.)
+                let ctrl = [Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]
+                    .into_iter()
+                    .any(|k| display.key_down(k));
+                let key = |k| if display.key_down(k) && !ctrl { 1.0 } else { 0.0 };
+                local.z -= key(Key::W) - key(Key::S);
+                local.x += key(Key::D) - key(Key::A);
+                let up = key(Key::Space) - key(Key::C);
+                let fast = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
+                let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
+                let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
+                if delta != Vec3::ZERO {
+                    app.fly(delta);
+                }
             }
         }
         // (While the menu is open too, so closing it doesn't turn by the time it was open.)
@@ -2058,7 +2164,7 @@ fn run() -> Result<(), String> {
             println!("{}", app.command_line(&options, time));
         }
         app.set_time(time);
-        let (view_ms, raster_ms) = app.render()?;
+        let (view_ms, raster_ms) = app.frame()?;
         if display.key_pressed(Key::F12) {
             shots += 1;
             let path = format!("moose-{shots}.png");

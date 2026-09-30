@@ -9,12 +9,32 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use glam::{EulerRot, Quat, Vec3};
-use moose_assets::{EntityKind, LevelDoc};
+use glam::{EulerRot, Quat, Vec2, Vec3};
+use moose_assets::{Assets, EntityKind, LevelDoc};
 use moose_scene::World;
 use moose_view::{PolygonSource, ViewGeometry};
 
 use crate::ui::Canvas;
+use crate::wire::{self, Axis, Ortho, Projection};
+
+/// What the editor shows: the 3D view, or a 2D view along an axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    Perspective,
+    Ortho(Axis),
+}
+
+impl ViewMode {
+    /// The next one (F6): 3D, top, front, side.
+    pub fn next(self) -> ViewMode {
+        match self {
+            ViewMode::Perspective => ViewMode::Ortho(Axis::Top),
+            ViewMode::Ortho(Axis::Top) => ViewMode::Ortho(Axis::Front),
+            ViewMode::Ortho(Axis::Front) => ViewMode::Ortho(Axis::Side),
+            ViewMode::Ortho(Axis::Side) => ViewMode::Perspective,
+        }
+    }
+}
 
 /// What is selected: a surface or an entity, by its row in the level's tables (so it
 /// survives rebuilding the level).
@@ -75,6 +95,12 @@ pub struct Editor {
     status: Option<(String, Instant)>,
     /// The grid step, an index into [`STEPS`].
     pub step: usize,
+    pub view: ViewMode,
+    /// Wireframe over the 3D view (F5).
+    pub wire: bool,
+    /// The 2D views' center and scale (pixels per meter), shared by all three.
+    pub ortho_center: Vec3,
+    pub ortho_scale: f32,
 }
 
 impl Editor {
@@ -90,6 +116,115 @@ impl Editor {
             redo: Vec::new(),
             status: None,
             step: 2,
+            view: ViewMode::Perspective,
+            wire: false,
+            ortho_center: Vec3::ZERO,
+            ortho_scale: 40.0,
+        }
+    }
+
+    /// The 2D view, if one is showing, for a `width` x `height` screen.
+    pub fn ortho(&self, width: usize, height: usize) -> Option<Ortho> {
+        match self.view {
+            ViewMode::Ortho(axis) => Some(Ortho {
+                axis,
+                center: self.ortho_center,
+                scale: self.ortho_scale,
+                width: width as f32,
+                height: height as f32,
+            }),
+            ViewMode::Perspective => None,
+        }
+    }
+
+    /// The level polygon (in the level mesh) drawing surface `surface`, if it is solid.
+    fn mesh_polygon(&self, surface: usize) -> Option<usize> {
+        self.doc.surfaces[surface].adjoin.is_none().then(|| {
+            self.doc.surfaces[..surface].iter().filter(|s| s.adjoin.is_none()).count()
+        })
+    }
+
+    /// The world entity row `row` is, if it isn't a spawn point.
+    fn world_entity(&self, row: usize) -> Option<usize> {
+        (self.doc.entities[row].kind != EntityKind::Spawn).then(|| {
+            self.doc.entities[..row].iter().filter(|e| e.kind != EntityKind::Spawn).count()
+        })
+    }
+
+    /// What is under screen point `(x, y)` in a 2D view: an entity whose outline (its box
+    /// on screen) holds it, the smallest; otherwise the surface with an edge nearest it,
+    /// within a few pixels.
+    pub fn pick_2d(&self, ortho: &Ortho, world: &World, assets: &Assets, x: f32, y: f32) -> Option<Selection> {
+        let at = Vec2::new(x, y);
+        let mut best: Option<(f32, Selection)> = None;
+        for (i, e) in world.entities.iter().enumerate() {
+            let corners = (0..8).map(|k| {
+                let pick = |bit: usize, lo: f32, hi: f32| if k & bit == 0 { lo } else { hi };
+                ortho.to_screen(Vec3::new(
+                    pick(1, e.bounds.min.x, e.bounds.max.x),
+                    pick(2, e.bounds.min.y, e.bounds.max.y),
+                    pick(4, e.bounds.min.z, e.bounds.max.z),
+                ))
+            });
+            let (lo, hi) = corners.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), c| (lo.min(c), hi.max(c)));
+            if at.cmpge(lo).all() && at.cmple(hi).all() {
+                let area = (hi - lo).x * (hi - lo).y;
+                let source = PolygonSource::Entity { entity: i as u32, polygon: 0 };
+                if best.is_none_or(|(a, _)| area < a)
+                    && let Some(selection) = self.selection_of(source)
+                {
+                    best = Some((area, selection));
+                }
+            }
+        }
+        if let Some((_, selection)) = best {
+            return Some(selection);
+        }
+        let geometry = assets.mesh(world.geometry);
+        let mut nearest: Option<(f32, usize)> = None;
+        for (i, polygon) in geometry.polygons.iter().enumerate() {
+            let points: Vec<Vec2> = geometry.polygon_points(polygon).map(|p| ortho.to_screen(p)).collect();
+            for k in 0..points.len() {
+                let d = distance_to_segment(at, points[k], points[(k + 1) % points.len()]);
+                if d < 6.0 && nearest.is_none_or(|(n, _)| d < n) {
+                    nearest = Some((d, i));
+                }
+            }
+        }
+        let (_, polygon) = nearest?;
+        self.selection_of(PolygonSource::World { sector: 0, polygon: polygon as u32 })
+    }
+
+    /// Draws a 2D view: the grid, the level's wireframe, and the selection and what the
+    /// pointer is over, outlined.
+    pub fn draw_2d(&self, canvas: &mut Canvas, ortho: &Ortho, world: &World, assets: &Assets) {
+        wire::draw_grid(canvas, ortho, self.step());
+        let projection = Projection::Ortho(ortho);
+        wire::draw_level(canvas, &projection, world, assets);
+        self.draw_selected(canvas, &projection, world, assets);
+    }
+
+    /// Outlines the selection and what the pointer is over, through `projection`.
+    pub fn draw_selected(&self, canvas: &mut Canvas, projection: &Projection, world: &World, assets: &Assets) {
+        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
+            match selection {
+                Some(Selection::Surface(i)) => {
+                    let Some(polygon) = self.mesh_polygon(i) else { continue };
+                    let geometry = assets.mesh(world.geometry);
+                    let points: Vec<Vec3> = geometry.polygon_points(&geometry.polygons[polygon]).collect();
+                    wire::outline(canvas, projection, &points, color);
+                }
+                Some(Selection::Entity(row)) => {
+                    let Some(e) = self.world_entity(row).and_then(|k| world.entities.get(k)) else { continue };
+                    let mesh = assets.mesh(e.mesh);
+                    let transform = e.transform();
+                    for polygon in &mesh.polygons {
+                        let points: Vec<Vec3> = mesh.polygon_points(polygon).map(|p| transform.transform_point3(p)).collect();
+                        wire::outline(canvas, projection, &points, color);
+                    }
+                }
+                None => {}
+            }
         }
     }
 
@@ -361,23 +496,33 @@ impl Editor {
 
     /// Draws the editor over the frame: outlines of the selection and what's under the
     /// pointer, the properties panel, and the status line.
-    pub fn draw(&self, canvas: &mut Canvas, view: &ViewGeometry) {
-        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
-            let Some(selection) = selection else { continue };
-            for p in &view.polygons {
-                if p.mirror.is_some() || !self.shows(selection, p.source) {
-                    continue;
-                }
-                let v = &view.vertices[p.vertices()];
-                for i in 0..v.len() {
-                    let (a, b) = (v[i], v[(i + 1) % v.len()]);
-                    canvas.line(a.x, a.y, b.x, b.y, color);
+    pub fn draw(&self, canvas: &mut Canvas, view: &ViewGeometry, camera: &moose_scene::View, world: &World, assets: &Assets) {
+        if self.view == ViewMode::Perspective {
+            if self.wire {
+                wire::draw_level(canvas, &Projection::Perspective(camera), world, assets);
+            }
+            for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED)] {
+                let Some(selection) = selection else { continue };
+                for p in &view.polygons {
+                    if p.mirror.is_some() || !self.shows(selection, p.source) {
+                        continue;
+                    }
+                    let v = &view.vertices[p.vertices()];
+                    for i in 0..v.len() {
+                        let (a, b) = (v[i], v[(i + 1) % v.len()]);
+                        canvas.line(a.x, a.y, b.x, b.y, color);
+                    }
                 }
             }
         }
         let layout = self.layout(canvas.width, canvas.height);
         canvas.shade(layout.x, layout.y, layout.width, layout.height, 70);
-        let title = if self.dirty() { "EDITOR  (unsaved)" } else { "EDITOR" };
+        let view = match self.view {
+            ViewMode::Perspective => "3D",
+            ViewMode::Ortho(axis) => axis.name(),
+        };
+        let title = format!("EDITOR  {view}{}", if self.dirty() { "  (unsaved)" } else { "" });
+        let title = title.as_str();
         canvas.text(layout.x + layout.pad, layout.y + layout.pad, title, TITLE, layout.scale);
         for (k, row) in self.panel().iter().enumerate() {
             let y = layout.row_y(k);
@@ -403,9 +548,10 @@ impl Editor {
     }
 
     /// The key hints at the bottom of the panel.
-    fn hints(&self) -> [String; 6] {
+    fn hints(&self) -> [String; 7] {
         [
             format!("Grid {} m (G)", moose_assets::number(self.step())),
+            "F6: 3D/top/front/side. F5: wire".to_string(),
             "Click: select. Hold right: look".to_string(),
             "Scroll or click a row to change it".to_string(),
             "Arrows, PgUp/Dn, [ ]: move, turn".to_string(),
@@ -469,6 +615,13 @@ impl Layout {
         let line = Canvas::line_height(self.scale);
         self.y + self.pad + line * (2 + k)
     }
+}
+
+/// How far `p` is from segment `a`-`b`.
+fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_squared() > 0.0 { ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0) } else { 0.0 };
+    p.distance(a + ab * t)
 }
 
 /// The sector containing `p`.
