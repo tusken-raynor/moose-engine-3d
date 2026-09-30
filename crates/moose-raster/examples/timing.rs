@@ -11,9 +11,10 @@
 //! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
 //! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
 //! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
-//! FLASHLIGHT=beam or FLASHLIGHT=sampled adds the app's flashlight at the camera (shadow slot
-//! 0, 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
-//! beam or lit at sample points. DITHER=1 dithers beams' fades. FLASHLIGHT_SHADOWS=0 turns
+//! FLASHLIGHT=beam, sampled or soft adds the app's flashlight at the camera (shadow slot 0,
+//! 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
+//! beam or lit at sample points (soft: fading over all 20 degrees, with no closer points
+//! where it fades). DITHER=1 dithers beams' fades. FLASHLIGHT_SHADOWS=0 turns
 //! its shadows off (a beam keeps its cone). FAST_BLEND=1 blends partly shadowed pixels by
 //! the fast approximation.
 //!
@@ -114,8 +115,8 @@ fn main() {
     let frames: usize = std::env::var("FRAMES").map_or(500, |f| f.parse().unwrap());
     let flashlight = std::env::var("FLASHLIGHT").ok().map(|f| match f.as_str() {
         "beam" => true,
-        "sampled" => false,
-        _ => panic!("FLASHLIGHT is beam or sampled"),
+        "sampled" | "soft" => false,
+        _ => panic!("FLASHLIGHT is beam, sampled or soft"),
     });
     let level_lights = world.lights().to_vec();
     let (mut view_s, mut raster_s) = (0.0f64, 0.0f64);
@@ -126,7 +127,12 @@ fn main() {
         c.sector = world.find_sector(c.position).unwrap();
         (c.yaw, c.pitch, c.roll) = (rnd(0.0, TAU), rnd(-1.0, 1.0), rnd(-PI / 8.0, PI / 8.0));
         if let Some(beam) = flashlight {
-            let fade: f32 = std::env::var("FADE").map_or(8.0, |f| f.parse().expect("degrees"));
+            let soft = std::env::var("FLASHLIGHT").is_ok_and(|f| f == "soft");
+            let fade: f32 = if soft {
+                20.0
+            } else {
+                std::env::var("FADE").map_or(8.0, |f| f.parse().expect("degrees"))
+            };
             let (color, range, cone) = (Vec3::new(3.4, 3.5, 3.9), 16.0, (20.0 - fade, 20.0));
             let mut light = moose_assets::Light::spot(
                 c.sector,
@@ -137,7 +143,7 @@ fn main() {
                 cone.0,
                 cone.1,
             );
-            (light.shadow, light.radius, light.beam) = (Some(0), 0.05, beam);
+            (light.shadow, light.radius, light.beam, light.coarse) = (Some(0), 0.05, beam, soft);
             light.shadows = std::env::var("FLASHLIGHT_SHADOWS").map_or(true, |s| s != "0");
             let mut lights = level_lights.clone();
             lights.push(light);

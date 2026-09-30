@@ -29,7 +29,9 @@
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
 //!   --cone MODE           how the flashlight's cone is drawn: beam (faded pixel by pixel
-//!                         with its shadow; the default) or sampled (lit at sample points)
+//!                         with its shadow; the default), sampled (lit at sample points)
+//!                         or soft (lit at sample points as they are, fading over all 20
+//!                         degrees: the cheapest)
 //!   --no-shadows          start with shadows off
 //!   --no-sun              start with the level's directional lights off
 //!   --light-scale K       the level's point and spot lights' source sizes (their shadows'
@@ -141,6 +143,16 @@ const FLASHLIGHT_COLOR: Vec3 = Vec3::new(3.4, 3.5, 3.9);
 const FLASHLIGHT_RANGE: f32 = 16.0;
 /// Its cone's outer half-angle, in degrees.
 const FLASHLIGHT_OUTER: f32 = 20.0;
+/// How the flashlight's cone is drawn: a beam (its cone drawn pixel by pixel with its
+/// shadow; see `Light::beam`), lit at sample points, or lit at them as they are and fading
+/// over all of it (see `Light::coarse`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cone {
+    Beam,
+    Sampled,
+    Soft,
+}
+
 /// How wide its cone fades inside that, in degrees, as the menu steps through them
 /// (`--flashlight-fade`): the inner half-angle is the outer less this. 0 is a hard edge.
 const FLASHLIGHT_FADES: [f32; 6] = [0.0, 2.0, 4.0, 8.0, 14.0, 20.0];
@@ -192,7 +204,7 @@ struct Options {
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
-    beam: bool,
+    cone: Cone,
     level_lights: bool,
     no_shadows: bool,
     no_sun: bool,
@@ -255,7 +267,7 @@ fn parse_args() -> Result<Options, String> {
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
         water: false,
         no_flashlight: false,
-        beam: true,
+        cone: Cone::Beam,
         no_shadows: false,
         no_sun: false,
         light_scale: 1.0,
@@ -315,10 +327,11 @@ fn parse_args() -> Result<Options, String> {
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--cone" => {
-                o.beam = match value()?.as_str() {
-                    "beam" => true,
-                    "sampled" => false,
-                    _ => return Err("--cone is beam or sampled".into()),
+                o.cone = match value()?.as_str() {
+                    "beam" => Cone::Beam,
+                    "sampled" => Cone::Sampled,
+                    "soft" => Cone::Soft,
+                    _ => return Err("--cone is beam, sampled or soft".into()),
                 }
             }
             "--no-shadows" => o.no_shadows = true,
@@ -409,9 +422,8 @@ struct Settings {
     /// How wide the flashlight's cone fades inside its edge, in degrees (one of
     /// `FLASHLIGHT_FADES`).
     flashlight_fade: f32,
-    /// The flashlight is a beam: its cone is drawn with its shadow, pixel by pixel, not lit
-    /// at sample points (see `Light::beam`).
-    beam: bool,
+    /// How the flashlight's cone is drawn.
+    cone: Cone,
     /// Where the flashlight was left when it was locked in place (sector, position,
     /// direction); `None` while it is on the player's shoulder.
     flashlight_lock: Option<(u32, Vec3, Vec3)>,
@@ -614,7 +626,7 @@ impl App {
                 sun_angle: options.sun_angle.map(|a| a.clamp(0.0, 45.0)),
                 light_radius: options.light_radius.max(0.0),
                 flashlight_fade: options.flashlight_fade.clamp(0.0, FLASHLIGHT_OUTER),
-                beam: options.beam,
+                cone: options.cone,
                 flashlight_lock: None,
                 smoothing: 2,
                 capped: options.fps != 0,
@@ -753,7 +765,8 @@ impl App {
             // Shadow slot 0: the view carves its shadows into polygons.
             light.shadow = self.settings.shadows.then_some(0);
             light.radius = self.settings.light_radius;
-            light.beam = self.settings.beam;
+            light.beam = self.settings.cone == Cone::Beam;
+            light.coarse = self.settings.cone == Cone::Soft;
             lights.push(light);
         }
         self.world.set_lights(lights, self.lights.1);
@@ -768,14 +781,26 @@ impl App {
             FLASHLIGHT_COLOR,
             FLASHLIGHT_RANGE,
             direction,
-            FLASHLIGHT_OUTER - self.settings.flashlight_fade,
+            FLASHLIGHT_OUTER - self.flashlight_fade(),
             FLASHLIGHT_OUTER,
         )
     }
 
     /// How the flashlight's cone is drawn, as `--cone` names it.
     fn cone_name(&self) -> &'static str {
-        if self.settings.beam { "beam" } else { "sampled" }
+        match self.settings.cone {
+            Cone::Beam => "beam",
+            Cone::Sampled => "sampled",
+            Cone::Soft => "soft",
+        }
+    }
+
+    /// How wide the flashlight's cone fades, in degrees: all of it for a soft cone.
+    fn flashlight_fade(&self) -> f32 {
+        match self.settings.cone {
+            Cone::Soft => FLASHLIGHT_OUTER,
+            _ => self.settings.flashlight_fade,
+        }
     }
 
     /// Puts the camera at `[x, y, z, yaw, pitch]` (degrees); `option` names it in errors.
@@ -849,9 +874,10 @@ impl App {
                 if s.flashlight_lock.is_some() { "locked here" } else { "shoulder" }.into()
             }
             Setting::FlashlightSize => format!("{} cm", (s.light_radius * 100.0).round()),
-            Setting::FlashlightFade => match s.flashlight_fade {
-                0.0 => "hard".into(),
-                fade => format!("{fade}°"),
+            Setting::FlashlightFade => match (s.cone, s.flashlight_fade) {
+                (Cone::Soft, _) => format!("{FLASHLIGHT_OUTER}° (soft)"),
+                (_, 0.0) => "hard".into(),
+                (_, fade) => format!("{fade}°"),
             },
             Setting::FlashlightDither => on(cfg.beam_dither),
             Setting::FlashlightBeam => self.cone_name().into(),
@@ -928,7 +954,11 @@ impl App {
             Setting::FlashlightFade => {
                 s.flashlight_fade = cycle(&FLASHLIGHT_FADES, s.flashlight_fade, dir)
             }
-            Setting::FlashlightBeam => s.beam = !s.beam,
+            Setting::FlashlightBeam => {
+                const CONES: [Cone; 3] = [Cone::Beam, Cone::Sampled, Cone::Soft];
+                let i = CONES.iter().position(|&c| c == s.cone).unwrap_or(0);
+                s.cone = CONES[wrap(i, CONES.len())];
+            }
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
             Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
             Setting::Water => s.water = !s.water,

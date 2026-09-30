@@ -1539,7 +1539,7 @@ fn build_tiles(
         let points = [(xa, ya), (xb, ya), (xa, yb), (xb, yb), ((xa + xb) / 2.0, (ya + yb) / 2.0)];
         spots
             .iter()
-            .filter(|l| !l.is_point() && !l.beam)
+            .filter(|l| !l.is_point() && !l.beam && !l.coarse)
             .map(|l| {
                 let (scale, offset) = l.cone();
                 let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);

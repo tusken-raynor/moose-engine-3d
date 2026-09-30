@@ -1631,10 +1631,17 @@ impl Run<'_> {
             let color = self.job.split_colors[j].to_array();
             split.light[j] = color.map(|c| F32s::fill(c) * strength);
             let reaches = &self.job.reaches[j * len..(j + 1) * len];
-            split.reaches[j] = F32s::from(std::array::from_fn::<f32, LANES, _>(|i| {
-                let px = first + i as i32 * STRIDE - self.x0;
-                reaches[px.clamp(0, len as i32 - 1) as usize]
-            }));
+            let start = first - self.x0;
+            split.reaches[j] = if STRIDE == 1 && start >= 0 && start as usize + LANES <= len {
+                // Side by side and all in the run: read at once.
+                let at = start as usize;
+                F32s::from(<[f32; LANES]>::try_from(&reaches[at..at + LANES]).unwrap())
+            } else {
+                F32s::from(std::array::from_fn::<f32, LANES, _>(|i| {
+                    let px = start + i as i32 * STRIDE;
+                    reaches[px.clamp(0, len as i32 - 1) as usize]
+                }))
+            };
         }
         if split.count > 0 {
             let t = split.count;

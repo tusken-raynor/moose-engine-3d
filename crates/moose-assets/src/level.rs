@@ -80,6 +80,10 @@ pub struct Light {
     /// and the renderer's shadow buffer fades the light across the cone in the part inside
     /// (see [`Light::sample_cone`]). It needs a shadow slot.
     pub beam: bool,
+    /// A spot light whose cone is lit at sample points as they are, with no closer ones
+    /// where it fades (the renderer's penumbra rule): for a soft cone, which they follow
+    /// anyway, at no cost over a point light.
+    pub coarse: bool,
 }
 
 /// A light swinging back and forth through its position: `offset` either way, smoothly (a
@@ -139,6 +143,7 @@ impl Light {
             is_static: false,
             motion: None,
             beam: false,
+            coarse: false,
         }
     }
 
@@ -159,6 +164,7 @@ impl Light {
             is_static: false,
             motion: None,
             beam: false,
+            coarse: false,
         }
     }
 
@@ -188,6 +194,7 @@ impl Light {
             is_static: false,
             motion: None,
             beam: false,
+            coarse: false,
         }
     }
 
