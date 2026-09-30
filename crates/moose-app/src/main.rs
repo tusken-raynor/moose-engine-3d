@@ -59,6 +59,9 @@
 //!   --level-lights        start with the level's own lights on (off by default, leaving the
 //!                         flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
+//!   --bench N             for --screenshot: render the frame N more times and print the
+//!                         average view and raster times (for measuring)
+//!   --show-shadow-mesh    overlay the shadow pieces' outlines (F4; see `draw_shadow_mesh`)
 //!   --show-samples        overlay where shading is sampled (sample rows red, sample
 //!                         points green)
 //!   --min-step N          smallest sample spacing on steep surfaces, in pixels
@@ -76,7 +79,7 @@
 //! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift
 //! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
 //! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
-//! reproduces this view, F3 debug HUD, Alt+Enter fullscreen, F12 screenshot. Every other setting
+//! reproduces this view, F3 debug HUD, F4 shadow mesh, Alt+Enter fullscreen, F12 screenshot. Every other setting
 //! is in the menu. While playing, the cursor is locked (hidden) for mouse look; in the menu
 //! it is free.
 
@@ -239,7 +242,11 @@ struct Options {
     light_radius: f32,
     flashlight_fade: f32,
     time: f32,
+    /// For --screenshot: render the frame this many times more, and report the average.
+    bench: u32,
     show_samples: bool,
+    /// Draw the shadow pieces' outlines over the frame (F4).
+    show_shadow_mesh: bool,
     dither_beam: bool,
     /// `RasterConfig` spacing limits, if given.
     min_step: Option<u32>,
@@ -312,7 +319,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         flashlight_fade: FLASHLIGHT_FADES[3],
         level_lights: false,
         time: 0.0,
+        bench: 0,
         show_samples: false,
+        show_shadow_mesh: false,
         dither_beam: false,
         min_step: None,
         light_spacing: None,
@@ -407,6 +416,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--level-lights" => o.level_lights = true,
             "--show-samples" => o.show_samples = true,
+            "--show-shadow-mesh" => o.show_shadow_mesh = true,
             "--dither-beam" => o.dither_beam = true,
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
             "--light-spacing" => {
@@ -429,6 +439,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                 o.step_threshold = Some(value()?.parse().map_err(|_| "bad --step-threshold")?)
             }
             "--time" => o.time = value()?.parse().map_err(|_| "bad --time")?,
+            "--bench" => o.bench = value()?.parse().map_err(|_| "bad --bench")?,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -482,6 +493,8 @@ struct Settings {
     cap: u32,
     /// The debug HUD is showing; F3 toggles.
     hud: bool,
+    /// The shadow pieces' outlines are drawn over the frame; F4 toggles.
+    shadow_mesh: bool,
 }
 
 /// A mirror ball's baked surroundings.
@@ -695,6 +708,7 @@ impl App {
                 capped: options.fps != 0,
                 cap: if options.fps == 0 { MAX_FPS } else { options.fps },
                 hud: options.hud || options.screenshot.is_none(),
+                shadow_mesh: options.show_shadow_mesh,
             },
             time: 0.0,
             levels: level_files(root),
@@ -1259,6 +1273,7 @@ impl App {
             Setting::PerPixelCrates => on(s.per_pixel_crates),
             Setting::FrameCap => if s.capped { format!("{} fps", s.cap) } else { "off".into() },
             Setting::Overlay => on(cfg.show_samples),
+            Setting::ShadowMesh => on(s.shadow_mesh),
             Setting::MinStep => format!("{} px", cfg.min_step),
             Setting::LightSpacing => format!("{} px", cfg.light_spacing),
             Setting::SteepLimit => {
@@ -1340,6 +1355,7 @@ impl App {
             Setting::PerPixelCrates => s.per_pixel_crates = !s.per_pixel_crates,
             Setting::FrameCap => s.capped = !s.capped,
             Setting::Overlay => cfg.show_samples = !cfg.show_samples,
+            Setting::ShadowMesh => s.shadow_mesh = !s.shadow_mesh,
             Setting::MinStep => {
                 cfg.min_step = cycle(&PIXEL_STEPS, cfg.min_step as f32, dir) as u32;
             }
@@ -1454,6 +1470,7 @@ impl App {
             (s.translucent_crates, "--translucent-crates"),
             (s.per_pixel_crates, "--per-pixel-crates"),
             (cfg.show_samples, "--show-samples"),
+            (s.shadow_mesh, "--show-shadow-mesh"),
             (cfg.beam_dither, "--dither-beam"),
         ] {
             if on {
@@ -1758,6 +1775,7 @@ enum Setting {
     PerPixelCrates,
     FrameCap,
     Overlay,
+    ShadowMesh,
     MinStep,
     LightSpacing,
     SteepLimit,
@@ -1851,6 +1869,7 @@ impl Page {
             ],
             Page::Sampling => &[
                 Set(Overlay),
+                Set(ShadowMesh),
                 Set(MinStep),
                 Set(LightSpacing),
                 Set(SteepLimit),
@@ -1924,6 +1943,7 @@ impl Item {
                 Setting::PerPixelCrates => "Per-pixel crates",
                 Setting::FrameCap => "Frame cap",
                 Setting::Overlay => "Sample overlay",
+                Setting::ShadowMesh => "Shadow mesh",
                 Setting::MinStep => "Minimum step",
                 Setting::LightSpacing => "Light spacing",
                 Setting::SteepLimit => "Steep limit",
@@ -1953,6 +1973,9 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
         width: app.width as usize,
         height: app.height as usize,
     };
+    if app.settings.shadow_mesh && !(app.editor.on && app.editor.view != editor::ViewMode::Perspective) {
+        draw_shadow_mesh(&mut canvas, &app.geometry);
+    }
     if app.editor.on && menu.is_none() {
         let camera = app.camera.view();
         app.editor.draw(&mut canvas, &camera, &app.world, &app.assets);
@@ -1967,6 +1990,65 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
             _ => "Up/Down choose   Left/Right change   Backspace back",
         };
         ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), hint);
+    }
+}
+
+/// Draws the last frame's shadow pieces (see `ViewGeometry::shadow_pieces`) over it, for
+/// seeing how shadows are carved: each piece's outline, colored by what it is, and a dot
+/// at each corner as bright as the light reaching it.
+///
+/// - Red: full shadow (none of the light reaches any corner; for a beam, also outside its
+///   pyramid).
+/// - Yellow: a soft edge (some of the light at some corner).
+/// - Cyan: all of the light, inside a beam's pyramid (its cone is worked out per pixel).
+/// - Green: all of the light (the lit parts a polygon is split into).
+///
+/// Pieces on polygons seen in mirrors are drawn dimmer.
+fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
+    let dim = |c: u32| (c >> 1) & 0x7F7F7F;
+    for polygon in &geometry.polygons {
+        let pieces = &geometry.shadow_pieces[polygon.first_shadow as usize..][..polygon.shadow_count as usize];
+        for piece in pieces {
+            let vertices =
+                &geometry.shadow_vertices[piece.first_vertex as usize..][..piece.vertex_count as usize];
+            if vertices.is_empty() {
+                continue;
+            }
+            let (lo, hi) = vertices
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v.light), hi.max(v.light)));
+            let color = if hi <= 0.0 {
+                0xE0_40_40
+            } else if lo < 1.0 {
+                0xF0_D0_40
+            } else if piece.beam.is_some() {
+                0x40_E0_E0
+            } else {
+                0x40_C0_40
+            };
+            let color = if polygon.mirror.is_some() { dim(color) } else { color };
+            for (i, a) in vertices.iter().enumerate() {
+                let b = &vertices[(i + 1) % vertices.len()];
+                canvas.line(a.x, a.y, b.x, b.y, color);
+            }
+            for v in vertices {
+                let g = (v.light.clamp(0.0, 1.0) * 255.0) as u32;
+                canvas.fill_centered(v.x, v.y, 3, g << 16 | g << 8 | g);
+            }
+        }
+    }
+    // The legend, bottom left.
+    let scale = if canvas.height >= 600 { 2 } else { 1 };
+    let line = ui::Canvas::line_height(scale);
+    let entries = [("full shadow", 0xE0_40_40), ("soft edge", 0xF0_D0_40), ("beam, lit", 0x40_E0_E0), ("lit", 0x40_C0_40)];
+    let gap = ui::Canvas::text_width("  ", scale);
+    let width = entries.iter().map(|(t, _)| ui::Canvas::text_width(t, scale) + gap).sum::<usize>() + gap;
+    let y = canvas.height.saturating_sub(2 * line);
+    canvas.shade(0, y.saturating_sub(line / 2), width, 2 * line, 90);
+    let mut x = gap / 2;
+    for (text, color) in entries {
+        canvas.text(x, y, text, color, scale);
+        x += ui::Canvas::text_width(text, scale) + gap;
     }
 }
 
@@ -2307,6 +2389,15 @@ fn run() -> Result<(), String> {
         app.editor.ortho_center = app.camera.position;
         app.set_time(options.time);
         let (view_ms, raster_ms) = app.frame()?;
+        if options.bench > 0 {
+            let (mut view, mut raster) = (0.0, 0.0);
+            for _ in 0..options.bench {
+                let (v, r) = app.frame()?;
+                (view, raster) = (view + v, raster + r);
+            }
+            let n = options.bench as f64;
+            println!("{} frames: view {:.3} ms, raster {:.3} ms on average", options.bench, view / n, raster / n);
+        }
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
         draw_ui(&mut app, options.menu.map(|page| (page, 0)), hud);
         app.save_png(Path::new(path))?;
@@ -2549,6 +2640,9 @@ fn run() -> Result<(), String> {
         clock = (now - started).as_secs_f64();
         if display.key_pressed(Key::F3) {
             app.settings.hud = !app.settings.hud;
+        }
+        if display.key_pressed(Key::F4) {
+            app.settings.shadow_mesh = !app.settings.shadow_mesh;
         }
         if !menu.open && display.key_pressed(Key::U) {
             app.change(Setting::FlashlightMount, 1);
