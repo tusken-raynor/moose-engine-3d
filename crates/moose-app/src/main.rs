@@ -28,6 +28,7 @@
 //!   --water               shiny floors start as water, not plain reflective tiles;
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
+//!   --fullscreen          start fullscreen (F11 switches)
 //!   --cone MODE           how the flashlight's cone is drawn: beam (faded pixel by pixel
 //!                         with its shadow; the default), sampled (lit at sample points)
 //!                         or soft (lit at sample points as they are, fading over all 20
@@ -68,7 +69,9 @@
 //! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift
 //! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
 //! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
-//! reproduces this view, F3 debug HUD, F12 screenshot. Every other setting is in the menu.
+//! reproduces this view, F3 debug HUD, F11 fullscreen, F12 screenshot. Every other setting
+//! is in the menu. While playing, the cursor is locked (hidden) for mouse look; in the menu
+//! it is free.
 
 mod ui;
 
@@ -202,6 +205,7 @@ struct Options {
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
+    fullscreen: bool,
     cone: Cone,
     level_lights: bool,
     no_shadows: bool,
@@ -264,6 +268,7 @@ fn parse_args() -> Result<Options, String> {
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
         water: false,
         no_flashlight: false,
+        fullscreen: false,
         cone: Cone::Beam,
         no_shadows: false,
         no_sun: false,
@@ -322,6 +327,7 @@ fn parse_args() -> Result<Options, String> {
             "--floor-texture" => o.floor_texture = value()?,
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
+            "--fullscreen" => o.fullscreen = true,
             "--cone" => {
                 o.cone = match value()?.as_str() {
                     "beam" => Cone::Beam,
@@ -1481,7 +1487,7 @@ impl Page {
                 "Space/C up/down, Shift faster",
                 "U lock the flashlight in place / remount it",
                 "Esc menu, F1 print a command line for this view",
-                "F3 debug HUD, F12 screenshot",
+                "F3 debug HUD, F11 fullscreen, F12 screenshot",
             ],
             Page::Flashlight => &[
                 "Locking leaves it where it is: walk around",
@@ -1624,6 +1630,7 @@ fn run() -> Result<(), String> {
     let s = &app.settings;
     let mut display =
         Display::open(&title, app.width, app.height, if s.capped { s.cap } else { 0 })?;
+    display.set_fullscreen(options.fullscreen);
     let mut capped = s.capped;
     let mut shots = 0;
     let mut last = Instant::now();
@@ -1651,6 +1658,11 @@ fn run() -> Result<(), String> {
             (menu.page, menu.selected) = (Page::Main, 0);
             menu.back.clear();
         }
+        if display.key_pressed(Key::F11) {
+            display.set_fullscreen(!display.is_fullscreen());
+        }
+        // Mouse look while playing; a free pointer in the menu.
+        display.set_cursor_locked(!menu.open);
         if menu.open {
             // The menu has the keys; the view holds still (the pointer's motion is dropped).
             display.mouse_delta();
