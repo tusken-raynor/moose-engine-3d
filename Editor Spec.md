@@ -10,7 +10,7 @@ The editor is a mode of the app, not a separate program: Tab switches between pl
 
 - picking with the mouse in the 3D view and in 2D views (top, front, side), with hover and selection outlines
 - a properties panel on the right: click a row to toggle or cycle it, scroll over it to change a number
-- entity editing: move, turn, scale, kind, model, static, occluder, duplicate, delete
+- entity editing: move, turn, scale, kind, model, animation, static, occluder, duplicate, delete
 - sector tools: extrude, push/pull, cleave, open and wall up, new room, delete sector, vertex moves
 - placement: lights (with spot cones), props, spawn points; the level's ambient light and sun
 - texture alignment on surfaces (levels with uvs)
@@ -18,7 +18,7 @@ The editor is a mode of the app, not a separate program: Tab switches between pl
 
 **Next:**
 
-- a model format of our own with a Blender exporter, a mesh editor, and skeletal animation (see Planned below)
+- a Blender exporter and a mesh editor (the model format and skeletal animation are built: see the Model Format Spec)
 - typing values and names (the display now reports typed text)
 - rubber-band and multiple selection; moving by dragging
 - per-sector properties once the level format has them
@@ -59,7 +59,7 @@ The panel shows what the selection can do; most rows are also on keys.
 | Surface | Its sector (click to select the sector), and for a solid surface: reflective, sky, extrude by (scroll), extrude, push/pull (scroll, or PgUp/PgDn), open to a matching surface of another sector, texture rows; for an opening: the sector it opens to, wall it up |
 | Sector | Cleave (then click the cut's two ends in a 2D view; Esc stops), delete |
 | Vertex | X, Y, Z (also the arrows and PgUp/PgDn) |
-| Entity | Kind, model (cycles through assets/models), position, yaw/pitch/roll, scale, static, occluder (mesh or none), duplicate, delete |
+| Entity | Kind, model (cycles through assets/models), animation (for a model with them: its animations, or none), position, yaw/pitch/roll, scale, static, occluder (mesh or none), duplicate, delete |
 | Light | Position, color, range, source radius, shadows, spot on/off with aim and cone angles, duplicate, delete |
 
 **Sector tools** are `LevelDoc` methods in `moose_assets` (`mmp_edit.rs`), each tested by loading its result:

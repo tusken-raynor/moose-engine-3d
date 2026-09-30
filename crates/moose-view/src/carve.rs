@@ -468,7 +468,7 @@ pub(crate) struct Carver {
     /// An occluder's faces, as ranges of `points`.
     faces: Vec<Range<usize>>,
     /// Whether each occluder model seen so far is convex.
-    convex: HashMap<MeshId, bool>,
+    convex: HashMap<(MeshId, usize), bool>,
     next_points: Vec<Vec3>,
     /// Sectors to visit from a light: (sector, window in, portal depth).
     stack: Vec<(u32, Option<Window>, u16)>,
@@ -597,36 +597,39 @@ impl Carver {
                     Occluder::Facing { .. } => None,
                 };
                 match (proxy, entity.occluder) {
-                    (Some(mesh), _) => {
-                        let convex = *self
-                            .convex
-                            .entry(mesh)
-                            .or_insert_with(|| is_convex(assets.mesh(mesh)));
-                        let mesh = assets.mesh(mesh);
-                        self.points.clear();
-                        self.faces.clear();
-                        for polygon in &mesh.polygons {
-                            let start = self.points.len();
-                            self.points.extend(
-                                mesh.polygon_points(polygon)
-                                    .map(|p| transform.transform_point3(p)),
-                            );
-                            self.faces.push(start..self.points.len());
-                        }
-                        if convex {
-                            self.add_volume(light, slot, owner);
-                        } else {
-                            // Any other shape: each face toward the light casts its own
-                            // volume, which together are exactly its shadow. Hard-edged
-                            // for now: soft edges need its silhouette's edges only.
-                            let hard = Light { radius: 0.0, ..*light };
-                            let faces = std::mem::take(&mut self.faces);
-                            for face in &faces {
-                                self.faces.clear();
-                                self.faces.push(face.clone());
-                                self.add_volume(&hard, slot, owner);
+                    (Some(mesh_id), _) => {
+                        let mesh = assets.mesh(mesh_id);
+                        // Its parts: its shadow proxies bone by bone, or the model whole.
+                        for (part, polygons) in occluder_parts(mesh).iter().enumerate() {
+                            let convex = *self
+                                .convex
+                                .entry((mesh_id, part))
+                                .or_insert_with(|| is_convex(mesh, polygons));
+                            self.points.clear();
+                            self.faces.clear();
+                            for &k in polygons {
+                                let start = self.points.len();
+                                self.points.extend(
+                                    mesh.polygon_points(&mesh.polygons[k])
+                                        .map(|p| transform.transform_point3(p)),
+                                );
+                                self.faces.push(start..self.points.len());
                             }
-                            self.faces = faces;
+                            if convex {
+                                self.add_volume(light, slot, owner);
+                            } else {
+                                // Any other shape: each face toward the light casts its own
+                                // volume, which together are exactly its shadow. Hard-edged
+                                // for now: soft edges need its silhouette's edges only.
+                                let hard = Light { radius: 0.0, ..*light };
+                                let faces = std::mem::take(&mut self.faces);
+                                for face in &faces {
+                                    self.faces.clear();
+                                    self.faces.push(face.clone());
+                                    self.add_volume(&hard, slot, owner);
+                                }
+                                self.faces = faces;
+                            }
                         }
                     }
                     (None, Occluder::Facing { sides, radius, center }) => {
@@ -728,6 +731,8 @@ impl Carver {
     /// (a static entity moved, a surface edited), when they may no longer hold.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+        // Meshes may have been replaced (models reloaded, posed copies reused).
+        self.convex.clear();
         self.cache_keys = [None; MAX_SHADOW_SLOTS as usize];
     }
 
@@ -1534,13 +1539,40 @@ fn portal_point(geometry: &Mesh, portal: &moose_assets::Portal) -> Vec3 {
 
 /// Whether a mesh is convex: every position on or behind every polygon's plane (within a
 /// small tolerance for its size).
-fn is_convex(mesh: &Mesh) -> bool {
+/// Whether polygons `polygons` of `mesh` bound a convex shape: every one of their points
+/// on or behind each of their planes.
+fn is_convex(mesh: &Mesh, polygons: &[usize]) -> bool {
     let tolerance = 1e-4 * (mesh.bounds.max - mesh.bounds.min).length().max(1e-3);
-    mesh.polygons.iter().all(|polygon| {
-        mesh.positions
+    polygons.iter().all(|&k| {
+        let plane = mesh.polygons[k].plane;
+        polygons
             .iter()
-            .all(|&p| polygon.plane.distance(p) <= tolerance)
+            .flat_map(|&j| mesh.polygon_points(&mesh.polygons[j]))
+            .all(|p| plane.distance(p) <= tolerance)
     })
+}
+
+/// The polygons a model casts shadows with, in parts (each convex, or cast face by face):
+/// its shadow proxies, one part per bone (by their first corner's bone), if it has any;
+/// otherwise all its polygons as one.
+fn occluder_parts(mesh: &Mesh) -> Vec<Vec<usize>> {
+    let proxies: Vec<usize> = (0..mesh.polygons.len()).filter(|&k| mesh.polygons[k].flags.proxy()).collect();
+    if proxies.is_empty() {
+        return vec![(0..mesh.polygons.len()).collect()];
+    }
+    let Some(skin) = &mesh.skin else {
+        return vec![proxies];
+    };
+    let mut parts: Vec<(u16, Vec<usize>)> = Vec::new();
+    for k in proxies {
+        let first = mesh.vertex_positions[mesh.polygons[k].first_vertex as usize];
+        let bone = skin.position_bones[first as usize];
+        match parts.iter_mut().find(|(b, _)| *b == bone) {
+            Some((_, part)) => part.push(k),
+            None => parts.push((bone, vec![k])),
+        }
+    }
+    parts.into_iter().map(|(_, part)| part).collect()
 }
 
 /// Clips a convex outline to the half-space of `plane` (keeping points on it).

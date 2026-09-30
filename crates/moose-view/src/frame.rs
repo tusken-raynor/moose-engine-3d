@@ -646,6 +646,9 @@ impl ViewGeometry {
             let mesh = assets.mesh(entity.mesh);
             let model = entity.transform();
             for (pi, polygon) in mesh.polygons.iter().enumerate() {
+                if polygon.flags.proxy() {
+                    continue;
+                }
                 points.clear();
                 points.extend(mesh.polygon_points(polygon).map(|p| model.transform_point3(p)));
                 let receiver = Receiver {
@@ -1065,6 +1068,10 @@ impl ViewGeometry {
                     PolygonKind::Prop
                 };
                 for (pi, polygon) in mesh.polygons.iter().enumerate() {
+                    // Shadow proxies aren't drawn.
+                    if polygon.flags.proxy() {
+                        continue;
+                    }
                     if polygon.plane.distance(eye_model) <= 0.0 {
                         self.stats.entity_polygons_backfacing += 1;
                         continue;

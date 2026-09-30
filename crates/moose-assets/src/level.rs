@@ -307,6 +307,8 @@ pub struct EntitySpawn {
     pub is_static: bool,
     /// What it casts shadows with.
     pub occluder: Occluder,
+    /// The animation it plays (by name), if its model has a skeleton.
+    pub animation: Option<String>,
 }
 
 /// The shape an entity blocks light with, for lights that cast shadows: its model unless

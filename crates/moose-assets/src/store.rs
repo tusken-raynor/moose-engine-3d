@@ -48,6 +48,10 @@ impl Assets {
         &self.meshes[id.0 as usize]
     }
 
+    pub fn mesh_mut(&mut self, id: MeshId) -> &mut Mesh {
+        &mut self.meshes[id.0 as usize]
+    }
+
     pub fn meshes(&self) -> &[Mesh] {
         &self.meshes
     }
@@ -81,10 +85,11 @@ impl Assets {
         let src = read(&path)?;
         match path.extension().and_then(|e| e.to_str()) {
             Some("obj") => obj::parse_obj(&path, name, &src),
+            Some("mmdl") => crate::mmdl::parse_mmdl(&path, name, &src),
             _ => Err(LoadError::new(
                 &path,
                 None,
-                "unsupported model format (expected .obj)",
+                "unsupported model format (expected .obj or .mmdl)",
             )),
         }
     }

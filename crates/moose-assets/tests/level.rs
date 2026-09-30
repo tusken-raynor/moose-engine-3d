@@ -678,3 +678,50 @@ fn cleaving_keeps_attributes_and_splits_every_opening_it_crosses() {
     d.cleave(room_b, Vec3::Z, Vec3::new(0.0, 0.0, -16.5)).unwrap();
     loads(&d);
 }
+
+#[test]
+fn the_walker_loads_with_its_skeleton_and_walks() {
+    let mut assets = assets();
+    let id = assets.load_mesh("walker.mmdl").unwrap();
+    let mesh = assets.mesh(id);
+    let skin = mesh.skin.as_ref().expect("a skeleton");
+    assert_eq!(skin.bones.len(), 7);
+    assert_eq!(skin.position_bones.len(), mesh.positions.len());
+    let proxies = mesh.polygons.iter().filter(|p| p.flags.proxy()).count();
+    let drawn = mesh.polygons.len() - proxies;
+    assert_eq!((drawn, proxies), (42, 42));
+    let walk = skin.animation("walk").unwrap();
+    assert!(skin.animation("idle").is_some());
+    // A quarter of the way through the walk (0.25 s of 1 s), the left leg swings 0.5 rad
+    // about x at its hip (-0.15, 0.9, 0): its foot moves along -z... or +z, and the right
+    // foot the other way.
+    let hip = Vec3::new(-0.15, 0.9, 0.0);
+    let foot_l = mesh.positions.iter().zip(&skin.position_bones).position(|(p, &b)| b == 3 && p.y == 0.0).unwrap();
+    let foot_r = mesh.positions.iter().zip(&skin.position_bones).position(|(p, &b)| b == 4 && p.y == 0.0).unwrap();
+    let matrices = skin.matrices(walk, 0.25);
+    let mut posed = vec![Vec3::ZERO; mesh.positions.len()];
+    skin.pose_positions(&mesh.positions, &matrices, &mut posed);
+    let (l, r) = (posed[foot_l], posed[foot_r]);
+    // The foot stays its distance from the hip (which bobs with the hips: the leg's
+    // matrix takes it where it is now), and the two feet part.
+    let hip_now = matrices[3].transform_point3(hip);
+    assert!((hip_now.y - (hip.y - 0.025)).abs() < 1e-4, "the hips bob down: {hip_now}");
+    assert!((l.distance(hip_now) - mesh.positions[foot_l].distance(hip)).abs() < 1e-4);
+    assert!((l.z - mesh.positions[foot_l].z).abs() > 0.3, "{l}");
+    assert!((l.z - mesh.positions[foot_l].z) * (r.z - mesh.positions[foot_r].z) < 0.0);
+    // And the level with it walking in it loads.
+    let level = assets.load_level("walker_rooms.mmp").unwrap();
+    let walker = level.spawns.iter().find(|s| s.name == "walker").unwrap();
+    assert_eq!(walker.animation.as_deref(), Some("walk"));
+}
+
+#[test]
+fn animations_must_be_the_models() {
+    let mut assets = assets();
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/levels/walker_rooms.mmp")).unwrap();
+    let bad = src.replace("anim=walk", "anim=dance");
+    let err = assets.parse_level("bad.mmp", &bad).unwrap_err().to_string();
+    assert!(err.contains("no animation 'dance'"), "{err}");
+    let bad = src.replace("anim=walk", "anim=walk static");
+    assert!(assets.parse_level("bad.mmp", &bad).is_err());
+}

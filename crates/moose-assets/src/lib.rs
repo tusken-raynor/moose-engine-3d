@@ -15,8 +15,10 @@ mod mesh;
 mod mmp;
 mod mmp_doc;
 mod mmp_edit;
+mod mmdl;
 mod obj;
 mod ripples;
+mod skin;
 mod store;
 mod text;
 mod texture;
@@ -34,6 +36,7 @@ pub use mmp_doc::{
 pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};
+pub use skin::{Animation, Bone, Pose, Skin};
 pub use store::{Assets, MeshId, TextureId};
 pub use texture::{CUBE_FACES, MipLevel, Texture, decode_png};
 

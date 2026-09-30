@@ -693,6 +693,7 @@ impl App {
             width: options.width,
             height: options.height,
         };
+        app.editor.learn_animations(&app.world, &app.assets);
         // Mirror balls' cube maps see the level's lights only, not the flashlight where the
         // player happens to start.
         app.apply_lights(false);
@@ -736,7 +737,9 @@ impl App {
             .assets
             .parse_level(&self.level, &text)
             .map_err(|e| e.to_string())?;
-        let world = World::new(level, &self.assets);
+        let mut world = World::new(level, &self.assets);
+        self.world.hand_over_copies(&mut world);
+        world.animate(&mut self.assets, self.time);
         self.camera.sector = world
             .find_sector(self.camera.position)
             .or_else(|| world.spawn_points.first().map(|s| s.sector))
@@ -766,6 +769,7 @@ impl App {
         self.geometry.bake_shadows(&self.world, &self.assets);
         let baked = self.bake_cube_maps();
         self.settings.level_lights = level_lights;
+        self.editor.learn_animations(&self.world, &self.assets);
         baked
     }
 
@@ -875,10 +879,11 @@ impl App {
         }
     }
 
-    /// Moves the water's animation to `time` seconds, redrawing its textures if the ripples
-    /// moved.
+    /// Moves the animated models and the water to `time` seconds, redrawing the water's
+    /// textures if the ripples moved.
     fn set_time(&mut self, time: f32) {
         self.time = time;
+        self.world.animate(&mut self.assets, time);
         if let (Some([water, heights]), Some(floor)) = (self.water_textures, self.floor_texture)
             && self.ripples.advance_to(time as f64)
         {
@@ -1514,7 +1519,7 @@ fn model_files(assets: &str) -> Vec<String> {
         .flatten()
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".obj"))
+        .filter(|n| n.ends_with(".obj") || n.ends_with(".mmdl"))
         .collect();
     names.sort();
     names
@@ -2421,6 +2426,39 @@ mod tests {
             app.travel(false);
         }
         assert_eq!(app.world.sectors.len(), sectors);
+    }
+
+    #[test]
+    fn animated_models_move_and_the_editor_picks_their_animation() {
+        use editor::{Field, Selection};
+        let mut app = test_app("walker_rooms.mmp");
+        let walker = |app: &App| app.world.entities.iter().position(|e| e.name == "walker").unwrap();
+        // Posed in a copy of its model, which moves on with time.
+        app.set_time(0.0);
+        let e = &app.world.entities[walker(&app)];
+        assert_ne!(e.mesh, e.model);
+        let at = |app: &App| app.assets.mesh(app.world.entities[walker(app)].mesh).positions.clone();
+        let start = at(&app);
+        app.set_time(0.25);
+        assert_ne!(at(&app), start);
+        // Rebuilds reuse the copy.
+        let row = app.editor.doc.entities.iter().position(|e| e.name == "walker").unwrap();
+        app.editor.selection = Some(Selection::Entity(row));
+        let label = |app: &App| {
+            app.editor.panel().into_iter().find(|r| r.label == "Animation").map(|r| r.value)
+        };
+        assert_eq!(label(&app).as_deref(), Some("walk"));
+        let meshes = app.assets.meshes().len();
+        app.edit(Field::Animation, 1.0);
+        assert_eq!(label(&app).as_deref(), Some("idle"));
+        app.edit(Field::Animation, 1.0);
+        assert_eq!(label(&app).as_deref(), Some("none"));
+        let e = &app.world.entities[walker(&app)];
+        assert_eq!(e.mesh, e.model, "not animated: its model as it is");
+        app.edit(Field::Animation, 1.0);
+        assert_eq!(label(&app).as_deref(), Some("walk"));
+        // One new level mesh per rebuild, and no more copies.
+        assert_eq!(app.assets.meshes().len(), meshes + 3);
     }
 
     #[test]

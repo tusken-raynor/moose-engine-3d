@@ -6,7 +6,7 @@ A `.mmp` ("moose map") file describes a level as convex **sectors** bounded by p
 
 The format is plain text and meant to be edited by hand. A version number in the header allows new sections and columns, such as materials, to be added later.
 
-Static meshes referenced by entities are `.obj` files for now.
+Models referenced by entities are `.obj` files or `.mmdl` files (see the Model Format Spec), which add shadow proxies, a skeleton and animations.
 
 ## Conventions
 
@@ -141,12 +141,13 @@ Options, after `name` (props and actors only):
 | --- | --- |
 | `static` | Props only. The prop never moves, so static lights' shadows from it and on it can be worked out once. |
 | `occluder=...` | What the entity casts shadows with. Without it, `mesh`. |
+| `anim=NAME` | It plays its model's animation `NAME` over and over (or holds its last frame, for one that doesn't loop), from when the level starts. Not with `static`. |
 
 Occluders are the artist's choice. Any shape works; a complex one only costs more to shadow with.
 
 | Occluder | Meaning |
 | --- | --- |
-| `mesh` | Its own model (the default) |
+| `mesh` | Its own model (the default): its shadow proxies if it has any (see the Model Format Spec), or else its polygons |
 | `none` | It casts no shadows |
 | `lod:N` | Level of detail `N` of its model (its own model until models have levels of detail) |
 | `model:FILE` | A separate proxy model from `assets/models/`, placed like the entity |
@@ -190,7 +191,7 @@ Options: `shadows=on|off` (default on).
 7. Adjoins are symmetric (`mirror.mirror == self`), each points back to its surface, the mirror surface lists the same vertices in reverse order, the two sides belong to different sectors, and flags use only the defined bits. Surface flags use only the defined bits, and portal surfaces have none.
 8. Every solid surface vertex references exactly one row per declared attribute; portal surface vertices reference none.
 9. Each entity's origin lies inside its sector: on the inner side of every one of the sector's surface planes. This is an exact test because sectors are convex.
-10. Entity names are unique. Spawn points have no model (`-`) and no options; props and actors must have one, and it must load. Scale is positive. Only props are `static`. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
+10. Entity names are unique. Spawn points have no model (`-`) and no options; props and actors must have one, and it must load. Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
 11. Ambient light and light colors are not negative. Each light's range is positive, and its position lies inside its sector (as for entities). Each light row has 8 or 13 fields before its options. A spot light's direction is not zero, and its angles satisfy 0 ≤ inner ≤ outer ≤ 180. A light's radius is 0 or more.
 12. Each directional light has 7 fields before its options, a direction that is not zero, a color that is not negative, and an angle from 0 to 45 degrees.
 13. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.

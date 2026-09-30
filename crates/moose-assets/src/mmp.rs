@@ -52,6 +52,7 @@ struct EntityRec {
     scale: f32,
     is_static: bool,
     occluder: OccluderRec,
+    animation: Option<String>,
 }
 
 /// An entity's occluder as written: a proxy model is loaded with the entity's.
@@ -489,6 +490,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
         // Options after the name.
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
+        let mut animation = None;
         for option in &r.tokens[11..] {
             let fail = |m: String| c.err(r.no, format!("entity '{name}': {m}"));
             if kind == EntityKind::Spawn {
@@ -502,6 +504,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     is_static = true;
                 }
                 Some(("occluder", value)) => occluder = occluder_option(value).map_err(fail)?,
+                Some(("anim", value)) if !value.is_empty() => animation = Some(value.to_string()),
                 _ => return Err(fail(format!("unknown option '{option}'"))),
             }
         }
@@ -516,6 +519,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             scale,
             is_static,
             occluder,
+            animation,
         });
     }
 
@@ -931,6 +935,19 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             ),
             None => None,
         };
+        // An animation its model has, on something that moves.
+        if let Some(name) = &e.animation {
+            if e.is_static {
+                return Err(c.err(e.line, format!("entity '{}': a static prop can't be animated", e.name)));
+            }
+            let skin = mesh.and_then(|m| assets.mesh(m).skin.as_ref());
+            if skin.and_then(|s| s.animation(name)).is_none() {
+                return Err(c.err(
+                    e.line,
+                    format!("entity '{}': its model has no animation '{name}'", e.name),
+                ));
+            }
+        }
         let occluder = match e.occluder {
             OccluderRec::Ready(o) => o,
             OccluderRec::Model(file) => Occluder::Model(
@@ -949,6 +966,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             scale: e.scale,
             is_static: e.is_static,
             occluder,
+            animation: e.animation,
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();

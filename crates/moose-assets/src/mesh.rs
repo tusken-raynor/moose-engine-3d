@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use glam::Vec3;
 
-use crate::geom::{Aabb, Plane, convex_polygon_plane};
+use crate::geom::{Aabb, Plane, best_plane, convex_polygon_plane};
 use crate::half::{f16_bits_to_f32, f32_to_f16_bits};
 
 /// How an attribute's components are stored in memory. The interpolation format
@@ -171,6 +171,13 @@ impl PolyFlags {
     pub const SKY: u32 = 0x2;
     /// Every flag the level format defines.
     pub const ALL: u32 = Self::REFLECTIVE | Self::SKY;
+    /// A model's shadow proxy: not drawn; its model casts shadows with its proxy polygons
+    /// (grouped by bone) instead of the drawn ones. Model polygons only.
+    pub const PROXY: u32 = 0x100;
+
+    pub fn proxy(self) -> bool {
+        self.0 & Self::PROXY != 0
+    }
 
     pub fn reflective(self) -> bool {
         self.0 & Self::REFLECTIVE != 0
@@ -212,6 +219,8 @@ pub struct Mesh {
     pub attribs: Vec<Attrib>,
     pub polygons: Vec<Polygon>,
     pub bounds: Aabb,
+    /// For an animated model, its skeleton and animations.
+    pub skin: Option<crate::skin::Skin>,
 }
 
 impl Mesh {
@@ -224,6 +233,26 @@ impl Mesh {
         self.vertex_positions[polygon.vertices()]
             .iter()
             .map(|&i| self.positions[i as usize])
+    }
+
+    /// Moves its positions to `positions` (as many as it has), and its polygons' planes and
+    /// its box with them: for posing an animated model. Unchecked: a polygon spanning
+    /// bones may bend a little, and gets the plane that fits its corners best (Newell's).
+    pub fn set_positions(&mut self, positions: &[Vec3]) {
+        self.positions.copy_from_slice(positions);
+        let mut points = Vec::new();
+        for polygon in &mut self.polygons {
+            points.clear();
+            points.extend(
+                self.vertex_positions[polygon.vertices()]
+                    .iter()
+                    .map(|&i| self.positions[i as usize]),
+            );
+            if let Some(plane) = best_plane(&points) {
+                polygon.plane = plane;
+            }
+        }
+        self.bounds = Aabb::from_points(self.positions.iter().copied());
     }
 }
 
@@ -254,6 +283,7 @@ impl MeshBuilder {
                 attribs,
                 polygons: Vec::new(),
                 bounds: Aabb::from_points([]),
+                skin: None,
             },
         }
     }
@@ -290,7 +320,13 @@ impl MeshBuilder {
     /// Drops positions nothing uses, keeping the rest in order, and returns the mesh.
     /// `extra` index lists (such as portal outlines) also keep their positions and are
     /// remapped in place along with the polygons.
-    pub fn finish(mut self, extra: &mut [&mut Vec<u32>]) -> Mesh {
+    pub fn finish(self, extra: &mut [&mut Vec<u32>]) -> Mesh {
+        self.finish_remapped(extra).0
+    }
+
+    /// As [`finish`](Self::finish), also returning where each position went (`u32::MAX`
+    /// for one dropped).
+    pub fn finish_remapped(mut self, extra: &mut [&mut Vec<u32>]) -> (Mesh, Vec<u32>) {
         let vertices = self.mesh.vertex_positions.len();
         for a in &self.mesh.attribs {
             debug_assert_eq!(
@@ -327,6 +363,6 @@ impl MeshBuilder {
             *i = remap[*i as usize];
         }
         self.mesh.bounds = Aabb::from_points(self.mesh.positions.iter().copied());
-        self.mesh
+        (self.mesh, remap)
     }
 }

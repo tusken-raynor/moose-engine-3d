@@ -1,4 +1,5 @@
-"""Generate the test assets: assets/models/crate.obj, the levels in assets/levels, the
+"""Generate the test assets: assets/models/crate.obj, ball.obj and walker.mmdl (an animated
+figure), the levels in assets/levels, the
 placeholder floor texture assets/textures/test_floor.png and the wall textures
 (brick_wall.png, panel_wall.png, stone_wall.png).
 
@@ -9,6 +10,9 @@ normal points toward a reference point (level: into the sector; crate: out
 of the cube). CCW-front convention.
 """
 import math, os, struct, sys, zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from moose_model import PROXY, quat_axis, write_model
 
 ROOT = sys.argv[1]
 
@@ -107,6 +111,90 @@ def crate_obj():
             idx += 1
         flines.append(f"f {' '.join(ids)}  # {name}")
     return "\n".join(lines + vlines + [""] + tlines + [""] + flines) + "\n"
+
+
+def walker_model():
+    """A figure of boxes on a skeleton, walking in place (see Model Format Spec.md): each
+    box moves with one bone, and each bone has a box shadow proxy like its part. Origin at
+    its feet, facing -Z."""
+    # Bones: name, parent, rest place relative to the parent (no rest turn).
+    bones = [
+        ("hips", None, (0.0, 0.9, 0.0)),
+        ("spine", 0, (0.0, 0.1, 0.0)),
+        ("head", 1, (0.0, 0.6, 0.0)),
+        ("leg_l", 0, (-0.15, 0.0, 0.0)),
+        ("leg_r", 0, (0.15, 0.0, 0.0)),
+        ("arm_l", 1, (-0.34, 0.55, 0.0)),
+        ("arm_r", 1, (0.34, 0.55, 0.0)),
+    ]
+    shirt, trousers, skin = (0.22, 0.38, 0.66), (0.16, 0.20, 0.36), (0.86, 0.66, 0.50)
+    # Parts: bone, box (model space at rest), color.
+    parts = [
+        (0, ((-0.24, 0.88, -0.12), (0.24, 1.0, 0.12)), trousers),
+        (1, ((-0.22, 1.0, -0.12), (0.22, 1.6, 0.12)), shirt),
+        (2, ((-0.12, 1.62, -0.13), (0.12, 1.92, 0.13)), skin),
+        (3, ((-0.24, 0.0, -0.08), (-0.06, 0.88, 0.08)), trousers),
+        (4, ((0.06, 0.0, -0.08), (0.24, 0.88, 0.08)), trousers),
+        (5, ((-0.40, 0.95, -0.06), (-0.26, 1.58, 0.06)), shirt),
+        (6, ((0.26, 0.95, -0.06), (0.40, 1.58, 0.06)), shirt),
+    ]
+    positions, position_bones, polygons, colors = [], [], [], []
+
+    def color_row(c):
+        colors.append([round(255 * min(1.0, x)) for x in c])
+        return len(colors) - 1
+
+    def box(bone, lo, hi, color, flags):
+        first = len(positions)
+        for k in range(8):
+            positions.append((hi[0] if k & 1 else lo[0], hi[1] if k & 2 else lo[1],
+                              hi[2] if k & 4 else lo[2]))
+            position_bones.append(bone)
+        center = tuple((lo[i] + hi[i]) / 2 for i in range(3))
+        # Faces by the corners they keep, with a shade: sides, top, bottom.
+        faces = [([0, 2, 6, 4], 0.8), ([1, 3, 7, 5], 0.8), ([0, 1, 5, 4], 0.6),
+                 ([2, 3, 7, 6], 1.2), ([0, 1, 3, 2], 0.9), ([4, 5, 7, 6], 0.9)]
+        for corners, shade in faces:
+            pts = [positions[first + k] for k in corners]
+            ordered = orient_away(pts, center)
+            ids = [first + corners[pts.index(p)] for p in ordered]
+            row = color_row(scale3(color, shade))
+            polygons.append((flags, [(i, [row]) for i in ids]))
+
+    for bone, (lo, hi), color in parts:
+        box(bone, lo, hi, color, 0)
+    for bone, (lo, hi), color in parts:
+        box(bone, lo, hi, color, PROXY)
+
+    x = (1.0, 0.0, 0.0)
+    y = (0.0, 1.0, 0.0)
+    rest = [t for (_, _, t) in bones]
+    ident = (0.0, 0.0, 0.0, 1.0)
+
+    def pose(turns, bob=0.0):
+        frame = []
+        for b, t in enumerate(rest):
+            if b == 0:
+                t = (t[0], t[1] + bob, t[2])
+            frame.append((t, turns.get(b, ident)))
+        return frame
+
+    walk = []
+    for f in range(24):
+        a = 2 * math.pi * f / 24
+        swing = math.sin(a)
+        walk.append(pose({1: quat_axis(y, 0.1 * swing),
+                          3: quat_axis(x, 0.5 * swing), 4: quat_axis(x, -0.5 * swing),
+                          5: quat_axis(x, -0.4 * swing), 6: quat_axis(x, 0.4 * swing)},
+                         bob=0.025 * math.cos(2 * a)))
+    idle = [pose({}), pose({1: quat_axis(x, 0.04)}, bob=-0.01)]
+    return write_model(
+        "walker", positions, position_bones,
+        [("color", "u8", 3, colors)], polygons,
+        bones=[(n, p, t, ident) for (n, p, t) in bones],
+        animations=[("walk", 24.0, True, walk), ("idle", 1.0, True, idle)],
+        about=["Moose v2 test actor: a figure of boxes walking in place.",
+               "Each part moves with one bone; the second set of boxes are its shadow proxies."])
 
 
 def ball_obj(radius=0.25, segments=24, rings=12):
@@ -612,6 +700,8 @@ with open(os.path.join(ROOT, "assets/models/crate.obj"), "w") as f:
     f.write(crate_obj())
 with open(os.path.join(ROOT, "assets/models/ball.obj"), "w") as f:
     f.write(ball_obj())
+with open(os.path.join(ROOT, "assets/models/walker.mmdl"), "w") as f:
+    f.write(walker_model())
 with open(os.path.join(ROOT, "assets/levels/two_rooms.mmp"), "w") as f:
     f.write(level_text("Two Rooms", "two box rooms joined by a hallway through two portals."))
 # Same level with shiny (reflective) floors throughout (both rooms and the hallway, so
@@ -669,4 +759,15 @@ with open(os.path.join(ROOT, "assets/levels/sunny_rooms.mmp"), "w") as f:
                        lights=[(room_a, (0.0, 2.3, 4.0), (0.45, 0.75, 1.5), 6.0)],
                        light_options="radius=0.05 oscillate=1.4142:0:-1.4142:5",
                        options={n: "static" for (k, _, m, *_, n) in entities if m == "crate.obj"}))
+# The courtyard with an animated figure walking in place in the sun: its shadow is cast by a
+# box proxy per bone, carved every frame as it moves.
+with open(os.path.join(ROOT, "assets/levels/walker_rooms.mmp"), "w") as f:
+    f.write(level_text("Walker Rooms",
+                       "sunny_rooms.mmp's courtyard with an animated figure (walker.mmdl) in it.",
+                       uv=True, ambient=(0.05, 0.06, 0.09), sky={room_b_ceiling},
+                       directional=[((0.45, -0.8, 0.55), (2.0, 1.85, 1.6), 0.53)],
+                       props=[("actor", room_b, "walker.mmdl", (1.5, 0.0, -16.5), (0, 30, 0), 1.0,
+                               "walker")],
+                       options={**{n: "static" for (k, _, m, *_, n) in entities if m == "crate.obj"},
+                                "walker": "anim=walk"}))
 print(f"verts={len(verts)} color_values={len(colors)} surfaces={len(surfaces)} adjoins={len(adjoins)}")

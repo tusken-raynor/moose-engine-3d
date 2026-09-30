@@ -65,6 +65,8 @@ pub enum Field {
     Scale,
     Kind,
     Model,
+    /// The animation it plays (cycles through its model's, and none).
+    Animation,
     Static,
     Occluder,
     Reflective,
@@ -191,6 +193,9 @@ pub struct Editor {
     pub bookmarks: [Option<(Vec3, f32, f32)>; 4],
     /// What the level loader last refused an edit over, and when (drawn in red a while).
     problem: Option<(Selection, Instant)>,
+    /// The animations of the level's models, by file name (see
+    /// [`learn_animations`](Self::learn_animations)).
+    animations: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Editor {
@@ -218,6 +223,17 @@ impl Editor {
             clipboard: None,
             bookmarks: [None; 4],
             problem: None,
+            animations: Default::default(),
+        }
+    }
+
+    /// Notes the animations of the models `world`'s entities use, for the panel.
+    pub fn learn_animations(&mut self, world: &World, assets: &Assets) {
+        for e in &world.entities {
+            if let (Some(name), Some(skin)) = (assets.mesh_name(e.model), &assets.mesh(e.model).skin) {
+                let names = skin.animations.iter().map(|a| a.name.clone()).collect();
+                self.animations.insert(name.to_string(), names);
+            }
         }
     }
 
@@ -581,6 +597,10 @@ impl Editor {
                 ];
                 if let Some(model) = &e.model {
                     rows.push(row("Model", model.clone(), Some(Field::Model)));
+                    let playing = e.options.iter().find_map(|o| o.strip_prefix("anim="));
+                    if playing.is_some() || self.animations.get(model).is_some_and(|a| !a.is_empty()) {
+                        rows.push(row("Animation", playing.unwrap_or("none").into(), Some(Field::Animation)));
+                    }
                 }
                 rows.extend([
                     row("X", n(e.position.x), Some(Field::X)),
@@ -933,6 +953,21 @@ impl Editor {
                             None => 0,
                         };
                         e.model = models.get(next as usize).cloned().or(e.model.take());
+                        // The new model's animations may differ.
+                        e.options.retain(|o| !o.starts_with("anim="));
+                    }
+                    Field::Animation => {
+                        // none → each of the model's animations → none.
+                        let names = e.model.as_ref().and_then(|m| self.animations.get(m)).cloned().unwrap_or_default();
+                        let now = e.options.iter().find_map(|o| o.strip_prefix("anim="));
+                        let k = now.and_then(|a| names.iter().position(|n| n == a)).map_or(0, |k| k + 1);
+                        let next = (k as isize + dir.signum() as isize).rem_euclid(names.len() as isize + 1) as usize;
+                        e.options.retain(|o| !o.starts_with("anim="));
+                        if next > 0 {
+                            e.options.push(format!("anim={}", names[next - 1]));
+                            // Animated models move, so they can't be static.
+                            e.set_option("static", false);
+                        }
                     }
                     Field::Static => {
                         let on = !e.has_option("static");

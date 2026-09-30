@@ -54,6 +54,23 @@ impl Aabb {
 /// Returns the plane of a planar, convex polygon whose points run counter-clockwise
 /// as seen from its front. Collinear points are allowed; repeated points,
 /// zero-area polygons and self-overlapping outlines are not.
+/// The plane that fits `points` best (Newell's normal, through their centroid), if they
+/// span any area. Not checked for flatness or convexity.
+pub(crate) fn best_plane(points: &[Vec3]) -> Option<Plane> {
+    let centroid = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+    let mut normal = Vec3::ZERO;
+    for (i, &p) in points.iter().enumerate() {
+        let (p, q) = (p - centroid, points[(i + 1) % points.len()] - centroid);
+        normal += Vec3::new(
+            (p.y - q.y) * (p.z + q.z),
+            (p.z - q.z) * (p.x + q.x),
+            (p.x - q.x) * (p.y + q.y),
+        );
+    }
+    let normal = normal.try_normalize()?;
+    Some(Plane { normal, d: -normal.dot(centroid) })
+}
+
 pub(crate) fn convex_polygon_plane(points: &[Vec3]) -> Result<Plane, String> {
     let n = points.len();
     if n < 3 {

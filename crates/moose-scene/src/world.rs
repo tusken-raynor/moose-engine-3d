@@ -37,6 +37,8 @@ pub struct World {
     sector_lights: Vec<Vec<u32>>,
     /// Per sector, every polygon bounding it (solid or portal), for containment and tracing.
     boundaries: Vec<Vec<Boundary>>,
+    /// Posed model copies no entity uses (from a world this one replaced), to reuse.
+    spare_copies: Vec<MeshId>,
 }
 
 /// A placed prop or actor.
@@ -45,7 +47,11 @@ pub struct Entity {
     pub name: String,
     /// `Prop` or `Actor`; decides the raster path when drawn.
     pub kind: EntityKind,
+    /// What it draws: its model, or its own posed copy of it if it's animated (see
+    /// [`World::animate`]).
     pub mesh: MeshId,
+    /// The model it was made from.
+    pub model: MeshId,
     /// The sector containing the entity's origin.
     pub sector: u32,
     pub position: Vec3,
@@ -61,6 +67,8 @@ pub struct Entity {
     pub occluder: Occluder,
     /// It never moves: static lights' shadows from it (and on it) can be worked out once.
     pub is_static: bool,
+    /// The animation it plays (by name), if its model has a skeleton.
+    pub animation: Option<String>,
 }
 
 
@@ -153,6 +161,7 @@ impl World {
                     name: spawn.name,
                     kind,
                     mesh,
+                    model: mesh,
                     sector: spawn.sector,
                     position: spawn.position,
                     rotation: spawn.rotation,
@@ -161,6 +170,7 @@ impl World {
                     sectors: Vec::new(),
                     occluder: spawn.occluder,
                     is_static: spawn.is_static,
+                    animation: spawn.animation,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }
@@ -178,6 +188,7 @@ impl World {
             lights: Vec::new(),
             sector_lights: Vec::new(),
             boundaries,
+            spare_copies: Vec::new(),
         };
         for i in 0..world.entities.len() {
             world.place_entity(i, assets);
@@ -281,6 +292,51 @@ impl World {
             list.sort_unstable();
         }
         self.lights = lights;
+    }
+
+    /// Poses the animated entities `time` seconds into their animations: moves each one's
+    /// own copy of its model (made the first time) to its skeleton's pose, and places it
+    /// again. An entity whose model has no such animation stays as it is.
+    pub fn animate(&mut self, assets: &mut Assets, time: f32) {
+        let mut posed = Vec::new();
+        for i in 0..self.entities.len() {
+            let entity = &self.entities[i];
+            let model = assets.mesh(entity.model);
+            let (Some(name), Some(skin)) = (&entity.animation, &model.skin) else {
+                continue;
+            };
+            let Some(animation) = skin.animation(name) else {
+                continue;
+            };
+            let matrices = skin.matrices(animation, time);
+            posed.resize(model.positions.len(), Vec3::ZERO);
+            skin.pose_positions(&model.positions, &matrices, &mut posed);
+            if entity.mesh == entity.model {
+                let copy = model.clone();
+                let mesh = match self.spare_copies.pop() {
+                    Some(mesh) => {
+                        *assets.mesh_mut(mesh) = copy;
+                        mesh
+                    }
+                    None => assets.add_mesh(copy),
+                };
+                self.entities[i].mesh = mesh;
+            }
+            assets.mesh_mut(self.entities[i].mesh).set_positions(&posed);
+            self.place_entity(i, assets);
+        }
+    }
+
+    /// Hands the posed copies of models this world made (see [`animate`](Self::animate))
+    /// to `to`, which replaces it, to reuse rather than add more.
+    pub fn hand_over_copies(&self, to: &mut World) {
+        to.spare_copies.extend(
+            self.entities
+                .iter()
+                .filter(|e| e.mesh != e.model)
+                .map(|e| e.mesh)
+                .chain(self.spare_copies.iter().copied()),
+        );
     }
 
     /// Recomputes an entity's derived `bounds` and `sectors` from its transform.
