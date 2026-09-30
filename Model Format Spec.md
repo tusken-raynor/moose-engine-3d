@@ -123,9 +123,22 @@ The loader refuses a model unless:
 - **`tools/moose_model.py`** writes `.mmdl` text from plain Python data (positions and their bones, attributes, polygons, bones, animations). It needs nothing but Python, so it's shared by the test asset generator and the Blender exporter.
 - **`tools/gen_test_assets.py`** builds the test actor with it: `walker.mmdl`, a figure of seven boxes on seven bones (hips, spine, head, legs, arms) with a proxy box each, and animations `walk` (24 frames at 24 fps, in place) and `idle`. It also writes `walker_rooms.mmp`, the sunny courtyard with the walker in it.
 
+- **`tools/blender/moose_export.py`** is the Blender exporter. Run it from the repo, either as `blender model.blend --background --python tools/blender/moose_export.py -- out.mmdl`, or from Blender's Text Editor, which adds File > Export > Moose Model. What it writes:
+  - **Meshes:** n-gons are kept. A face that isn't flat and convex, or that spans bones, becomes its triangles. Modifiers are applied, with the armature at rest.
+  - **Proxies:** objects named `proxy_*` become shadow proxies.
+  - **Attributes:**
+    - `color` comes from the active color attribute, or else the material's viewport color.
+    - `uv` has v flipped to grow downward.
+  - **Skeleton:** every bone of the armature, parents first. Each vertex takes the bone of its strongest vertex group, or the bone its object is parented to.
+  - **Animations:**
+    - Every action on the armature's bones, sampled at every frame at the scene's rate.
+    - An action loops unless its name ends in `_once`, or it has a manual frame range without Cyclic. A loop's repeated last frame is dropped.
+  - **Axes:** a model facing Blender's front view (−Y) faces the engine's forward (−Z).
+
+  **Untested in Blender** (Blender wasn't available when it was written). Its conversion logic is plain Python, and `tools/blender/test_moose_export.py` tests it. The test's model loads and poses correctly in the engine. The parts that call Blender's API (`gather`, `add_mesh`, `sample_actions`) have never run.
+
 ## Planned
 
-- **Blender exporter** (`tools/blender/moose_export.py`): mesh n-gons with their uvs and colors, the armature's rest pose, each vertex's strongest bone, actions sampled per frame, and objects named `proxy_*` as shadow proxies.
 - **Up to four bone weights per position**, for linear blend skinning (smoother joints) where it pays.
 - **Materials** per polygon, and **levels of detail**, set in the engine's mesh editor.
 - **Root motion** and blending between animations.
