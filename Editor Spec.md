@@ -1,6 +1,6 @@
 # Editor Spec
 
-Sep 30, 2026 · Built: an in-engine level editor (Tab) with picking, 2D views, sector tools, placement, undo and saving
+Sep 30, 2026 · Built: an in-engine level editor (Tab) with picking, 2D views, sector tools, placement, undo and saving, and a mesh editor for models
 
 ## Overview
 
@@ -15,10 +15,12 @@ The editor is a mode of the app, not a separate program: Tab switches between pl
 - placement: lights (with spot cones), props, spawn points; the level's ambient light and sun
 - texture alignment on surfaces (levels with uvs)
 - undo and redo, saving, copy and paste, camera bookmarks, hot reload of models, textures and the level
+- a mesh editor (M) for `.mmdl` models: shadow proxies, proxy boxes per bone, polygon colors
 
 **Next:**
 
-- a Blender exporter and a mesh editor (the model format and skeletal animation are built: see the Model Format Spec)
+- materials and levels of detail in the mesh editor
+- trying the Blender exporter in Blender (written, but untested there: see the Model Format Spec)
 - typing values and names (the display now reports typed text)
 - rubber-band and multiple selection; moving by dragging
 - per-sector properties once the level format has them
@@ -85,6 +87,8 @@ The panel shows what the selection can do; most rows are also on keys.
 | Right button held | Look (3D) or pan (2D) |
 | Wheel | Change the row under the pointer, or zoom a 2D view |
 | V | Vertex picking |
+| M | Mesh editor on the selected entity's model, and back |
+| P | Mesh editor: clicks pick shadow proxies, or drawn polygons |
 | G | Grid step: 1/16, 1/8, 1/4, 1/2, 1 m |
 | Arrows, PgUp/PgDn | Move the selection along the view's axes (the world axes nearest the 3D view's forward and right); push/pull a surface |
 | `[` `]` | Turn an entity, or aim a spot light |
@@ -95,7 +99,18 @@ The panel shows what the selection can do; most rows are also on keys.
 | Ctrl+D, Ctrl+C, Ctrl+V | Duplicate; copy; paste where the view is |
 | Ctrl+1–4, 1–4 | Keep a camera place; go back to it |
 
-For screenshots: `--edit`, `--select NAME` (or `surface:N`, `sector:N`, `vertex:N`, `light:N`), `--view 3d|top|front|side`, `--wire`, `--zoom PX_PER_M`.
+For screenshots: `--edit`, `--select NAME` (or `surface:N`, `sector:N`, `vertex:N`, `light:N`), `--view 3d|top|front|side`, `--wire`, `--zoom PX_PER_M`, `--edit-model` (the mesh editor on the selected entity's model), `--polygon N`.
+
+## Mesh editor
+
+M (or the entity's "Mesh editor" row) opens the selected entity's `.mmdl` model, shown on that entity (posed, if it's animated). It sets what Blender doesn't know (see the Model Format Spec):
+
+- **Picking:** a click picks one of the model's drawn polygons in the 3D view (the renderer's picking). With P, it picks its shadow proxies instead, which aren't drawn. They are outlined in pink, and a click picks the nearest one facing the eye. The Polygon row steps through all of them.
+- **A polygon:** drawn or a shadow proxy; its color (red, green, blue in sixteenths, as a new `color` row so polygons sharing rows keep theirs); delete it.
+- **Proxies per bone:** a proxy box around the drawn polygons of a bone (the selected polygon's bone, or the whole model), with that bone; or remove a bone's proxies (all, with nothing selected).
+- **How edits work:** as the level's. The model's tables (`moose_assets::ModelDoc`) are written as text, loaded by the model loader (which checks them) into the same asset, and the level is rebuilt so the entities using it (and their posed copies) take it. A refused edit is undone with the loader's message.
+- **Undo, redo and saving** (Ctrl+Z, Ctrl+Y, Ctrl+S) are the model's own while the mesh editor is open. Ctrl+S writes the model's file; comments in it aren't kept.
+- **Leaving** (M, Esc with no polygon selected, or Done) with unsaved changes is refused once, with a message. Leaving again drops them: the model is read from its file again.
 
 ## Display
 
@@ -107,10 +122,12 @@ The editor needed a new display layer: `moose-present` now uses winit (window an
 - Extrude copies the surface's attribute values onto the new sector's surfaces, so textures stretch along the new sides: map them flat afterwards.
 - Portals can be picked only in 2D views (they aren't drawn in 3D).
 - Mirror balls' cube maps are re-baked on every rebuild (a few ms each).
+- The mesh editor can't move positions or make polygons: shapes come from Blender. Level edits wait while it is open.
+- A model file changed on disk while the mesh editor has it open is reloaded under it; the editor's tables win at the next edit or save.
 
-## Planned: models and animation
+## Models and animation
 
-Agreed Sep 29 (see the editor-and-models direction in memory):
+Agreed Sep 29 (see the editor-and-models direction in memory); built Sep 30 (the Model Format Spec has the details):
 
 - **Blender stays the authoring tool.** A Blender exporter add-on writes our own model format, which keeps convex n-gons (glTF only stores triangles).
 - **Skeletal animation, Half-Life style:** one bone per vertex first, with room for up to four weights for linear blend skinning later. Per bone per frame: sample the keyframes (quaternion slerp or nlerp), walk the hierarchy, multiply by the inverse bind pose; per vertex, one matrix multiply on the mesh's position list. Polygons spanning bones bend, so the exporter triangulates only those.

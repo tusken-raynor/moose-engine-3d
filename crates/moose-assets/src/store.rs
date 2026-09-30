@@ -104,6 +104,17 @@ impl Assets {
         Ok(true)
     }
 
+    /// Replaces loaded model `name` with one read from `src` (its file's text, as the
+    /// mesh editor has it), keeping its handle. Nothing changes if `src` doesn't load.
+    pub fn set_model_text(&mut self, name: &str, src: &str) -> Result<(), LoadError> {
+        let id = self
+            .mesh_id(name)
+            .ok_or_else(|| LoadError::new(Path::new(name), None, "that model isn't loaded"))?;
+        let path = self.root.join("models").join(name);
+        self.meshes[id.0 as usize] = crate::mmdl::parse_mmdl(&path, name, src)?;
+        Ok(())
+    }
+
     /// The names of the models and textures loaded from files.
     pub fn loaded_files(&self) -> (Vec<String>, Vec<String>) {
         (

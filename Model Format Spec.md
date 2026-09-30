@@ -1,6 +1,6 @@
 # Model Format Spec (.mmdl, version 1)
 
-Sep 30, 2026 · Built: the format, its loader, skeletal posing, shadow proxies, a Python writer and a test actor
+Sep 30, 2026 · Built: the format, its loader, skeletal posing, shadow proxies, a Python writer, a test actor, a Blender exporter (untested in Blender) and editing tables for the mesh editor
 
 ## Overview
 
@@ -140,5 +140,5 @@ The loader refuses a model unless:
 ## Planned
 
 - **Up to four bone weights per position**, for linear blend skinning (smoother joints) where it pays.
-- **Materials** per polygon, and **levels of detail**, set in the engine's mesh editor.
+- **Materials** per polygon, and **levels of detail**, set in the engine's mesh editor (built, with proxies and colors so far: see the Editor Spec).
 - **Root motion** and blending between animations.

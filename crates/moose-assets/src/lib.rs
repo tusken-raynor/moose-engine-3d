@@ -16,6 +16,7 @@ mod mmp;
 mod mmp_doc;
 mod mmp_edit;
 mod mmdl;
+mod mmdl_doc;
 mod obj;
 mod ripples;
 mod skin;
@@ -33,6 +34,7 @@ pub use mmp_doc::{
     AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,
     number, occluder_value,
 };
+pub use mmdl_doc::{AnimationDoc, BoneDoc, ModelDoc, ModelPolygonDoc};
 pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};

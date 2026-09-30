@@ -118,6 +118,18 @@ pub enum Field {
     TextureProject,
     /// Puts what was copied (Ctrl+C) where the view is.
     Paste,
+    /// Opens (or leaves) the mesh editor on an entity's model (M).
+    EditModel,
+    /// Mesh editor: steps through the model's polygons.
+    PolygonPick,
+    /// Mesh editor: clicks pick proxies or drawn polygons (P).
+    PickProxies,
+    /// Mesh editor: a polygon drawn or a shadow proxy.
+    Proxy,
+    /// Mesh editor: a proxy box around a bone's polygons (the selected polygon's bone).
+    ProxyBox,
+    /// Mesh editor: removes a bone's proxies.
+    RemoveProxies,
 }
 
 /// What Ctrl+C copied.
@@ -130,7 +142,10 @@ pub enum Clip {
 impl Field {
     /// Whether it changes the level (rather than what the editor is doing).
     pub fn is_edit(self) -> bool {
-        !matches!(self, Field::SelectSector | Field::ExtrudeBy | Field::Cleave)
+        !matches!(
+            self,
+            Field::SelectSector | Field::ExtrudeBy | Field::Cleave | Field::EditModel | Field::PolygonPick | Field::PickProxies
+        )
     }
 }
 
@@ -196,6 +211,8 @@ pub struct Editor {
     /// The animations of the level's models, by file name (see
     /// [`learn_animations`](Self::learn_animations)).
     animations: std::collections::HashMap<String, Vec<String>>,
+    /// The mesh editor, while it's open.
+    pub model: Option<crate::mesh_edit::ModelEdit>,
 }
 
 impl Editor {
@@ -224,6 +241,7 @@ impl Editor {
             bookmarks: [None; 4],
             problem: None,
             animations: Default::default(),
+            model: None,
         }
     }
 
@@ -375,7 +393,7 @@ impl Editor {
     }
 
     /// The world entity row `row` is, if it isn't a spawn point.
-    fn world_entity(&self, row: usize) -> Option<usize> {
+    pub fn world_entity(&self, row: usize) -> Option<usize> {
         (self.doc.entities[row].kind != EntityKind::Spawn).then(|| {
             self.doc.entities[..row].iter().filter(|e| e.kind != EntityKind::Spawn).count()
         })
@@ -473,6 +491,9 @@ impl Editor {
 
     /// The properties panel's rows for the selection.
     pub fn panel(&self) -> Vec<PanelRow> {
+        if let Some(model) = &self.model {
+            return model.panel();
+        }
         let row = |label: &str, value: String, field: Option<Field>| PanelRow {
             label: label.to_string(),
             value,
@@ -600,6 +621,9 @@ impl Editor {
                     let playing = e.options.iter().find_map(|o| o.strip_prefix("anim="));
                     if playing.is_some() || self.animations.get(model).is_some_and(|a| !a.is_empty()) {
                         rows.push(row("Animation", playing.unwrap_or("none").into(), Some(Field::Animation)));
+                    }
+                    if model.ends_with(".mmdl") {
+                        rows.push(row("Mesh editor (M)", String::new(), Some(Field::EditModel)));
                     }
                 }
                 rows.extend([
@@ -1036,7 +1060,10 @@ impl Editor {
         wire::draw_grid(canvas, ortho, self.step());
         let projection = Projection::Ortho(ortho);
         wire::draw_level(canvas, &projection, world, assets);
-        self.draw_marks(canvas, &projection, world, assets);
+        match &self.model {
+            Some(model) => model.draw(canvas, &projection, world, assets),
+            None => self.draw_marks(canvas, &projection, world, assets),
+        }
     }
 
     /// Draws the editor over the frame: in the 3D view its wireframe (F5) and marks, then
@@ -1047,7 +1074,10 @@ impl Editor {
             if self.wire {
                 wire::draw_level(canvas, &projection, world, assets);
             }
-            self.draw_marks(canvas, &projection, world, assets);
+            match &self.model {
+                Some(model) => model.draw(canvas, &projection, world, assets),
+                None => self.draw_marks(canvas, &projection, world, assets),
+            }
         }
         self.draw_panel(canvas);
     }
@@ -1167,11 +1197,14 @@ impl Editor {
             ViewMode::Perspective => "3D",
             ViewMode::Ortho(axis) => axis.name(),
         };
-        let title = format!(
-            "EDITOR  {view}{}{}",
-            if self.vertices { "  vertices" } else { "" },
-            if self.dirty() { "  (unsaved)" } else { "" }
-        );
+        let title = match &self.model {
+            Some(model) => format!("MESH EDITOR  {view}{}", if model.dirty() { "  (unsaved)" } else { "" }),
+            None => format!(
+                "EDITOR  {view}{}{}",
+                if self.vertices { "  vertices" } else { "" },
+                if self.dirty() { "  (unsaved)" } else { "" }
+            ),
+        };
         canvas.text(layout.x + layout.pad, layout.y + layout.pad, &title, TITLE, layout.scale);
         for (k, row) in self.panel().iter().enumerate() {
             let y = layout.row_y(k);
@@ -1199,6 +1232,9 @@ impl Editor {
 
     /// The key hints at the bottom of the panel.
     fn hints(&self) -> [String; 10] {
+        if let Some(model) = &self.model {
+            return model.hints();
+        }
         [
             format!("Grid {} m (G)", moose_assets::number(self.step())),
             "F6: 3D/top/front/side. F5: wire".to_string(),
@@ -1338,8 +1374,8 @@ const TITLE: u32 = 0xFF_D4_7A;
 const TEXT: u32 = 0xD8_D8_D8;
 const DIM: u32 = 0x8C_8C_8C;
 /// Outline colors: the selection, and what the pointer is over.
-const SELECTED: u32 = 0xFF_E0_40;
-const HOVER: u32 = 0x60_A0_FF;
+pub(crate) const SELECTED: u32 = 0xFF_E0_40;
+pub(crate) const HOVER: u32 = 0x60_A0_FF;
 const VERTEX: u32 = 0xB0_B0_C0;
 const LIGHT: u32 = 0xFF_B0_40;
 const SPAWN: u32 = 0x40_E0_E0;

@@ -17,6 +17,8 @@
 //!                         over the 3D view (F5), and 2D views' pixels per meter
 //!   --select NAME         in the editor, start with the entity NAME (or surface:N,
 //!                         sector:N, vertex:N, light:N) selected
+//!   --edit-model          in the editor, open the mesh editor on the selected entity's
+//!                         model; --polygon N also selects its polygon N
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
 //!                         on a player standing there
 //!   --flashlight-at X,Y,Z,DX,DY,DZ  start with the flashlight locked at X,Y,Z, aimed along
@@ -79,6 +81,7 @@
 //! it is free.
 
 mod editor;
+mod mesh_edit;
 mod ui;
 mod wire;
 
@@ -86,7 +89,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use moose_assets::{Assets, LevelDoc, Light, MeshId, RIPPLE_SIZE, Ripples, Texture, TextureId};
+use moose_assets::{Assets, LevelDoc, Light, MeshId, ModelDoc, RIPPLE_SIZE, Ripples, Texture, TextureId};
 use moose_present::{Display, Key, MouseButton};
 use moose_raster::shaders::{
     CubeReflection, Textured, TexturedFresnel, TexturedTranslucent, UnlitColor, VertexColor,
@@ -199,6 +202,8 @@ struct Options {
     /// Start in the editor, with an entity (by name) or a surface (`surface:N`) selected.
     edit: bool,
     select: Option<String>,
+    /// Open the mesh editor on the selected entity's model, with polygon N selected.
+    edit_model: Option<Option<usize>>,
     /// The editor's view, its wireframe over the 3D view, and its 2D views' scale.
     view: editor::ViewMode,
     wire: bool,
@@ -275,6 +280,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         screenshot: None,
         edit: false,
         select: None,
+        edit_model: None,
         view: editor::ViewMode::Perspective,
         wire: false,
         zoom: None,
@@ -340,6 +346,10 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--zoom" => o.zoom = Some(value()?.parse().map_err(|_| "bad --zoom")?),
             "--select" => o.select = Some(value()?),
+            "--edit-model" => o.edit_model = Some(None),
+            "--polygon" => {
+                o.edit_model = Some(Some(value()?.parse().map_err(|_| "bad --polygon")?));
+            }
             "--at" => o.at = Some(pose(&value()?, "--at")?),
             "--lock-flashlight" => o.lock_flashlight = Some(pose(&value()?, "--lock-flashlight")?),
             "--flashlight-at" => {
@@ -776,6 +786,14 @@ impl App {
     /// An edit of the editor's selection (see `editor::Editor::change`): made in the
     /// tables and the level rebuilt, or undone with the reason if the level rejects it.
     fn edit(&mut self, field: editor::Field, dir: f32) {
+        if field == editor::Field::EditModel {
+            self.toggle_model();
+            return;
+        }
+        if self.editor.model.is_some() {
+            self.edit_model(field, dir);
+            return;
+        }
         if !field.is_edit() {
             self.editor.command(field, dir);
             return;
@@ -794,8 +812,131 @@ impl App {
         }
     }
 
-    /// Undoes (or redoes) the last edit.
+    /// Opens the mesh editor on the selected entity's model, or leaves it. Leaving with
+    /// unsaved changes is refused once; the second time drops them (the model is read from
+    /// its file again).
+    fn toggle_model(&mut self) {
+        if let Some(model) = &mut self.editor.model {
+            if model.dirty() && !model.warned {
+                model.warned = true;
+                self.editor.say("the model has unsaved changes: Ctrl+S saves them, leaving again drops them");
+                return;
+            }
+            let (file, dirty) = (model.file.clone(), model.dirty());
+            self.editor.model = None;
+            if dirty {
+                let result = self
+                    .assets
+                    .reload_mesh(&file)
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| self.rebuild());
+                match result {
+                    Ok(()) => self.editor.say(format!("dropped the changes to {file}")),
+                    Err(e) => self.editor.say(e),
+                }
+            }
+            return;
+        }
+        let Some(editor::Selection::Entity(row)) = self.editor.selection else {
+            self.editor.say("select an entity with a .mmdl model first");
+            return;
+        };
+        let Some(file) = self.editor.doc.entities[row].model.clone().filter(|m| m.ends_with(".mmdl")) else {
+            self.editor.say("the mesh editor edits .mmdl models (export one from Blender)");
+            return;
+        };
+        let Some(entity) = self.editor.world_entity(row) else {
+            return;
+        };
+        let path = self.assets.root().join("models").join(&file);
+        let doc = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|src| ModelDoc::parse(&path, &src).map_err(|e| e.to_string()));
+        match doc {
+            Ok(doc) => {
+                self.editor.model = Some(mesh_edit::ModelEdit::new(file.clone(), path, doc, entity));
+                self.editor.say(format!("editing {file}"));
+            }
+            Err(e) => self.editor.say(e),
+        }
+    }
+
+    /// A mesh editor change: made in the model's tables, loaded (which checks them) and the
+    /// level rebuilt with it; or undone, with the reason.
+    fn edit_model(&mut self, field: editor::Field, dir: f32) {
+        let Some(model) = &mut self.editor.model else {
+            return;
+        };
+        if !field.is_edit() {
+            model.command(field, dir);
+            return;
+        }
+        let before = model.begin();
+        let changed = model.change(field, dir);
+        let (file, text) = (model.file.clone(), model.doc.to_text());
+        let mut loaded = false;
+        let result = changed.and_then(|what| {
+            self.assets.set_model_text(&file, &text).map_err(|e| e.to_string())?;
+            loaded = true;
+            self.rebuild()?;
+            Ok(what)
+        });
+        let model = self.editor.model.as_mut().unwrap();
+        match result {
+            Ok(what) => {
+                model.commit(before);
+                self.editor.say(what);
+            }
+            Err(why) => {
+                let old = before.0.to_text();
+                model.revert(before);
+                if loaded {
+                    // The model loaded, but the level refused it: back as it was.
+                    let _ = self.assets.set_model_text(&file, &old);
+                    let _ = self.rebuild();
+                }
+                self.editor.say(why);
+            }
+        }
+    }
+
+    /// Writes the mesh editor's model to its file.
+    fn save_model(&mut self) {
+        let Some(model) = &mut self.editor.model else {
+            return;
+        };
+        let path = model.path.clone();
+        match std::fs::write(&path, model.doc.to_text()) {
+            Ok(()) => {
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
+                    self.watched.insert(path.clone(), modified);
+                }
+                model.mark_saved();
+                self.editor.say(format!("saved {}", path.display()));
+            }
+            Err(e) => self.editor.say(format!("cannot save {}: {e}", path.display())),
+        }
+    }
+
+    /// Undoes (or redoes) the last edit (of the model, in the mesh editor).
     fn travel(&mut self, redo: bool) {
+        if let Some(model) = &mut self.editor.model {
+            if !model.travel(redo) {
+                self.editor.say(if redo { "nothing to redo" } else { "nothing to undo" });
+                return;
+            }
+            let (file, text) = (model.file.clone(), model.doc.to_text());
+            let result = self
+                .assets
+                .set_model_text(&file, &text)
+                .map_err(|e| e.to_string())
+                .and_then(|()| self.rebuild());
+            match result {
+                Ok(()) => self.editor.say(if redo { "redone" } else { "undone" }),
+                Err(e) => self.editor.say(e),
+            }
+            return;
+        }
         if !self.editor.travel(redo) {
             self.editor.say(if redo { "nothing to redo" } else { "nothing to undo" });
             return;
@@ -1866,6 +2007,10 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         (Some(o), Some((x, y))) => Some(o.to_world(x, y)),
         _ => None,
     };
+    if app.editor.model.is_some() {
+        model_input(app, display, &projection, ortho.is_some(), cursor, over_panel, (ctrl, shift));
+        return false;
+    }
     app.editor.hover = match cursor {
         Some((x, y)) if !over_panel => {
             let at = glam::Vec2::new(x, y);
@@ -1961,6 +2106,9 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             app.editor.ortho_center = position;
         }
     }
+    if display.key_pressed(Key::M) {
+        app.edit(Field::EditModel, 1.0);
+    }
     if display.key_pressed(Key::G) {
         app.editor.step = (app.editor.step + 1) % editor::STEPS.len();
         let step = app.editor.step();
@@ -2022,6 +2170,81 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     true
 }
 
+/// The mesh editor's mouse and keys (see [`edit_input`]): picking the model's polygons in
+/// the 3D view, the panel, undo and saving.
+fn model_input(
+    app: &mut App,
+    display: &Display,
+    projection: &wire::Projection,
+    two_d: bool,
+    cursor: Option<(f32, f32)>,
+    over_panel: bool,
+    (ctrl, shift): (bool, bool),
+) {
+    use editor::Field;
+    let (w, h) = (app.width as usize, app.height as usize);
+    let model = app.editor.model.as_ref().unwrap();
+    let hover = match cursor {
+        Some((x, y)) if !over_panel && !two_d => {
+            if model.proxies {
+                model.pick_proxy(projection, app.camera.position, glam::Vec2::new(x, y), &app.world, &app.assets)
+            } else {
+                app.geometry.pick(x, y).and_then(|(source, _)| match source {
+                    PolygonSource::Entity { entity, polygon } if entity as usize == model.entity => {
+                        Some(polygon as usize)
+                    }
+                    _ => None,
+                })
+            }
+        }
+        _ => None,
+    };
+    app.editor.model.as_mut().unwrap().hover = hover;
+    let row_field = cursor
+        .filter(|_| over_panel)
+        .and_then(|(x, y)| app.editor.row_at(x, y, w, h))
+        .and_then(|k| app.editor.panel()[k].field);
+    if display.mouse_clicked(MouseButton::Left) {
+        if over_panel {
+            if let Some(field) = row_field {
+                app.edit(field, 1.0);
+            }
+        } else if two_d {
+            app.editor.say("pick the model's polygons in the 3D view (F6)");
+        } else if cursor.is_some() {
+            app.editor.model.as_mut().unwrap().polygon = hover;
+        }
+    }
+    let scroll = display.scroll();
+    if scroll != 0.0
+        && let Some(field) = row_field
+        && !matches!(field, Field::Delete | Field::EditModel | Field::ProxyBox | Field::RemoveProxies)
+    {
+        app.edit(field, scroll.signum());
+    }
+    if ctrl {
+        if display.key_pressed(Key::Z) {
+            app.travel(shift);
+        }
+        if display.key_pressed(Key::Y) {
+            app.travel(true);
+        }
+        if display.key_pressed(Key::S) {
+            app.save_model();
+        }
+        return;
+    }
+    if display.key_pressed(Key::P) {
+        app.edit(Field::PickProxies, 1.0);
+    }
+    if display.key_pressed(Key::M) {
+        app.edit(Field::EditModel, 1.0);
+    }
+    if display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
+        app.edit(Field::Delete, 1.0);
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -2069,6 +2292,11 @@ fn run() -> Result<(), String> {
                     .ok_or(format!("--select: no entity '{name}'"))?,
             ),
         });
+    }
+    if let Some(polygon) = options.edit_model {
+        app.edit(editor::Field::EditModel, 1.0);
+        let model = app.editor.model.as_mut().ok_or("--edit-model: select an entity with a .mmdl model")?;
+        model.polygon = polygon;
     }
     if let Some(path) = &options.screenshot {
         if let Some(at) = options.at {
@@ -2120,8 +2348,15 @@ fn run() -> Result<(), String> {
         last = now;
 
         if display.key_pressed(Key::Escape) {
-            // In the editor, Esc stops a cut, then drops the selection, first.
-            if app.editor.on && !menu.open && app.editor.cutting.is_some() {
+            // In the editor, Esc stops a cut, then drops the selection, first; in the mesh
+            // editor, drops the polygon, then leaves it.
+            if app.editor.on && !menu.open && let Some(model) = &mut app.editor.model {
+                if model.polygon.is_some() {
+                    model.polygon = None;
+                } else {
+                    app.edit(editor::Field::EditModel, 1.0);
+                }
+            } else if app.editor.on && !menu.open && app.editor.cutting.is_some() {
                 app.editor.cutting = None;
                 app.editor.say("cut stopped");
             } else if app.editor.on && !menu.open && app.editor.selection.is_some() {
@@ -2459,6 +2694,54 @@ mod tests {
         assert_eq!(label(&app).as_deref(), Some("walk"));
         // One new level mesh per rebuild, and no more copies.
         assert_eq!(app.assets.meshes().len(), meshes + 3);
+    }
+
+    #[test]
+    fn the_mesh_editor_sets_proxies_and_drops_unsaved_changes() {
+        use editor::{Field, Selection};
+        let mut app = test_app("walker_rooms.mmp");
+        let row = app.editor.doc.entities.iter().position(|e| e.name == "walker").unwrap();
+        app.editor.selection = Some(Selection::Entity(row));
+        assert!(app.editor.panel().iter().any(|r| r.field == Some(Field::EditModel)));
+        app.edit(Field::EditModel, 1.0);
+        assert!(app.editor.model.is_some(), "opened on the walker");
+        let model_id = app.assets.mesh_id("walker.mmdl").unwrap();
+        let original = app.assets.mesh(model_id).clone();
+        let proxies = |app: &App| app.assets.mesh(model_id).polygons.iter().filter(|p| p.flags.proxy()).count();
+        // The first polygon (the hips' box, drawn) made a proxy: the model and the walker's
+        // posed copy have it.
+        app.edit(Field::PolygonPick, 1.0);
+        assert_eq!(app.editor.model.as_ref().unwrap().polygon, Some(0));
+        app.edit(Field::Proxy, 1.0);
+        assert_eq!(proxies(&app), 43);
+        let walker = app.world.entities.iter().find(|e| e.name == "walker").unwrap();
+        assert!(app.assets.mesh(walker.mesh).polygons[0].flags.proxy());
+        // Undone; then the hips' proxies removed and a box put back around them.
+        app.travel(false);
+        assert_eq!(proxies(&app), 42);
+        app.edit(Field::RemoveProxies, 1.0);
+        assert_eq!(proxies(&app), 36);
+        app.edit(Field::PolygonPick, 1.0);
+        app.edit(Field::ProxyBox, 1.0);
+        assert_eq!(proxies(&app), 42);
+        // Leaving asks first, then drops the changes: the model is as on disk.
+        app.edit(Field::EditModel, 1.0);
+        assert!(app.editor.model.is_some(), "refused once: unsaved changes");
+        app.edit(Field::EditModel, 1.0);
+        assert!(app.editor.model.is_none());
+        assert_eq!(app.assets.mesh(model_id), &original);
+        // Saving writes the tables (here to a scratch file).
+        app.edit(Field::EditModel, 1.0);
+        let path = std::env::temp_dir().join("moose_mesh_editor_test.mmdl");
+        let model = app.editor.model.as_mut().unwrap();
+        model.path = path.clone();
+        model.polygon = Some(1);
+        app.edit(Field::Proxy, 1.0);
+        app.save_model();
+        assert!(!app.editor.model.as_ref().unwrap().dirty());
+        let saved = ModelDoc::parse(&path, &std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.polygons[1].proxy());
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
