@@ -1396,5 +1396,12 @@ mod tests {
         let got = ctx.light(&full_light())[0].to_array();
         let (all, rest) = ((2.0f32.powf(1.0 / super::GAMMA) * 65536.0).round() as i32, 65536);
         assert_eq!(got, [all, rest, all, rest, rest, all, all, rest]);
+        // The fast blend, halfway through a split light of 1 over nothing: close to exact
+        // (0.5^(1 / GAMMA) = 0.73), in gamma-2 terms (0.71).
+        ctx.split.fast = true;
+        ctx.split.reaches[0] = F32s::fill(0.5);
+        ctx.split.total = [F32s::fill(1.0); 3];
+        let half = ctx.light(&[I32s::fill(0); 3])[0].to_array()[0] as f32 / 65536.0;
+        assert!((half - 0.5f32.powf(1.0 / super::GAMMA)).abs() < 0.03, "{half}");
     }
 }

@@ -81,6 +81,10 @@ pub struct RasterConfig {
     /// Beams' fades (see `Light::beam`) are drawn as a stipple, each pixel lit or not by a
     /// 4×4 ordered dither: a retro look, and cheap, as no pixel needs a partial light.
     pub beam_dither: bool,
+    /// Blend partly shadowed pixels (penumbras, beams' fades) by a fast approximation:
+    /// between the exact light with and without the split lights, in gamma-2 terms (a
+    /// square root, no tables). Exact where they reach fully or not at all.
+    pub fast_blend: bool,
 }
 
 impl Default for RasterConfig {
@@ -99,6 +103,7 @@ impl Default for RasterConfig {
             penumbra_padding: 16,
             show_samples: false,
             beam_dither: false,
+            fast_blend: false,
         }
     }
 }
@@ -2133,6 +2138,7 @@ fn shade_points(
         x0,
         splits: p.splits as usize,
         split_colors: p.split_colors,
+        fast_blend: config.fast_blend,
         reaches: &s.reaches,
         row: s.row,
         half_rate: p.half_rate,

@@ -46,6 +46,8 @@
 //!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
 //!                         degree edge (default 8; 0 is a hard edge)
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
+//!   --fast-blend          blend partly shadowed pixels (penumbras, the beam's fade) by a
+//!                         fast approximation instead of exactly
 //!   --level-lights        start with the level's own lights on (off by default, leaving the
 //!                         flashlight and the ambient light)
 //!   --time T              seconds into the water's animation, for --screenshot
@@ -206,6 +208,7 @@ struct Options {
     time: f32,
     show_samples: bool,
     dither_beam: bool,
+    fast_blend: bool,
     /// `RasterConfig` spacing limits, if given.
     min_step: Option<u32>,
     light_spacing: Option<u32>,
@@ -267,6 +270,7 @@ fn parse_args() -> Result<Options, String> {
         time: 0.0,
         show_samples: false,
         dither_beam: false,
+        fast_blend: false,
         min_step: None,
         light_spacing: None,
         steep_limit: None,
@@ -342,6 +346,7 @@ fn parse_args() -> Result<Options, String> {
             "--level-lights" => o.level_lights = true,
             "--show-samples" => o.show_samples = true,
             "--dither-beam" => o.dither_beam = true,
+            "--fast-blend" => o.fast_blend = true,
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
             "--light-spacing" => {
                 o.light_spacing = Some(value()?.parse().map_err(|_| "bad --light-spacing")?)
@@ -498,6 +503,7 @@ impl App {
         let mut renderer = Renderer::new(RasterConfig {
             show_samples: options.show_samples,
             beam_dither: options.dither_beam,
+            fast_blend: options.fast_blend,
             min_step: options.min_step.unwrap_or(defaults.min_step),
             light_spacing: options.light_spacing.unwrap_or(defaults.light_spacing),
             steep_limit: options.steep_limit.unwrap_or(defaults.steep_limit),
@@ -858,6 +864,7 @@ impl App {
             Setting::PerPixelCrates => on(s.per_pixel_crates),
             Setting::FrameCap => if s.capped { format!("{} fps", s.cap) } else { "off".into() },
             Setting::Overlay => on(cfg.show_samples),
+            Setting::LightBlend => if cfg.fast_blend { "fast" } else { "exact" }.into(),
             Setting::MinStep => format!("{} px", cfg.min_step),
             Setting::LightSpacing => format!("{} px", cfg.light_spacing),
             Setting::SteepLimit => {
@@ -935,6 +942,7 @@ impl App {
             Setting::PerPixelCrates => s.per_pixel_crates = !s.per_pixel_crates,
             Setting::FrameCap => s.capped = !s.capped,
             Setting::Overlay => cfg.show_samples = !cfg.show_samples,
+            Setting::LightBlend => cfg.fast_blend = !cfg.fast_blend,
             Setting::MinStep => {
                 cfg.min_step = cycle(&PIXEL_STEPS, cfg.min_step as f32, dir) as u32;
             }
@@ -1048,6 +1056,7 @@ impl App {
             (s.per_pixel_crates, "--per-pixel-crates"),
             (cfg.show_samples, "--show-samples"),
             (cfg.beam_dither, "--dither-beam"),
+            (cfg.fast_blend, "--fast-blend"),
         ] {
             if on {
                 add(flag.to_string());
@@ -1338,6 +1347,7 @@ enum Setting {
     PerPixelCrates,
     FrameCap,
     Overlay,
+    LightBlend,
     MinStep,
     LightSpacing,
     SteepLimit,
@@ -1427,6 +1437,7 @@ impl Page {
                 Set(Fade),
                 Set(TranslucentCrates),
                 Set(PerPixelCrates),
+                Set(LightBlend),
                 Set(FrameCap),
             ],
             Page::Sampling => &[
@@ -1504,6 +1515,7 @@ impl Item {
                 Setting::PerPixelCrates => "Per-pixel crates",
                 Setting::FrameCap => "Frame cap",
                 Setting::Overlay => "Sample overlay",
+                Setting::LightBlend => "Soft light blend",
                 Setting::MinStep => "Minimum step",
                 Setting::LightSpacing => "Light spacing",
                 Setting::SteepLimit => "Steep limit",

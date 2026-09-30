@@ -13,7 +13,9 @@
 //! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
 //! FLASHLIGHT=beam or FLASHLIGHT=sampled adds the app's flashlight at the camera (shadow slot
 //! 0, 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
-//! beam or lit at sample points. DITHER=1 dithers beams' fades.
+//! beam or lit at sample points. DITHER=1 dithers beams' fades. FLASHLIGHT_SHADOWS=0 turns
+//! its shadows off (a beam keeps its cone). FAST_BLEND=1 blends partly shadowed pixels by
+//! the fast approximation.
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -63,6 +65,7 @@ fn main() {
     let mut renderer = Renderer::new(RasterConfig {
         min_step: setting("MIN_STEP", defaults.min_step),
         beam_dither: std::env::var("DITHER").is_ok_and(|d| d == "1"),
+        fast_blend: std::env::var("FAST_BLEND").is_ok_and(|d| d == "1"),
         light_spacing: setting("LIGHT_SPACING", defaults.light_spacing),
         penumbra_threshold: std::env::var("PENUMBRA_THRESHOLD")
             .map_or(defaults.penumbra_threshold, |v| v.parse().expect("a number")),
@@ -135,6 +138,7 @@ fn main() {
                 cone.1,
             );
             (light.shadow, light.radius, light.beam) = (Some(0), 0.05, beam);
+            light.shadows = std::env::var("FLASHLIGHT_SHADOWS").map_or(true, |s| s != "0");
             let mut lights = level_lights.clone();
             lights.push(light);
             world.set_lights(lights, world.ambient);
