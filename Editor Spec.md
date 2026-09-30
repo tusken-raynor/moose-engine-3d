@@ -114,7 +114,12 @@ M (or the entity's "Mesh editor" row) opens the selected entity's `.mmdl` model,
 
 ## Display
 
-The editor needed a new display layer: `moose-present` now uses winit (window and input) and softbuffer (pixels on screen) instead of minifb, keeping the app's polling loop through winit's pump events. It adds real fullscreen (F11, `--fullscreen`), a locked hidden cursor with raw mouse motion for looking, the cursor's position in framebuffer pixels, clicks, the wheel and typed text. The framebuffer is scaled to fill the window, keeping its shape (high-density displays, resized windows, fullscreen), across threads by rows.
+The editor needed a new display layer: `moose-present` now uses winit (window and input) and softbuffer (pixels on screen) instead of minifb, keeping the app's polling loop through winit's pump events. It adds real fullscreen (Alt+Enter, which is Option+Return on a Mac; also F11 where the system leaves it alone; `--fullscreen`), a locked hidden cursor with raw mouse motion for looking, the cursor's position in framebuffer pixels, clicks, the wheel and typed text. The framebuffer is scaled to fill the window, keeping its shape (high-density displays, resized windows, fullscreen), nearest pixel.
+
+- **On macOS, the compositor does the scaling, on the GPU:** frames go over at the framebuffer's size, and the window is black around them. The window also gets the color space softbuffer tags frames with (device RGB). Without it, macOS converted every pixel of every frame to the display's color profile on the CPU, about 11 ms a frame in a 2560 × 1440 window, which held the game near 80 fps whatever the render time. Showing a 1280 × 720 frame now takes about 1 ms.
+- **Elsewhere, the frame is scaled on the CPU,** across threads by rows.
+- **The frame rate cap keeps to a schedule,** so it holds exactly.
+- **Measuring:** the debug HUD (F3) shows the present time, and `cargo run --release -p moose-present --example present_bench` times presenting alone.
 
 ## Known limits
 

@@ -8,3 +8,10 @@ edition.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
 rayon.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The versions winit uses: to set up how the window shows frames (see `setup_macos`).
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = ["NSColor", "NSColorSpace", "NSResponder", "NSView", "NSWindow", "objc2-quartz-core"] }
+objc2-foundation = { version = "0.2", features = ["NSArray"] }
+objc2-quartz-core = { version = "0.2", features = ["CALayer"] }

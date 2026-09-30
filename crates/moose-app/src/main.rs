@@ -35,7 +35,7 @@
 //!   --water               shiny floors start as water, not plain reflective tiles;
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
-//!   --fullscreen          start fullscreen (F11 switches)
+//!   --fullscreen          start fullscreen (Alt+Enter switches)
 //!   --cone MODE           how the flashlight's cone is drawn: beam (faded pixel by pixel
 //!                         with its shadow; the default), sampled (lit at sample points)
 //!                         or soft (lit at sample points as they are, fading over all 20
@@ -76,7 +76,7 @@
 //! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift
 //! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
 //! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
-//! reproduces this view, F3 debug HUD, F11 fullscreen, F12 screenshot. Every other setting
+//! reproduces this view, F3 debug HUD, Alt+Enter fullscreen, F12 screenshot. Every other setting
 //! is in the menu. While playing, the cursor is locked (hidden) for mouse look; in the menu
 //! it is free.
 
@@ -1359,12 +1359,14 @@ impl App {
     }
 
     /// The debug HUD's lines: frame rate and times, where the camera is, and what's on.
-    fn hud(&self, fps: f64, view_ms: f64, raster_ms: f64) -> Vec<String> {
+    /// `present_ms` is showing the last frames (see `PresentTimes`: copying, handing it to
+    /// the system, and the window's events, without the frame rate cap's wait).
+    fn hud(&self, fps: f64, view_ms: f64, raster_ms: f64, present_ms: f64) -> Vec<String> {
         let (c, s) = (&self.camera, &self.settings);
         let on = |b: bool, name: &str| if b { name.to_string() } else { format!("{name} off") };
         vec![
             format!(
-                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms",
+                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms   present {present_ms:.2} ms",
                 if s.capped { format!(" (cap {})", s.cap) } else { String::new() },
             ),
             format!(
@@ -1869,7 +1871,7 @@ impl Page {
                 "Space/C up/down, Shift faster",
                 "U lock the flashlight in place / remount it",
                 "Esc menu, F1 print a command line for this view",
-                "F3 debug HUD, F11 fullscreen, F12 screenshot",
+                "F3 debug HUD, Alt+Enter fullscreen, F12 screenshot",
             ],
             Page::Flashlight => &[
                 "Locking leaves it where it is: walk around",
@@ -2305,7 +2307,7 @@ fn run() -> Result<(), String> {
         app.editor.ortho_center = app.camera.position;
         app.set_time(options.time);
         let (view_ms, raster_ms) = app.frame()?;
-        let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms));
+        let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
         draw_ui(&mut app, options.menu.map(|page| (page, 0)), hud);
         app.save_png(Path::new(path))?;
         println!(
@@ -2334,7 +2336,8 @@ fn run() -> Result<(), String> {
     };
     // Frame rate and times, averaged over half a second for the HUD.
     let (mut stats_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
-    let mut stats = (0.0, 0.0, 0.0);
+    let mut stats = (0.0, 0.0, 0.0, 0.0);
+    let mut present_sum = 0.0;
     // Pointer motion still being turned (see `MOUSE_SMOOTHING`): when its window starts,
     // and the motion, in pixels. And the time of this frame's start, in seconds.
     let mut look: Vec<(f64, (f32, f32))> = Vec::new();
@@ -2371,7 +2374,11 @@ fn run() -> Result<(), String> {
             app.editor.on = !app.editor.on;
             app.editor.hover = None;
         }
-        if display.key_pressed(Key::F11) {
+        // Fullscreen: Alt+Enter (Option+Return on a Mac). F11 too, where the system
+        // doesn't take it (macOS shows the desktop). Not Ctrl+Cmd+F: macOS takes that for
+        // its own fullscreen, which fights ours and hangs the window.
+        let alt = display.key_down(Key::LeftAlt) || display.key_down(Key::RightAlt);
+        if (alt && display.key_pressed(Key::Enter)) || display.key_pressed(Key::F11) {
             display.set_fullscreen(!display.is_fullscreen());
         }
         // Mouse look while playing, and in the editor while the right button is held; a
@@ -2400,7 +2407,7 @@ fn run() -> Result<(), String> {
             if let (Item::Set(setting), true) = (item, dir != 0) {
                 app.change(setting, dir);
             }
-            if display.key_pressed(Key::Enter) {
+            if display.key_pressed(Key::Enter) && !alt {
                 match item {
                     Item::Resume => menu.open = false,
                     Item::Respawn => {
@@ -2570,12 +2577,14 @@ fn run() -> Result<(), String> {
         let elapsed = stats_at.elapsed().as_secs_f64();
         if elapsed >= 0.5 {
             let n = frames as f64;
-            stats = (n / elapsed, view_sum / n, raster_sum / n);
-            (stats_at, frames, view_sum, raster_sum) = (Instant::now(), 0, 0.0, 0.0);
+            stats = (n / elapsed, view_sum / n, raster_sum / n, present_sum / n);
+            (stats_at, frames, view_sum, raster_sum, present_sum) = (Instant::now(), 0, 0.0, 0.0, 0.0);
         }
-        let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2));
+        let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2, stats.3));
         draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), hud);
         display.present(&app.pixels)?;
+        let t = display.present_times();
+        present_sum += t.copy + t.show + t.events;
     }
     Ok(())
 }

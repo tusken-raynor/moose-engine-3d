@@ -18,7 +18,9 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
+#[cfg(not(target_os = "macos"))]
+use winit::window::Fullscreen;
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 /// A key, by where it is on the keyboard (a US layout's names).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -86,6 +88,25 @@ struct State {
     last_frame: Instant,
     /// For scaling: each window column's framebuffer column, for the window's size.
     columns: Vec<u32>,
+    /// How long the last frame's showing took (see [`PresentTimes`]).
+    times: PresentTimes,
+    /// The system scales frames to fit the window (macOS): they go over at their own size.
+    system_scales: bool,
+}
+
+/// Where the last [`Display::present`] spent its time, in milliseconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PresentTimes {
+    /// Copying (and scaling) the frame into the window's buffer.
+    pub copy: f64,
+    /// Handing the buffer to the system to show.
+    pub show: f64,
+    /// Waiting out the frame rate cap.
+    pub wait: f64,
+    /// Gathering input and window events.
+    pub events: f64,
+    /// The window's size in pixels.
+    pub window: (u32, u32),
 }
 
 impl Display {
@@ -117,6 +138,8 @@ impl Display {
                 interval: None,
                 last_frame: Instant::now(),
                 columns: Vec::new(),
+                times: PresentTimes::default(),
+                system_scales: false,
             },
         };
         display.set_max_fps(max_fps);
@@ -143,22 +166,34 @@ impl Display {
             "framebuffer size does not match the window"
         );
         self.state.draw(pixels)?;
-        if let Some(interval) = self.state.interval {
-            let next = self.state.last_frame + interval;
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
+        // Frames keep to a schedule, one interval apart: a sleep that overshoots makes the
+        // next wait shorter, rather than every frame late. A frame that's late anyway
+        // starts the schedule again.
+        let waiting = Instant::now();
+        self.state.last_frame = match self.state.interval {
+            Some(interval) if self.state.last_frame + interval > waiting => {
+                let next = self.state.last_frame + interval;
+                std::thread::sleep(next - waiting);
+                next
             }
-        }
-        self.state.last_frame = Instant::now();
+            _ => waiting,
+        };
+        self.state.times.wait = ms(waiting.elapsed());
         let s = &mut self.state;
         s.pressed.clear();
         s.repeated.clear();
         s.clicked = [false; 3];
         s.scroll = 0.0;
         s.text.clear();
+        let pumping = Instant::now();
         self.pump(Some(Duration::ZERO));
+        self.state.times.events = ms(pumping.elapsed());
         Ok(())
+    }
+
+    /// Where the last `present` spent its time.
+    pub fn present_times(&self) -> PresentTimes {
+        self.state.times
     }
 
     fn pump(&mut self, timeout: Option<Duration>) {
@@ -183,7 +218,7 @@ impl Display {
     pub fn set_fullscreen(&mut self, on: bool) {
         self.state.fullscreen = on;
         if let Some(window) = &self.state.window {
-            window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+            apply_fullscreen(window, on);
         }
     }
 
@@ -268,6 +303,67 @@ fn fit(width: u32, height: u32, window_width: u32, window_height: u32) -> (f32, 
     (scale, (window_width - w.min(window_width)) / 2, (window_height - h.min(window_height)) / 2)
 }
 
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Sets up how macOS shows our frames; returns whether it scales them itself.
+///
+/// - The window gets the color space softbuffer tags frames with (device RGB), so they're
+///   shown as they are. Otherwise macOS converts every pixel of every frame to the display's
+///   color profile on the CPU as the frame is shown: about 11 ms a frame in a 2560 x 1440
+///   window, which held the frame rate near 80.
+/// - softbuffer's layer scales its contents to fit, keeping their shape, nearest pixel (on
+///   the GPU, by the compositor), with the window black around them. So frames go over at
+///   the framebuffer's size: no scaling on the CPU, and softbuffer (which allocates a fresh
+///   buffer each frame) clears a quarter of the memory on a Retina display.
+#[cfg(target_os = "macos")]
+fn setup_macos(window: &Window) -> bool {
+    use objc2_app_kit::{NSColor, NSColorSpace, NSView};
+    use objc2_quartz_core::{kCAFilterNearest, kCAGravityResizeAspect};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return false;
+    };
+    // SAFETY: winit's handle is to the window's live NSView, used on the main thread.
+    let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+    let Some(ns_window) = view.window() else {
+        return false;
+    };
+    unsafe {
+        ns_window.setColorSpace(Some(&NSColorSpace::deviceRGBColorSpace()));
+        ns_window.setBackgroundColor(Some(&NSColor::blackColor()));
+    }
+    // softbuffer's layer: the one it adds to the view's.
+    let layer = unsafe { view.layer().and_then(|root| root.sublayers()?.lastObject()) };
+    let Some(layer) = layer else {
+        return false;
+    };
+    unsafe {
+        layer.setContentsGravity(kCAGravityResizeAspect);
+        layer.setMagnificationFilter(kCAFilterNearest);
+        layer.setMinificationFilter(kCAFilterNearest);
+    }
+    true
+}
+
+/// Fills the screen with the window, or puts it back. On macOS, the "simple" way: the
+/// window covers the screen and the menu bar and Dock hide. (winit's borderless fullscreen
+/// there is the system's own, which animates the window into a Space of its own; that got
+/// stuck partway, the window on a grey backdrop and keys lost.)
+fn apply_fullscreen(window: &Window, on: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        window.set_simple_fullscreen(on);
+    }
+    #[cfg(not(target_os = "macos"))]
+    window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+}
+
 fn apply_cursor_lock(window: &Window, locked: bool) {
     if locked {
         // Locked where supported (macOS, Wayland); otherwise kept inside the window.
@@ -286,13 +382,22 @@ impl State {
         let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else {
             return Ok(());
         };
-        let size = window.inner_size();
-        let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+        let window_size = window.inner_size();
+        if window_size.width == 0 || window_size.height == 0 {
             return Ok(()); // minimized
+        }
+        let size = if self.system_scales {
+            winit::dpi::PhysicalSize::new(self.width, self.height)
+        } else {
+            window_size
+        };
+        let (Some(ww), Some(wh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return Ok(());
         };
         surface
             .resize(ww, wh)
             .map_err(|e| format!("cannot size the window's buffer: {e}"))?;
+        let copying = Instant::now();
         let mut buffer = surface
             .buffer_mut()
             .map_err(|e| format!("cannot draw to the window: {e}"))?;
@@ -326,7 +431,12 @@ impl State {
                     row[(left + shown_w) as usize..].fill(0);
                 });
         }
-        buffer.present().map_err(|e| format!("cannot present frame: {e}"))
+        let showing = Instant::now();
+        self.times.copy = ms(showing - copying);
+        self.times.window = (window_size.width, window_size.height);
+        buffer.present().map_err(|e| format!("cannot present frame: {e}"))?;
+        self.times.show = ms(showing.elapsed());
+        Ok(())
     }
 }
 
@@ -349,8 +459,12 @@ impl ApplicationHandler for State {
             self.open = false;
             return;
         };
+        #[cfg(target_os = "macos")]
+        {
+            self.system_scales = setup_macos(&window);
+        }
         if self.fullscreen {
-            window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            apply_fullscreen(&window, true);
         }
         apply_cursor_lock(&window, self.cursor_locked);
         self.window = Some(window);

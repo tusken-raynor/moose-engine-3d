@@ -737,6 +737,10 @@ dependencies = [
 name = "moose-present"
 version = "0.2.0"
 dependencies = [
+ "objc2 0.5.2",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
+ "objc2-quartz-core 0.2.2",
  "rayon",
  "softbuffer",
  "winit",
