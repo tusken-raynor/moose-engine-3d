@@ -1126,9 +1126,6 @@ pub struct Split {
     pub reaches: [F32s; MAX_SPLIT],
     /// All the light, theirs included, encoded like a `light` output (1 being 1).
     pub total: [F32s; 3],
-    /// Blend partly shadowed pixels by the fast approximation (see
-    /// [`PixelContext::light`]).
-    pub fast: bool,
 }
 
 /// What `shade_pixel` sees besides its interpolated values.
@@ -1145,8 +1142,14 @@ pub struct PixelContext<'a> {
 impl PixelContext<'_> {
     /// The light at the pixels: a `light` output (16.16, gamma-encoded, from the lights
     /// the sample stage added up) with the lights whose shadows cover part of the polygon
-    /// added back, each as much as its shadow lets through at each pixel. Added in linear
-    /// terms: decoded, summed with them, and encoded again.
+    /// added back, each as much as its shadow lets through at each pixel.
+    ///
+    /// Where all of them reach or none, that is exactly the total or the rest, both worked
+    /// out at the sample points. Between, it blends from the rest `e0` to the total `e1`
+    /// (encoded) in gamma-2 terms, `sqrt(e0^2 + (e1^2 - e0^2) f)`, where `f` is how much of
+    /// their light reaches (each one's light as much as reaches, over all of it): close to
+    /// adding in linear terms (the encoding is `light^(1 / 2.2)`), with a square root and
+    /// no tables.
     #[inline(always)]
     pub fn light(&self, light: &[I32s; 3]) -> [I32s; 3] {
         if self.split.count == 0 {
@@ -1175,30 +1178,17 @@ impl PixelContext<'_> {
             });
         }
         let scale = F32s::fill(1.0 / 65536.0);
-        if self.split.fast {
-            // Between the two ends, the rest `e0` and all of it `e1` (both encoded, exact),
-            // in gamma-2 terms: `sqrt(e0^2 + (e1^2 - e0^2) f)`, where `f` is how much of the
-            // split lights' light reaches (their light, as much as reaches of each, over
-            // all of it). Exact where all of it reaches and where none does.
-            return std::array::from_fn(|c| {
-                let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
-                for j in 0..self.split.count {
-                    all += self.split.light[j][c];
-                    reaching += self.split.reaches[j] * self.split.light[j][c];
-                }
-                let f = reaching / all.max(F32s::fill(1e-12));
-                let e0 = light[c].round_float() * scale;
-                let e1 = self.split.total[c];
-                let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
-                (e * F32s::fill(65536.0)).round_int()
-            });
-        }
         std::array::from_fn(|c| {
-            let mut sum = crate::shaders::decode_light(light[c].round_float() * scale);
+            let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
             for j in 0..self.split.count {
-                sum += self.split.reaches[j] * self.split.light[j][c];
+                all += self.split.light[j][c];
+                reaching += self.split.reaches[j] * self.split.light[j][c];
             }
-            (crate::shaders::encode_light(sum) * F32s::fill(65536.0)).round_int()
+            let f = reaching / all.max(F32s::fill(1e-12));
+            let e0 = light[c].round_float() * scale;
+            let e1 = self.split.total[c];
+            let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
+            (e * F32s::fill(65536.0)).round_int()
         })
     }
 }
@@ -1296,8 +1286,6 @@ pub struct SpanJob<'a> {
     /// `reaches[j * len + i]` for light `j` at pixel `x0 + i`).
     pub splits: usize,
     pub split_colors: [Vec3; MAX_SPLIT],
-    /// Blend partly shadowed pixels by the fast approximation (`RasterConfig::fast_blend`).
-    pub fast_blend: bool,
     pub reaches: &'a [f32],
     /// The framebuffer row.
     pub row: i32,
@@ -1622,7 +1610,6 @@ impl Run<'_> {
         // pixel, clamped to the run).
         let mut split = Split {
             count: self.job.splits,
-            fast: self.job.fast_blend,
             ..Split::default()
         };
         let len = self.color.len();
@@ -1932,7 +1919,6 @@ mod tests {
                     x0: x,
                     splits: 0,
                     split_colors: [Vec3::ZERO; MAX_SPLIT],
-                    fast_blend: false,
                     reaches: &[],
                     row: 0,
                     half_rate,

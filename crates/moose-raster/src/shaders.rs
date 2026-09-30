@@ -103,33 +103,6 @@ pub(crate) fn encode_light(l: F32s) -> F32s {
     F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize]))
 }
 
-/// [`DECODE_LUT`] entries per unit of encoded light.
-const DECODE_SCALE: f32 = 256.0;
-
-/// `e^GAMMA` at `e = i / DECODE_SCALE`: encoded light (0 to 4) back to linear, for
-/// [`decode_light`] to blend between neighboring entries.
-static DECODE_LUT: std::sync::LazyLock<[f32; 1026]> = std::sync::LazyLock::new(|| {
-    std::array::from_fn(|i| (i as f32 / DECODE_SCALE).powf(GAMMA))
-});
-
-/// Encoded light (as a `light` output holds it, 1 being 1) back to linear, by
-/// [`DECODE_LUT`], blended between entries.
-#[inline(always)]
-pub(crate) fn decode_light(e: F32s) -> F32s {
-    use crate::shader::LANES;
-    let lut = &*DECODE_LUT;
-    let x = (e * F32s::fill(DECODE_SCALE))
-        .max(F32s::fill(0.0))
-        .min(F32s::fill((lut.len() - 2) as f32));
-    let i = x.trunc_int().to_array();
-    let f = x - x.floor();
-    let (a, b) = (
-        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize])),
-        F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize + 1])),
-    );
-    a + (b - a) * f
-}
-
 /// XRGB from a `color` output (three 8.8 channels, 0-255) under the 16.16 `light` (see
 /// [`light_output`]), each channel at most 255. Color and light are interpolated apart and
 /// multiplied per pixel: clamping lit colors at sample points would bend them near edges,
@@ -1368,23 +1341,29 @@ mod tests {
         let rest = [I32s::fill(0); 3];
         // No split lights: the light as it is.
         assert_eq!(ctx.light(&full_light()), full_light());
-        // A split light of 1 (linear) over nothing: all, half and none of it, encoded (as
-        // light outputs are: to the power 1 / GAMMA).
+        // A split light of 1 (linear) over nothing, so all the light is 1 (encoded): all,
+        // half and none of it. Halfway, between the two ends in gamma-2 terms: sqrt(0.5) =
+        // 0.71, close to adding in linear terms (0.5^(1 / GAMMA) = 0.73).
         let mut split = Split {
             count: 1,
             ..Split::default()
         };
         split.light[0] = [F32s::fill(1.0); 3];
         split.reaches[0] = F32s::from([1.0, 0.5, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        split.total = [F32s::fill(1.0); 3];
         ctx.split = split;
         let close = |got: i32, want: f32| (got as f32 - want * 65536.0).abs() <= 65536.0 * 1e-3;
         let lit = ctx.light(&rest)[0].to_array();
         assert!(close(lit[0], 1.0), "{}", lit[0]);
-        assert!(close(lit[1], 0.5f32.powf(1.0 / super::GAMMA)), "{}", lit[1]);
+        assert!(close(lit[1], 0.5f32.sqrt()), "{}", lit[1]);
+        assert!((lit[1] as f32 / 65536.0 - 0.5f32.powf(1.0 / super::GAMMA)).abs() < 0.03);
         assert!(lit[2] < 10, "{}", lit[2]);
-        // Over a light of its own strength (encoded 1): the two add in linear terms.
+        // Over a light of its own strength (encoded 1), all the light 2 in linear terms:
+        // all of it where all reaches, the rest where none does.
+        let two = 2.0f32.powf(1.0 / super::GAMMA);
+        ctx.split.total = [F32s::fill(two); 3];
         let both = ctx.light(&full_light())[0].to_array();
-        assert!(close(both[0], 2.0f32.powf(1.0 / super::GAMMA)), "{}", both[0]);
+        assert!(close(both[0], two), "{}", both[0]);
         assert!(close(both[2], 1.0), "{}", both[2]);
         // None of it anywhere (outside a beam): the rest of the light, exactly.
         ctx.split.reaches[0] = F32s::fill(0.0);
@@ -1396,12 +1375,5 @@ mod tests {
         let got = ctx.light(&full_light())[0].to_array();
         let (all, rest) = ((2.0f32.powf(1.0 / super::GAMMA) * 65536.0).round() as i32, 65536);
         assert_eq!(got, [all, rest, all, rest, rest, all, all, rest]);
-        // The fast blend, halfway through a split light of 1 over nothing: close to exact
-        // (0.5^(1 / GAMMA) = 0.73), in gamma-2 terms (0.71).
-        ctx.split.fast = true;
-        ctx.split.reaches[0] = F32s::fill(0.5);
-        ctx.split.total = [F32s::fill(1.0); 3];
-        let half = ctx.light(&[I32s::fill(0); 3])[0].to_array()[0] as f32 / 65536.0;
-        assert!((half - 0.5f32.powf(1.0 / super::GAMMA)).abs() < 0.03, "{half}");
     }
 }

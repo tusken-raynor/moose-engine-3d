@@ -15,8 +15,7 @@
 //! 5 cm source, a 20 degree cone fading over FADE degrees, default 8), its cone drawn as a
 //! beam or lit at sample points (soft: fading over all 20 degrees, with no closer points
 //! where it fades). DITHER=1 dithers beams' fades. FLASHLIGHT_SHADOWS=0 turns
-//! its shadows off (a beam keeps its cone). FAST_BLEND=1 blends partly shadowed pixels by
-//! the fast approximation.
+//! its shadows off (a beam keeps its cone).
 //!
 //! cargo run --release -p moose-raster --example timing
 use std::f32::consts::{PI, TAU};
@@ -66,7 +65,6 @@ fn main() {
     let mut renderer = Renderer::new(RasterConfig {
         min_step: setting("MIN_STEP", defaults.min_step),
         beam_dither: std::env::var("DITHER").is_ok_and(|d| d == "1"),
-        fast_blend: std::env::var("FAST_BLEND").is_ok_and(|d| d == "1"),
         light_spacing: setting("LIGHT_SPACING", defaults.light_spacing),
         penumbra_threshold: std::env::var("PENUMBRA_THRESHOLD")
             .map_or(defaults.penumbra_threshold, |v| v.parse().expect("a number")),
