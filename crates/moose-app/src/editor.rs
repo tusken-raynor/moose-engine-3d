@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use glam::{EulerRot, Quat, Vec2, Vec3};
-use moose_assets::{Assets, EntityKind, LevelDoc};
+use moose_assets::{Assets, EntityDoc, EntityKind, LevelDoc, LightDoc};
 use moose_scene::World;
 use moose_view::PolygonSource;
 
@@ -50,6 +50,7 @@ pub enum Selection {
     Sector(usize),
     Vertex(usize),
     Entity(usize),
+    Light(usize),
 }
 
 /// A change the panel or a key asks for.
@@ -84,6 +85,28 @@ pub enum Field {
     /// Cuts along the line clicked (see [`Editor::cut`]).
     Cut,
     NewRoom,
+    /// A light's color channels, range, and source radius.
+    Red,
+    Green,
+    Blue,
+    Range,
+    Radius,
+    Shadows,
+    /// A light's cone: on or off, and its half-angles.
+    Spot,
+    Inner,
+    Outer,
+    AddLight,
+    AddProp,
+    AddSpawn,
+    /// The level's ambient light.
+    AmbientRed,
+    AmbientGreen,
+    AmbientBlue,
+    /// The sun (the first directional light): its size, and where it comes from.
+    SunAngle,
+    SunYaw,
+    SunPitch,
 }
 
 impl Field {
@@ -305,6 +328,25 @@ impl Editor {
             .map(|(_, v)| Selection::Vertex(v))
     }
 
+    /// The light or spawn point whose marker is nearest screen point `at` through
+    /// `projection`, within a few pixels.
+    pub fn pick_marker(&self, projection: &Projection, at: Vec2) -> Option<Selection> {
+        let lights = self.doc.lights.iter().enumerate().map(|(i, l)| (l.position, Selection::Light(i)));
+        let spawns = self
+            .doc
+            .entities
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == EntityKind::Spawn)
+            .map(|(i, e)| (e.position, Selection::Entity(i)));
+        lights
+            .chain(spawns)
+            .filter_map(|(p, selection)| Some((projection.point(p)?.distance(at), selection)))
+            .filter(|&(d, _)| d < PICK_RADIUS + 2.0)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, selection)| selection)
+    }
+
     /// What is under screen point `at` in a 2D view: an entity whose outline (its box on
     /// screen) holds it, the smallest; otherwise the surface (openings too) with an edge
     /// nearest it, within a few pixels.
@@ -359,10 +401,57 @@ impl Editor {
         };
         let n = moose_assets::number;
         match self.selection {
-            None => vec![
-                row("Nothing selected", String::new(), None),
-                row("New room", format!("{}x{}x{} m", ROOM.x, ROOM.y, ROOM.z), Some(Field::NewRoom)),
-            ],
+            None => {
+                let ambient = self.doc.ambient.unwrap_or(Vec3::ONE);
+                let mut rows = vec![
+                    row("Level", self.doc.name.clone(), None),
+                    row("New room", format!("{}x{}x{} m", ROOM.x, ROOM.y, ROOM.z), Some(Field::NewRoom)),
+                    row("Add a light", String::new(), Some(Field::AddLight)),
+                    row("Add a prop", String::new(), Some(Field::AddProp)),
+                    row("Add a spawn point", String::new(), Some(Field::AddSpawn)),
+                    row("Ambient red", n(ambient.x), Some(Field::AmbientRed)),
+                    row("Ambient green", n(ambient.y), Some(Field::AmbientGreen)),
+                    row("Ambient blue", n(ambient.z), Some(Field::AmbientBlue)),
+                ];
+                if let Some(sun) = self.doc.directional.first() {
+                    let (yaw, pitch) = aim_of(-sun.direction);
+                    rows.push(row("Sun size", format!("{}°", n(sun.angle)), Some(Field::SunAngle)));
+                    rows.push(row("Sun from (yaw)", format!("{}°", n(yaw)), Some(Field::SunYaw)));
+                    rows.push(row("Sun height", format!("{}°", n(pitch)), Some(Field::SunPitch)));
+                }
+                rows
+            }
+            Some(Selection::Light(i)) => {
+                let l = &self.doc.lights[i];
+                let option = |key: &str| light_option(l, key).map(str::to_string);
+                let mut rows = vec![
+                    row("Light", i.to_string(), None),
+                    row("X", n(l.position.x), Some(Field::X)),
+                    row("Y", n(l.position.y), Some(Field::Y)),
+                    row("Z", n(l.position.z), Some(Field::Z)),
+                    row("Red", n(l.color.x), Some(Field::Red)),
+                    row("Green", n(l.color.y), Some(Field::Green)),
+                    row("Blue", n(l.color.z), Some(Field::Blue)),
+                    row("Range", format!("{} m", n(l.range)), Some(Field::Range)),
+                    row("Source radius", format!("{} m", option("radius").unwrap_or("0".into())), Some(Field::Radius)),
+                    row("Shadows", option("shadows").unwrap_or("on".into()), Some(Field::Shadows)),
+                    row("Spot", if l.spot.is_some() { "on" } else { "off" }.into(), Some(Field::Spot)),
+                ];
+                if let Some((dir, inner, outer)) = l.spot {
+                    let (yaw, pitch) = aim_of(dir);
+                    rows.push(row("Aim (yaw)", format!("{}°", n(yaw)), Some(Field::Yaw)));
+                    rows.push(row("Aim (pitch)", format!("{}°", n(pitch)), Some(Field::Pitch)));
+                    rows.push(row("Inner", format!("{}°", n(inner)), Some(Field::Inner)));
+                    rows.push(row("Outer", format!("{}°", n(outer)), Some(Field::Outer)));
+                }
+                if let Some(motion) = option("oscillate") {
+                    rows.push(row("Swings", motion, None));
+                }
+                rows.push(row("Sector", self.doc.sectors[l.sector].name.clone(), None));
+                rows.push(row("Duplicate", String::new(), Some(Field::Duplicate)));
+                rows.push(row("Delete", String::new(), Some(Field::Delete)));
+                rows
+            }
             Some(Selection::Surface(i)) => {
                 let s = &self.doc.surfaces[i];
                 let mut rows = vec![
@@ -540,6 +629,139 @@ impl Editor {
                 let p = self.doc.vertices[v];
                 Ok(format!("vertex {v} at {}, {}, {}", n(p.x), n(p.y), n(p.z)))
             }
+            (None, Field::AddLight | Field::AddProp | Field::AddSpawn) => {
+                let at = self.anchor.map(|v| snap(v, step));
+                let sector = sector_of(world, at)?;
+                match field {
+                    Field::AddLight => {
+                        self.doc.lights.push(LightDoc {
+                            sector,
+                            position: at,
+                            color: Vec3::new(1.0, 0.9, 0.75),
+                            range: 6.0,
+                            spot: None,
+                            options: vec!["radius=0.05".into()],
+                        });
+                        self.selection = Some(Selection::Light(self.doc.lights.len() - 1));
+                        Ok("added a light".into())
+                    }
+                    _ => {
+                        let spawn = field == Field::AddSpawn;
+                        let model = (!spawn).then(|| {
+                            models.iter().find(|m| m.as_str() == "crate.obj").or(models.first()).cloned()
+                        });
+                        let model = match model {
+                            Some(None) => return Err("there are no models in assets/models".into()),
+                            Some(Some(m)) => Some(m),
+                            None => None,
+                        };
+                        let name = self.unique_name(if spawn { "spawn" } else { "prop" });
+                        self.doc.entities.push(EntityDoc {
+                            kind: if spawn { EntityKind::Spawn } else { EntityKind::Prop },
+                            sector,
+                            model,
+                            position: at,
+                            rotation: Quat::IDENTITY,
+                            scale: 1.0,
+                            name: name.clone(),
+                            options: if spawn { Vec::new() } else { vec!["static".into()] },
+                        });
+                        self.selection = Some(Selection::Entity(self.doc.entities.len() - 1));
+                        Ok(format!("added {name}"))
+                    }
+                }
+            }
+            (None, Field::AmbientRed | Field::AmbientGreen | Field::AmbientBlue) => {
+                let a = self.doc.ambient.get_or_insert(Vec3::ONE);
+                let c = match field {
+                    Field::AmbientRed => &mut a.x,
+                    Field::AmbientGreen => &mut a.y,
+                    _ => &mut a.z,
+                };
+                *c = (*c + 0.01 * dir).max(0.0);
+                Ok(format!("ambient {}, {}, {}", n(a.x), n(a.y), n(a.z)))
+            }
+            (None, Field::SunAngle | Field::SunYaw | Field::SunPitch) => {
+                let Some(sun) = self.doc.directional.first_mut() else {
+                    return Err("the level has no sun".into());
+                };
+                match field {
+                    Field::SunAngle => sun.angle = (sun.angle + 0.25 * dir).clamp(0.0, 45.0),
+                    _ => {
+                        let (mut yaw, mut pitch) = aim_of(-sun.direction);
+                        if field == Field::SunYaw {
+                            yaw += TURN * dir;
+                        } else {
+                            pitch = (pitch + 5.0 * dir).clamp(5.0, 90.0);
+                        }
+                        sun.direction = -aim(yaw, pitch);
+                    }
+                }
+                Ok("sun moved".into())
+            }
+            (Some(Selection::Light(i)), Field::Duplicate) => {
+                let mut copy = self.doc.lights[i].clone();
+                copy.position.x += step;
+                copy.sector = sector_of(world, copy.position)?;
+                self.doc.lights.push(copy);
+                self.selection = Some(Selection::Light(self.doc.lights.len() - 1));
+                Ok("duplicated the light".into())
+            }
+            (Some(Selection::Light(i)), Field::Delete) => {
+                self.doc.lights.remove(i);
+                self.selection = None;
+                Ok("deleted the light".into())
+            }
+            (Some(Selection::Light(i)), field) => {
+                let l = &mut self.doc.lights[i];
+                match field {
+                    Field::X => l.position.x = snap(l.position.x + step * dir, step),
+                    Field::Y => l.position.y = snap(l.position.y + step * dir, step),
+                    Field::Z => l.position.z = snap(l.position.z + step * dir, step),
+                    Field::Red => l.color.x = (l.color.x + 0.05 * dir).max(0.0),
+                    Field::Green => l.color.y = (l.color.y + 0.05 * dir).max(0.0),
+                    Field::Blue => l.color.z = (l.color.z + 0.05 * dir).max(0.0),
+                    Field::Range => l.range = (l.range + 0.5 * dir).max(0.5),
+                    Field::Radius => {
+                        let r = light_option(l, "radius").and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+                        let r = (r + 0.01 * dir).max(0.0);
+                        set_light_option(l, "radius", (r > 0.0).then(|| n(r)));
+                    }
+                    Field::Shadows => {
+                        let off = light_option(l, "shadows") == Some("off");
+                        set_light_option(l, "shadows", (!off).then(|| "off".to_string()));
+                    }
+                    Field::Spot => {
+                        l.spot = match l.spot {
+                            Some(_) => None,
+                            None => Some((Vec3::NEG_Y, 25.0, 40.0)),
+                        };
+                    }
+                    Field::Yaw | Field::Pitch | Field::Inner | Field::Outer => {
+                        let Some((dir3, inner, outer)) = &mut l.spot else {
+                            return Err("that light isn't a spot light".into());
+                        };
+                        match field {
+                            Field::Inner => *inner = (*inner + dir).clamp(0.0, *outer),
+                            Field::Outer => *outer = (*outer + dir).clamp(*inner, 180.0),
+                            _ => {
+                                let (mut yaw, mut pitch) = aim_of(*dir3);
+                                if field == Field::Yaw {
+                                    yaw += TURN * dir;
+                                } else {
+                                    pitch = (pitch + TURN * dir).clamp(-90.0, 90.0);
+                                }
+                                *dir3 = aim(yaw, pitch);
+                            }
+                        }
+                    }
+                    _ => return Err("that doesn't apply here".into()),
+                }
+                if matches!(field, Field::X | Field::Y | Field::Z) {
+                    l.sector = sector_of(world, l.position)?;
+                }
+                Ok(format!("light {i} changed"))
+            }
             (Some(Selection::Entity(i)), Field::Duplicate) => {
                 let mut copy = self.doc.entities[i].clone();
                 copy.name = self.unique_name(&copy.name);
@@ -667,9 +889,58 @@ impl Editor {
         self.draw_panel(canvas);
     }
 
+    /// The level's lights (a diamond, with a line where a spot light shines) and spawn
+    /// points (a square, with a line where they face); the selected or pointed-at one in
+    /// its color, the selected light's reach as a circle in a 2D view.
+    fn draw_markers(&self, canvas: &mut Canvas, projection: &Projection) {
+        let color_of = |selection: Selection, normal: u32| {
+            if self.selection == Some(selection) {
+                SELECTED
+            } else if self.hover == Some(selection) {
+                HOVER
+            } else {
+                normal
+            }
+        };
+        for (i, l) in self.doc.lights.iter().enumerate() {
+            let color = color_of(Selection::Light(i), LIGHT);
+            if let Some(p) = projection.point(l.position) {
+                for (a, b) in [((0.0, -6.0), (6.0, 0.0)), ((6.0, 0.0), (0.0, 6.0)), ((0.0, 6.0), (-6.0, 0.0)), ((-6.0, 0.0), (0.0, -6.0))] {
+                    canvas.line(p.x + a.0, p.y + a.1, p.x + b.0, p.y + b.1, color);
+                }
+            }
+            if let Some((dir, _, _)) = l.spot {
+                projection.line(canvas, l.position, l.position + dir.normalize_or_zero() * 0.75, color);
+            }
+            if self.selection == Some(Selection::Light(i))
+                && let Projection::Ortho(o) = projection
+            {
+                let (right, up) = o.axis.basis();
+                let ring: Vec<Vec3> = (0..48)
+                    .map(|k| {
+                        let a = k as f32 * std::f32::consts::TAU / 48.0;
+                        l.position + (right * a.cos() + up * a.sin()) * l.range
+                    })
+                    .collect();
+                wire::outline(canvas, projection, &ring, RANGE);
+            }
+        }
+        for (i, e) in self.doc.entities.iter().enumerate() {
+            if e.kind != EntityKind::Spawn {
+                continue;
+            }
+            let color = color_of(Selection::Entity(i), SPAWN);
+            if let Some(p) = projection.point(e.position) {
+                canvas.fill_centered(p.x, p.y, 7, color);
+            }
+            projection.line(canvas, e.position, e.position + e.rotation * Vec3::NEG_Z * 0.75, color);
+        }
+    }
+
     /// The selection and what the pointer is over, outlined; the vertices, with vertex
     /// picking on; and a cut being drawn.
     fn draw_marks(&self, canvas: &mut Canvas, projection: &Projection, world: &World, assets: &Assets) {
+        self.draw_markers(canvas, projection);
         if self.vertices {
             for v in self.used_vertices() {
                 if let Some(p) = projection.point(self.doc.vertices[v]) {
@@ -692,6 +963,7 @@ impl Editor {
                         canvas.fill_centered(p.x, p.y, 7, color);
                     }
                 }
+                Some(Selection::Light(_)) => {}
                 Some(Selection::Entity(row)) => {
                     let Some(e) = self.world_entity(row).and_then(|k| world.entities.get(k)) else {
                         continue;
@@ -846,6 +1118,33 @@ fn sector_of(world: &World, p: Vec3) -> Result<usize, String> {
         .ok_or_else(|| "that's outside the level".to_string())
 }
 
+/// A light's option `key` (`key=value`), if it has one.
+fn light_option<'a>(l: &'a LightDoc, key: &str) -> Option<&'a str> {
+    l.options.iter().find_map(|o| o.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// Sets a light's option `key` to `value`, or removes it.
+fn set_light_option(l: &mut LightDoc, key: &str, value: Option<String>) {
+    l.options.retain(|o| !o.starts_with(&format!("{key}=")));
+    if let Some(value) = value {
+        l.options.push(format!("{key}={value}"));
+    }
+}
+
+/// A direction's yaw (degrees, turning left from -Z) and pitch (up from level).
+fn aim_of(d: Vec3) -> (f32, f32) {
+    let d = d.normalize_or_zero();
+    let yaw = (-d.x).atan2(-d.z).to_degrees();
+    let pitch = d.y.clamp(-1.0, 1.0).asin().to_degrees();
+    (yaw, pitch)
+}
+
+/// The direction of yaw and pitch (degrees; see [`aim_of`]).
+fn aim(yaw: f32, pitch: f32) -> Vec3 {
+    let (yaw, pitch) = (yaw.to_radians(), pitch.to_radians());
+    Vec3::new(-yaw.sin() * pitch.cos(), pitch.sin(), -yaw.cos() * pitch.cos())
+}
+
 /// `v` on the grid of `step`.
 fn snap(v: f32, step: f32) -> f32 {
     (v / step).round() * step
@@ -858,4 +1157,7 @@ const DIM: u32 = 0x8C_8C_8C;
 const SELECTED: u32 = 0xFF_E0_40;
 const HOVER: u32 = 0x60_A0_FF;
 const VERTEX: u32 = 0xB0_B0_C0;
+const LIGHT: u32 = 0xFF_B0_40;
+const SPAWN: u32 = 0x40_E0_E0;
+const RANGE: u32 = 0x80_60_20;
 const CUT: u32 = 0xFF_50_50;

@@ -16,7 +16,7 @@
 //!   --view V, --wire, --zoom S  the editor's view (3d, top, front or side; F6), wireframe
 //!                         over the 3D view (F5), and 2D views' pixels per meter
 //!   --select NAME         in the editor, start with the entity NAME (or surface:N,
-//!                         sector:N, vertex:N) selected
+//!                         sector:N, vertex:N, light:N) selected
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
 //!                         on a player standing there
 //!   --flashlight-at X,Y,Z,DX,DY,DZ  start with the flashlight locked at X,Y,Z, aimed along
@@ -1798,6 +1798,8 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             let at = glam::Vec2::new(x, y);
             if app.editor.vertices {
                 app.editor.pick_vertex(&projection, at)
+            } else if let Some(marker) = app.editor.pick_marker(&projection, at) {
+                Some(marker)
             } else if let Some(o) = &ortho {
                 app.editor.pick_2d(o, &app.world, at)
             } else {
@@ -1878,7 +1880,10 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             }
         }
     }
-    if !matches!(app.editor.selection, Some(Selection::Entity(_) | Selection::Vertex(_))) {
+    if !matches!(
+        app.editor.selection,
+        Some(Selection::Entity(_) | Selection::Vertex(_) | Selection::Light(_))
+    ) {
         return false;
     }
     // Along the screen's axes in a 2D view; in the 3D view, along the world axes nearest
@@ -1958,6 +1963,7 @@ fn run() -> Result<(), String> {
             Some(("surface", n)) => editor::Selection::Surface(index(n)?),
             Some(("sector", n)) => editor::Selection::Sector(index(n)?),
             Some(("vertex", n)) => editor::Selection::Vertex(index(n)?),
+            Some(("light", n)) => editor::Selection::Light(index(n)?),
             _ => editor::Selection::Entity(
                 app.editor
                     .doc
@@ -2328,6 +2334,59 @@ mod tests {
         let before = app.editor.doc.clone();
         app.edit(Field::Y, 1.0);
         assert_eq!(app.editor.doc, before, "refused: the floor isn't flat any more");
+    }
+
+    #[test]
+    fn lights_and_things_are_placed_and_changed() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        let (lights, entities, spawns) = (
+            app.lights.0.len(),
+            app.world.entities.len(),
+            app.world.spawn_points.len(),
+        );
+        // In the middle of room_a.
+        app.editor.anchor = Vec3::new(0.0, 2.0, 4.0);
+        for field in [Field::AddLight, Field::AddProp, Field::AddSpawn] {
+            app.editor.selection = None;
+            app.edit(field, 1.0);
+        }
+        assert_eq!(app.lights.0.len(), lights + 1);
+        assert_eq!(app.world.entities.len(), entities + 1);
+        assert_eq!(app.world.spawn_points.len(), spawns + 1);
+        // The light: moved down the hallway it follows into, made a spot, aimed.
+        let light = app.editor.doc.lights.len() - 1;
+        app.editor.selection = Some(Selection::Light(light));
+        app.editor.step = editor::STEPS.len() - 1; // 1 m
+        for _ in 0..6 {
+            app.edit(Field::Z, -1.0);
+        }
+        let hallway = app.editor.doc.sectors.iter().position(|s| s.name == "hallway").unwrap();
+        assert_eq!(app.editor.doc.lights[light].sector, hallway);
+        app.edit(Field::Spot, 1.0);
+        app.edit(Field::Pitch, 1.0);
+        let (dir, _, _) = app.editor.doc.lights[light].spot.unwrap();
+        assert!(dir.y > -1.0 + 1e-3, "aimed up from straight down");
+        assert!(app.lights.0.iter().any(|l| !l.is_point()));
+        app.edit(Field::Delete, 1.0);
+        assert_eq!(app.lights.0.len(), lights);
+        // The level's ambient light.
+        app.editor.selection = None;
+        app.edit(Field::AmbientRed, 5.0);
+        assert!(app.world.ambient.x > app.world.ambient.y);
+    }
+
+    #[test]
+    fn the_sun_turns() {
+        use editor::Field;
+        let mut app = test_app("sunny_rooms.mmp");
+        let before = app.editor.doc.directional[0].direction;
+        app.editor.selection = None;
+        app.edit(Field::SunYaw, 1.0);
+        app.edit(Field::SunPitch, 1.0);
+        let after = app.editor.doc.directional[0].direction;
+        assert!(before.normalize().angle_between(after.normalize()) > 0.1);
+        assert!(app.lights.0.iter().any(|l| l.directional && l.direction.angle_between(after.normalize()) < 1e-3));
     }
 
     #[test]
