@@ -13,6 +13,7 @@ mod half;
 mod level;
 mod mesh;
 mod mmp;
+pub use mmp::{merged_options, option_key};
 mod mmp_doc;
 mod mmp_edit;
 mod mmdl;
@@ -27,11 +28,12 @@ mod texture;
 pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
-    DirectionalLight, EntityKind, EntitySpawn, Level, Light, NO_SECTOR, Occluder, Oscillation,
+    DirectionalLight, EntityKind, EntitySpawn, Level, Light, NO_SECTOR, Occluder, Oscillation, ShadowKind,
     Portal, PortalFlags, Sector,
 };
 pub use mmp_doc::{
     AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,
+    TemplateDoc,
     number, occluder_value,
 };
 pub use mmdl_doc::{AnimationDoc, BoneDoc, ModelDoc, ModelPolygonDoc};

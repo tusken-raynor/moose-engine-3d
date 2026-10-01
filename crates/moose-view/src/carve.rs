@@ -25,7 +25,7 @@ use std::ops::Range;
 
 use glam::Vec3;
 
-use moose_assets::{Assets, Light, Mesh, MeshId};
+use moose_assets::{ShadowKind, Assets, Light, Mesh, MeshId};
 use moose_scene::{Occluder, World};
 
 use crate::clip::Edge;
@@ -218,6 +218,10 @@ pub(crate) struct Piece {
     count: u32,
     pub shadowed: u32,
     pub beamed: u32,
+    /// The shadow slots of the lights it is in the hard shadow of a caster whose shadows
+    /// are blurred (see `ShadowKind::Blurred`): the renderer blurs it, so it is not in
+    /// their full shadow (`shadowed`), and other volumes still carve it.
+    pub blurred: u32,
     first_volume: u32,
     volume_count: u32,
 }
@@ -288,6 +292,9 @@ pub(crate) struct Receiver<'a> {
     /// Carve beams (see [`Light::beam`]): not in reflections, where they are lit at sample
     /// points.
     pub beams: bool,
+    /// Carve every shadow hard, from the lights' centers (in reflections, where they cost
+    /// less and show less).
+    pub hard: bool,
 }
 
 /// Which parts of the lights' shadows [`Carver::carve`] carves.
@@ -369,6 +376,14 @@ struct CacheKey {
     radius: f32,
     range: f32,
     cos_outer: f32,
+}
+
+/// An edge of a volume's outline, for blurring hard shadows (see [`Carver::penumbra_width`]):
+/// the region's plane through it, and its ends.
+#[derive(Clone, Copy)]
+struct VolumeEdge {
+    plane: Half,
+    caster: (Vec3, Vec3),
 }
 
 /// A window into a sector from a light: its planes through the light (to clip windows seen
@@ -462,6 +477,18 @@ struct Volume {
     /// Nothing about it ever changes: a window, or a static occluder's shadow (from a
     /// static light, it can be cached).
     is_static: bool,
+    /// Ranges of `Carver::planes`: its hard region, the planes through the light's center
+    /// and its outline (and its caps), for surfaces that take hard shadows (seen in
+    /// mirrors). The same as `planes` for a light with no size.
+    hard: Range<u32>,
+    /// A caster whose shadows are blurred (see `ShadowKind::Blurred`): carved hard, every
+    /// frame, its pieces marked `blurred`.
+    blur: bool,
+    /// Its outline's edges (a range of `Carver::volume_edges`), and the light's source at
+    /// its size: what a blurred shadow's width is measured from (see
+    /// [`Carver::penumbra_width`]).
+    edges: Range<u32>,
+    size: Source,
 }
 
 /// Carves polygons for every shadow-casting light. Reuse one; buffers keep their capacity.
@@ -472,6 +499,7 @@ pub(crate) struct Carver {
     /// The windows into sectors: (sector, its volume).
     windows: Vec<(u32, u32)>,
     volumes: Vec<Volume>,
+    volume_edges: Vec<VolumeEdge>,
     wedges: Vec<Wedge>,
     // Per polygon: each piece's soft shadows, as indices into `volumes`.
     volume_lists: Vec<u32>,
@@ -507,11 +535,16 @@ impl Carver {
     /// (whose shadows are cached; see `ViewConfig::dynamic_shadows`). The shadows carved
     /// every frame, a dynamic light's and moving occluders', are from a source `softness`
     /// times the light's size (see `ViewConfig::dynamic_softness`).
-    pub fn prepare(&mut self, world: &World, assets: &Assets, lights: &[Light], dynamic: bool, softness: f32) {
+    ///
+    /// Each entity's shadows are as its [`ShadowKind`] says: a blurred one's are carved
+    /// hard, the light's size kept with them for the renderer's blur (see
+    /// [`Carver::penumbra_width`]).
+    pub fn prepare(&mut self, world: &World, assets: &Assets, lights: &[Light], (dynamic, softness): (bool, f32)) {
         self.casters.clear();
         self.planes.clear();
         self.windows.clear();
         self.volumes.clear();
+        self.volume_edges.clear();
         self.wedges.clear();
         let geometry = assets.mesh(world.geometry);
         for light in lights {
@@ -521,6 +554,7 @@ impl Carver {
             let shadows = light.shadows && (dynamic || light.is_static);
             let carved = Light { radius: light.radius * softness, ..*light };
             let light = if light.is_static { light } else { &carved };
+
             let beamed = light.beam && !light.is_point() && !light.directional;
             if !shadows && !beamed {
                 continue;
@@ -615,7 +649,12 @@ impl Carver {
                 }
                 let first = self.volumes.len();
                 let transform = entity.transform();
-                let light = if entity.is_static { light } else { &carved };
+                // Moving occluders' shadows are carved every frame, at the dynamic softness;
+                // blurred and hard ones are carved hard.
+                let sized = if entity.is_static { light } else { &carved };
+                let size = Source::of(sized);
+                let hard = Light { radius: 0.0, ..*sized };
+                let light = if entity.shadow == ShadowKind::Soft { sized } else { &hard };
                 let source = Source::of(light);
                 let proxy = match entity.occluder {
                     Occluder::None => continue,
@@ -695,8 +734,11 @@ impl Carver {
                     }
                     _ => {}
                 }
+                let blur = entity.shadow == ShadowKind::Blurred;
                 for volume in &mut self.volumes[first..] {
-                    volume.is_static = entity.is_static;
+                    volume.is_static = entity.is_static && !blur;
+                    volume.blur = blur;
+                    volume.size = size;
                 }
             }
             let volumes_end = self.volumes.len() as u32;
@@ -901,6 +943,7 @@ impl Carver {
         let source = Source::of(light);
         let start = self.planes.len() as u32;
         let first_wedge = self.wedges.len() as u32;
+        let first_edge = self.volume_edges.len() as u32;
         let mut core = Vec::with_capacity(outline.len());
         let mut hards: Vec<Half> = Vec::with_capacity(outline.len());
         let mut soft = source.soft() && ordered;
@@ -910,15 +953,19 @@ impl Carver {
                 soft = false;
                 continue;
             };
+            let caster = (a, b);
             // Facing into the shadow: into an occluder's outline, out of a window's.
             let shadow = if window { hard.flip() } else { hard };
             match source.grazing(a, b, shadow, keep) {
                 Some((outer, inner)) => {
-                    self.planes.push(if window { inner.flip() } else { outer });
+                    let plane = if window { inner.flip() } else { outer };
+                    self.volume_edges.push(VolumeEdge { plane, caster });
+                    self.planes.push(plane);
                     core.push(if window { outer.flip() } else { inner });
                     self.wedges.push(Wedge { outer, inner });
                 }
                 None => {
+                    self.volume_edges.push(VolumeEdge { plane: hard, caster });
                     self.planes.push(hard);
                     soft = false;
                 }
@@ -927,6 +974,7 @@ impl Carver {
         }
         self.planes.extend_from_slice(caps);
         let end = self.planes.len() as u32;
+        let edges = first_edge..self.volume_edges.len() as u32;
         if !soft || hards.len() != outline.len() {
             // Hard (or not wholly soft): the region only.
             self.wedges.truncate(first_wedge as usize);
@@ -939,9 +987,14 @@ impl Carver {
                 slot,
                 owner,
                 is_static: true,
+                hard: start..end,
+                blur: false,
+                edges,
+                size: source,
             });
             return;
         }
+
         self.planes.extend(core);
         let core_end = self.planes.len() as u32;
         let n = outline.len();
@@ -964,16 +1017,69 @@ impl Carver {
         if sectors.iter().all(Option::is_some) {
             self.planes.extend(sectors.into_iter().flatten());
         }
+        let sectors_end = self.planes.len() as u32;
+        // Its hard region, for surfaces that take hard shadows.
+        self.planes.extend_from_slice(&hards);
+        self.planes.extend_from_slice(caps);
+        let hard = sectors_end..self.planes.len() as u32;
         self.volumes.push(Volume {
             planes: start..end,
             core: end..core_end,
             window,
-            sectors: core_end..self.planes.len() as u32,
+            sectors: core_end..sectors_end,
             wedges: first_wedge..self.wedges.len() as u32,
             slot,
             owner,
             is_static: true,
+            hard,
+            blur: false,
+            edges,
+            size: source,
         });
+    }
+
+    /// How wide the soft edge of a blurred shadow (see `ShadowKind::Blurred`) of the light
+    /// in shadow slot `slot` at `p` would be, on a surface of `entity` (if one's): of the
+    /// blurred casters' volumes `p` is in, the plane it is closest to (of an edge of the
+    /// outline). Its width is the source's size seen from that edge, times how far `p` is
+    /// from it, measured square to the light's rays: 0 where a caster touches the surface,
+    /// growing away from it. 0 if `p` is in none.
+    pub fn penumbra_width(&self, slot: u8, p: Vec3, entity: Option<u32>) -> f32 {
+        let Some(caster) = self.casters.iter().find(|c| c.bit == 1 << slot) else {
+            return 0.0;
+        };
+        // The nearest boundary: how far `p` is from it, and its width.
+        let mut best: Option<(f32, f32)> = None;
+        for v in caster.volumes.clone() {
+            let volume = &self.volumes[v as usize];
+            if !volume.blur || (volume.owner.is_some() && volume.owner == entity) {
+                continue;
+            }
+            let planes = &self.planes[volume.planes.start as usize..volume.planes.end as usize];
+            if !planes.iter().all(|h| h.distance(p) >= -1e-4) {
+                continue;
+            }
+            let edges = &self.volume_edges[volume.edges.start as usize..volume.edges.end as usize];
+            let Some((d, e)) = edges.iter().map(|e| (e.plane.distance(p), e)).min_by(|x, y| x.0.total_cmp(&y.0))
+            else {
+                continue;
+            };
+            if best.is_some_and(|(b, _)| b <= d) {
+                continue;
+            }
+            let (a, b) = e.caster;
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared().max(1e-12)).clamp(0.0, 1.0);
+            let q = a + ab * t;
+            let width = match volume.size {
+                Source::Point { at, radius } => 2.0 * radius * p.distance(q) / q.distance(at).max(1e-3),
+                Source::Distant { spread, .. } => {
+                    2.0 * spread / (1.0 - spread * spread).max(1e-6).sqrt() * p.distance(q)
+                }
+            };
+            best = Some((d, width));
+        }
+        best.map_or(0.0, |(_, w)| w)
     }
 
     /// The shadow slot bits of static lights, for a static polygon (world space, in its own
@@ -1004,6 +1110,7 @@ impl Carver {
             self.keep_polygon_edges = true;
             let only = Receiver {
                 parts: Parts::Static(bit),
+                hard: false,
                 ..*receiver
             };
             let count = self.carve(&records, &edges, stride, 0, &only).len();
@@ -1140,6 +1247,7 @@ impl Carver {
             count: edges.len() as u32,
             shadowed: 0,
             beamed: 0,
+            blurred: 0,
             first_volume: 0,
             volume_count: 0,
         });
@@ -1215,7 +1323,8 @@ impl Carver {
                     if !sectors.contains(&sector) {
                         continue;
                     }
-                    let planes = self.volumes[v as usize].planes.clone();
+                    let volume = &self.volumes[v as usize];
+                    let planes = if receiver.hard { volume.hard.clone() } else { volume.planes.clone() };
                     // What no window has reached yet waits for the next.
                     let mut next = Vec::new();
                     for piece in std::mem::take(&mut self.work) {
@@ -1223,7 +1332,11 @@ impl Carver {
                         let inside = self.split_region(piece, planes.clone(), lined);
                         next.append(&mut self.rest);
                         if let Some(inside) = inside {
-                            self.soft_split(inside, v, bit, lined);
+                            if receiver.hard {
+                                self.pieces.push(inside);
+                            } else {
+                                self.soft_split(inside, v, bit, lined);
+                            }
                         }
                     }
                     self.work = next;
@@ -1236,7 +1349,10 @@ impl Carver {
             // Occluders: each lit piece is split by each shadow volume.
             for v in self.casters[c].volumes.clone() {
                 let volume = &self.volumes[v as usize];
-                let (planes, owner) = (volume.planes.clone(), volume.owner);
+                // Blurred (not in reflections), hard, or soft.
+                let blur = volume.blur && !receiver.hard;
+                let planes = if receiver.hard { volume.hard.clone() } else { volume.planes.clone() };
+                let owner = volume.owner;
                 // An occluder's shape stands in for its model, so it doesn't shadow it.
                 if owner.is_some() && owner == receiver.entity {
                     continue;
@@ -1250,7 +1366,7 @@ impl Carver {
                 while i < self.work.len() {
                     let piece = self.work[i];
                     i += 1;
-                    if piece.shadowed & bit != 0 {
+                    if piece.shadowed & bit != 0 || (blur && piece.blurred & bit != 0) {
                         self.pieces.push(piece);
                         continue;
                     }
@@ -1259,8 +1375,16 @@ impl Carver {
                     let rest = std::mem::take(&mut self.rest);
                     self.pieces.extend_from_slice(&rest);
                     self.rest = rest;
-                    if let Some(inside) = inside {
-                        self.soft_split(inside, v, bit, lined);
+                    if let Some(mut inside) = inside {
+                        if blur {
+                            inside.blurred |= bit;
+                            self.pieces.push(inside);
+                        } else if receiver.hard {
+                            inside.shadowed |= bit;
+                            self.pieces.push(inside);
+                        } else {
+                            self.soft_split(inside, v, bit, lined);
+                        }
                     }
                 }
             }
@@ -1481,6 +1605,7 @@ impl Carver {
         let keep = |p: Piece| Piece {
             shadowed: piece.shadowed,
             beamed: piece.beamed,
+            blurred: piece.blurred,
             first_volume: piece.first_volume,
             volume_count: piece.volume_count,
             ..p
@@ -1538,6 +1663,7 @@ impl Carver {
             count: n as u32,
             shadowed: 0,
             beamed: 0,
+            blurred: 0,
             first_volume: 0,
             volume_count: 0,
         })
@@ -1702,7 +1828,7 @@ mod tests {
 
     /// A level polygon in sector 0 on the plane through `point` facing `normal`.
     fn at(normal: Vec3, point: Vec3) -> Receiver<'static> {
-        Receiver { sectors: &[0], entity: None, normal, point, parts: Parts::All, beams: true }
+        Receiver { sectors: &[0], entity: None, normal, point, parts: Parts::All, beams: true, hard: false }
     }
 
     fn area(records: &[f32], stride: usize) -> f32 {
@@ -1968,6 +2094,87 @@ mod tests {
             }
         }
         assert!(lo < 0.01 && hi > 0.99, "{lo}..{hi}");
+    }
+
+    /// A 1 m square 2 m below a light of radius 0.2 and 1 m above a floor, as in
+    /// `a_light_with_a_size_casts_a_core_and_a_soft_edge`: the carver, the floor's records
+    /// and edges.
+    fn square_over_floor(light: &Light) -> (Carver, Vec<f32>, Vec<Edge>, usize) {
+        let center = light.position;
+        let square = [
+            Vec3::new(-0.5, 1.0, -0.5),
+            Vec3::new(-0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, -0.5),
+        ];
+        let mut c = Carver::default();
+        c.points.extend_from_slice(&square);
+        c.faces.push(0..4);
+        c.add_volume(light, 0, None);
+        c.casters.push(Caster {
+            bit: 1,
+            is_static: false,
+            source: Source::Point { at: center, radius: 0.0 },
+            range: 100.0,
+            light: Light::point(0, center, Vec3::ONE, 100.0),
+            whole: Some(0),
+            windows: 0..0,
+            volumes: 0..1,
+            shadows: true,
+            beam: None,
+        });
+        let floor = [
+            Vec3::new(-3.0, 0.0, -3.0),
+            Vec3::new(-3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, 3.0),
+            Vec3::new(3.0, 0.0, -3.0),
+        ];
+        (c, records(&floor), (0..4).map(Edge::Input).collect(), RECORD_FLOATS + 4)
+    }
+
+    #[test]
+    fn a_surface_in_a_mirror_takes_hard_shadows() {
+        // The square's hard shadow, from the light's center: 1.5 m across on the floor.
+        let center = Vec3::new(0.0, 3.0, 0.0);
+        let mut light = Light::point(0, center, Vec3::ONE, 100.0);
+        light.radius = 0.2;
+        let (mut c, floor, edges, stride) = square_over_floor(&light);
+        let receiver = Receiver { hard: true, ..at(Vec3::Y, Vec3::ZERO) };
+        let n = c.carve(&floor, &edges, stride, 0, &receiver).len();
+        let mut dark = 0.0;
+        for i in 0..n {
+            let p = c.piece(i);
+            assert_eq!(p.volume_count, 0, "no soft edges");
+            if p.shadowed != 0 {
+                dark += area(c.records(&p), stride);
+            }
+        }
+        assert!((dark - 1.5 * 1.5).abs() < 1e-3, "hard shadow {dark}");
+    }
+
+    #[test]
+    fn a_blurred_caster_marks_its_hard_shadow_and_how_wide_its_edge_is() {
+        // Carved hard and marked blurred, not dark; its edge on the floor at x = 0.75 is
+        // 1.03 m from the square's edge, which is 2.06 m from the light: 0.4 * 1.03 / 2.06
+        // = 0.2 m wide.
+        let center = Vec3::new(0.0, 3.0, 0.0);
+        let light = Light::point(0, center, Vec3::ONE, 100.0);
+        let (mut c, floor, edges, stride) = square_over_floor(&light);
+        c.volumes[0].blur = true;
+        c.volumes[0].size = Source::Point { at: center, radius: 0.2 };
+        let n = c.carve(&floor, &edges, stride, 0, &at(Vec3::Y, Vec3::ZERO)).len();
+        let mut blurred = 0.0;
+        for i in 0..n {
+            let p = c.piece(i);
+            assert_eq!(p.shadowed, 0, "not in full shadow");
+            if p.blurred != 0 {
+                blurred += area(c.records(&p), stride);
+            }
+        }
+        assert!((blurred - 1.5 * 1.5).abs() < 1e-3, "blurred shadow {blurred}");
+        let width = c.penumbra_width(0, Vec3::new(0.75, 0.0, 0.0), None);
+        assert!((width - 0.2).abs() < 1e-3, "width {width}");
+        assert_eq!(c.penumbra_width(0, Vec3::new(2.0, 0.0, 0.0), None), 0.0, "outside it");
     }
 
     #[test]
@@ -2296,6 +2503,7 @@ mod tests {
             point: floor[0],
             parts: Parts::All,
             beams: true,
+            hard: false,
         };
         let n = c.carve(&records(&floor), &edges, stride, 0, &receiver).len();
         // The opening is 1 m below the light and the floor 3 m. Planes through an edge of it

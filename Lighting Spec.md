@@ -194,7 +194,7 @@ Shadows are drawn per pixel from a **shadow buffer**. The view works out where e
   - The outer plane turns no further than keeps the occluder on its shadow side. A light whose sphere straddles the plane of a face next to the edge would otherwise turn it through the occluder. That happens with a light a little above a crate's top: from part of the light the top faces away, and the edge is no outline. The soft edge then fell wholly on one side, the full shadow reached its region's boundary, and the shadow came out hard-edged and cut short. The plane now stops at the face's plane, and the fade runs from there.
   - The soft ring is carved sector by sector, between planes through the light and the outline's corners, and each sector is split by its edge's inner plane. Past it, within every inner plane, lies the core.
   - Each soft piece's vertices get how much of the light reaches them. Each wedge covers part of the light, from 0 on its outer plane to 1 on its inner, eased with a smoothstep. An occluder covers the product of its wedges' parts.
-  - **Seeing the pieces:** F4, the Sampling page's Shadow mesh, or `--show-shadow-mesh` draws every shadow piece's outline over the frame: red full shadow, yellow soft edge, cyan lit inside a beam's pyramid, green lit; a dot at each corner as bright as the light reaching it; dimmer in mirrors.
+  - **Seeing the pieces:** F4, the Sampling page's Shadow mesh, or `--show-shadow-mesh` draws every shadow piece's outline over the frame: red full shadow, yellow soft edge, cyan lit inside a beam's pyramid, green lit, magenta a blurred caster's hard shadow (below); a dot at each corner as bright as the light reaching it; dimmer in mirrors.
   - **Occluders' parts add up**, capped at all of the light. This is exact for occluders side by side as seen from the light, and too dark where one is behind another. Multiplying what each leaves uncovered (the first version) left a lit line where stacked crates meet: each covers half of the light at their seam, and 0.5 × 0.5 let a quarter through. Smoothstep is symmetric, so the two edges' parts sum to exactly 1.
   - **Full shadow wins.** A piece in one occluder's core and another's soft edge is dark. Before this fix, the shadow buffer used the soft value there, which drew the thin fully lit line along the seam.
   - **A value along each edge at a contact corner.** Where an occluder's edge touches the surface its shadow falls on (a doorway jamb or a crate's corner on the floor), a soft piece has a corner on the edge's line. There both of the wedge's planes meet, and how much of the light reaches has no one value: it is the same all along each ray out from the line, from none to all. Plain Gouraud gave that corner an arbitrary 0 or 1 and spread it over the whole soft edge, which looked hard: shiny_rooms' doorway lit by the flashlight near the jamb, and a crate's shadow from a 10° sun. So each vertex has two values, along the edge arriving and along the one leaving, and a corner whose two differ is drawn as two vertices in the same place (a zero-length edge between them). Only the wedge whose line the corner is on is taken along the edge (at the edge's other end, or the piece's center if that is on the line too); every other soft edge the piece is in keeps its value at the corner. A corner counts as on a line when the wedge's width there is under 1% of its width at the piece's center: carved pieces stop 1 mm short of an occluder (`CAP_BIAS`), so the corner is near the line, not on it.
@@ -293,6 +293,37 @@ Sep 29. A level light can move: `oscillate=DX:DY:DZ:PERIOD` (Level Format Spec) 
 - **Shadows:** a moving light isn't static (`Light::is_static` is false), so it isn't baked. Its shadows (windows and occluders) are carved every frame, like the flashlight's, while static lights keep their baked shadows.
 - **sunny_rooms:** a light-blue lamp 2.3 m up in the middle of room_a swings 2 m toward each of the two corners without crates, every 5 seconds, with soft shadows (`radius=0.05`). The crates' shadows swing around them.
 - **Cost there:** the view takes about 0.09 ms with the lamp and the sun, against about 0.03 ms for the sun alone.
+
+## Blurred and hard shadows
+
+Each entity casts its shadows one of three ways (`shadow=` in the level, usually set by its template; see the Level Format Spec):
+
+- **soft** (the default): soft edges carved into the surfaces, as above. Exact, and cached for static props.
+- **hard:** carved from the light's center, no soft edge. The cheapest.
+- **blurred:** carved hard, then blurred on screen by how wide its soft edge would be. It suits figures that cast shadows with simple proxies, like the walker: the blur hides how simple they are, and carving their soft edges every frame is what costs most. Blurred casters are always carved every frame, never cached.
+
+**Carving.** A blurred caster's volume is carved hard (`Volume::blur`). The pieces inside it are marked `blurred` for that light, not `shadowed`, and other volumes still carve them, so a carved shadow overlapping a blurred one stays exact. `Carver::penumbra_width` gives each corner of such a piece the width its soft edge would have. That's the light's size seen from the outline edge whose plane the corner is nearest, times how far the corner is from that edge: 0 where the caster touches the surface. The view emits these pieces as `ShadowPiece::occluded`, their light being whatever else reaches them (all of it, a beam's cone, a soft edge's part), with the widths on their vertices.
+
+**The occlusion buffer.** As a row is shaded, the shadow buffer (`reaches`, per pixel per split light) holds everything exact: cone fades, carved soft edges, full shadow. A second buffer (`occluded`) starts at 1, and blurred pieces write 0 into it. The blur softens only `occluded`, and the light at a pixel is the product. Before this split, the blur wrote straight into `reaches` and wiped out the flashlight's cone fade around the walker, leaving a bright halo where its shadow should be.
+
+**The blur grid** (`BlurGrid` in the rasterizer), built only on frames with blurred pieces in view, before the rows are drawn:
+- **Mask:** a grid of cells, 8×8 pixels by default (`--blur-scale`; with `--blur-half-rate`, twice as wide as tall), records at each one's center the surface seen there (w on screen, as a plane), whether it is in a blurred caster's hard shadow, and the width there in pixels. The rows' own visibility code finds the surface, one cell row per band of rows.
+- **Width:** each cell near a shadow takes the width of the nearest shadowed cell on its plane, along its row, then down its column.
+- **Blur:** a box that wide, along rows then down columns, over cells on the cell's plane only (w on screen of one plane), so a shadow doesn't spread onto what's in front of or behind its surface. A box whose cells all agree is skipped, by row and column sums.
+- **Shading:** each pixel takes the blurred value from the (up to) four nearest cells on its plane, mixed with its exact hard value where the soft edge is under two cells wide. Only the first 4 shadow slots are blurred; later ones stay hard.
+- **Weaknesses:** a shadow hidden behind its caster on screen can't be seen by the blur, which then lightens what's beside it: next to the walker's legs. The grid's cells can show as small steps where they switch surfaces.
+
+**Cost.** walker_rooms' crate view at 1920×1080, flashlight on, softness ×4 and dynamic ×4, best of 3:
+
+| Walker's shadow | View | Raster | Total |
+| --- | --- | --- | --- |
+| soft | 2.89 ms | 4.31 ms | 7.20 ms |
+| blurred, 4×4 cells | 0.79 ms | 8.28 ms | 9.07 ms |
+| blurred, 8×8 cells | 0.77 ms | 5.62 ms | 6.39 ms |
+
+The view time drops because the walker's soft carving goes; the grid costs a roughly fixed amount whatever the softness. 8×8 cells are the default: on the walker they look as good as 4×4. An ordered dither of the blurred edges was tried and dropped: it looked no better.
+
+**Hard shadows in reflections.** Surfaces seen in mirrors take every shadow carved every frame hard (`Receiver::hard`): soft, blurred and hard casters alike, and dynamic lights' windows. Each volume keeps its hard region, the planes through the light's center and its outline (`Volume::hard`), so the shadow's edge is where a hard shadow's would be, not at its soft edge's outer side. Cached shadows on mirrored static surfaces stay soft: they cost nothing more.
 
 ## Dynamic shadows setting
 

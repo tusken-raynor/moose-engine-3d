@@ -9,7 +9,7 @@ use glam::{EulerRot, Quat, Vec3};
 use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
 use crate::level::{
-    DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, Oscillation, Portal,
+    DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, ShadowKind, Oscillation, Portal,
     PortalFlags, Sector,
 };
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
@@ -52,7 +52,24 @@ struct EntityRec {
     scale: f32,
     is_static: bool,
     occluder: OccluderRec,
+    shadow: ShadowKind,
     animation: Option<String>,
+}
+
+/// An option's key: the part before `=`, or the whole word for a flag.
+pub fn option_key(option: &str) -> &str {
+    option.split_once('=').map_or(option, |(key, _)| key)
+}
+
+/// An entity's options, over its template's: the template's, but those it sets itself
+/// (by key) as it sets them.
+pub fn merged_options(template: &[String], own: &[String]) -> Vec<String> {
+    template
+        .iter()
+        .filter(|t| !own.iter().any(|o| option_key(o) == option_key(t)))
+        .chain(own)
+        .cloned()
+        .collect()
 }
 
 /// An entity's occluder as written: a proxy model is loaded with the entity's.
@@ -434,6 +451,23 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         });
     }
 
+    // ---- Templates (optional): named models with default options, which entities can
+    // place by name and override option by option.
+    let mut templates: Vec<(String, String, Vec<String>)> = Vec::new();
+    if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "templates") {
+        let section = c.section("templates", false, None)?;
+        for r in &section.rows {
+            if r.tokens.len() < 2 {
+                return Err(c.err(r.no, format!("template row needs a name and a model, found {} field(s)", r.tokens.len())));
+            }
+            let name = r.tokens[0].clone();
+            if templates.iter().any(|t| t.0 == name) {
+                return Err(c.err(r.no, format!("template name '{name}' is used twice")));
+            }
+            templates.push((name, r.tokens[1].clone(), r.tokens[2..].to_vec()));
+        }
+    }
+
     // ---- Entities
     let section = c.section("entities", false, None)?;
     let mut entities = Vec::new();
@@ -463,7 +497,12 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 format!("entity '{name}': sector {sector} does not exist"),
             ));
         }
-        let model = (r.tokens[2] != "-").then(|| r.tokens[2].clone());
+        // A template's model and options, or a model file.
+        let template = templates.iter().find(|t| t.0 == r.tokens[2]);
+        let model = match template {
+            Some(t) => Some(t.1.clone()),
+            None => (r.tokens[2] != "-").then(|| r.tokens[2].clone()),
+        };
         match (kind, &model) {
             (EntityKind::Spawn, Some(_)) => {
                 return Err(c.err(
@@ -490,21 +529,31 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
         // Options after the name.
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
-        let mut animation = None;
-        for option in &r.tokens[11..] {
+        let (mut shadow, mut animation) = (ShadowKind::Soft, None);
+        let options = merged_options(template.map_or(&[][..], |t| &t.2), &r.tokens[11..]);
+        for option in &options {
             let fail = |m: String| c.err(r.no, format!("entity '{name}': {m}"));
             if kind == EntityKind::Spawn {
                 return Err(fail(format!("spawn points take no options ('{option}')")));
             }
             match option.split_once('=') {
-                None if option == "static" => {
-                    if kind == EntityKind::Actor {
+                None | Some(("static", "on" | "off")) if option_key(option) == "static" => {
+                    is_static = option != "static=off";
+                    if is_static && kind == EntityKind::Actor {
                         return Err(fail("only props can be static".to_string()));
                     }
-                    is_static = true;
+                }
+                Some(("shadow", value)) => {
+                    shadow = match value {
+                        "soft" => ShadowKind::Soft,
+                        "blurred" => ShadowKind::Blurred,
+                        "hard" => ShadowKind::Hard,
+                        _ => return Err(fail(format!("unknown shadow '{value}' (expected soft, blurred or hard)"))),
+                    }
                 }
                 Some(("occluder", value)) => occluder = occluder_option(value).map_err(fail)?,
-                Some(("anim", value)) if !value.is_empty() => animation = Some(value.to_string()),
+                // `none` overrides a template's.
+                Some(("anim", value)) if !value.is_empty() => animation = (value != "none").then(|| value.to_string()),
                 _ => return Err(fail(format!("unknown option '{option}'"))),
             }
         }
@@ -519,6 +568,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             scale,
             is_static,
             occluder,
+            shadow,
             animation,
         });
     }
@@ -966,6 +1016,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             scale: e.scale,
             is_static: e.is_static,
             occluder,
+            shadow: e.shadow,
             animation: e.animation,
         });
     }

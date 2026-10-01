@@ -81,6 +81,13 @@ pub struct RasterConfig {
     /// Beams' fades (see `Light::beam`) are drawn as a stipple, each pixel lit or not by a
     /// 4×4 ordered dither: a retro look, and cheap, as no pixel needs a partial light.
     pub beam_dither: bool,
+    /// Pixels per cell of the grid blurred casters' shadows are blurred on (see
+    /// [`BlurGrid`]), each way: its resolution.
+    pub blur_scale: u32,
+    /// Blur grid cells twice as wide as they are tall (half the columns), like the
+    /// half-rate shading of reflections.
+    pub blur_half_rate: bool,
+
 }
 
 impl Default for RasterConfig {
@@ -99,6 +106,9 @@ impl Default for RasterConfig {
             penumbra_padding: 16,
             show_samples: false,
             beam_dither: false,
+            blur_scale: 8,
+            blur_half_rate: false,
+
         }
     }
 }
@@ -226,6 +236,8 @@ struct PolygonSetup {
     /// reaches each pixel.
     splits: u8,
     split_colors: [Vec3; MAX_SPLIT],
+    /// Each split light's shadow slot.
+    split_slots: [u8; MAX_SPLIT],
     first_shadow: u32,
     shadows: u16,
     /// Its material's outputs per sample point.
@@ -292,6 +304,7 @@ struct ThreadBins {
     shadow_lines: Vec<Option<EdgeLine>>,
     shadow_light: Vec<f32>,
     shadow_rays: Vec<Vec3>,
+    shadow_width: Vec<f32>,
 }
 
 /// A polygon's shadow piece, binned: its vertices (`count` from `first`), its light's split
@@ -305,6 +318,8 @@ struct ShadowSetup {
     beam: Option<(f32, f32)>,
     row_top: i32,
     row_end: i32,
+    /// See `ShadowPiece::occluded`.
+    occluded: bool,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -392,6 +407,11 @@ struct RowScratch {
     /// Where one translucent span is in front: pixels, and the opaque span behind (if any).
     visible: Vec<(i32, i32, Option<u32>)>,
     blend: Vec<u32>,
+    /// How much of each split light the run's pixels get past occluders' hard shadows to
+    /// be blurred (see `ShadowPiece::occluded`): 1 or 0, until softened.
+    occluded: Vec<f32>,
+    /// The blur grid's columns of cells under a run (see `BlurGrid::soften`).
+    blur_cells: Vec<(f32, f32, f32)>,
 }
 
 /// Counts and timings from the last frame.
@@ -408,6 +428,8 @@ pub struct RenderStats {
     /// Time threads spent drawing bands in phase 2, summed over all threads. Compared with
     /// `rows * threads`, the rest is waiting: for the slowest band, and to start and join.
     pub rows_busy: Duration,
+    /// Building and blurring the shadow blur grid (see `RasterConfig::shadow_blur`).
+    pub blur: Duration,
 }
 
 /// The span buffer renderer. Keeps its arenas and scratchpads between frames.
@@ -422,14 +444,18 @@ pub struct Renderer {
     scratch: Vec<Mutex<RowScratch>>,
     /// What untextured polygons sample: 1x1 opaque white.
     blank: Texture,
+    blur: BlurGrid,
 }
 
-/// The textures polygons sample, and the frame's focal length and ambient light.
+/// The textures polygons sample, and the frame's focal length and ambient light; and the
+/// shadow blur grid, if shadows are blurred.
+#[derive(Clone, Copy)]
 struct Textures<'a> {
     assets: &'a Assets,
     blank: &'a Texture,
     focal: f32,
     ambient: Vec3,
+    blur: Option<&'a BlurGrid>,
 }
 
 impl Textures<'_> {
@@ -452,6 +478,7 @@ impl Renderer {
             bins: Vec::new(),
             scratch: Vec::new(),
             blank: Texture::solid("blank", 0xFFFF_FFFF),
+            blur: BlurGrid::default(),
         }
     }
 
@@ -499,6 +526,7 @@ impl Renderer {
             blank: &self.blank,
             focal: geometry.focal,
             ambient: geometry.ambient,
+            blur: None,
         };
         let setup_started = Instant::now();
         // ---- Phase 1: polygon setup and binning, split by polygon. Each thread writes only
@@ -525,6 +553,7 @@ impl Renderer {
             bins.shadow_lines.clear();
             bins.shadow_light.clear();
             bins.shadow_rays.clear();
+            bins.shadow_width.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -550,6 +579,18 @@ impl Renderer {
             self.bins.iter_mut().enumerate().for_each(set_up);
         }
 
+        let blur_started = Instant::now();
+        // Blurred casters' shadows (see `ShadowPiece::occluded`), if any are in view.
+        let blur_on = self.bins.iter().any(|b| b.shadows.iter().any(|piece| piece.occluded))
+            && self.config.blur_scale > 0
+            && band_rows % self.config.blur_scale as i32 == 0;
+        if blur_on {
+            self.blur.build(&self.bins, &self.scratch, &self.config, viewport, band_rows, geometry.focal);
+        }
+        let textures = Textures {
+            blur: blur_on.then_some(&self.blur),
+            ..textures
+        };
         let rows_started = Instant::now();
         // ---- Phase 2: rows, split into bands. Each thread owns its band's rows.
         let width = target.width as usize;
@@ -575,7 +616,8 @@ impl Renderer {
             bands: bands as u32,
             threads: threads as u32,
             prepare: setup_started - started,
-            setup: rows_started - setup_started,
+            setup: blur_started - setup_started,
+            blur: rows_started - blur_started,
             rows: done - rows_started,
             rows_busy: Duration::from_nanos(busy.into_inner()),
         })
@@ -876,10 +918,12 @@ fn setup_polygon(
             beam: piece.beam,
             row_top: pixel_edge(top),
             row_end: pixel_edge(bottom),
+            occluded: piece.occluded,
         });
         for v in vertices {
             bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
             bins.shadow_rays.push(v.ray);
+            bins.shadow_width.push(v.width);
             bins.shadow_lines.push(v.line);
             bins.shadow_light.push(v.light);
         }
@@ -899,6 +943,7 @@ fn setup_polygon(
         n_vals: n_vals as u16,
         splits: splits as u8,
         split_colors,
+        split_slots,
         first_shadow,
         shadows: (bins.shadows.len() as u32 - first_shadow) as u16,
         n_out: (layout_len(entry.io.interp) + split_outputs(splits)) as u16,
@@ -1909,6 +1954,8 @@ fn shadow_run(
     let len = (x1 - x0).max(0) as usize;
     s.reaches.clear();
     s.reaches.resize(p.splits as usize * len, 1.0);
+    s.occluded.clear();
+    s.occluded.resize(p.splits as usize * len, 1.0);
     let row = s.row;
     for piece in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
         if row < piece.row_top || row >= piece.row_end {
@@ -1927,6 +1974,15 @@ fn shadow_run(
         let (from, to) = (pixel_edge(xl).max(x0), pixel_edge(xr).min(x1));
         if from >= to {
             continue;
+        }
+        // In an occluder's shadow, to be blurred: dark in the occlusion buffer, and lit
+        // (by a beam's cone, inside its pyramid) here.
+        if piece.occluded {
+            let split = piece.split as usize * len;
+            s.occluded[split + (from - x0) as usize..split + (to - x0) as usize].fill(0.0);
+            if piece.beam.is_none() {
+                continue;
+            }
         }
         // At each crossing: w, the light times w, and the ray times w (all linear across
         // the row).
@@ -2134,6 +2190,12 @@ fn shade_points(
     row_points(s, index, p.n_out as usize, shown, x1);
     // The shadow buffer for the run: how much of each split light reaches each pixel.
     shadow_run(s, &bins[t], p, x0, x1, config.beam_dither);
+    if let Some(grid) = textures.blur {
+        grid.soften(s, &bins[t], p, x0, x1);
+        for (r, o) in s.reaches.iter_mut().zip(&s.occluded) {
+            *r *= o;
+        }
+    }
     let job = SpanJob {
         x_left,
         x_right,
@@ -2392,6 +2454,515 @@ fn insert_resolved(list: &[Span], new: Span, out: &mut Vec<Span>) {
         cursor = cursor.max(b);
     }
     push(out, &new, cursor, new.x1);
+}
+
+/// Shadow slots the blur grid softens (see `RasterConfig::shadow_blur`): 0 to this.
+const BLUR_CHANNELS: usize = 4;
+
+/// The farthest, in pixels, a soft edge reaches from a hard shadow's edge: how far the
+/// blur looks for one, and its largest radius.
+const BLUR_REACH: i32 = 96;
+
+/// One cell of the blur grid: what is seen at its center pixel.
+#[derive(Clone, Copy)]
+struct BlurCell {
+    /// The surface seen there, as w on screen (`w = a + b x + c y`, at pixel centers), and
+    /// w at the cell's center; 0 for none.
+    plane: [f32; 3],
+    w: f32,
+    /// Per channel (shadow slot): 1 lit, 0 in its hard shadow; NaN where the light doesn't
+    /// light the surface at all.
+    hard: [f32; BLUR_CHANNELS],
+    /// Per channel, in hard shadow: how wide its soft edge would be there, in pixels.
+    width: [f32; BLUR_CHANNELS],
+}
+
+impl Default for BlurCell {
+    fn default() -> Self {
+        Self { plane: [0.0; 3], w: 0.0, hard: [f32::NAN; BLUR_CHANNELS], width: [0.0; BLUR_CHANNELS] }
+    }
+}
+
+/// Soft shadows by blurring hard ones on screen, a prototype. Before the rows are drawn,
+/// a grid of cells (`RasterConfig::blur_scale` pixels each way, or twice that across at
+/// half rate) records, at each one's
+/// center, the surface seen there, whether it is in each light's hard shadow, and how wide
+/// that shadow's soft edge would be (from the view: 0 where an occluder touches the
+/// surface, growing away from it). Each cell near a shadow's edge then takes the width of
+/// the nearest cell in shadow, and the grid is blurred by a box that wide (in rows, then
+/// columns), only across cells on the same plane as it (w on screen of one plane), so a
+/// shadow doesn't spread onto the surfaces in front or behind. As a row is drawn, each
+/// pixel of a polygon split for a light takes the blurred grid at it (from the four
+/// nearest cells on its plane), mixed with its own hard shadow where the soft edge is
+/// narrower than a few cells.
+#[derive(Default)]
+struct BlurGrid {
+    /// Pixels per cell: across and down.
+    scale: (i32, i32),
+    cols: usize,
+    rows: usize,
+    /// The viewport's corner.
+    origin: (i32, i32),
+    cells: Vec<BlurCell>,
+    /// Per channel, per cell: blurred, and the blur's width (pixels; 0 for none).
+    soft: Vec<f32>,
+    radius: Vec<f32>,
+    /// Scratch: per cell, the nearest cell in shadow along its row (x offset, width), and
+    /// the row pass's result.
+    near: Vec<Option<(i32, f32)>>,
+    across: Vec<f32>,
+    /// Per channel: some cell is in its hard shadow.
+    active: [bool; BLUR_CHANNELS],
+}
+
+impl BlurGrid {
+    /// Pixel center of cell `(i, j)`.
+    fn center(&self, i: usize, j: usize) -> (f32, f32) {
+        (
+            self.origin.0 as f32 + (i as i32 * self.scale.0 + self.scale.0 / 2) as f32 + 0.5,
+            self.origin.1 as f32 + (j as i32 * self.scale.1 + self.scale.1 / 2) as f32 + 0.5,
+        )
+    }
+
+    /// Whether cell `k` (at pixel center `at`) is on the plane `plane`.
+    fn on(&self, plane: [f32; 3], k: usize, at: (f32, f32)) -> bool {
+        let w = self.cells[k].w;
+        w > 0.0 && (plane[0] + plane[1] * at.0 + plane[2] * at.1 - w).abs() <= 0.01 * w
+    }
+
+    fn build(
+        &mut self,
+        bins: &[ThreadBins],
+        scratch: &[Mutex<RowScratch>],
+        config: &RasterConfig,
+        viewport: Viewport,
+        band_rows: i32,
+        focal: f32,
+    ) {
+        let down = config.blur_scale as i32;
+        let scale = (if config.blur_half_rate { 2 * down } else { down }, down);
+        self.scale = scale;
+        self.cols = (viewport.width as i32 + scale.0 - 1) as usize / scale.0 as usize;
+        self.rows = (viewport.height as i32 + scale.1 - 1) as usize / scale.1 as usize;
+        self.origin = (viewport.x as i32, viewport.y as i32);
+        let n = self.cols * self.rows;
+        self.cells.clear();
+        self.cells.resize(n, BlurCell::default());
+        // The cells, band by band (each band holds `band_rows / scale.1` of their rows).
+        let per_band = (band_rows / scale.1) as usize;
+        let (cols, origin) = (self.cols, self.origin);
+        self.cells.par_chunks_mut(cols * per_band).enumerate().for_each(|(band, cells)| {
+            let t = rayon::current_thread_index().unwrap_or(0) % scratch.len();
+            let mut s = scratch[t].lock().unwrap();
+            mask_band(&mut s, bins, band, (cols, per_band, scale, origin), focal, cells);
+        });
+        // Each channel blurred.
+        self.soft.clear();
+        self.soft.resize(n * BLUR_CHANNELS, 1.0);
+        self.radius.clear();
+        self.radius.resize(n * BLUR_CHANNELS, 0.0);
+        for ch in 0..BLUR_CHANNELS {
+            self.blur_channel(ch);
+        }
+    }
+
+    fn blur_channel(&mut self, ch: usize) {
+        let (cols, rows, n) = (self.cols, self.rows, self.cols * self.rows);
+        let base = ch * n;
+        self.active[ch] = self.cells.iter().any(|c| c.hard[ch] < 0.5);
+        if !self.active[ch] {
+            return;
+        }
+        let hard: Vec<f32> = self.cells.iter().map(|c| c.hard[ch]).collect();
+        let (sx, sy) = self.scale;
+        let (reach, reach_y) = (BLUR_REACH / sx, BLUR_REACH / sy);
+        let (mut near, mut radius, mut across, mut soft) = (
+            std::mem::take(&mut self.near),
+            std::mem::take(&mut self.radius),
+            std::mem::take(&mut self.across),
+            std::mem::take(&mut self.soft),
+        );
+        let grid = &*self;
+        // Along rows: the nearest cell in shadow on the same plane, within reach (each one
+        // in shadow is its own).
+        near.clear();
+        near.resize(n, None);
+        near.par_chunks_mut(cols).enumerate().for_each(|(j, near)| {
+            let darks: Vec<i32> = (0..cols as i32).filter(|&i| hard[j * cols + i as usize] < 0.5).collect();
+            if darks.is_empty() {
+                return;
+            }
+            for (i, slot) in near.iter_mut().enumerate() {
+                let k = j * cols + i;
+                let cell = &grid.cells[k];
+                if cell.w <= 0.0 {
+                    continue;
+                }
+                let at = darks.partition_point(|&d| d < i as i32);
+                let (mut lo, mut hi) = (at as i32 - 1, at as i32);
+                while lo >= 0 || (hi as usize) < darks.len() {
+                    let dl = if lo >= 0 { i as i32 - darks[lo as usize] } else { i32::MAX };
+                    let dh = if (hi as usize) < darks.len() { darks[hi as usize] - i as i32 } else { i32::MAX };
+                    let x = if dh <= dl { darks[hi as usize] } else { darks[lo as usize] };
+                    if dh.min(dl) > reach {
+                        break;
+                    }
+                    let kk = j * cols + x as usize;
+                    if grid.on(cell.plane, kk, grid.center(x as usize, j)) {
+                        *slot = Some((x - i as i32, grid.cells[kk].width[ch]));
+                        break;
+                    }
+                    if dh <= dl { hi += 1 } else { lo -= 1 }
+                }
+            }
+        });
+        // How many cells of each column, down to each row, have one: to skip columns with
+        // none within reach.
+        let mut counts = vec![0u32; (rows + 1) * cols];
+        for j in 0..rows {
+            for i in 0..cols {
+                counts[(j + 1) * cols + i] = counts[j * cols + i] + near[j * cols + i].is_some() as u32;
+            }
+        }
+        // Down columns: the nearest of those, on the cell's plane, is its blur's width.
+        radius[base..base + n].par_chunks_mut(cols).enumerate().for_each(|(j, out)| {
+            let (top, bottom) = ((j as i32 - reach_y).max(0) as usize, (j as i32 + reach_y).min(rows as i32 - 1) as usize);
+            for (i, r) in out.iter_mut().enumerate() {
+                let k = j * cols + i;
+                let cell = &grid.cells[k];
+                if cell.w <= 0.0 || hard[k].is_nan() || counts[(bottom + 1) * cols + i] == counts[top * cols + i] {
+                    continue;
+                }
+                if hard[k] < 0.5 {
+                    *r = cell.width[ch];
+                    continue;
+                }
+                let mut best: Option<(i32, f32)> = None;
+                for jj in top..=bottom {
+                    let Some((dx, width)) = near[jj * cols + i] else {
+                        continue;
+                    };
+                    let dy = jj as i32 - j as i32;
+                    let d2 = (dx * sx) * (dx * sx) + (dy * sy) * (dy * sy);
+                    if best.is_some_and(|(b, _)| b <= d2) {
+                        continue;
+                    }
+                    let x = (i as i32 + dx) as usize;
+                    if grid.on(cell.plane, jj * cols + x, grid.center(x, jj)) {
+                        best = Some((d2, width));
+                    }
+                }
+                if let Some((_, width)) = best {
+                    *r = width;
+                }
+            }
+        });
+        // A box as wide as that: along rows, then down columns, on the cell's plane. Where
+        // every cell in its reach has the same value, that is the average whatever their
+        // planes: sums of values and of cells with one tell.
+        let half = |r: f32| ((r / sx as f32 * 0.5).ceil() as i32).min(reach);
+        let half_y = |r: f32| ((r / sy as f32 * 0.5).ceil() as i32).min(reach_y);
+        let valid = |v: f32| if v.is_nan() { (0.0, 0.0) } else { (v, 1.0) };
+        across.clear();
+        across.resize(n, 0.0);
+        let radius_ch = &radius[base..base + n];
+        across.par_chunks_mut(cols).enumerate().for_each(|(j, out)| {
+            let mut sums = vec![(0.0f32, 0.0f32); cols + 1];
+            for i in 0..cols {
+                let (v, c) = valid(hard[j * cols + i]);
+                sums[i + 1] = (sums[i].0 + v, sums[i].1 + c);
+            }
+            for (i, o) in out.iter_mut().enumerate() {
+                let k = j * cols + i;
+                let r = half(radius_ch[k]);
+                *o = hard[k];
+                if r <= 0 || hard[k].is_nan() {
+                    continue;
+                }
+                let (a, b) = ((i as i32 - r).max(0) as usize, (i as i32 + r).min(cols as i32 - 1) as usize);
+                let (v, c) = (sums[b + 1].0 - sums[a].0, sums[b + 1].1 - sums[a].1);
+                if v <= 0.0 || v >= c {
+                    continue;
+                }
+                let plane = grid.cells[k].plane;
+                let (mut sum, mut count) = (0.0, 0.0);
+                for ii in a..=b {
+                    let kk = j * cols + ii;
+                    if !hard[kk].is_nan() && grid.on(plane, kk, grid.center(ii, j)) {
+                        sum += hard[kk];
+                        count += 1.0;
+                    }
+                }
+                if count > 0.0 {
+                    *o = sum / count;
+                }
+            }
+        });
+        let mut column = vec![(0.0f32, 0.0f32); (rows + 1) * cols];
+        for j in 0..rows {
+            for i in 0..cols {
+                let (v, c) = valid(across[j * cols + i]);
+                let prev = column[j * cols + i];
+                column[(j + 1) * cols + i] = (prev.0 + v, prev.1 + c);
+            }
+        }
+        soft[base..base + n].par_chunks_mut(cols).enumerate().for_each(|(j, out)| {
+            for (i, o) in out.iter_mut().enumerate() {
+                let k = j * cols + i;
+                let r = half_y(radius_ch[k]);
+                *o = across[k];
+                if r <= 0 || hard[k].is_nan() {
+                    continue;
+                }
+                let (a, b) = ((j as i32 - r).max(0) as usize, (j as i32 + r).min(rows as i32 - 1) as usize);
+                let (v, c) = (
+                    column[(b + 1) * cols + i].0 - column[a * cols + i].0,
+                    column[(b + 1) * cols + i].1 - column[a * cols + i].1,
+                );
+                if c > 0.0 && (v <= 0.0 || v >= c) {
+                    continue;
+                }
+                let plane = grid.cells[k].plane;
+                let (mut sum, mut count) = (0.0, 0.0);
+                for jj in a..=b {
+                    let kk = jj * cols + i;
+                    if !across[kk].is_nan() && grid.on(plane, kk, grid.center(i, jj)) {
+                        sum += across[kk];
+                        count += 1.0;
+                    }
+                }
+                if count > 0.0 {
+                    *o = sum / count;
+                }
+            }
+        });
+        self.near = near;
+        self.radius = radius;
+        self.across = across;
+        self.soft = soft;
+    }
+
+    /// Softens the shadow buffer of a run of polygon `p`'s row (see `shadow_run`): each
+    /// pixel of each split light it blurs takes the blurred grid, from the (up to) four
+    /// nearest cells on its plane, mixed with its hard shadow where the soft edge there is
+    /// under two cells wide.
+    fn soften(&self, s: &mut RowScratch, b: &ThreadBins, p: &PolygonSetup, x0: i32, x1: i32) {
+        let len = (x1 - x0).max(0) as usize;
+        if len == 0 {
+            return;
+        }
+        let data = &b.planes[p.first_plane as usize..];
+        let (ox, oy, w0, wx, wy) = (data[0], data[1], data[2], data[3], data[4]);
+        let plane = [w0 - wx * ox - wy * oy, wx, wy];
+        let n = self.cols * self.rows;
+        let (sx, sy) = (self.scale.0 as f32, self.scale.1 as f32);
+        let to_grid = |v: f32, o: i32, scale: f32| (v + 0.5 - o as f32 - scale * 0.5) / scale;
+        let gy = to_grid(s.row as f32, self.origin.1, sy);
+        let j0 = gy.floor() as i32;
+        let fy = gy - j0 as f32;
+        // The cells the run's pixels fall between, on its two grid rows.
+        let i_first = to_grid(x0 as f32, self.origin.0, sx).floor() as i32;
+        let i_last = to_grid((x1 - 1) as f32, self.origin.0, sx).floor() as i32 + 1;
+        let count = (i_last - i_first + 1) as usize;
+        for split in 0..p.splits as usize {
+            let ch = p.split_slots[split] as usize;
+            if ch >= BLUR_CHANNELS {
+                continue;
+            }
+            if !self.active[ch] {
+                continue;
+            }
+            // Per column of cells: the two cells on its grid rows on the polygon's plane,
+            // blended down to the row (value and width times weight, and weight).
+            let columns = &mut s.blur_cells;
+            columns.clear();
+            let mut any = false;
+            for c in 0..count {
+                let i = i_first + c as i32;
+                let mut column = (0.0f32, 0.0f32, 0.0f32);
+                for (d, wgt) in [(0, 1.0 - fy), (1, fy)] {
+                    let j = j0 + d;
+                    if i < 0 || j < 0 || i >= self.cols as i32 || j >= self.rows as i32 || wgt <= 0.0 {
+                        continue;
+                    }
+                    let k = j as usize * self.cols + i as usize;
+                    let (v, r) = (self.soft[ch * n + k], self.radius[ch * n + k]);
+                    if !v.is_nan() && self.on(plane, k, self.center(i as usize, j as usize)) {
+                        column = (column.0 + v * wgt, column.1 + r * wgt, column.2 + wgt);
+                    }
+                }
+                any |= column.1 > 0.0;
+                columns.push(column);
+            }
+            if !any {
+                continue;
+            }
+            // Between each two columns: the pixels whose cells they are, blended across.
+            let out = &mut s.occluded[split * len..(split + 1) * len];
+            let column_x = |c: usize| self.origin.0 + (i_first + c as i32) * self.scale.0 + self.scale.0 / 2;
+            for c in 0..count - 1 {
+                let (a, b) = (s.blur_cells[c], s.blur_cells[c + 1]);
+                if a.1 <= 0.0 && b.1 <= 0.0 {
+                    continue;
+                }
+                let (from, to) = (column_x(c).max(x0), column_x(c + 1).min(x1));
+                for px in from..to {
+                    let fx = (px - column_x(c)) as f32 / sx;
+                    let weight = a.2 + (b.2 - a.2) * fx;
+                    if weight <= 1e-6 {
+                        continue;
+                    }
+                    let soft = (a.0 + (b.0 - a.0) * fx) / weight;
+                    let radius = (a.1 + (b.1 - a.1) * fx) / weight;
+                    let t = (radius / (2.0 * sx.max(sy))).clamp(0.0, 1.0);
+                    let o = &mut out[(px - x0) as usize];
+                    *o += (soft - *o) * t;
+                }
+            }
+        }
+    }
+}
+
+/// Fills band `band`'s cells of the blur grid (`per_band` rows of `cols`, from the
+/// band's first; `scale` pixels each, across and down, from the viewport's corner
+/// `origin`): at each one's
+/// center pixel, the opaque surface seen there, as the rows find it, and its hard shadow.
+fn mask_band(
+    s: &mut RowScratch,
+    bins: &[ThreadBins],
+    band: usize,
+    (cols, per_band, scale, origin): (usize, usize, (i32, i32), (i32, i32)),
+    focal: f32,
+    cells: &mut [BlurCell],
+) {
+    s.world.clear();
+    s.span.clear();
+    s.pixel.clear();
+    for b in bins {
+        let Some(bb) = b.bands.get(band) else {
+            continue;
+        };
+        s.world.extend_from_slice(&bb.world);
+        s.span.extend_from_slice(&bb.span);
+        s.pixel.extend_from_slice(&bb.pixel);
+    }
+    let poly = |id: u32| {
+        let (t, l) = split_id(id);
+        &bins[t].polygons[l]
+    };
+    s.span.sort_by(|&a, &b| poly(b).max_w.total_cmp(&poly(a).max_w));
+    for (jr, row_cells) in cells.chunks_mut(cols).enumerate().take(per_band) {
+        let j = band * per_band + jr;
+        let row = origin.1 + j as i32 * scale.1 + scale.1 / 2;
+        s.row = row;
+        s.states.clear();
+        s.spans.clear();
+        for i in 0..s.world.len() {
+            if let Some(span) = row_span(s, bins, s.world[i], 0, row) {
+                s.spans.push(span);
+            }
+        }
+        s.spans.sort_by_key(|sp| sp.x0);
+        for i in 0..s.span.len() {
+            if let Some(span) = row_span(s, bins, s.span[i], 0, row) {
+                insert_resolved(&s.spans, span, &mut s.spans_next);
+                std::mem::swap(&mut s.spans, &mut s.spans_next);
+            }
+        }
+        s.pixel_spans.clear();
+        for i in 0..s.pixel.len() {
+            if let Some(span) = row_span(s, bins, s.pixel[i], 0, row) {
+                s.pixel_spans.push(span);
+            }
+        }
+        // The surface at each cell's center: the opaque span there, unless a per-pixel
+        // actor is in front.
+        s.visible.clear();
+        let mut next = 0;
+        for (i, cell) in row_cells.iter_mut().enumerate() {
+            let x = origin.0 + i as i32 * scale.0 + scale.0 / 2;
+            while next < s.spans.len() && s.spans[next].x1 <= x {
+                next += 1;
+            }
+            let mut seen = s.spans.get(next).filter(|sp| sp.x0 <= x).map(|sp| (sp.w(x), sp.state));
+            for sp in &s.pixel_spans {
+                if sp.x0 <= x && x < sp.x1 && seen.is_none_or(|(w, _)| sp.w(x) > w) {
+                    seen = Some((sp.w(x), sp.state));
+                }
+            }
+            *cell = BlurCell::default();
+            if let Some((w, state)) = seen {
+                cell.w = w;
+                s.visible.push((i as i32, i as i32 + 1, Some(state)));
+            }
+        }
+        // Runs of cells on one polygon, its shadow pieces walked once per run.
+        let mut r = 0;
+        while r < s.visible.len() {
+            let (first, _, state) = s.visible[r];
+            let mut last = first + 1;
+            while r + 1 < s.visible.len() && s.visible[r + 1].2 == state && s.visible[r + 1].0 == last {
+                last += 1;
+                r += 1;
+            }
+            r += 1;
+            let (t, l) = split_id(s.states[state.unwrap() as usize].id);
+            let b = &bins[t];
+            let p = &b.polygons[l];
+            let data = &b.planes[p.first_plane as usize..];
+            let (ox, oy, w0, wx, wy) = (data[0], data[1], data[2], data[3], data[4]);
+            let plane = [w0 - wx * ox - wy * oy, wx, wy];
+            let run = &mut row_cells[first as usize..last as usize];
+            for cell in run.iter_mut() {
+                cell.plane = plane;
+            }
+            for k in p.first_light as usize..p.first_light as usize + p.light_count as usize {
+                let Some(ch) = b.lights[k].shadow.map(|c| c as usize).filter(|&c| c < BLUR_CHANNELS) else {
+                    continue;
+                };
+                for cell in run.iter_mut() {
+                    cell.hard[ch] = 1.0;
+                }
+                let split = b.light_split[k];
+                if split == NO_SPLIT {
+                    continue;
+                }
+                let x_of = |i: usize| origin.0 + (first + i as i32) * scale.0 + scale.0 / 2;
+                for piece in &b.shadows[p.first_shadow as usize..][..p.shadows as usize] {
+                    if !piece.occluded || piece.split != split || row < piece.row_top || row >= piece.row_end {
+                        continue;
+                    }
+                    let range = piece.first as usize..piece.first as usize + piece.count as usize;
+                    let verts = &b.shadow_vertices[range.clone()];
+                    let Some(((il, xl), (ir, xr))) = crossings(verts, &b.shadow_lines[range.clone()], row) else {
+                        continue;
+                    };
+                    let (from, to) = (pixel_edge(xl), pixel_edge(xr));
+                    let width = &b.shadow_width[range];
+                    let at = |i: usize| {
+                        let (w, alpha) = edge_at_row(verts, i, row);
+                        let k = (i + 1) % verts.len();
+                        (w, (width[i] + (width[k] - width[i]) * alpha) * w)
+                    };
+                    let ((wl, dl), (wr, dr)) = (at(il), at(ir));
+                    let span = (xr - xl).max(1e-6);
+                    for (i, cell) in run.iter_mut().enumerate() {
+                        let x = x_of(i);
+                        if x < from || x >= to {
+                            continue;
+                        }
+                        let t = ((x as f32 + 0.5 - xl) / span).clamp(0.0, 1.0);
+                        let w = wl + (wr - wl) * t;
+                        if w <= 0.0 {
+                            continue;
+                        }
+                        cell.hard[ch] = 0.0;
+                        cell.width[ch] = (dl + (dr - dl) * t) / w * focal * cell.w;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

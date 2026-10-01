@@ -137,6 +137,10 @@ adjoins 4
    2   14       3       0x3
    3   23       2       0x3
 
+templates 1
+#  id  name    model        [options]
+   0   walker  walker.mmdl  shadow=blurred anim=walk
+
 entities 8
 #  id  kind   sector  model      x       y       z       pitch  yaw   roll  scale  name  [options]
    0   spawn  0       -          0.00    0.00    6.00    0      0     0     1.00   player_start
@@ -146,7 +150,7 @@ entities 8
    4   prop   1       crate.obj  0.30    0.00    -6.00   0      10    0     1.00   crate_hall static
    5   prop   2       crate.obj  0.00    0.00    -16.00  0      45    0     1.00   crate_b1  static
    6   prop   2       crate.obj  3.00    0.00    -18.00  0      0     0     1.00   crate_b2  static
-   7   actor  2       walker.mmdl 1.50    0.00    -16.50  0      30    0     1.00   walker   anim=walk
+   7   actor  2       walker     1.50    0.00    -16.50  0      30    0     1.00   walker
 
 ambient 0.05 0.06 0.09
 

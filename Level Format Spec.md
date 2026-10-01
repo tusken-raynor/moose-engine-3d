@@ -33,7 +33,7 @@ Models referenced by entities are `.obj` files or `.mmdl` files (see the Model F
 - Quoted strings may contain spaces.
 - The file begins with the header `MOOSEMAP 1`.
 - Each remaining section begins with its keyword and a row count. Rows start with an `id` that must equal the row's position, counting from 0.
-- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, `entities`, then optionally `ambient`, optionally `lights` and optionally `directional`.
+- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, optionally `templates`, `entities`, then optionally `ambient`, optionally `lights` and optionally `directional`.
 - Some rows take **options** after their fixed columns: words like `static`, or `key=value` pairs like `radius=0.05`. Options are optional and can come in any order.
 
 ```
@@ -123,13 +123,28 @@ Solid surfaces reference every attribute on every vertex. Portal surfaces list v
 
 Adjoins always come in pairs. The two surfaces use the same vertex indices in reverse order, so each portal matches its partner exactly by construction.
 
+**`templates`** (optional): named models with default options, which entities place by name instead of a model file.
+
+```
+templates 1
+#  id  name    model        [options]
+   0   walker  walker.mmdl  shadow=blurred anim=walk
+```
+
+| Column | Meaning |
+| --- | --- |
+| `name` | What entities write in their `model` column to place it |
+| `model` | Model file name, resolved from `assets/models/` |
+
+Its options are any of an entity's (below). An entity placed by a template gets the template's options, except those it sets itself, key by key: `shadow=hard` on the instance replaces the template's `shadow=`. A flag is turned off with `=off` (`static=off`), and a template's animation with `anim=none`.
+
 **`entities`**
 
 | Column | Meaning |
 | --- | --- |
 | `kind` | `spawn`, `prop` or `actor`. The kind belongs to the instance, not the model: the same mesh can be placed as a prop or an actor. `prop` and `actor` map to the span buffer module's `MeshKind`; world geometry comes from sectors only. |
 | `sector` | The sector that contains the entity's origin. It is the starting point for portal traversal and culling. |
-| `model` | Model file name, resolved from `assets/models/`, or `-` for none |
+| `model` | A template's name (see `templates`), a model file name resolved from `assets/models/`, or `-` for none |
 | `x y z` | Position of the model origin in world space |
 | `pitch yaw roll` | Orientation in degrees (see Conventions) |
 | `scale` | Uniform scale |
@@ -139,9 +154,10 @@ Options, after `name` (props and actors only):
 
 | Option | Meaning |
 | --- | --- |
-| `static` | Props only. The prop never moves, so static lights' shadows from it and on it can be worked out once. |
+| `static` | Props only. The prop never moves, so static lights' shadows from it and on it can be worked out once. `static=on` is the same, `static=off` turns off a template's. |
 | `occluder=...` | What the entity casts shadows with. Without it, `mesh`. |
-| `anim=NAME` | It plays its model's animation `NAME` over and over (or holds its last frame, for one that doesn't loop), from when the level starts. Not with `static`. |
+| `shadow=soft\|blurred\|hard` | How its shadows' edges are drawn, from a light with a size. `soft` (the default) carves their soft edges: exact, and cached for static props. `blurred` carves them hard and blurs them on screen, as wide as their soft edge would be: for figures casting shadows with simple proxies, whose blur hides how simple they are; worked out every frame. `hard` carves them from the light's center: the cheapest. |
+| `anim=NAME` | It plays its model's animation `NAME` over and over (or holds its last frame, for one that doesn't loop), from when the level starts. Not with `static`. `anim=none` turns off a template's. |
 
 Occluders are the artist's choice. Any shape works; a complex one only costs more to shadow with.
 
@@ -191,7 +207,7 @@ Options: `shadows=on|off` (default on).
 7. Adjoins are symmetric (`mirror.mirror == self`), each points back to its surface, the mirror surface lists the same vertices in reverse order, the two sides belong to different sectors, and flags use only the defined bits. Surface flags use only the defined bits, and portal surfaces have none.
 8. Every solid surface vertex references exactly one row per declared attribute; portal surface vertices reference none.
 9. Each entity's origin lies inside its sector: on the inner side of every one of the sector's surface planes. This is an exact test because sectors are convex.
-10. Entity names are unique. Spawn points have no model (`-`) and no options; props and actors must have one, and it must load. Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
+10. Template names are unique, and each template row has a name and a model. Entity names are unique. Spawn points have no model (`-`) and no options; props and actors must have one, and it must load. Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
 11. Ambient light and light colors are not negative. Each light's range is positive, and its position lies inside its sector (as for entities). Each light row has 8 or 13 fields before its options. A spot light's direction is not zero, and its angles satisfy 0 ≤ inner ≤ outer ≤ 180. A light's radius is 0 or more.
 12. Each directional light has 7 fields before its options, a direction that is not zero, a color that is not negative, and an angle from 0 to 45 degrees.
 13. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.
@@ -202,5 +218,4 @@ Options: `shadows=on|off` (default on).
 - More surface flags (for example two-sided, translucent).
 - Portals with a drawn surface (water, glass) for the translucent pass.
 - Per-sector properties (ambient light, fog, tint).
-- Entity templates instead of raw model file names.
 - A binary format for fast loading, compiled from this text format.

@@ -47,6 +47,9 @@
 //!   --dynamic-softness K  the same for shadows carved every frame, dynamic lights' (the
 //!                         flashlight's) and moving occluders', at most --softness (default 1)
 //!   --no-shadow-cache     carve static lights' shadows every frame (to compare)
+//!   --blur-scale N        pixels per cell of the grid blurred shadows are blurred on, each
+//!                         way (default 8; it must divide 8, the rows per band)
+//!   --blur-half-rate      blur grid cells twice as wide as they are tall
 //!   --no-dynamic-shadows  only baked shadows: none from the flashlight or moving lights,
 //!                         moving occluders, or on moving surfaces (no carving per frame)
 //!   --hud, --menu PAGE    for --screenshot: draw the debug HUD, or a menu page (main,
@@ -236,6 +239,8 @@ struct Options {
     menu: Option<Page>,
     no_shadow_cache: bool,
     no_dynamic_shadows: bool,
+    blur_scale: Option<u32>,
+    blur_half_rate: bool,
     flashlight_fade: f32,
     time: f32,
     /// For --screenshot: render the frame this many times more, and report the average.
@@ -311,6 +316,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         menu: None,
         no_shadow_cache: false,
         no_dynamic_shadows: false,
+        blur_scale: None,
+        blur_half_rate: false,
         flashlight_fade: FLASHLIGHT_FADES[3],
         level_lights: false,
         time: 0.0,
@@ -403,6 +410,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--no-shadow-cache" => o.no_shadow_cache = true,
             "--no-dynamic-shadows" => o.no_dynamic_shadows = true,
+            "--blur-scale" => o.blur_scale = Some(value()?.parse().map_err(|_| "bad --blur-scale")?),
+            "--blur-half-rate" => o.blur_half_rate = true,
             "--flashlight-fade" => {
                 o.flashlight_fade = value()?.parse().map_err(|_| "bad --flashlight-fade")?
             }
@@ -575,6 +584,8 @@ impl App {
         let mut renderer = Renderer::new(RasterConfig {
             show_samples: options.show_samples,
             beam_dither: options.dither_beam,
+            blur_scale: options.blur_scale.unwrap_or(defaults.blur_scale),
+            blur_half_rate: options.blur_half_rate,
             min_step: options.min_step.unwrap_or(defaults.min_step),
             light_spacing: options.light_spacing.unwrap_or(defaults.light_spacing),
             steep_limit: options.steep_limit.unwrap_or(defaults.steep_limit),
@@ -844,7 +855,8 @@ impl App {
             self.editor.say("select an entity with a .mmdl model first");
             return;
         };
-        let Some(file) = self.editor.doc.entities[row].model.clone().filter(|m| m.ends_with(".mmdl")) else {
+        let doc = &self.editor.doc;
+        let Some(file) = doc.model_file(&doc.entities[row]).filter(|m| m.ends_with(".mmdl")).map(String::from) else {
             self.editor.say("the mesh editor edits .mmdl models (export one from Blender)");
             return;
         };
@@ -1974,6 +1986,8 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
 /// - Yellow: a soft edge (some of the light at some corner).
 /// - Cyan: all of the light, inside a beam's pyramid (its cone is worked out per pixel).
 /// - Green: all of the light (the lit parts a polygon is split into).
+/// - Magenta: a blurred caster's hard shadow (see `ShadowKind::Blurred`), which the
+///   renderer blurs.
 ///
 /// Pieces on polygons seen in mirrors are drawn dimmer.
 fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
@@ -1989,7 +2003,9 @@ fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
             let (lo, hi) = vertices
                 .iter()
                 .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v.light), hi.max(v.light)));
-            let color = if hi <= 0.0 {
+            let color = if piece.occluded {
+                0xE0_40_E0
+            } else if hi <= 0.0 {
                 0xE0_40_40
             } else if lo < 1.0 {
                 0xF0_D0_40
@@ -2012,7 +2028,7 @@ fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
     // The legend, bottom left.
     let scale = if canvas.height >= 600 { 2 } else { 1 };
     let line = ui::Canvas::line_height(scale);
-    let entries = [("full shadow", 0xE0_40_40), ("soft edge", 0xF0_D0_40), ("beam, lit", 0x40_E0_E0), ("lit", 0x40_C0_40)];
+    let entries = [("full shadow", 0xE0_40_40), ("soft edge", 0xF0_D0_40), ("beam, lit", 0x40_E0_E0), ("lit", 0x40_C0_40), ("blurred", 0xE0_40_E0)];
     let gap = ui::Canvas::text_width("  ", scale);
     let width = entries.iter().map(|(t, _)| ui::Canvas::text_width(t, scale) + gap).sum::<usize>() + gap;
     let y = canvas.height.saturating_sub(2 * line);
@@ -2757,7 +2773,7 @@ mod tests {
         let label = |app: &App| {
             app.editor.panel().into_iter().find(|r| r.label == "Animation").map(|r| r.value)
         };
-        assert_eq!(label(&app).as_deref(), Some("walk"));
+        assert_eq!(label(&app).as_deref(), Some("walk (template)"));
         let meshes = app.assets.meshes().len();
         app.edit(Field::Animation, 1.0);
         assert_eq!(label(&app).as_deref(), Some("idle"));
@@ -2766,9 +2782,20 @@ mod tests {
         let e = &app.world.entities[walker(&app)];
         assert_eq!(e.mesh, e.model, "not animated: its model as it is");
         app.edit(Field::Animation, 1.0);
-        assert_eq!(label(&app).as_deref(), Some("walk"));
+        assert_eq!(label(&app).as_deref(), Some("walk"), "its own, over its template's");
         // One new level mesh per rebuild, and no more copies.
         assert_eq!(app.assets.meshes().len(), meshes + 3);
+        // Its shadow, blurred by its template; its own option only where it differs.
+        let shadow = |app: &App| app.editor.panel().into_iter().find(|r| r.label == "Shadow").map(|r| r.value);
+        assert_eq!(shadow(&app).as_deref(), Some("blurred (template)"));
+        app.edit(Field::Shadow, 1.0);
+        assert_eq!(shadow(&app).as_deref(), Some("hard"));
+        assert_eq!(app.world.entities[walker(&app)].shadow, moose_assets::ShadowKind::Hard);
+        app.edit(Field::Shadow, 1.0);
+        app.edit(Field::Shadow, 1.0);
+        assert_eq!(shadow(&app).as_deref(), Some("blurred (template)"));
+        let row = app.editor.doc.entities.iter().position(|e| e.name == "walker").unwrap();
+        assert!(!app.editor.doc.entities[row].options.iter().any(|o| o.starts_with("shadow=")));
     }
 
     #[test]

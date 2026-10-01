@@ -21,6 +21,7 @@ pub struct LevelDoc {
     pub sectors: Vec<SectorDoc>,
     pub surfaces: Vec<SurfaceDoc>,
     pub adjoins: Vec<AdjoinDoc>,
+    pub templates: Vec<TemplateDoc>,
     pub entities: Vec<EntityDoc>,
     pub ambient: Option<Vec3>,
     pub lights: Vec<LightDoc>,
@@ -60,11 +61,20 @@ pub struct AdjoinDoc {
     pub flags: u32,
 }
 
+/// A template: a name entities can place instead of a model file, its model, and the
+/// options they get unless they set their own (by key).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplateDoc {
+    pub name: String,
+    pub model: String,
+    pub options: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityDoc {
     pub kind: EntityKind,
     pub sector: usize,
-    /// Its model's file name; `None` for a spawn point.
+    /// Its template's name or its model's file name; `None` for a spawn point.
     pub model: Option<String>,
     pub position: Vec3,
     pub rotation: Quat,
@@ -92,6 +102,25 @@ pub struct DirectionalDoc {
     pub color: Vec3,
     pub angle: f32,
     pub options: Vec<String>,
+}
+
+impl LevelDoc {
+    /// The template an entity places, if its model column names one.
+    pub fn template_of(&self, e: &EntityDoc) -> Option<&TemplateDoc> {
+        let name = e.model.as_deref()?;
+        self.templates.iter().find(|t| t.name == name)
+    }
+
+    /// The model file an entity draws: its template's, or the one it names.
+    pub fn model_file<'a>(&'a self, e: &'a EntityDoc) -> Option<&'a str> {
+        self.template_of(e).map(|t| t.model.as_str()).or(e.model.as_deref())
+    }
+
+    /// An entity's options in effect: its template's, but those it sets itself (by key)
+    /// as it sets them.
+    pub fn options_of(&self, e: &EntityDoc) -> Vec<String> {
+        crate::mmp::merged_options(self.template_of(e).map_or(&[][..], |t| &t.options), &e.options)
+    }
 }
 
 impl EntityDoc {
@@ -191,6 +220,20 @@ impl LevelDoc {
                 flags: c.hex(r, 2)?,
             });
         }
+        let mut templates = Vec::new();
+        if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "templates") {
+            let section = c.section("templates", false, None)?;
+            for r in &section.rows {
+                if r.tokens.len() < 2 {
+                    return Err(c.err(r.no, "template row needs a name and a model"));
+                }
+                templates.push(TemplateDoc {
+                    name: r.tokens[0].clone(),
+                    model: r.tokens[1].clone(),
+                    options: r.tokens[2..].to_vec(),
+                });
+            }
+        }
         let section = c.section("entities", false, None)?;
         let mut entities = Vec::new();
         for r in &section.rows {
@@ -274,6 +317,7 @@ impl LevelDoc {
             sectors,
             surfaces,
             adjoins,
+            templates,
             entities,
             ambient,
             lights,
@@ -344,6 +388,14 @@ impl LevelDoc {
         line("#  id  surface  mirror  flags".into());
         for (i, a) in self.adjoins.iter().enumerate() {
             line(format!("   {i:<3} {:<8} {:<7} {:#x}", a.surface, a.mirror, a.flags));
+        }
+        if !self.templates.is_empty() {
+            line(String::new());
+            line(format!("templates {}", self.templates.len()));
+            line("#  id  name  model  [options]".into());
+            for (i, t) in self.templates.iter().enumerate() {
+                line(format!("   {i:<3} {:<10} {:<12} {}", t.name, t.model, t.options.join(" ")));
+            }
         }
         line(String::new());
         line(format!("entities {}", self.entities.len()));

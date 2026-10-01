@@ -307,8 +307,25 @@ pub struct EntitySpawn {
     pub is_static: bool,
     /// What it casts shadows with.
     pub occluder: Occluder,
+    /// How its shadows' edges are drawn.
+    pub shadow: ShadowKind,
     /// The animation it plays (by name), if its model has a skeleton.
     pub animation: Option<String>,
+}
+
+/// How an entity's shadows' edges are drawn, from a light with a size.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShadowKind {
+    /// Soft edges carved into the surfaces they fall on: exact, the best looking for most
+    /// shapes, and cached for static props.
+    #[default]
+    Soft,
+    /// Carved hard, then blurred on screen by how wide their soft edge would be: for
+    /// figures that cast shadows with simple proxies, whose blur hides how simple they
+    /// are. Worked out every frame.
+    Blurred,
+    /// Hard edges, from the light's center: the cheapest.
+    Hard,
 }
 
 /// The shape an entity blocks light with, for lights that cast shadows: its model unless

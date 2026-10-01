@@ -445,6 +445,37 @@ fn loads_entity_options() {
 }
 
 #[test]
+fn loads_templates_and_shadow_kinds() {
+    use moose_assets::ShadowKind;
+    // Entity 1 placed by a template, its options the template's unless it sets its own.
+    let templated = |own: &str| {
+        let src = LEVEL
+            .replacen("crate.obj", "box", 1)
+            .replacen("1.00   crate_a1", &format!("1.00   crate_a1 {own}"), 1)
+            .replacen("entities ", "templates 1\n   0   box  crate.obj  static shadow=hard\n\nentities ", 1);
+        let mut a = assets();
+        let level = a.parse_level("two_rooms.mmp", &src).unwrap();
+        (level.spawns[1].clone(), a.mesh_id("crate.obj").unwrap())
+    };
+    let (e, crate_mesh) = templated("");
+    assert_eq!((e.mesh, e.is_static, e.shadow), (Some(crate_mesh), true, ShadowKind::Hard));
+    let (e, _) = templated("shadow=blurred static=off");
+    assert_eq!((e.is_static, e.shadow), (false, ShadowKind::Blurred));
+    // Without a template or the option: soft.
+    let level = assets().parse_level("two_rooms.mmp", LEVEL).unwrap();
+    assert_eq!(level.spawns[1].shadow, ShadowKind::Soft);
+    let row = "1.00   crate_a1";
+    assert_rejects(row, &format!("{row} shadow=fuzzy"), "unknown shadow 'fuzzy'");
+    let twice = LEVEL.replacen(
+        "entities ",
+        "templates 2\n   0   box  crate.obj\n   1   box  crate.obj\n\nentities ",
+        1,
+    );
+    let msg = assets().parse_level("two_rooms.mmp", &twice).err().unwrap().to_string();
+    assert!(msg.contains("template name 'box' is used twice"), "{msg}");
+}
+
+#[test]
 fn rejects_entity_option_errors() {
     let row = "1.00   crate_a1";
     let options = |o: &str| format!("{row} {o}");
@@ -536,7 +567,7 @@ fn loads_and_checks_moving_lights() {
 #[test]
 fn levels_written_back_load_the_same() {
     use moose_assets::LevelDoc;
-    for file in ["two_rooms.mmp", "shiny_rooms.mmp", "sunny_rooms.mmp", "mirror_rooms.mmp"] {
+    for file in ["two_rooms.mmp", "shiny_rooms.mmp", "sunny_rooms.mmp", "mirror_rooms.mmp", "walker_rooms.mmp"] {
         let path = format!("{}/../../assets/levels/{file}", env!("CARGO_MANIFEST_DIR"));
         let src = std::fs::read_to_string(&path).unwrap();
         let mut assets = assets();
@@ -562,6 +593,7 @@ fn levels_written_back_load_the_same() {
             // (angle_between takes an acos, imprecise near 0.)
             assert!(a.rotation.angle_between(b.rotation) < 1e-3, "{} turned", a.name);
             assert_eq!((a.scale, a.is_static, a.occluder), (b.scale, b.is_static, b.occluder));
+            assert_eq!((a.shadow, &a.animation), (b.shadow, &b.animation), "{}", a.name);
         }
     }
 }

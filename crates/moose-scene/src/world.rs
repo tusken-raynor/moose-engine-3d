@@ -1,6 +1,6 @@
 use glam::{Affine3A, Quat, Vec3};
 use moose_assets::{
-    Aabb, Assets, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, Plane, Portal,
+    Aabb, Assets, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
     Sector,
 };
 
@@ -67,6 +67,8 @@ pub struct Entity {
     pub occluder: Occluder,
     /// It never moves: static lights' shadows from it (and on it) can be worked out once.
     pub is_static: bool,
+    /// How its shadows' edges are drawn.
+    pub shadow: ShadowKind,
     /// The animation it plays (by name), if its model has a skeleton.
     pub animation: Option<String>,
 }
@@ -170,6 +172,7 @@ impl World {
                     sectors: Vec::new(),
                     occluder: spawn.occluder,
                     is_static: spawn.is_static,
+                    shadow: spawn.shadow,
                     animation: spawn.animation,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),

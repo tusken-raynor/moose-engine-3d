@@ -622,7 +622,7 @@ impl ViewGeometry {
     /// many (light, surface) pairs have a shadow: some of the surface in the light's shadow.
     pub fn bake_shadows(&mut self, world: &World, assets: &Assets) -> usize {
         let carver = &mut self.scratch.carver;
-        carver.prepare(world, assets, world.lights(), false, 1.0);
+        carver.prepare(world, assets, world.lights(), (false, 1.0));
         let geometry = assets.mesh(world.geometry);
         let mut points = Vec::new();
         let mut count = 0;
@@ -639,6 +639,7 @@ impl ViewGeometry {
                     point: points[0],
                     parts: Parts::All,
                     beams: false,
+                    hard: false,
                 };
                 let bits = carver.cache((0, pi, 0), &points, &receiver);
                 count += shadowed(carver, bits, (0, pi, 0));
@@ -663,6 +664,7 @@ impl ViewGeometry {
                     point: points[0],
                     parts: Parts::All,
                     beams: false,
+                    hard: false,
                 };
                 let key = (1, ei as u32, pi as u32);
                 let bits = carver.cache(key, &points, &receiver);
@@ -719,8 +721,7 @@ impl ViewGeometry {
                 world,
                 assets,
                 &self.lights,
-                self.config.dynamic_shadows,
-                self.config.dynamic_softness,
+                (self.config.dynamic_shadows, self.config.dynamic_softness),
             );
         self.visits.clear();
         self.mirrors.clear();
@@ -1390,6 +1391,8 @@ fn emit_pieces(
         parts: Parts::All,
         // In reflections, beams are lit at sample points: cheaper, and half-rate there.
         beams: mirror.is_none(),
+        // In reflections, shadows carved every frame are hard.
+        hard: mirror.is_some(),
     };
     // A static polygon's shadows from static lights are cached (carved the first time it
     // is seen); only moving occluders are carved for them every frame.
@@ -1419,7 +1422,7 @@ fn emit_pieces(
     for i in 0..pieces {
         let piece = carver.piece(i);
         out.values.clear();
-        touched |= piece.shadowed | piece.beamed | carver.soft_values(&piece, &mut out.values);
+        touched |= piece.shadowed | piece.beamed | piece.blurred | carver.soft_values(&piece, &mut out.values);
         dark &= piece.shadowed;
     }
     // And the cached ones.
@@ -1446,7 +1449,7 @@ fn emit_pieces(
             let piece = carver.piece(i);
             out.values.clear();
             let soft = carver.soft_values(&piece, &mut out.values);
-            let slots = (piece.shadowed | piece.beamed | soft) & split;
+            let slots = (piece.shadowed | piece.beamed | piece.blurred | soft) & split;
             let per_vertex = soft.count_ones() as usize;
             let (records, edges) = (carver.records(&piece), carver.edges(&piece));
             let mut bits = slots;
@@ -1458,6 +1461,9 @@ fn emit_pieces(
                 // shadow of another occluder of the same light.
                 let soft_at = (soft >> slot & 1 != 0 && !dark)
                     .then(|| (soft & ((1 << slot) - 1)).count_ones() as usize);
+                // In a blurred caster's hard shadow (and not in full shadow): the renderer
+                // blurs it.
+                let occluded = piece.blurred >> slot & 1 != 0 && !dark;
                 // Inside a beam's pyramid, its cone fades the light too.
                 let beam = (piece.beamed >> slot & 1 != 0 && !dark)
                     .then(|| carver.beam(slot as u8))
@@ -1465,13 +1471,19 @@ fn emit_pieces(
                 let first_vertex = out.shadow_vertices.len() as u32;
                 for (v, (r, edge)) in records.chunks_exact(stride).zip(edges).enumerate() {
                     let (x, y) = to_screen(view, Vec3::from_slice(r));
+                    let world = Vec3::from_slice(&r[3..6]);
                     let vertex = ShadowVertex {
                         x,
                         y,
                         w: 1.0 / r[2],
                         line: edge_line(view, edge, plane_lines),
                         light: 0.0,
-                        ray: beam.map_or(Vec3::ZERO, |b| b.ray(Vec3::from_slice(&r[3..6]))),
+                        ray: beam.map_or(Vec3::ZERO, |b| b.ray(world)),
+                        width: if occluded {
+                            carver.penumbra_width(slot as u8, world, receiver.entity)
+                        } else {
+                            0.0
+                        },
                     };
                     let light = match soft_at {
                         Some(k) => out.values[v * per_vertex + k],
@@ -1488,6 +1500,7 @@ fn emit_pieces(
                         first_vertex,
                         vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
                         beam: beam.map(|b| b.cone),
+                        occluded,
                     },
                 );
             }
@@ -1619,6 +1632,7 @@ fn emit_cached(
                     CachedEdge::Line(a, b) => line_through(view, space.to_clip(a), space.to_clip(b)),
                 },
             };
+            let p = Vec3::from_slice(&r[3..6]);
             let vertex = ShadowVertex {
                 x,
                 y,
@@ -1626,8 +1640,8 @@ fn emit_cached(
                 line,
                 light: 0.0,
                 ray: Vec3::ZERO,
+                width: 0.0,
             };
-            let p = Vec3::from_slice(&r[3..6]);
             let light = |along: usize| {
                 let along = Vec3::from_slice(&clipped[along * STRIDE + 3..][..3]);
                 cached.light(soft, p, along, center)
@@ -1643,6 +1657,7 @@ fn emit_cached(
                 first_vertex,
                 vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
                 beam: None,
+                occluded: false,
             },
         );
     }
@@ -1725,6 +1740,10 @@ pub struct ShadowPiece {
     /// `Light::cone`), which fades it further at each pixel by the angle between the
     /// pixel's ray (its vertices' `ray`, interpolated) and the beam's axis (x).
     pub beam: Option<(f32, f32)>,
+    /// In a blurred caster's hard shadow (see `ShadowKind::Blurred`): its vertices' light
+    /// is what reaches past everything else (all of it, a beam's cone, or a soft edge's
+    /// part), and the renderer blurs the caster's shadow over it.
+    pub occluded: bool,
 }
 
 /// A vertex of a [`ShadowPiece`]: where it is on screen (exact, like [`ScreenVertex`]), the
@@ -1744,6 +1763,9 @@ pub struct ShadowVertex {
     /// In a beam's piece: the way from the light to it, in the beam's frame (x along its
     /// axis); zero in others.
     pub ray: Vec3,
+    /// In a blurred caster's hard shadow (see `ShadowPiece::occluded`): how wide its soft
+    /// edge would be here, in world units, square to the light's rays; 0 otherwise.
+    pub width: f32,
 }
 
 /// Appends a shadow piece's vertex with how much of the light reaches it along the edges
@@ -1815,6 +1837,7 @@ fn push_shadow_piece(vertices: &mut Vec<ShadowVertex>, pieces: &mut Vec<ShadowPi
                 line: a.line,
                 light: a.light + (b.light - a.light) * t,
                 ray: a.ray + (b.ray - a.ray) * t,
+                width: a.width + (b.width - a.width) * t,
             });
         }
     }

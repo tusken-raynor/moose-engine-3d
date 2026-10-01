@@ -69,6 +69,8 @@ pub enum Field {
     Animation,
     Static,
     Occluder,
+    /// How its shadows' edges are drawn: soft, blurred or hard.
+    Shadow,
     Reflective,
     Sky,
     Duplicate,
@@ -616,11 +618,23 @@ impl Editor {
                     row("Name", e.name.clone(), None),
                     row("Kind", kind.into(), (e.kind != EntityKind::Spawn).then_some(Field::Kind)),
                 ];
-                if let Some(model) = &e.model {
-                    rows.push(row("Model", model.clone(), Some(Field::Model)));
-                    let playing = e.options.iter().find_map(|o| o.strip_prefix("anim="));
-                    if playing.is_some() || self.animations.get(model).is_some_and(|a| !a.is_empty()) {
-                        rows.push(row("Animation", playing.unwrap_or("none").into(), Some(Field::Animation)));
+                // Its options in effect (its template's, unless it sets its own), each
+                // marked where it comes from the template.
+                let options = self.doc.options_of(e);
+                let from_template = |key: &str| {
+                    let own = e.options.iter().any(|o| moose_assets::option_key(o) == key);
+                    let set = options.iter().any(|o| moose_assets::option_key(o) == key);
+                    if set && !own { " (template)" } else { "" }
+                };
+                let value = |key: &str| options.iter().find_map(|o| o.strip_prefix(key)?.strip_prefix('='));
+                if let Some(named) = &e.model {
+                    let model = self.doc.model_file(e).unwrap_or(named).to_string();
+                    let shown = if self.doc.template_of(e).is_some() { format!("{named} (template)") } else { named.clone() };
+                    rows.push(row("Model", shown, Some(Field::Model)));
+                    let playing = value("anim");
+                    if playing.is_some() || self.animations.get(&model).is_some_and(|a| !a.is_empty()) {
+                        let shown = format!("{}{}", playing.unwrap_or("none"), from_template("anim"));
+                        rows.push(row("Animation", shown, Some(Field::Animation)));
                     }
                     if model.ends_with(".mmdl") {
                         rows.push(row("Mesh editor (M)", String::new(), Some(Field::EditModel)));
@@ -636,12 +650,14 @@ impl Editor {
                     row("Scale", n(e.scale), Some(Field::Scale)),
                 ]);
                 if e.kind == EntityKind::Prop {
-                    let on = if e.has_option("static") { "on" } else { "off" };
-                    rows.push(row("Static", on.into(), Some(Field::Static)));
+                    let on = if is_static(&options) { "on" } else { "off" };
+                    rows.push(row("Static", format!("{on}{}", from_template("static")), Some(Field::Static)));
                 }
                 if e.kind != EntityKind::Spawn {
-                    let occluder = e.options.iter().find_map(|o| o.strip_prefix("occluder=")).unwrap_or("mesh");
-                    rows.push(row("Occluder", occluder.into(), Some(Field::Occluder)));
+                    let occluder = value("occluder").unwrap_or("mesh");
+                    rows.push(row("Occluder", format!("{occluder}{}", from_template("occluder")), Some(Field::Occluder)));
+                    let shadow = value("shadow").unwrap_or("soft");
+                    rows.push(row("Shadow", format!("{shadow}{}", from_template("shadow")), Some(Field::Shadow)));
                 }
                 rows.push(row("Sector", self.doc.sectors[e.sector].name.clone(), None));
                 rows.push(row("Duplicate", String::new(), Some(Field::Duplicate)));
@@ -942,6 +958,13 @@ impl Editor {
                 Ok(format!("deleted {name}"))
             }
             (Some(Selection::Entity(i)), field) => {
+                // Its template's options, and the templates it could place instead of a model.
+                let template: Vec<String> =
+                    self.doc.template_of(&self.doc.entities[i]).map(|t| t.options.clone()).unwrap_or_default();
+                let models: Vec<String> =
+                    self.doc.templates.iter().map(|t| t.name.clone()).chain(models.iter().cloned()).collect();
+                let model_files: Vec<(String, String)> =
+                    self.doc.templates.iter().map(|t| (t.name.clone(), t.model.clone())).collect();
                 let e = &mut self.doc.entities[i];
                 let turn = |q: Quat, which: usize| {
                     let (mut yaw, mut pitch, mut roll) = q.to_euler(EulerRot::YXZ);
@@ -967,7 +990,7 @@ impl Editor {
                             _ => EntityKind::Prop,
                         };
                         if e.kind == EntityKind::Actor {
-                            e.set_option("static", false);
+                            not_static(e, &template);
                         }
                     }
                     Field::Model => {
@@ -982,20 +1005,46 @@ impl Editor {
                     }
                     Field::Animation => {
                         // none → each of the model's animations → none.
-                        let names = e.model.as_ref().and_then(|m| self.animations.get(m)).cloned().unwrap_or_default();
-                        let now = e.options.iter().find_map(|o| o.strip_prefix("anim="));
+                        let file = e.model.as_ref().map(|m| {
+                            model_files.iter().find(|(t, _)| t == m).map_or(m.clone(), |(_, f)| f.clone())
+                        });
+                        let names = file.and_then(|m| self.animations.get(&m)).cloned().unwrap_or_default();
+                        let options = moose_assets::merged_options(&template, &e.options);
+                        let now = options.iter().find_map(|o| o.strip_prefix("anim="));
                         let k = now.and_then(|a| names.iter().position(|n| n == a)).map_or(0, |k| k + 1);
                         let next = (k as isize + dir.signum() as isize).rem_euclid(names.len() as isize + 1) as usize;
                         e.options.retain(|o| !o.starts_with("anim="));
                         if next > 0 {
                             e.options.push(format!("anim={}", names[next - 1]));
                             // Animated models move, so they can't be static.
-                            e.set_option("static", false);
+                            not_static(e, &template);
+                        } else if template.iter().any(|o| o.starts_with("anim=") && o != "anim=none") {
+                            // None, over its template's.
+                            e.options.push("anim=none".into());
                         }
                     }
                     Field::Static => {
-                        let on = !e.has_option("static");
-                        e.set_option("static", on);
+                        // Its own option only where it differs from its template.
+                        let on = !is_static(&moose_assets::merged_options(&template, &e.options));
+                        e.options.retain(|o| moose_assets::option_key(o) != "static");
+                        if on != is_static(&template) {
+                            e.options.push(if on { "static" } else { "static=off" }.into());
+                        }
+                    }
+                    Field::Shadow => {
+                        // soft → blurred → hard → soft; its own option only where it
+                        // differs from its template.
+                        const KINDS: [&str; 3] = ["soft", "blurred", "hard"];
+                        let of = |options: &[String]| {
+                            options.iter().find_map(|o| o.strip_prefix("shadow=")).unwrap_or("soft").to_string()
+                        };
+                        let now = of(&moose_assets::merged_options(&template, &e.options));
+                        let k = KINDS.iter().position(|&s| s == now).unwrap_or(0) as isize;
+                        let next = KINDS[(k + dir.signum() as isize).rem_euclid(3) as usize];
+                        e.options.retain(|o| moose_assets::option_key(o) != "shadow");
+                        if next != of(&template) {
+                            e.options.push(format!("shadow={next}"));
+                        }
                     }
                     Field::Occluder => {
                         // mesh (the default) → none → back.
@@ -1382,3 +1431,16 @@ const SPAWN: u32 = 0x40_E0_E0;
 const RANGE: u32 = 0x80_60_20;
 const CUT: u32 = 0xFF_50_50;
 const PROBLEM: u32 = 0xFF_20_20;
+
+/// Whether options in effect make a prop static (`static`, or `static=on`).
+fn is_static(options: &[String]) -> bool {
+    options.iter().rev().find(|o| moose_assets::option_key(o) == "static").is_some_and(|o| o != "static=off")
+}
+
+/// Makes an entity not static, over its template's options (`template`).
+fn not_static(e: &mut moose_assets::EntityDoc, template: &[String]) {
+    e.options.retain(|o| moose_assets::option_key(o) != "static");
+    if is_static(template) {
+        e.options.push("static=off".into());
+    }
+}
