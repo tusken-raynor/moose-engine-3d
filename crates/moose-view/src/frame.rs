@@ -1469,12 +1469,16 @@ fn emit_pieces(
                     };
                     push_shadow_vertex(out.shadow_vertices, vertex, light);
                 }
-                out.shadow_pieces.push(ShadowPiece {
-                    slot: slot as u8,
-                    first_vertex,
-                    vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
-                    beam: beam.map(|b| b.cone),
-                });
+                push_shadow_piece(
+                    out.shadow_vertices,
+                    out.shadow_pieces,
+                    ShadowPiece {
+                        slot: slot as u8,
+                        first_vertex,
+                        vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+                        beam: beam.map(|b| b.cone),
+                    },
+                );
             }
         }
         // The cached pieces, clipped as the polygon was and projected.
@@ -1620,12 +1624,16 @@ fn emit_cached(
             let light = (light((j + count - 1) % count), light((j + 1) % count));
             push_shadow_vertex(out.shadow_vertices, vertex, light);
         }
-        out.shadow_pieces.push(ShadowPiece {
-            slot,
-            first_vertex,
-            vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
-            beam: None,
-        });
+        push_shadow_piece(
+            out.shadow_vertices,
+            out.shadow_pieces,
+            ShadowPiece {
+                slot,
+                first_vertex,
+                vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+                beam: None,
+            },
+        );
     }
 }
 
@@ -1739,6 +1747,90 @@ fn push_shadow_vertex(
         out.push(ShadowVertex { light: arriving, line: None, ..vertex });
     }
     out.push(ShadowVertex { light: leaving, ..vertex });
+}
+
+/// How far apart the values at the ends of each triangle's far edge may be in a fan from a
+/// corner with two values (see [`push_shadow_piece`]): the corner has halfway between
+/// them, so a triangle's edges from it are off by at most half this near it.
+const FAN_STEP: f32 = 0.125;
+
+/// Pushes a shadow piece, its vertices `piece.first_vertex..` of `vertices`.
+///
+/// One with a corner with two values (where an occluder's edge touches the surface: see
+/// [`push_shadow_vertex`]) is pushed as a fan of triangles from that corner instead: the
+/// rasterizer interpolates a piece's values down its edges, then across each row, so the
+/// corner's rows would split it, the rows above taking one of its values and the rows
+/// below the other, across all of it (a hard line level with the corner). What reaches
+/// the surface is the same along each ray out from the corner, and in a fan each triangle
+/// gets one value at the corner: halfway between those at its far corners, which are
+/// close (the far edges are split so, see `FAN_STEP`).
+fn push_shadow_piece(vertices: &mut Vec<ShadowVertex>, pieces: &mut Vec<ShadowPiece>, piece: ShadowPiece) {
+    let first = piece.first_vertex as usize;
+    let m = vertices.len() - first;
+    let v = &vertices[first..];
+    // The corner: a vertex ending the edge arriving, then one in the same place starting
+    // the edge leaving, with another value.
+    let twofold = |j: usize| {
+        let (a, b) = (v[j], v[(j + 1) % m]);
+        a.line.is_none() && (a.x, a.y) == (b.x, b.y) && (a.light - b.light).abs() > 1e-3
+    };
+    let mut corners = (0..m).filter(|&j| twofold(j));
+    let (Some(arriving), None) = (corners.next(), corners.next()) else {
+        pieces.push(piece);
+        return;
+    };
+    if m < 4 {
+        pieces.push(piece);
+        return;
+    }
+    let corner = v[(arriving + 1) % m];
+    // The far corners, from the one after it round to the one before, with more along
+    // each edge between them where their values are far apart: at even steps along it in
+    // the world (perspective-correct, as the rasterizer interpolates along it).
+    let mut far: Vec<ShadowVertex> = Vec::with_capacity(m + 8);
+    let ends: Vec<ShadowVertex> = (2..m).map(|k| v[(arriving + k) % m]).collect();
+    for pair in ends.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        far.push(a);
+        let steps = ((a.light - b.light).abs() / FAN_STEP).ceil().clamp(1.0, 8.0) as u32;
+        let (za, zb) = (1.0 / a.w, 1.0 / b.w);
+        for step in 1..steps {
+            let t = step as f32 / steps as f32;
+            let z = za + (zb - za) * t;
+            far.push(ShadowVertex {
+                x: (a.x * za * (1.0 - t) + b.x * zb * t) / z,
+                y: (a.y * za * (1.0 - t) + b.y * zb * t) / z,
+                w: 1.0 / z,
+                line: a.line,
+                light: a.light + (b.light - a.light) * t,
+                ray: a.ray + (b.ray - a.ray) * t,
+            });
+        }
+    }
+    far.push(ends[ends.len() - 1]);
+    vertices.truncate(first);
+    // The edges out from the corner between triangles, walked along the same line by both.
+    let spoke = |p: &ShadowVertex| Some(EdgeLine::between((corner.x, corner.y), (p.x, p.y)));
+    let last = far.len() - 1;
+    for j in 0..last {
+        let (a, b) = (far[j], far[j + 1]);
+        let first_vertex = vertices.len() as u32;
+        vertices.push(ShadowVertex {
+            light: (a.light + b.light) * 0.5,
+            line: if j == 0 { corner.line } else { spoke(&a) },
+            ..corner
+        });
+        vertices.push(a);
+        vertices.push(ShadowVertex {
+            line: if j + 1 == last { b.line } else { spoke(&b) },
+            ..b
+        });
+        pieces.push(ShadowPiece {
+            first_vertex,
+            vertex_count: 3,
+            ..piece
+        });
+    }
 }
 
 /// The four side planes of the view frustum in clip space: x = -w, x = w, y = -w, y = w.

@@ -295,13 +295,16 @@ struct ThreadBins {
 }
 
 /// A polygon's shadow piece, binned: its vertices (`count` from `first`), its light's split
-/// index, and its beam's cone, if it is part of one (see `ShadowPiece::beam`).
+/// index, its beam's cone, if it is part of one (see `ShadowPiece::beam`), and the rows
+/// its edges cross (`row_top..row_end`: no other row is in it).
 #[derive(Clone, Copy)]
 struct ShadowSetup {
     first: u32,
     count: u16,
     split: u8,
     beam: Option<(f32, f32)>,
+    row_top: i32,
+    row_end: i32,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -863,11 +866,16 @@ fn setup_polygon(
             continue;
         };
         let vertices = &geometry.shadow_vertices[piece.first_vertex as usize..][..piece.vertex_count as usize];
+        let (top, bottom) = vertices
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(t, b), v| (t.min(v.y), b.max(v.y)));
         bins.shadows.push(ShadowSetup {
             first: bins.shadow_vertices.len() as u32,
             count: piece.vertex_count,
             split: j as u8,
             beam: piece.beam,
+            row_top: pixel_edge(top),
+            row_end: pixel_edge(bottom),
         });
         for v in vertices {
             bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
@@ -1903,6 +1911,9 @@ fn shadow_run(
     s.reaches.resize(p.splits as usize * len, 1.0);
     let row = s.row;
     for piece in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
+        if row < piece.row_top || row >= piece.row_end {
+            continue;
+        }
         let range = piece.first as usize..piece.first as usize + piece.count as usize;
         let (verts, lines, light, rays) = (
             &bins.shadow_vertices[range.clone()],

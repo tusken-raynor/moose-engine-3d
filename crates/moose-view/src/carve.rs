@@ -48,6 +48,11 @@ pub const MAX_SHADOW_SLOTS: u8 = 32;
 /// stop short of an occluder by `CAP_BIAS`, so a corner where it touches a surface is
 /// near the line, not on it.)
 const NEAR_LINE: f32 = 0.01;
+/// How far a cached soft piece's value may be, halfway along an edge, from halfway between
+/// its ends' values before a corner is added there (see [`Carver::cache`]); and how many
+/// times an edge is halved at most.
+const REFINE_OFF: f32 = 0.125;
+const REFINE_DEPTH: u32 = 5;
 
 /// A half-space: points with `normal · p + offset > 0`, in world space.
 #[derive(Clone, Copy, Debug)]
@@ -1039,7 +1044,10 @@ impl Carver {
                 let start = cached.vertices.len() as u32;
                 let piece_records = self.records(&piece);
                 let piece_edges = self.edges(&piece);
-                for (r, &edge) in piece_records.chunks_exact(stride).zip(piece_edges) {
+                let corners: Vec<Vec3> =
+                    piece_records.chunks_exact(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
+                let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
+                for (k, (&world, &edge)) in corners.iter().zip(piece_edges).enumerate() {
                     let edge = match edge {
                         PieceEdge::Clip(Edge::Input(e)) => CachedEdge::Polygon(e),
                         PieceEdge::Line(a, b) => (0..n)
@@ -1050,10 +1058,18 @@ impl Carver {
                             .map_or(CachedEdge::Line(a, b), |e| CachedEdge::Polygon(e as u16)),
                         PieceEdge::Clip(Edge::Plane(_)) => unreachable!("no clip planes here"),
                     };
-                    cached.vertices.push(CachedVertex {
-                        world: Vec3::new(r[3], r[4], r[5]),
-                        edge,
-                    });
+                    cached.vertices.push(CachedVertex { world, edge });
+                    if soft {
+                        // Corners along the edge where its values don't go evenly from end
+                        // to end: a cut that runs close along a soft edge's outer or inner
+                        // plane from near its line (where the value changes fast) crosses
+                        // all of it in a short way, and the rest of the way is flat.
+                        let next = corners[(k + 1) % corners.len()];
+                        let value = |p: Vec3, along: Vec3| cached.light(&piece_soft, p, along, center);
+                        let mut added = Vec::new();
+                        refine(&value, (world, value(world, next)), (next, value(next, world)), REFINE_DEPTH, &mut added);
+                        cached.vertices.extend(added.into_iter().map(|world| CachedVertex { world, edge }));
+                    }
                 }
                 cached.pieces.push((start..cached.vertices.len() as u32, piece_soft));
             }
@@ -1551,6 +1567,23 @@ fn reaching<'a>(
         }
     }
     through * (1.0 - covered.min(1.0))
+}
+
+/// Appends the points to add along the edge from `a` to `b` (each with its value) where
+/// the value `value(p, toward)` halfway along it is more than `REFINE_OFF` from halfway
+/// between theirs, in order: halving it, and each half, up to `depth` times.
+fn refine(value: &impl Fn(Vec3, Vec3) -> f32, a: (Vec3, f32), b: (Vec3, f32), depth: u32, out: &mut Vec<Vec3>) {
+    if depth == 0 {
+        return;
+    }
+    let middle = (a.0 + b.0) * 0.5;
+    let m = value(middle, b.0);
+    if (m - (a.1 + b.1) * 0.5).abs() <= REFINE_OFF {
+        return;
+    }
+    refine(value, a, (middle, m), depth - 1, out);
+    out.push(middle);
+    refine(value, (middle, m), b, depth - 1, out);
 }
 
 /// A point on a portal (its first corner).
