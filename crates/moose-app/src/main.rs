@@ -5,12 +5,12 @@
 //! Options (all but the screenshot ones can also be changed in the options menu, Esc):
 //!   --level NAME          level in assets/levels (default shiny_rooms.mmp)
 //!   --size WxH            framebuffer size (default 1280x720)
-//!   --bump SHADER         the brick walls' shader, the test surface for bump mapping: off
-//!                         (plain, the default), normal (brick_wall_normal.png, a normal
-//!                         map) or basis (radiosity normal mapping, from the normal packed
-//!                         in the brick texture's alpha)
+//!   --bump SHADER         the brick walls' bumps, the test surface for bump mapping: off
+//!                         (the default) or normal (brick_wall_normal.png, a normal map)
 //!   --bump-sampler NAME   how the bumps are read: nearest, dithered, bilinear (the
 //!                         default) or trilinear
+//!   --specular S          the brick walls' highlight, its strength (default 0: none)
+//!   --shininess P         the highlight's power, a power of two (default 32)
 //!   --filter NAME         texture sampler: METHOD_mipmap_MIP, with METHOD nearest, bilinear
 //!                         or dithered and MIP none, nearest, linear or dithered (default
 //!                         bilinear_mipmap_linear)
@@ -103,8 +103,9 @@ use glam::Vec3;
 use moose_assets::{Assets, LevelDoc, Light, MeshId, ModelDoc, RIPPLE_SIZE, Ripples, Texture, TextureId};
 use moose_present::{Display, Key, MouseButton};
 use moose_raster::shaders::{
-    CubeReflection, Textured, TexturedBasis, TexturedFresnel, TexturedNormal, TexturedTranslucent,
-    UnlitColor, VertexColor, VertexColorFresnel, VertexColorTranslucent, Water, filter,
+    CubeReflection, Textured, TexturedFresnel, TexturedNormal, TexturedNormalSpecular, TexturedSpecular,
+    TexturedTranslucent, UnlitColor, VertexColor, VertexColorFresnel, VertexColorTranslucent, Water,
+    filter,
 };
 use moose_raster::{
     MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target, register_per_filter,
@@ -140,9 +141,10 @@ const DEFAULT_FLOOR_TEXTURE: &str = "metal_tile.png";
 /// Wall textures (in levels with uvs), in assets/textures: sector i gets the i-th, cycling,
 /// so the test levels' rooms and hallway each have their own.
 const WALL_TEXTURES: [&str; 3] = ["brick_wall.png", "panel_wall.png", "stone_wall.png"];
-/// The brick walls' texture: the test surface for bump mapping (see [`Bump`]). Its alpha
-/// is a packed normal (see `moose_assets::bump::pack`).
+/// The brick walls' texture: the test surface for bump mapping (see [`Bump`]). Plain, it
+/// gets close-up detail noise, `DETAIL` strong, masked by its alpha (none on the mortar).
 const BRICK_TEXTURE: &str = "brick_wall.png";
+const DETAIL: f32 = 0.1;
 /// Where sampler `f` is in `filter::ALL`.
 fn sampler_index(f: u8) -> usize {
     filter::ALL.iter().position(|&g| g == f).expect("a sampler")
@@ -232,6 +234,8 @@ struct Options {
     filter: usize,
     bump: Bump,
     bump_sampler: usize,
+    specular: f32,
+    shininess: f32,
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
@@ -314,6 +318,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
         bump: Bump::Off,
         bump_sampler: 2,
+        specular: 0.0,
+        shininess: 32.0,
         water: false,
         no_flashlight: false,
         fullscreen: false,
@@ -398,6 +404,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     format!("--bump is one of {}", Bump::ALL.map(Bump::name).join(", "))
                 })?;
             }
+            "--specular" => o.specular = value()?.parse().map_err(|_| "bad --specular")?,
+            "--shininess" => o.shininess = value()?.parse().map_err(|_| "bad --shininess")?,
             "--bump-sampler" => {
                 let name = value()?;
                 o.bump_sampler = BUMP_SAMPLERS.iter().position(|&s| s == name).ok_or_else(|| {
@@ -483,6 +491,10 @@ struct Settings {
     /// `BUMP_SAMPLERS`).
     bump: Bump,
     bump_sampler: usize,
+    /// The brick walls' highlight: its strength (0 for none; one of `SPECULARS`) and its
+    /// power (one of `SHININESS`).
+    specular: f32,
+    shininess: f32,
     /// Shiny floors are water.
     water: bool,
     /// Lighting is on (off, surfaces show their full color).
@@ -531,30 +543,32 @@ struct CubeMap {
 }
 
 /// The brick walls' shader, the test surface for bump mapping: each reads its bumps where
-/// it wants them (see `moose_raster::shaders::textured_bump`).
+/// it wants them (see `moose_raster::shaders::textured_lit`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bump {
     Off,
     /// A normal map, `BRICK_NORMALS`; the brick texture's alpha is free.
     Normal,
-    /// Radiosity normal mapping, from the normal packed in the brick texture's alpha.
-    Basis,
 }
 
 impl Bump {
-    const ALL: [Bump; 3] = [Bump::Off, Bump::Normal, Bump::Basis];
+    const ALL: [Bump; 2] = [Bump::Off, Bump::Normal];
 
     fn name(self) -> &'static str {
         match self {
             Bump::Off => "off",
             Bump::Normal => "normal",
-            Bump::Basis => "basis",
         }
     }
 }
 
-/// How the bump shaders read the bumps (see `textured_bump::SAMPLERS`).
-const BUMP_SAMPLERS: [&str; 4] = moose_raster::shaders::textured_bump::SAMPLERS;
+/// How the bump shaders read the bumps (see `textured_lit::SAMPLERS`).
+const BUMP_SAMPLERS: [&str; 4] = moose_raster::shaders::textured_lit::SAMPLERS;
+
+/// The brick walls' highlight strengths and powers the menu steps through (see
+/// `--specular`, `--shininess`).
+const SPECULARS: [f32; 5] = [0.0, 0.25, 0.5, 1.0, 2.0];
+const SHININESS: [f32; 6] = [4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
 
 /// The brick walls' normal map (baked with the brick texture's alpha by
 /// `cargo run -p moose-assets --example bake_brick`, from `brick_wall_height.png`).
@@ -594,9 +608,10 @@ struct App {
     bindings: Vec<(Key, Setting)>,
     /// A note shown at the bottom of the screen for a moment, and when it was made.
     toast: Option<(String, Instant)>,
-    /// The brick walls' bump shaders (see [`Bump`]), one per sampler in `filter::ALL`:
-    /// normal, basis. And their normal map, if the bricks are loaded.
-    textured_bump: [[MaterialId; 12]; 2],
+    /// The brick walls' lit shaders (see [`Bump`]), one per sampler in `filter::ALL`:
+    /// normal, and with a highlight: flat, normal. And their normal map, if the bricks are
+    /// loaded.
+    brick_shaders: [[MaterialId; 12]; 3],
     brick_normals: Option<TextureId>,
     /// The crate model and its texture, if the level has crates.
     crate_texture: Option<(MeshId, TextureId)>,
@@ -630,7 +645,6 @@ impl App {
     fn new(options: &Options) -> Result<App, String> {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
         let mut assets = Assets::new(root);
-        assets.packed_alpha(BRICK_TEXTURE);
         let level = assets
             .load_level(&options.level)
             .map_err(|e| e.to_string())?;
@@ -671,9 +685,10 @@ impl App {
         let water = register_per_filter!(renderer, Water);
         let textured_translucent = register_per_filter!(renderer, TexturedTranslucent);
         let cube_reflection = register_per_filter!(renderer, CubeReflection);
-        let textured_bump = [
+        let brick_shaders = [
             register_per_filter!(renderer, TexturedNormal),
-            register_per_filter!(renderer, TexturedBasis),
+            register_per_filter!(renderer, TexturedSpecular),
+            register_per_filter!(renderer, TexturedNormalSpecular),
         ];
         let crate_texture = match assets.mesh_id(CRATE_MODEL) {
             Some(mesh) => Some((
@@ -753,7 +768,7 @@ impl App {
             floor_texture,
             wall_textures,
             brick_texture,
-            textured_bump,
+            brick_shaders,
             bindings: load_bindings(),
             toast: None,
             brick_normals,
@@ -773,6 +788,8 @@ impl App {
                 filter: options.filter,
                 bump: options.bump,
                 bump_sampler: options.bump_sampler,
+                specular: options.specular.max(0.0),
+                shininess: options.shininess.clamp(1.0, 256.0),
                 water: options.water,
                 lit: !options.unlit,
                 penumbra: options.penumbra.clamp(1.0 / 64.0, 64.0),
@@ -1355,6 +1372,8 @@ impl App {
             Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
             Setting::Bump => s.bump.name().into(),
             Setting::BumpSampler => BUMP_SAMPLERS[s.bump_sampler].into(),
+            Setting::Specular => if s.specular > 0.0 { format!("x{}", s.specular) } else { "off".into() },
+            Setting::Shininess => format!("{}", s.shininess),
             Setting::Water => on(s.water),
             Setting::Bounces => self.geometry.config.max_reflections.to_string(),
             Setting::Reflectance => s.reflectance.to_string(),
@@ -1425,6 +1444,8 @@ impl App {
                 s.bump = Bump::ALL[wrap(i, Bump::ALL.len())];
             }
             Setting::BumpSampler => s.bump_sampler = wrap(s.bump_sampler, BUMP_SAMPLERS.len()),
+            Setting::Specular => s.specular = cycle(&SPECULARS, s.specular, dir),
+            Setting::Shininess => s.shininess = cycle(&SHININESS, s.shininess, dir),
             Setting::Water => s.water = !s.water,
             Setting::Bounces => {
                 let b = &mut self.geometry.config.max_reflections;
@@ -1523,6 +1544,9 @@ impl App {
         add(format!("--filter {}", filter::name(filter::ALL[s.filter])));
         if s.bump != Bump::Off {
             add(format!("--bump {} --bump-sampler {}", s.bump.name(), BUMP_SAMPLERS[s.bump_sampler]));
+        }
+        if s.specular > 0.0 {
+            add(format!("--specular {} --shininess {}", s.specular, s.shininess));
         }
         add(format!("--bounces {}", self.geometry.config.max_reflections));
         add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
@@ -1647,7 +1671,8 @@ impl App {
         let (water, water_textures) = (self.water[s.filter], self.water_textures);
         let (wall_textures, brick_texture) = (&self.wall_textures, self.brick_texture);
         let (brick_normals, bump, bump_sampler) = (self.brick_normals, s.bump, s.bump_sampler);
-        let textured_bump = self.textured_bump.map(|m| m[s.filter]);
+        let (specular, shininess) = (s.specular, s.shininess);
+        let brick_shaders = self.brick_shaders.map(|m| m[s.filter]);
         let (crate_texture, textured_translucent) =
             (self.crate_texture, self.textured_translucent[s.filter]);
         let level = self.assets.mesh(self.world.geometry);
@@ -1695,22 +1720,25 @@ impl App {
                             // Brick walls, the test surface for bump mapping: the shader
                             // chosen, with their normal map too.
                             if wall.is_some() && texture == wall && wall == brick_texture && !is_water {
-                                let shader = match bump {
-                                    Bump::Off => None,
-                                    Bump::Normal => Some((textured_bump[0], [wall, brick_normals])),
-                                    Bump::Basis => Some((textured_bump[1], [wall, None])),
+                                let shiny = specular > 0.0;
+                                let shader = match (bump, shiny) {
+                                    (Bump::Off, false) => None,
+                                    (Bump::Normal, false) => Some((brick_shaders[0], [wall, brick_normals])),
+                                    (Bump::Off, true) => Some((brick_shaders[1], [wall, None])),
+                                    (Bump::Normal, true) => Some((brick_shaders[2], [wall, brick_normals])),
                                 };
                                 if let Some((material, textures)) = shader {
                                     return Surface {
                                         textures,
-                                        params: Params::new(&[bump_sampler as f32]),
+                                        params: Params::new(&[bump_sampler as f32, specular, shininess.log2().round()]),
                                         ..Surface::new(material)
                                     };
                                 }
                             }
+                            let detail = if wall.is_some() && wall == brick_texture { DETAIL } else { 0.0 };
                             return Surface {
                                 textures,
-                                params: Params::new(&[0.0]),
+                                params: Params::new(&[detail]),
                                 ..Surface::new(if texture.is_some() { textured } else { opaque })
                             };
                         }
@@ -1895,6 +1923,8 @@ enum Setting {
     Filter,
     Bump,
     BumpSampler,
+    Specular,
+    Shininess,
     Water,
     Bounces,
     Reflectance,
@@ -1988,6 +2018,8 @@ impl Page {
                 Set(Filter),
                 Set(Bump),
                 Set(BumpSampler),
+                Set(Specular),
+                Set(Shininess),
                 Set(Water),
                 Set(Bounces),
                 Set(Reflectance),
@@ -2066,6 +2098,8 @@ impl Item {
                 Setting::Filter => "Texture filter",
                 Setting::Bump => "Brick bump shader",
                 Setting::BumpSampler => "Bump sampler",
+                Setting::Specular => "Brick specular",
+                Setting::Shininess => "Brick shininess",
                 Setting::Water => "Water floors",
                 Setting::Bounces => "Reflection bounces",
                 Setting::Reflectance => "Floor reflectance",

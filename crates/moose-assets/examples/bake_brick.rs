@@ -1,21 +1,19 @@
-//! Bakes the brick wall's bump data, the test surface for bump and normal mapping, from
-//! its height, `brick_wall_height.png` (grey: 0 in the mortar, the bricks rising over 2
-//! texels from their edges to 1; see `moose_assets::bump::bevel_heights`):
+//! Bakes the brick wall's bump data, the test surface for bump mapping, from its height,
+//! `brick_wall_height.png` (grey: 0 in the mortar, the bricks rising over 2 texels from
+//! their edges to 1; see `moose_assets::bump::bevel_heights`):
 //!
-//! - `brick_wall.png`'s alpha: the height's normals, packed (see `moose_assets::bump::pack`),
-//!   for the radiosity basis shader, which reads its bumps there.
 //! - `brick_wall_normal.png`: a tangent-space normal map, `(n + 1) / 2` in its red, green
-//!   and blue (its alpha 255), for the normal map shader, which leaves the brick texture's
-//!   alpha free.
+//!   and blue (its alpha 255), for the normal map shaders.
+//! - `brick_wall.png`'s alpha: a mask of the bricks (255) and the mortar (0), the height
+//!   above 0 or not, which the detail noise is masked by.
 //!
-//! Without the height file, it is made from `brick_wall.png`'s alpha as a mask of the bricks
-//! (above 0) and the mortar (0). Run from the repository:
-//! `cargo run -p moose-assets --example bake_brick`.
+//! Without the height file, it is made from `brick_wall.png`'s alpha as that mask. Run from
+//! the repository: `cargo run -p moose-assets --example bake_brick`.
 
 use std::path::Path;
 
 use moose_assets::Assets;
-use moose_assets::bump::{bevel_heights, normals, pack};
+use moose_assets::bump::{bevel_heights, normals};
 
 /// How many texels the bricks' edges round over.
 const BEVEL: f32 = 2.0;
@@ -42,20 +40,19 @@ fn main() -> Result<(), String> {
             heights
         }
     };
-    let n = normals(&heights, w, h, STRENGTH);
     let color: Vec<u8> = base
         .texels
         .iter()
-        .zip(&n)
-        .flat_map(|(&t, &n)| [(t >> 16) as u8, (t >> 8) as u8, t as u8, pack(n)])
+        .zip(&heights)
+        .flat_map(|(&t, &v)| [(t >> 16) as u8, (t >> 8) as u8, t as u8, if v > 0.0 { 255 } else { 0 }])
         .collect();
-    let normal: Vec<u8> = n
+    let normal: Vec<u8> = normals(&heights, w, h, STRENGTH)
         .iter()
         .flat_map(|n| [byte(n[0] * 0.5 + 0.5), byte(n[1] * 0.5 + 0.5), byte(n[2] * 0.5 + 0.5), 255])
         .collect();
     write(&textures.join("brick_wall.png"), w, h, &color, png::ColorType::Rgba)?;
     write(&textures.join("brick_wall_normal.png"), w, h, &normal, png::ColorType::Rgba)?;
-    println!("baked brick_wall.png's packed normals and brick_wall_normal.png ({w}x{h})");
+    println!("baked brick_wall.png's mask and brick_wall_normal.png ({w}x{h})");
     Ok(())
 }
 

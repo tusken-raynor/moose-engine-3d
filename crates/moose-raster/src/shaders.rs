@@ -660,9 +660,9 @@ struct Bumps {
     /// The sum of the lights' directions (toward them, unit length) times their share of
     /// the flat brightness: lights in front of the surface only.
     toward: [F32s; 3],
-    /// The light along each of the radiosity basis's directions (see
-    /// [`moose_assets::bump::BASIS`]), ambient included, over the average of the three.
-    basis: [F32s; 3],
+    /// The lights' color (linear) where they reach, before any surface's cosine: lights in
+    /// front of the surface only. A highlight's.
+    color: [F32s; 3],
 }
 
 /// [`Bumps`] of the lights that always reach the polygon's pixels (`rest`: all but its
@@ -676,10 +676,10 @@ fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> (
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     let luma = |c: glam::Vec3| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
     let ambient = F32s::fill(luma(ctx.ambient));
-    // Per group (rest, all): the flat brightness, the summed directions, the basis.
+    // Per group (rest, all): the flat brightness, the summed directions, the color.
     let mut flat = [ambient; 2];
     let mut toward = [[zero; 3]; 2];
-    let mut basis = [[ambient; 3]; 2];
+    let mut color = [[zero; 3]; 2];
     let dot = |a: &[F32s; 3], b: &[F32s; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
@@ -693,13 +693,12 @@ fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> (
         let (scale, offset) = l.sample_cone();
         let dir = [F32s::fill(l.direction.x), F32s::fill(l.direction.y), F32s::fill(l.direction.z)];
         let c = (F32s::fill(offset) - dot(&d, &dir) * inv_len * F32s::fill(scale)).max(zero).min(one);
-        let k = t * t * c * c * (F32s::fill(3.0) - c - c) * F32s::fill(luma(l.color));
+        let reach = t * t * c * c * (F32s::fill(3.0) - c - c);
+        let k = reach * F32s::fill(luma(l.color));
         // Toward the light, in tangent space.
         let to = frame.map(|axis| dot(axis, &d) * inv_len);
         let front = to[2].max(zero);
         let lit = k * front.simd_gt(zero).select(one, zero);
-        let along = moose_assets::bump::BASIS
-            .map(|b| k * (to[0] * F32s::fill(b[0]) + to[1] * F32s::fill(b[1]) + to[2] * F32s::fill(b[2])).max(zero));
         // A split light (as `diffuse` tells them) is in all only.
         let split = ctx.light_split.get(i).is_some_and(|&j| (j as usize) < ctx.split.len());
         for g in if split { 1..2 } else { 0..2 } {
@@ -707,117 +706,21 @@ fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> (
             for (sum, v) in toward[g].iter_mut().zip(to) {
                 *sum += lit * v;
             }
-            for (sum, a) in basis[g].iter_mut().zip(along) {
-                *sum += a;
+            let shines = reach * front.simd_gt(zero).select(one, zero);
+            for (sum, l) in color[g].iter_mut().zip([l.color.x, l.color.y, l.color.z]) {
+                *sum += shines * F32s::fill(l);
             }
         }
     }
     let group = |g: usize| {
         let over = flat[g].max(F32s::fill(1e-6)).recip();
-        let b = basis[g];
-        let average = ((b[0] + b[1] + b[2]) * F32s::fill(1.0 / 3.0)).max(F32s::fill(1e-6)).recip();
         Bumps {
             ambient: ambient * over,
             toward: toward[g].map(|v| v * over),
-            basis: b.map(|v| v * average),
+            color: color[g],
         }
     };
     (group(0), group(1))
-}
-
-/// The radiosity basis weights (see [`moose_assets::bump::basis_weights`]) of the normal
-/// packed in a texel's alpha (see [`moose_assets::bump::pack`]), by its byte: looked up,
-/// not decoded, per pixel. Each weight a byte (0 to 255), the three in one word,
-/// red-green-blue like a texel: one load per lookup, not three (faster, in the filtered
-/// lookups' four per pixel).
-static PACKED_WEIGHTS: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(|| {
-    std::array::from_fn(|b| {
-        let w = moose_assets::bump::basis_weights(moose_assets::bump::unpack(b as u8));
-        let byte = |v: f32| (v * 255.0).round() as u32;
-        byte(w[0]) << 16 | byte(w[1]) << 8 | byte(w[2])
-    })
-});
-
-/// The `table` entries the texels' alpha bytes pick, lane by lane, as three lanes, 0 to 1.
-#[inline(always)]
-fn packed(texel: U32s, table: &[u32; 256]) -> [F32s; 3] {
-    use crate::shader::LANES;
-    let index = (texel >> 24_u32).to_array();
-    let rows = U32s::from(std::array::from_fn::<u32, LANES, _>(|i| table[index[i] as usize & 255]));
-    let k = F32s::fill(1.0 / 255.0);
-    [channel(rows, 16) * k, channel(rows, 8) * k, channel(rows, 0) * k]
-}
-
-/// The `table` entries of the packed normals in mip level `level`'s alpha (see
-/// [`moose_assets::bump::repack_mips`]) at `u`, `v` (as for
-/// [`level_nearest`](crate::shader::level_nearest)), blended bilinearly: each of the four
-/// texels around the point looked up, then weighed by how near its center is. Bytes can't
-/// be blended (their x and y bits would mix); what they stand for can, and blending basis
-/// weights is exact.
-#[inline(always)]
-fn packed_bilinear(level: &moose_assets::MipLevel, u: I32s, v: I32s, table: &[u32; 256]) -> [F32s; 3] {
-    use crate::shader::LANES;
-    // Texel coordinates with an 8-bit fraction, half a texel back so that texel centers
-    // land on whole numbers (as `level_bilinear` has them).
-    let to_texels = |c: I32s, log2: u32| {
-        let shift = 8 - log2 as i32;
-        let c = if shift >= 0 { c >> shift } else { c << -shift };
-        c - I32s::fill(128)
-    };
-    let (u, v) = (to_texels(u, level.width_log2), to_texels(v, level.height_log2));
-    let (x, y): (I32s, I32s) = (u >> 8, v >> 8);
-    let (wm, hm) = (I32s::fill(level.width as i32 - 1), I32s::fill(level.height as i32 - 1));
-    let row = level.width_log2 as i32;
-    let (x0, x1) = (x & wm, (x + I32s::fill(1)) & wm);
-    let (y0, y1) = ((y & hm) << row, ((y + I32s::fill(1)) & hm) << row);
-    let mask = level.texels.len() - 1;
-    let gather = |i: I32s| {
-        let i = i.to_array();
-        U32s::from(std::array::from_fn::<u32, LANES, _>(|k| level.texels[i[k] as usize & mask]))
-    };
-    let (t00, t10) = (packed(gather(y0 | x0), table), packed(gather(y0 | x1), table));
-    let (t01, t11) = (packed(gather(y1 | x0), table), packed(gather(y1 | x1), table));
-    let k = F32s::fill(1.0 / 256.0);
-    let (fx, fy) = ((u & I32s::fill(255)).round_float() * k, (v & I32s::fill(255)).round_float() * k);
-    std::array::from_fn(|c| {
-        let top = t00[c] + (t10[c] - t00[c]) * fx;
-        let bottom = t01[c] + (t11[c] - t01[c]) * fx;
-        top + (bottom - top) * fy
-    })
-}
-
-/// [`packed_bilinear`] at each lane's mip level for its level of detail `lod` (8.8): the
-/// nearest level, or with `between`, the level below it blended toward the next.
-#[inline(always)]
-fn packed_filtered(tex: &moose_assets::Texture, uv: &[I32s; 2], lod: I16s, between: bool, table: &[u32; 256]) -> [F32s; 3] {
-    use crate::shader::LANES;
-    let last = tex.levels.len() as i32 - 1;
-    let lod = I32s::from_i16x8(lod).max(I32s::fill(0)).min(I32s::fill(last << 8));
-    let level: I32s = if between {
-        lod >> 8
-    } else {
-        let nearest: I32s = (lod + I32s::fill(128)) >> 8;
-        nearest.min(I32s::fill(last))
-    };
-    let levels = level.to_array();
-    let fraction = (lod & I32s::fill(255)).to_array();
-    let (lo, hi) = (*levels.iter().min().unwrap(), *levels.iter().max().unwrap());
-    let mut out = [[0.0f32; LANES]; 3];
-    for l in lo..=hi {
-        let near = packed_bilinear(&tex.levels[l as usize], uv[0], uv[1], table).map(|c| c.to_array());
-        let next = (between && l < last && fraction.iter().any(|&f| f > 0))
-            .then(|| packed_bilinear(&tex.levels[l as usize + 1], uv[0], uv[1], table).map(|c| c.to_array()));
-        for i in (0..LANES).filter(|&i| levels[i] == l) {
-            for c in 0..3 {
-                let t = fraction[i] as f32 / 256.0;
-                out[c][i] = match &next {
-                    Some(next) if between => near[c][i] + (next[c][i] - near[c][i]) * t,
-                    _ => near[c][i],
-                };
-            }
-        }
-    }
-    out.map(F32s::from)
 }
 
 /// A texel's byte `shift` bits up as a float, 0 to 255.
@@ -827,29 +730,35 @@ fn channel(texel: U32s, shift: u32) -> F32s {
     b.round_float()
 }
 
-/// [`Textured`] with bumps, two ways, each a factor on the light at each pixel worked out
-/// from the bumps at the texel and the light's directions at the sample points (see
-/// [`Bumps`]), 1 on a flat texel:
+/// [`Textured`] with bumps and specular highlights, in any combination: `BUMP` is where
+/// the bumps come from ([`FLAT`] or [`NORMAL_MAP`]) and `SPECULAR` adds a highlight. Each light's direction is kept apart from the summed light at the sample
+/// points (see [`Bumps`]), for the lights that always reach and for all of them, and
+/// pixels weigh those by their texel's bumps:
 ///
-/// - [`TexturedNormal`] (texture 1's color a tangent-space normal map, `(n + 1) / 2`):
-///   the lights' directions summed into one at the sample points, and the texel's normal's
-///   cosine with it. Texture 0's alpha is left for other things.
-/// - [`TexturedBasis`] (texture 0's alpha a packed normal; see
-///   [`moose_assets::bump::pack`]): the light along three directions at the sample points,
-///   and the texel's blend of them, its weights looked up by its byte; no per-pixel dot
-///   product or normalizing, and any number of lights. One texture.
+/// - Bumps are a factor on the light, 1 on a flat texel. With a normal map (texture 1's
+///   color, `(n + 1) / 2`), the texel's normal's cosine with the lights' directions summed
+///   into one; texture 0's alpha is left for other things.
+/// - The highlight is Blinn-Phong's, from the lights' summed direction (the dominant one):
+///   the texel's normal's cosine with the half vector between it and the eye's direction,
+///   to a power, times the lights' color and a strength, added to the lit color. One
+///   highlight per group of lights, whatever their number.
 ///
-/// Params: how the bumps are read (`values[0]`, one of [`SAMPLERS`]).
-pub mod textured_bump {
+/// Params: how the bumps are read (`values[0]`, one of [`SAMPLERS`]), the highlight's
+/// strength (`values[1]`) and its power's log2 (`values[2]`: 5 is a power of 32).
+pub mod textured_lit {
     use super::filter::{
         BILINEAR_MIPMAP_LINEAR, BILINEAR_MIPMAP_NEAREST, DITHERED_MIPMAP_NEAREST, NEAREST_MIPMAP_NEAREST,
     };
     use crate::shader::{F32s, Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext};
 
+    /// Where [`TexturedLit`]'s bumps come from: none, or a normal map in texture 1's
+    /// color.
+    pub const FLAT: u8 = 0;
+    pub const NORMAL_MAP: u8 = 1;
+
     /// How the bumps are read, by `params.values[0]`: the nearest texel of the nearest
     /// mip level; dithered (one texel, moved by an ordered dither); bilinear (the four
-    /// around, blended); trilinear (bilinear in two levels, blended). A packed normal is
-    /// filtered by what it stands for (see [`super::packed_filtered`]).
+    /// around, blended); trilinear (bilinear in two levels, blended).
     pub const SAMPLERS: [&str; 4] = ["nearest", "dithered", "bilinear", "trilinear"];
 
     crate::material_io! {
@@ -857,36 +766,20 @@ pub mod textured_bump {
         sampled { uv: 2, lod: 1, normal: 3, tangent: 3, bitangent: 3, position: 3 }
         fixed32 { uv: 2, light: 3 }
         fixed16 { lod: 1 }
-        float { bump: 8 }
+        float { bump: 8, spec: 12 }
     }
 
-    #[inline(always)]
-    fn vertex(v: &Vertex) -> Sampled {
-        Sampled {
-            uv: v.uv,
-            normal: v.face_normal,
-            tangent: v.face_tangent,
-            bitangent: v.face_bitangent,
-            ..Default::default()
-        }
-    }
+    /// Textured, bumpy and shiny as `BUMP` and `SPECULAR` say (see the module).
+    pub struct TexturedLit<const FILTER: u8, const BUMP: u8, const SPECULAR: bool>;
 
-    /// The bumps of the lights that always reach the polygon's pixels, and of all of them
-    /// (see [`super::bumps`]).
-    #[inline(always)]
-    fn bumps(s: &SampledLanes, ctx: &SampleContext) -> (super::Bumps, super::Bumps) {
-        super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal])
-    }
+    /// The configurations the app uses.
+    pub type TexturedNormal<const FILTER: u8> = TexturedLit<FILTER, NORMAL_MAP, false>;
+    pub type TexturedSpecular<const FILTER: u8> = TexturedLit<FILTER, FLAT, true>;
+    pub type TexturedNormalSpecular<const FILTER: u8> = TexturedLit<FILTER, NORMAL_MAP, true>;
 
     /// Bumps past this level of detail (8.8: textures shrunk to a third or less) are
     /// smaller than pixels: those pixels are lit flat.
     const FAR: i32 = 400;
-
-    /// Whether the lanes are too far away to show bumps (see [`FAR`]).
-    #[inline(always)]
-    fn far(b: &Fixed16) -> bool {
-        I32s::from_i16x8(b.lod[0]).simd_gt(I32s::fill(FAR)).all()
-    }
 
     /// Which of [`SAMPLERS`] reads the bumps.
     #[inline(always)]
@@ -894,107 +787,67 @@ pub mod textured_bump {
         (ctx.params.values[0].max(0.0) as usize).min(SAMPLERS.len() - 1)
     }
 
-    /// Whether some of the split lights (see `PixelContext::light`) reach some lane.
+    /// The half vector between the lights' summed direction (`toward`, any length) and
+    /// the way to the eye (`eye`, unit length), unit length: or the way to the eye, where
+    /// no light comes from any one way.
     #[inline(always)]
-    fn split_reaches(ctx: &PixelContext) -> bool {
-        (0..ctx.split.count).any(|j| ctx.split.reaches[j].simd_gt(F32s::fill(0.0)).any())
+    fn half(toward: &[F32s; 3], eye: &[F32s; 3]) -> [F32s; 3] {
+        let len2 = toward[0] * toward[0] + toward[1] * toward[1] + toward[2] * toward[2];
+        let inv = len2.max(F32s::fill(1e-12)).recip_sqrt();
+        let lit = len2.simd_gt(F32s::fill(1e-12));
+        let h: [F32s; 3] = std::array::from_fn(|c| eye[c] + lit.select(toward[c] * inv, F32s::fill(0.0)));
+        let inv = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).max(F32s::fill(1e-12)).recip_sqrt();
+        h.map(|v| v * inv)
     }
 
-    /// The texel's color under the light, the lights that always reach bumped by
-    /// `rest` and all of them by `all` (linear factors; see `PixelContext::light_scaled`).
-    #[inline(always)]
-    fn lit(texel: U32s, a: &Fixed32, rest: F32s, all: F32s, ctx: &PixelContext) -> U32s {
-        let encode = |f: F32s| f.max(F32s::fill(0.0)).sqrt();
-        let light = ctx.light_scaled(&a.light, encode(rest), encode(all));
-        super::lit_texel(texel, &light) & U32s::fill(0xFF_FFFF)
-    }
-
-    /// The texel's color under the light, flat.
-    #[inline(always)]
-    fn flat(texel: U32s, a: &Fixed32, ctx: &PixelContext) -> U32s {
-        super::lit_texel(texel, &ctx.light(&a.light)) & U32s::fill(0xFF_FFFF)
-    }
-
-    /// Texture 1's color a tangent-space normal map, `(n + 1) / 2`.
-    pub struct TexturedNormal<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
-
-    impl<const FILTER: u8> Material for TexturedNormal<FILTER> {
+    impl<const FILTER: u8, const BUMP: u8, const SPECULAR: bool> Material for TexturedLit<FILTER, BUMP, SPECULAR> {
         crate::material_types!();
 
         #[inline(always)]
         fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
-            vertex(v)
+            Sampled {
+                uv: v.uv,
+                normal: v.face_normal,
+                tangent: v.face_tangent,
+                bitangent: v.face_bitangent,
+                ..Default::default()
+            }
         }
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let (rest, all) = bumps(s, ctx);
-            Interp {
-                uv: s.uv,
-                lod: s.lod,
-                light: super::light_output(super::diffuse(ctx, &s.position, &s.normal)),
-                bump: [
+            let frame = [&s.tangent, &s.bitangent, &s.normal];
+            let (rest, all) = super::bumps(ctx, &s.position, frame);
+            let zero = F32s::fill(0.0);
+            let bump = match BUMP {
+                NORMAL_MAP => [
                     rest.ambient, rest.toward[0], rest.toward[1], rest.toward[2],
                     all.ambient, all.toward[0], all.toward[1], all.toward[2],
                 ],
-            }
-        }
-
-        #[inline(always)]
-        fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
-            let texel = super::texel::<FILTER>(ctx.textures[0], &a.uv, b.lod[0], ctx.at);
-            // Which lights bump it: those that always reach, if any has a direction (not
-            // the ambient light only), and the split ones, if any reaches.
-            let sideways = |k: usize| c.bump[k] * c.bump[k] + c.bump[k + 1] * c.bump[k + 1] + c.bump[k + 2] * c.bump[k + 2];
-            let rest = sideways(1).simd_ge(F32s::fill(1e-4)).any();
-            let all = ctx.split.count > 0 && split_reaches(ctx);
-            if far(b) || !(rest || all) {
-                return flat(texel, a, ctx);
-            }
-            let (tex, lod) = (ctx.textures[1], b.lod[0]);
-            let n = match sampler(ctx) {
-                0 => super::texel::<NEAREST_MIPMAP_NEAREST>(tex, &a.uv, lod, ctx.at),
-                1 => super::texel::<DITHERED_MIPMAP_NEAREST>(tex, &a.uv, lod, ctx.at),
-                2 => super::texel::<BILINEAR_MIPMAP_NEAREST>(tex, &a.uv, lod, ctx.at),
-                _ => super::texel::<BILINEAR_MIPMAP_LINEAR>(tex, &a.uv, lod, ctx.at),
+                _ => [zero; 8],
             };
-            // (byte - 127.5) / 127.5 each: the cosines with the summed directions.
-            let (k, half) = (F32s::fill(1.0 / 127.5), F32s::fill(127.5));
-            let n = [super::channel(n, 16) - half, super::channel(n, 8) - half, super::channel(n, 0) - half];
-            let factor = |g: usize| {
-                let cos = n[0] * c.bump[g + 1] + n[1] * c.bump[g + 2] + n[2] * c.bump[g + 3];
-                c.bump[g] + (cos * k).max(F32s::fill(0.0))
+            let spec = if SPECULAR {
+                // The way to the eye, in tangent space.
+                let to_eye = [
+                    F32s::fill(ctx.eye.x) - s.position[0],
+                    F32s::fill(ctx.eye.y) - s.position[1],
+                    F32s::fill(ctx.eye.z) - s.position[2],
+                ];
+                let inv = (to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2])
+                    .max(F32s::fill(1e-12))
+                    .recip_sqrt();
+                let eye = frame.map(|axis| (axis[0] * to_eye[0] + axis[1] * to_eye[1] + axis[2] * to_eye[2]) * inv);
+                let (hr, ha) = (half(&rest.toward, &eye), half(&all.toward, &eye));
+                [hr[0], hr[1], hr[2], rest.color[0], rest.color[1], rest.color[2], ha[0], ha[1], ha[2], all.color[0], all.color[1], all.color[2]]
+            } else {
+                [zero; 12]
             };
-            let one = F32s::fill(1.0);
-            let rested = if rest { factor(0) } else { one };
-            lit(texel, a, rested, if all { factor(4) } else { rested }, ctx)
-        }
-    }
-
-    /// Texture 0's alpha a packed normal (see [`moose_assets::bump::pack`]), its mip levels
-    /// made from the normals (see `Assets::packed_alpha`).
-    pub struct TexturedBasis<const FILTER: u8 = BILINEAR_MIPMAP_LINEAR>;
-
-    impl<const FILTER: u8> Material for TexturedBasis<FILTER> {
-        crate::material_types!();
-
-        #[inline(always)]
-        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
-            vertex(v)
-        }
-
-        #[inline(always)]
-        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let (rest, all) = bumps(s, ctx);
-            let zero = F32s::fill(0.0);
             Interp {
                 uv: s.uv,
                 lod: s.lod,
                 light: super::light_output(super::diffuse(ctx, &s.position, &s.normal)),
-                bump: [
-                    rest.basis[0], rest.basis[1], rest.basis[2], zero,
-                    all.basis[0], all.basis[1], all.basis[2], zero,
-                ],
+                bump,
+                spec,
             }
         }
 
@@ -1002,33 +855,90 @@ pub mod textured_bump {
         fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
             let tex = ctx.textures[0];
             let texel = super::texel::<FILTER>(tex, &a.uv, b.lod[0], ctx.at);
-            // Which lights bump it: those that always reach, unless the same light comes
-            // along all three directions (the ambient light only), and the split ones, if
-            // any reaches.
             let one = F32s::fill(1.0);
-            let off = (c.bump[0] - one).abs().max((c.bump[1] - one).abs()).max((c.bump[2] - one).abs());
-            let rest = off.simd_ge(F32s::fill(0.01)).any();
-            let all = ctx.split.count > 0 && split_reaches(ctx);
-            if far(b) || !(rest || all) {
-                return flat(texel, a, ctx);
-            }
-            // Its packed normal's weights: by the byte of one texel, or filtered by what
-            // the bytes stand for.
-            let (lod, table) = (b.lod[0], &*super::PACKED_WEIGHTS);
-            let w = match sampler(ctx) {
-                0 => super::packed(super::texel::<NEAREST_MIPMAP_NEAREST>(tex, &a.uv, lod, ctx.at), table),
-                1 => super::packed(super::texel::<DITHERED_MIPMAP_NEAREST>(tex, &a.uv, lod, ctx.at), table),
-                2 => super::packed_filtered(tex, &a.uv, lod, false, table),
-                _ => super::packed_filtered(tex, &a.uv, lod, true, table),
+            let far = I32s::from_i16x8(b.lod[0]).simd_gt(I32s::fill(FAR)).all();
+            // Which lights bump it: those that always reach, if any has a direction (not
+            // the ambient light only), and the split ones, if any reaches.
+            let rest = match BUMP {
+                NORMAL_MAP => (c.bump[1] * c.bump[1] + c.bump[2] * c.bump[2] + c.bump[3] * c.bump[3])
+                    .simd_ge(F32s::fill(1e-4))
+                    .any(),
+                _ => false,
             };
-            let factor = |g: usize| w[0] * c.bump[g] + w[1] * c.bump[g + 1] + w[2] * c.bump[g + 2];
-            let rested = if rest { factor(0) } else { one };
-            lit(texel, a, rested, if all { factor(4) } else { rested }, ctx)
+            let all = ctx.split.count > 0 && (0..ctx.split.count).any(|j| ctx.split.reaches[j].simd_gt(F32s::fill(0.0)).any());
+            let bumpy = BUMP != FLAT && !far && (rest || all || SPECULAR);
+            // The texel's normal (tangent space; z out), and its bumps' factors on the
+            // lights that always reach and on all of them.
+            let (mut normal, mut factors) = ([F32s::fill(0.0), F32s::fill(0.0), one], (one, one));
+            if bumpy {
+                let lod = b.lod[0];
+                let t = ctx.textures[1];
+                let n = match sampler(ctx) {
+                    0 => super::texel::<NEAREST_MIPMAP_NEAREST>(t, &a.uv, lod, ctx.at),
+                    1 => super::texel::<DITHERED_MIPMAP_NEAREST>(t, &a.uv, lod, ctx.at),
+                    2 => super::texel::<BILINEAR_MIPMAP_NEAREST>(t, &a.uv, lod, ctx.at),
+                    _ => super::texel::<BILINEAR_MIPMAP_LINEAR>(t, &a.uv, lod, ctx.at),
+                };
+                let k = F32s::fill(1.0 / 127.5);
+                normal = [16, 8, 0].map(|shift| (super::channel(n, shift) - F32s::fill(127.5)) * k);
+                let factor = |g: usize| {
+                    let cos = normal[0] * c.bump[g + 1] + normal[1] * c.bump[g + 2] + normal[2] * c.bump[g + 3];
+                    c.bump[g] + cos.max(F32s::fill(0.0))
+                };
+                let rested = if rest { factor(0) } else { one };
+                factors = (rested, if all { factor(4) } else { rested });
+            }
+            let light = if bumpy {
+                let encode = |f: F32s| f.max(F32s::fill(0.0)).sqrt();
+                ctx.light_scaled(&a.light, encode(factors.0), encode(factors.1))
+            } else {
+                ctx.light(&a.light)
+            };
+            let lit = super::lit_texel(texel, &light) & U32s::fill(0xFF_FFFF);
+            if !SPECULAR {
+                return lit;
+            }
+            // The highlight: per group, its color times the normal's cosine with its half
+            // vector (both normalized: interpolated, they shorten between sample points,
+            // which would show the sample grid in a sharp highlight) to the power.
+            let strength = ctx.params.values[1];
+            if strength <= 0.0 {
+                return lit;
+            }
+            let squarings = ctx.params.values[2].clamp(0.0, 8.0) as u32;
+            let n_len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
+                .max(F32s::fill(1e-12))
+                .recip_sqrt();
+            let shine = |g: usize| {
+                let h = &c.spec[g..g + 3];
+                let h_len = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).max(F32s::fill(1e-12)).recip_sqrt();
+                let mut p = ((normal[0] * h[0] + normal[1] * h[1] + normal[2] * h[2]) * n_len * h_len).max(F32s::fill(0.0));
+                for _ in 0..squarings {
+                    p = p * p;
+                }
+                [c.spec[g + 3] * p, c.spec[g + 4] * p, c.spec[g + 5] * p]
+            };
+            let rest_shine = shine(0);
+            let shine = if ctx.split.count > 0 {
+                let (all_shine, f) = (shine(6), ctx.split_reach());
+                std::array::from_fn(|k| rest_shine[k] + (all_shine[k] - rest_shine[k]) * f)
+            } else {
+                rest_shine
+            };
+            // Added to the gamma-encoded color as it is (a cheat: light adds in linear
+            // terms), each channel at most 255.
+            let add = shine.map(|v| (v * F32s::fill(255.0 * strength)).min(F32s::fill(255.0)).round_int());
+            let channel = |shift: u32, k: usize| {
+                let base: I32s = wide::bytemuck::cast((lit >> shift) & U32s::fill(255));
+                let sum: U32s = wide::bytemuck::cast((base + add[k]).min(I32s::fill(255)));
+                sum << shift
+            };
+            channel(16, 0) | channel(8, 1) | channel(0, 2)
         }
     }
 }
 
-pub use textured_bump::{TexturedBasis, TexturedNormal};
+pub use textured_lit::{TexturedLit, TexturedNormal, TexturedNormalSpecular, TexturedSpecular};
 
 /// [`Textured`], translucent: the texture's color at a uniform opacity, blended over what
 /// is behind.

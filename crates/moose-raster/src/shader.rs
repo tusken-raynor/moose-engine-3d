@@ -1220,6 +1220,19 @@ impl PixelContext<'_> {
         };
         scaled.light(&rested)
     }
+
+    /// How much of the split lights' light reaches each pixel, 0 to 1 (each one's as much
+    /// as its shadow lets through, over all of theirs; on green, the brightest channel):
+    /// 0 without split lights.
+    #[inline(always)]
+    pub fn split_reach(&self) -> F32s {
+        let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
+        for j in 0..self.split.count {
+            all += self.split.light[j][1];
+            reaching += self.split.reaches[j] * self.split.light[j][1];
+        }
+        reaching / all.max(F32s::fill(1e-12))
+    }
 }
 
 /// What a translucent pixel is drawn over, for `shade_over`: `w` is the surface's
