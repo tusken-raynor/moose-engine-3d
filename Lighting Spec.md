@@ -325,6 +325,34 @@ The view time drops because the walker's soft carving goes; the grid costs a rou
 
 **Hard shadows in reflections.** Surfaces seen in mirrors take every shadow carved every frame hard (`Receiver::hard`): soft, blurred and hard casters alike, and dynamic lights' windows. Each volume keeps its hard region, the planes through the light's center and its outline (`Volume::hard`), so the shadow's edge is where a hard shadow's would be, not at its soft edge's outer side. Cached shadows on mirrored static surfaces stay soft: they cost nothing more.
 
+## Bump mapping (experiment)
+
+The brick walls are the test surface for bump mapping. The Rendering page's Brick bump shader (`--bump off|normal|basis`) picks the shader bound to them, and its Bump sampler (`--bump-sampler`) how that shader reads its bumps. Each shader reads its bumps where it wants them. Every other texture keeps its own material. Lighting stays at sample points, and stays agnostic of the lights' kinds: the sample stage works out how the light falls in tangent space, and pixels only weigh that by the texel's bumps.
+
+**The bricks' bump data** is baked by `cargo run -p moose-assets --example bake_brick` from `brick_wall_height.png` (0 in the mortar, the bricks rising over 2 texels from their edges, made once from the brick texture's old alpha, a mask of the bricks; `bump::bevel_heights`). It runs again to the same bytes.
+- `brick_wall_normal.png`: a tangent-space normal map in its color, `(n + 1) / 2`, for the normal shader. The brick texture's alpha stays free (for roughness, say).
+- `brick_wall.png`'s alpha: the same normals packed into a byte, for the basis shader, which then needs only the one texture. x in the high 4 bits, y in the low 4, each -7 to 7 so that flat is exact; z is implied, `(x / 7, y / 7, 0.6)` normalized, so the steepest leans 59° (`bump::pack`, `unpack`). A packed byte can't be averaged or blended (its x and y bits would mix), so a texture marked `Assets::packed_alpha` has its mip levels' alpha remade from the normals (`bump::repack_mips`). The bricks' detail noise, which this alpha used to mask, is off.
+- Tried and dropped: bump maps derived from brightness at load (albedo isn't height: brick_wall's grey mortar is brighter than its red bricks and came out raised); emboss (the height a step toward the light against the texel's: cheapest, but it looked bad most of the time); a shader decoding the packed normal for the normal map's cosine (it cost what reading the color normal map does, with coarser normals).
+
+**The shaders** (`moose_raster::shaders::textured_bump`), each a factor on the light at each pixel, normalized so a flat texel's is exactly 1:
+- **normal** (`TexturedNormal`, texture 1's color): the sample points sum the lights' directions into one tangent-space vector, each weighted by its brightness over the flat surface's (and keep the ambient's share). A pixel takes its texel's normal's cosine with it: `ambient + max(n·v, 0)`. Lights from opposite sides cancel in the sum, so it favors one dominant light.
+- **basis** (`TexturedBasis`, texture 0's alpha; Half-Life 2's radiosity normal mapping): the sample points light three fixed tangent-space directions, over their average; a pixel blends them by its normal's weights, looked up by its byte in a 256-entry table. Three multiply-adds, no dot product, and any number of lights each from its own side. Three directions can't light every way alike: light from above lights the bricks' left edges a little more than their right.
+- **Samplers:** nearest, dithered (one texel, moved by an ordered dither; rough up close), bilinear (the default), trilinear. For the normal map these are the usual samplers. For the packed byte, nearest and dithered read one texel, and bilinear and trilinear look up each of the four texels around the point and blend the weights (`packed_bilinear`): exact, as weights blend linearly. Doing that lane by lane in scalar code cost about 0.6 ms more than in SIMD (same pixels), and a table of the three weights as floats (three loads per lookup) about 0.2 ms more than as bytes in one word (one load).
+- **Tangent space:** `face_tangent` and `face_bitangent` are built-in vertex inputs like `face_normal`: the world directions the polygon's `uv` grows along, from its first three vertices.
+- **Each light bumps where it reaches:** the sample points add the lights up, so their directions are kept apart first, as summaries in tangent space: one of the lights that always reach the polygon's pixels (the ambient light and the lights not split off), one of all of them. Split lights (a beam's cone, a partial shadow; see `PixelContext::light`) are cut pixel by pixel, after the sample points. A pixel bumps the two lights apart, by its texel's normal, and blends them as much as the split lights reach it (`PixelContext::light_scaled`), as their colors are blended. So the level lights still bump a wall outside the flashlight's cone, and the flashlight bumps it only inside. A first try summed all the lights into one summary and scaled the bumps by how much of the light reached each pixel: the flashlight, counted at full strength all over any wall it touched, swamped the level lights' directions, and outside its cone the scaling took their bumps away.
+- **Early-outs:** a block of 8 pixels is lit flat, without reading its bumps, where the lights that always reach have no direction (ambient only) and no split light reaches it (outside the cone, in shadow), or where the texture is shrunk past a third (`FAR`), where bumps are smaller than pixels.
+
+**Cost.** All of it is per pixel, the bumps' read and a few multiplies; the sample stage's extra work and values cost about 0.02 ms. The brick wall filling the frame at 1920×1080 under a grazing flashlight, best of 6 (2.69 ms plain):
+
+| Sampler | normal | basis |
+| --- | --- | --- |
+| nearest | +0.87 ms | +0.82 ms |
+| dithered | +0.87 ms | +0.89 ms |
+| bilinear | +1.15 ms | +1.49 ms |
+| trilinear | +1.22 ms | +1.53 ms |
+
+Basis's filtered lookups read four texels and four table entries per pixel, where the normal map's bilinear read blends four texels' bytes.
+
 ## Dynamic shadows setting
 
 Sep 29. `ViewConfig::dynamic_shadows` (the options menu's Lighting page, and `--no-dynamic-shadows`), a performance option.

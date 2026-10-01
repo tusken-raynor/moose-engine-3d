@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::shader::{
     F32s, Fill,
-    Behind, Draw, FACE_NORMAL, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, MAX_SPLIT, NO_SPLIT, split_outputs,
+    Behind, Draw, FACE_BITANGENT, FACE_NORMAL, FACE_TANGENT, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, MAX_SPLIT, NO_SPLIT, split_outputs,
     Material, MaterialEntry, MaterialId, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
@@ -624,8 +624,33 @@ impl Renderer {
     }
 }
 
+/// A polygon's tangent and bitangent, in model space: the directions its `uv` attribute's
+/// u and v grow along it, each unit length (from its first three vertices; zero without
+/// `uv`, or for a polygon whose texture is degenerate on it).
+fn face_tangents(mesh: &moose_assets::Mesh, polygon: &moose_assets::Polygon) -> (Vec3, Vec3) {
+    let Some(uv) = mesh.attribs.iter().find(|a| a.name == UV && a.count == 2) else {
+        return (Vec3::ZERO, Vec3::ZERO);
+    };
+    let vs: Vec<usize> = polygon.vertices().take(3).collect();
+    if vs.len() < 3 {
+        return (Vec3::ZERO, Vec3::ZERO);
+    }
+    let p = |v: usize| mesh.positions[mesh.vertex_positions[v] as usize];
+    let t = |v: usize| (uv.data.get_f32(v * 2), uv.data.get_f32(v * 2 + 1));
+    let (e1, e2) = (p(vs[1]) - p(vs[0]), p(vs[2]) - p(vs[0]));
+    let ((u0, v0), (u1, v1), (u2, v2)) = (t(vs[0]), t(vs[1]), t(vs[2]));
+    let (du1, dv1, du2, dv2) = (u1 - u0, v1 - v0, u2 - u0, v2 - v0);
+    let det = du1 * dv2 - du2 * dv1;
+    if det.abs() < 1e-12 {
+        return (Vec3::ZERO, Vec3::ZERO);
+    }
+    let tangent = (e1 * dv2 - e2 * dv1) / det;
+    let bitangent = (e2 * du1 - e1 * du2) / det;
+    (tangent.normalize_or_zero(), bitangent.normalize_or_zero())
+}
+
 /// Where a vertex stage input comes from.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum VertexSource {
     /// A mesh attribute: its index in the mesh's attributes, and its count.
     Attrib(usize, usize),
@@ -633,6 +658,10 @@ enum VertexSource {
     Position,
     /// The source polygon's plane normal, in world space.
     FaceNormal,
+    /// The source polygon's tangent and bitangent: which way, in world space, its `uv`
+    /// attribute's u and v grow (see [`face_tangents`]).
+    FaceTangent,
+    FaceBitangent,
 }
 
 /// A material mapped onto a mesh.
@@ -671,6 +700,8 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
         let builtin = match want.name {
             POSITION => Some(VertexSource::Position),
             FACE_NORMAL => Some(VertexSource::FaceNormal),
+            FACE_TANGENT => Some(VertexSource::FaceTangent),
+            FACE_BITANGENT => Some(VertexSource::FaceBitangent),
             _ => None,
         };
         if let Some(source) = builtin {
@@ -781,6 +812,12 @@ fn setup_polygon(
     let object = geometry.objects[p.object as usize];
     let model = object.transform();
     let face_normal = (object.rotation * source.plane.normal).to_array();
+    let tangents = remap
+        .vertex
+        .iter()
+        .any(|v| matches!(v, VertexSource::FaceTangent | VertexSource::FaceBitangent))
+        .then(|| face_tangents(mesh, source))
+        .map(|(t, b)| ((object.rotation * t).to_array(), (object.rotation * b).to_array()));
     let ctx = VertexContext {
         object: &object,
         params: &s.params,
@@ -808,6 +845,12 @@ fn setup_polygon(
                 }
                 VertexSource::FaceNormal => {
                     input[i..i + 3].copy_from_slice(&face_normal);
+                    i += 3;
+                }
+                VertexSource::FaceTangent | VertexSource::FaceBitangent => {
+                    let (t, b) = tangents.unwrap_or_default();
+                    let v = if from == VertexSource::FaceTangent { t } else { b };
+                    input[i..i + 3].copy_from_slice(&v);
                     i += 3;
                 }
             }
@@ -2977,6 +3020,35 @@ mod tests {
         let mut out = Vec::new();
         vertex_lods(&verts, |i| uvs[i], size, &mut out);
         out
+    }
+
+    #[test]
+    fn a_crates_faces_have_tangents_along_their_texture() {
+        // Each face's tangent and bitangent are unit length, in its plane, and point the
+        // way its u and v grow across it.
+        let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+        let id = assets.load_mesh("crate.obj").unwrap();
+        let mesh = assets.mesh(id);
+        let uv = mesh.attribs.iter().find(|a| a.name == UV).unwrap();
+        for polygon in &mesh.polygons {
+            let (t, b) = face_tangents(mesh, polygon);
+            let n = polygon.plane.normal;
+            assert!((t.length() - 1.0).abs() < 1e-4 && (b.length() - 1.0).abs() < 1e-4);
+            assert!(t.dot(n).abs() < 1e-4 && b.dot(n).abs() < 1e-4);
+            let vs: Vec<usize> = polygon.vertices().collect();
+            let at = |v: usize| mesh.positions[mesh.vertex_positions[v] as usize];
+            let (du, dv) = (
+                uv.data.get_f32(vs[1] * 2) - uv.data.get_f32(vs[0] * 2),
+                uv.data.get_f32(vs[1] * 2 + 1) - uv.data.get_f32(vs[0] * 2 + 1),
+            );
+            let along = at(vs[1]) - at(vs[0]);
+            if du.abs() > 1e-4 {
+                assert_eq!(along.dot(t) > 0.0, du > 0.0, "u grows along the tangent");
+            }
+            if dv.abs() > 1e-4 {
+                assert_eq!(along.dot(b) > 0.0, dv > 0.0, "v grows along the bitangent");
+            }
+        }
     }
 
     #[test]

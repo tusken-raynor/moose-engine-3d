@@ -35,6 +35,34 @@ pub enum Key {
     Period, Slash, Backquote,
 }
 
+impl Key {
+    /// Every key.
+    pub const ALL: [Key; 82] = {
+        use Key::*;
+        [
+            A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+            Key0, Key1, Key2, Key3, Key4, Key5, Key6, Key7, Key8, Key9,
+            F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+            Up, Down, Left, Right,
+            Escape, Enter, Backspace, Tab, Space, Delete, Insert, Home, End, PageUp, PageDown,
+            LeftShift, RightShift, LeftCtrl, RightCtrl, LeftAlt, RightAlt, LeftSuper, RightSuper,
+            Minus, Equal, LeftBracket, RightBracket, Backslash, Semicolon, Apostrophe, Comma,
+            Period, Slash, Backquote,
+        ]
+    };
+
+    /// Its name, as written in key binding files: `A`, `5`, `F7`, `Home`, `Minus`.
+    pub fn name(self) -> String {
+        let name = format!("{self:?}");
+        name.strip_prefix("Key").filter(|d| !d.is_empty()).map_or(name.clone(), String::from)
+    }
+
+    /// The key named `name` (see [`Key::name`]), ignoring case.
+    pub fn named(name: &str) -> Option<Key> {
+        Key::ALL.into_iter().find(|k| k.name().eq_ignore_ascii_case(name))
+    }
+}
+
 /// A mouse button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
@@ -246,6 +274,11 @@ impl Display {
     /// True once for each press of `key` (no key repeat).
     pub fn key_pressed(&self, key: Key) -> bool {
         self.state.pressed.contains(&key)
+    }
+
+    /// The keys pressed since the last frame (once each; no key repeat).
+    pub fn pressed_keys(&self) -> Vec<Key> {
+        self.state.pressed.iter().copied().collect()
     }
 
     /// True once for each press of `key`, and again as it repeats while held.

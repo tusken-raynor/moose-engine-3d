@@ -5,6 +5,12 @@
 //! Options (all but the screenshot ones can also be changed in the options menu, Esc):
 //!   --level NAME          level in assets/levels (default shiny_rooms.mmp)
 //!   --size WxH            framebuffer size (default 1280x720)
+//!   --bump SHADER         the brick walls' shader, the test surface for bump mapping: off
+//!                         (plain, the default), normal (brick_wall_normal.png, a normal
+//!                         map) or basis (radiosity normal mapping, from the normal packed
+//!                         in the brick texture's alpha)
+//!   --bump-sampler NAME   how the bumps are read: nearest, dithered, bilinear (the
+//!                         default) or trilinear
 //!   --filter NAME         texture sampler: METHOD_mipmap_MIP, with METHOD nearest, bilinear
 //!                         or dithered and MIP none, nearest, linear or dithered (default
 //!                         bilinear_mipmap_linear)
@@ -81,7 +87,8 @@
 //! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
 //! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
 //! reproduces this view, F3 debug HUD, F4 shadow mesh, Alt+Enter fullscreen, F12 screenshot. Every other setting
-//! is in the menu. While playing, the cursor is locked (hidden) for mouse look; in the menu
+//! is in the menu, where B on a setting binds a key to it (pressed while playing, it does
+//! what Enter does there; kept in ~/.config/moose/keys.txt), and Delete unbinds it. While playing, the cursor is locked (hidden) for mouse look; in the menu
 //! it is free.
 
 mod editor;
@@ -96,8 +103,8 @@ use glam::Vec3;
 use moose_assets::{Assets, LevelDoc, Light, MeshId, ModelDoc, RIPPLE_SIZE, Ripples, Texture, TextureId};
 use moose_present::{Display, Key, MouseButton};
 use moose_raster::shaders::{
-    CubeReflection, Textured, TexturedFresnel, TexturedTranslucent, UnlitColor, VertexColor,
-    VertexColorFresnel, VertexColorTranslucent, Water, filter,
+    CubeReflection, Textured, TexturedBasis, TexturedFresnel, TexturedNormal, TexturedTranslucent,
+    UnlitColor, VertexColor, VertexColorFresnel, VertexColorTranslucent, Water, filter,
 };
 use moose_raster::{
     MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target, register_per_filter,
@@ -133,10 +140,9 @@ const DEFAULT_FLOOR_TEXTURE: &str = "metal_tile.png";
 /// Wall textures (in levels with uvs), in assets/textures: sector i gets the i-th, cycling,
 /// so the test levels' rooms and hallway each have their own.
 const WALL_TEXTURES: [&str; 3] = ["brick_wall.png", "panel_wall.png", "stone_wall.png"];
-/// Walls with this texture get close-up detail noise, `DETAIL` strong, masked by its alpha
-/// (none on the mortar).
-const DETAIL_TEXTURE: &str = "brick_wall.png";
-const DETAIL: f32 = 0.1;
+/// The brick walls' texture: the test surface for bump mapping (see [`Bump`]). Its alpha
+/// is a packed normal (see `moose_assets::bump::pack`).
+const BRICK_TEXTURE: &str = "brick_wall.png";
 /// Where sampler `f` is in `filter::ALL`.
 fn sampler_index(f: u8) -> usize {
     filter::ALL.iter().position(|&g| g == f).expect("a sampler")
@@ -224,6 +230,8 @@ struct Options {
     fps: u32,
     /// Index into `filter::ALL`.
     filter: usize,
+    bump: Bump,
+    bump_sampler: usize,
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
@@ -304,6 +312,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         fps: MAX_FPS,
         filter: sampler_index(filter::BILINEAR_MIPMAP_LINEAR),
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
+        bump: Bump::Off,
+        bump_sampler: 2,
         water: false,
         no_flashlight: false,
         fullscreen: false,
@@ -382,6 +392,18 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     format!("--filter is one of {}", names.join(", "))
                 })?;
             }
+            "--bump" => {
+                let name = value()?;
+                o.bump = Bump::ALL.into_iter().find(|b| b.name() == name).ok_or_else(|| {
+                    format!("--bump is one of {}", Bump::ALL.map(Bump::name).join(", "))
+                })?;
+            }
+            "--bump-sampler" => {
+                let name = value()?;
+                o.bump_sampler = BUMP_SAMPLERS.iter().position(|&s| s == name).ok_or_else(|| {
+                    format!("--bump-sampler is one of {}", BUMP_SAMPLERS.join(", "))
+                })?;
+            }
             "--floor-texture" => o.floor_texture = value()?,
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
@@ -457,6 +479,10 @@ struct Settings {
     fade_range: f32,
     /// Texture sampler, an index into `filter::ALL`.
     filter: usize,
+    /// The brick walls' bump shader, and how it reads the bumps (an index into
+    /// `BUMP_SAMPLERS`).
+    bump: Bump,
+    bump_sampler: usize,
     /// Shiny floors are water.
     water: bool,
     /// Lighting is on (off, surfaces show their full color).
@@ -504,6 +530,37 @@ struct CubeMap {
     radius: f32,
 }
 
+/// The brick walls' shader, the test surface for bump mapping: each reads its bumps where
+/// it wants them (see `moose_raster::shaders::textured_bump`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bump {
+    Off,
+    /// A normal map, `BRICK_NORMALS`; the brick texture's alpha is free.
+    Normal,
+    /// Radiosity normal mapping, from the normal packed in the brick texture's alpha.
+    Basis,
+}
+
+impl Bump {
+    const ALL: [Bump; 3] = [Bump::Off, Bump::Normal, Bump::Basis];
+
+    fn name(self) -> &'static str {
+        match self {
+            Bump::Off => "off",
+            Bump::Normal => "normal",
+            Bump::Basis => "basis",
+        }
+    }
+}
+
+/// How the bump shaders read the bumps (see `textured_bump::SAMPLERS`).
+const BUMP_SAMPLERS: [&str; 4] = moose_raster::shaders::textured_bump::SAMPLERS;
+
+/// The brick walls' normal map (baked with the brick texture's alpha by
+/// `cargo run -p moose-assets --example bake_brick`, from `brick_wall_height.png`).
+const BRICK_NORMALS: &str = "brick_wall_normal.png";
+
+
 struct App {
     assets: Assets,
     world: World,
@@ -531,7 +588,16 @@ struct App {
     /// Per sector, its walls' texture, if the level has uvs.
     wall_textures: Vec<Option<TextureId>>,
     /// The texture whose walls get detail noise, if loaded.
-    detail_texture: Option<TextureId>,
+    brick_texture: Option<TextureId>,
+    /// Hotkeys: each key does what Enter does on its setting in the menu (see
+    /// `App::bind`), kept in `bindings_path()`.
+    bindings: Vec<(Key, Setting)>,
+    /// A note shown at the bottom of the screen for a moment, and when it was made.
+    toast: Option<(String, Instant)>,
+    /// The brick walls' bump shaders (see [`Bump`]), one per sampler in `filter::ALL`:
+    /// normal, basis. And their normal map, if the bricks are loaded.
+    textured_bump: [[MaterialId; 12]; 2],
+    brick_normals: Option<TextureId>,
     /// The crate model and its texture, if the level has crates.
     crate_texture: Option<(MeshId, TextureId)>,
     /// The translucent textured shader (crates with T), one per sampler in `filter::ALL`.
@@ -564,6 +630,7 @@ impl App {
     fn new(options: &Options) -> Result<App, String> {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
         let mut assets = Assets::new(root);
+        assets.packed_alpha(BRICK_TEXTURE);
         let level = assets
             .load_level(&options.level)
             .map_err(|e| e.to_string())?;
@@ -604,6 +671,10 @@ impl App {
         let water = register_per_filter!(renderer, Water);
         let textured_translucent = register_per_filter!(renderer, TexturedTranslucent);
         let cube_reflection = register_per_filter!(renderer, CubeReflection);
+        let textured_bump = [
+            register_per_filter!(renderer, TexturedNormal),
+            register_per_filter!(renderer, TexturedBasis),
+        ];
         let crate_texture = match assets.mesh_id(CRATE_MODEL) {
             Some(mesh) => Some((
                 mesh,
@@ -640,7 +711,11 @@ impl App {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())?;
-        let detail_texture = assets.texture_id(DETAIL_TEXTURE);
+        let brick_texture = assets.texture_id(BRICK_TEXTURE);
+        let brick_normals = match brick_texture {
+            Some(_) => Some(assets.load_texture(BRICK_NORMALS).map_err(|e| e.to_string())?),
+            None => None,
+        };
         let ripples = Ripples::new(1);
         let water_textures = floor_texture.map(|floor| {
             let water = ripples.texture("water", assets.texture(floor).base());
@@ -677,7 +752,11 @@ impl App {
             water_textures,
             floor_texture,
             wall_textures,
-            detail_texture,
+            brick_texture,
+            textured_bump,
+            bindings: load_bindings(),
+            toast: None,
+            brick_normals,
             crate_texture,
             textured_translucent,
             cube_reflection,
@@ -692,6 +771,8 @@ impl App {
                 reflectance: options.f0.clamp(0.0, 1.0),
                 fade_range: options.fade.max(0.0),
                 filter: options.filter,
+                bump: options.bump,
+                bump_sampler: options.bump_sampler,
                 water: options.water,
                 lit: !options.unlit,
                 penumbra: options.penumbra.clamp(1.0 / 64.0, 64.0),
@@ -1220,7 +1301,10 @@ impl App {
                 _ => ui::Row {
                     label: item.label().to_string(),
                     value: match item {
-                        Item::Set(s) => Some(self.value(s)),
+                        Item::Set(s) => Some(match self.binding(s) {
+                            Some(key) => format!("{}  [{}]", self.value(s), key.name()),
+                            None => self.value(s),
+                        }),
                         _ => None,
                     },
                 },
@@ -1269,6 +1353,8 @@ impl App {
             Setting::FlashlightDither => on(cfg.beam_dither),
             Setting::FlashlightBeam => self.cone_name().into(),
             Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
+            Setting::Bump => s.bump.name().into(),
+            Setting::BumpSampler => BUMP_SAMPLERS[s.bump_sampler].into(),
             Setting::Water => on(s.water),
             Setting::Bounces => self.geometry.config.max_reflections.to_string(),
             Setting::Reflectance => s.reflectance.to_string(),
@@ -1334,6 +1420,11 @@ impl App {
             }
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
             Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
+            Setting::Bump => {
+                let i = Bump::ALL.iter().position(|&b| b == s.bump).unwrap_or(0);
+                s.bump = Bump::ALL[wrap(i, Bump::ALL.len())];
+            }
+            Setting::BumpSampler => s.bump_sampler = wrap(s.bump_sampler, BUMP_SAMPLERS.len()),
             Setting::Water => s.water = !s.water,
             Setting::Bounces => {
                 let b = &mut self.geometry.config.max_reflections;
@@ -1430,6 +1521,9 @@ impl App {
             add(format!("--flashlight-at {},{},{},{},{},{}", p.x, p.y, p.z, d.x, d.y, d.z));
         }
         add(format!("--filter {}", filter::name(filter::ALL[s.filter])));
+        if s.bump != Bump::Off {
+            add(format!("--bump {} --bump-sampler {}", s.bump.name(), BUMP_SAMPLERS[s.bump_sampler]));
+        }
         add(format!("--bounces {}", self.geometry.config.max_reflections));
         add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
         add(format!(
@@ -1486,6 +1580,39 @@ impl App {
             .move_to(&self.world, self.camera.position + Vec3::Y * EYE_HEIGHT);
     }
 
+    /// The key bound to `setting`, if any.
+    fn binding(&self, setting: Setting) -> Option<Key> {
+        self.bindings.iter().find(|&&(_, s)| s == setting).map(|&(k, _)| k)
+    }
+
+    /// Binds `key` to `setting` (each key does one setting, each setting has one key),
+    /// unless the game uses it; saves the bindings. Returns what happened, to show.
+    fn bind(&mut self, setting: Setting, key: Key) -> String {
+        if RESERVED.contains(&key) {
+            return format!("{} is taken: the game uses it", key.name());
+        }
+        self.bindings.retain(|&(k, s)| k != key && s != setting);
+        self.bindings.push((key, setting));
+        let mut said = format!("{} bound to {}", key.name(), Item::Set(setting).label());
+        if let Err(e) = save_bindings(&self.bindings) {
+            said = format!("{said} (not saved: {e})");
+        }
+        said
+    }
+
+    /// Unbinds `setting`'s key, if it has one, and saves the bindings.
+    fn unbind(&mut self, setting: Setting) {
+        let before = self.bindings.len();
+        self.bindings.retain(|&(_, s)| s != setting);
+        if self.bindings.len() != before {
+            let said = match save_bindings(&self.bindings) {
+                Ok(()) => format!("{} unbound", Item::Set(setting).label()),
+                Err(e) => format!("not saved: {e}"),
+            };
+            self.toast = Some((said, Instant::now()));
+        }
+    }
+
     /// Renders one frame into `pixels`, returning (view ms, raster ms). The lights are set
     /// first, so the flashlight follows the camera.
     fn render(&mut self) -> Result<(f64, f64), String> {
@@ -1518,7 +1645,9 @@ impl App {
             self.floor_texture,
         );
         let (water, water_textures) = (self.water[s.filter], self.water_textures);
-        let (wall_textures, detail_texture) = (&self.wall_textures, self.detail_texture);
+        let (wall_textures, brick_texture) = (&self.wall_textures, self.brick_texture);
+        let (brick_normals, bump, bump_sampler) = (self.brick_normals, s.bump, s.bump_sampler);
+        let textured_bump = self.textured_bump.map(|m| m[s.filter]);
         let (crate_texture, textured_translucent) =
             (self.crate_texture, self.textured_translucent[s.filter]);
         let level = self.assets.mesh(self.world.geometry);
@@ -1563,14 +1692,25 @@ impl App {
                         // A shiny surface whose reflection was drawn is drawn over it. Past the
                         // bounce limit (or with its reflection not drawn), it is plain.
                         if p.reflection.is_none() {
-                            let detail = if wall.is_some() && wall == detail_texture {
-                                DETAIL
-                            } else {
-                                0.0
-                            };
+                            // Brick walls, the test surface for bump mapping: the shader
+                            // chosen, with their normal map too.
+                            if wall.is_some() && texture == wall && wall == brick_texture && !is_water {
+                                let shader = match bump {
+                                    Bump::Off => None,
+                                    Bump::Normal => Some((textured_bump[0], [wall, brick_normals])),
+                                    Bump::Basis => Some((textured_bump[1], [wall, None])),
+                                };
+                                if let Some((material, textures)) = shader {
+                                    return Surface {
+                                        textures,
+                                        params: Params::new(&[bump_sampler as f32]),
+                                        ..Surface::new(material)
+                                    };
+                                }
+                            }
                             return Surface {
                                 textures,
-                                params: Params::new(&[detail]),
+                                params: Params::new(&[0.0]),
                                 ..Surface::new(if texture.is_some() { textured } else { opaque })
                             };
                         }
@@ -1753,6 +1893,8 @@ enum Setting {
     FlashlightFade,
     FlashlightDither,
     Filter,
+    Bump,
+    BumpSampler,
     Water,
     Bounces,
     Reflectance,
@@ -1844,6 +1986,8 @@ impl Page {
             ],
             Page::Rendering => &[
                 Set(Filter),
+                Set(Bump),
+                Set(BumpSampler),
                 Set(Water),
                 Set(Bounces),
                 Set(Reflectance),
@@ -1876,6 +2020,7 @@ impl Page {
                 "U lock the flashlight in place / remount it",
                 "Esc menu, F1 print a command line for this view",
                 "F3 debug HUD, Alt+Enter fullscreen, F12 screenshot",
+                "B on a setting binds a key to it, Delete unbinds",
             ],
             Page::Flashlight => &[
                 "Locking leaves it where it is: walk around",
@@ -1919,6 +2064,8 @@ impl Item {
                 Setting::FlashlightFade => "Fade",
                 Setting::FlashlightDither => "Dither",
                 Setting::Filter => "Texture filter",
+                Setting::Bump => "Brick bump shader",
+                Setting::BumpSampler => "Bump sampler",
                 Setting::Water => "Water floors",
                 Setting::Bounces => "Reflection bounces",
                 Setting::Reflectance => "Floor reflectance",
@@ -1940,6 +2087,69 @@ impl Item {
     }
 }
 
+/// Keys the game, the editor or the menu use, which can't be hotkeys (B binds one in the
+/// menu).
+const RESERVED: &[Key] = &[
+    Key::W, Key::A, Key::S, Key::D, Key::Q, Key::E, Key::C, Key::U, Key::V, Key::G, Key::M,
+    Key::P, Key::Z, Key::Y, Key::B, Key::Space, Key::Tab, Key::Escape, Key::Enter,
+    Key::Backspace, Key::Delete, Key::Up, Key::Down, Key::Left, Key::Right, Key::PageUp,
+    Key::PageDown, Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::LeftBracket,
+    Key::RightBracket, Key::F1, Key::F3, Key::F4, Key::F5, Key::F6, Key::F11, Key::F12,
+    Key::LeftShift, Key::RightShift, Key::LeftCtrl, Key::RightCtrl, Key::LeftAlt,
+    Key::RightAlt, Key::LeftSuper, Key::RightSuper,
+];
+
+/// Where hotkeys are kept: `~/.config/moose/keys.txt`, a line per key: its name, then
+/// its setting's.
+fn bindings_path() -> Option<PathBuf> {
+    // (Tests keep their hands off the real file.)
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/moose/keys.txt"))
+}
+
+/// Every setting the menu has.
+fn all_settings() -> Vec<Setting> {
+    Page::ALL
+        .iter()
+        .flat_map(|page| page.items())
+        .filter_map(|item| if let Item::Set(s) = item { Some(*s) } else { None })
+        .collect()
+}
+
+/// The saved hotkeys (see `bindings_path`); none if there are none. Lines that name no
+/// key or setting (left from another version) are skipped.
+fn load_bindings() -> Vec<(Key, Setting)> {
+    let Some(text) = bindings_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return Vec::new();
+    };
+    let settings = all_settings();
+    text.lines()
+        .filter_map(|line| {
+            let (key, setting) = line.split_once(' ')?;
+            let key = Key::named(key.trim()).filter(|k| !RESERVED.contains(k))?;
+            let setting = settings.iter().find(|s| format!("{s:?}") == setting.trim())?;
+            Some((key, *setting))
+        })
+        .collect()
+}
+
+/// Saves the hotkeys (see `bindings_path`).
+fn save_bindings(bindings: &[(Key, Setting)]) -> Result<(), String> {
+    let Some(path) = bindings_path() else {
+        return if cfg!(test) { Ok(()) } else { Err("no home folder".into()) };
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut text = String::from("# Moose hotkeys: a key, then the setting it changes as Enter does in the menu.\n");
+    for (key, setting) in bindings {
+        text.push_str(&format!("{} {setting:?}\n", key.name()));
+    }
+    std::fs::write(&path, text).map_err(|e| e.to_string())
+}
+
 /// The options menu: open or not, the page showing, the selected row on it, and the pages
 /// it was opened from.
 struct Menu {
@@ -1947,10 +2157,12 @@ struct Menu {
     page: Page,
     selected: usize,
     back: Vec<(Page, usize)>,
+    /// The setting waiting for a key to bind (B pressed on it).
+    binding: Option<Setting>,
 }
 
 /// Draws the menu page or the HUD over the app's frame, as the settings say.
-fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>) {
+fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, binding: Option<Setting>, hud: Option<Vec<String>>) {
     let rows = menu.map(|(page, _)| app.rows(page));
     let mut canvas = ui::Canvas {
         pixels: &mut app.pixels,
@@ -1968,12 +2180,17 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, hud: Option<Vec<String>>)
         ui::draw_hud(&mut canvas, &lines);
     }
     if let (Some((page, selected)), Some(rows)) = (menu, rows) {
-        let hint = match page {
-            Page::Main => "Up/Down choose   Enter pick   Esc close",
-            Page::Levels => "Up/Down choose   Enter load   Backspace back",
-            _ => "Up/Down choose   Left/Right change   Backspace back",
+        let hint = match (page, binding) {
+            (_, Some(setting)) => format!("Press a key for {}   Esc cancels", Item::Set(setting).label()),
+            (Page::Main, _) => "Up/Down choose   Enter pick   Esc close".into(),
+            (Page::Levels, _) => "Up/Down choose   Enter load   Backspace back".into(),
+            _ => "Up/Down choose   Left/Right change   B bind a key   Backspace back".into(),
         };
-        ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), hint);
+        ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), &hint);
+    } else if let Some((text, at)) = &app.toast
+        && at.elapsed() < Duration::from_secs(2)
+    {
+        ui::draw_toast(&mut canvas, text);
     }
 }
 
@@ -2387,7 +2604,7 @@ fn run() -> Result<(), String> {
             println!("{} frames: view {:.3} ms, raster {:.3} ms on average", options.bench, view / n, raster / n);
         }
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
-        draw_ui(&mut app, options.menu.map(|page| (page, 0)), hud);
+        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, hud);
         app.save_png(Path::new(path))?;
         println!(
             "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
@@ -2412,6 +2629,7 @@ fn run() -> Result<(), String> {
         page: Page::Main,
         selected: 0,
         back: Vec::new(),
+        binding: None,
     };
     // Frame rate and times, averaged over half a second for the HUD.
     let (mut stats_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
@@ -2431,8 +2649,10 @@ fn run() -> Result<(), String> {
 
         if display.key_pressed(Key::Escape) {
             // In the editor, Esc stops a cut, then drops the selection, first; in the mesh
-            // editor, drops the polygon, then leaves it.
-            if app.editor.on && !menu.open && let Some(model) = &mut app.editor.model {
+            // editor, drops the polygon, then leaves it. While binding a key, it cancels.
+            if menu.open && menu.binding.is_some() {
+                menu.binding = None;
+            } else if app.editor.on && !menu.open && let Some(model) = &mut app.editor.model {
                 if model.polygon.is_some() {
                     model.polygon = None;
                 } else {
@@ -2464,7 +2684,16 @@ fn run() -> Result<(), String> {
         // free pointer otherwise.
         let looking = !menu.open && (!app.editor.on || display.mouse_down(MouseButton::Right));
         display.set_cursor_locked(looking);
-        if menu.open {
+        if let Some(setting) = menu.binding.filter(|_| menu.open) {
+            // Waiting for a key to bind: the first one pressed (Esc cancels, above).
+            display.mouse_delta();
+            look.clear();
+            if let Some(key) = display.pressed_keys().into_iter().find(|&k| k != Key::Escape) {
+                let said = app.bind(setting, key);
+                app.toast = Some((said, Instant::now()));
+                menu.binding = None;
+            }
+        } else if menu.open {
             // The menu has the keys; the view holds still (the pointer's motion is dropped).
             display.mouse_delta();
             look.clear();
@@ -2485,6 +2714,15 @@ fn run() -> Result<(), String> {
             };
             if let (Item::Set(setting), true) = (item, dir != 0) {
                 app.change(setting, dir);
+            }
+            // B binds a key to the setting (as Enter on it), Delete unbinds it.
+            if let Item::Set(setting) = item {
+                if display.key_pressed(Key::B) {
+                    menu.binding = Some(setting);
+                }
+                if display.key_pressed(Key::Delete) {
+                    app.unbind(setting);
+                }
             }
             if display.key_pressed(Key::Enter) && !alt {
                 match item {
@@ -2635,6 +2873,16 @@ fn run() -> Result<(), String> {
         if !menu.open && display.key_pressed(Key::U) {
             app.change(Setting::FlashlightMount, 1);
         }
+        // Hotkeys: as Enter on their settings in the menu.
+        if !menu.open {
+            for (key, setting) in app.bindings.clone() {
+                if display.key_pressed(key) {
+                    app.change(setting, 1);
+                    let said = format!("{}: {}", Item::Set(setting).label(), app.value(setting));
+                    app.toast = Some((said, Instant::now()));
+                }
+            }
+        }
         if app.settings.capped != capped {
             capped = app.settings.capped;
             display.set_max_fps(if capped { app.settings.cap } else { 0 });
@@ -2663,7 +2911,7 @@ fn run() -> Result<(), String> {
             (stats_at, frames, view_sum, raster_sum, present_sum) = (Instant::now(), 0, 0.0, 0.0, 0.0);
         }
         let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2, stats.3));
-        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), hud);
+        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, hud);
         display.present(&app.pixels)?;
         let t = display.present_times();
         present_sum += t.copy + t.show + t.events;
@@ -2796,6 +3044,28 @@ mod tests {
         assert_eq!(shadow(&app).as_deref(), Some("blurred (template)"));
         let row = app.editor.doc.entities.iter().position(|e| e.name == "walker").unwrap();
         assert!(!app.editor.doc.entities[row].options.iter().any(|o| o.starts_with("shadow=")));
+    }
+
+    #[test]
+    fn hotkeys_bind_one_key_to_one_setting_and_not_the_games_keys() {
+        let mut app = test_app("walker_rooms.mmp");
+        assert!(app.bind(Setting::Bump, Key::W).contains("taken"));
+        assert_eq!(app.binding(Setting::Bump), None);
+        app.bind(Setting::Bump, Key::H);
+        assert_eq!(app.binding(Setting::Bump), Some(Key::H));
+        // The key moves to another setting; the setting takes another key.
+        app.bind(Setting::ShadowMesh, Key::H);
+        assert_eq!((app.binding(Setting::Bump), app.binding(Setting::ShadowMesh)), (None, Some(Key::H)));
+        app.bind(Setting::ShadowMesh, Key::F7);
+        assert_eq!(app.bindings, vec![(Key::F7, Setting::ShadowMesh)]);
+        app.unbind(Setting::ShadowMesh);
+        assert!(app.bindings.is_empty());
+        // Every setting and key is found again by its saved name.
+        for setting in all_settings() {
+            assert!(all_settings().iter().any(|s| format!("{s:?}") == format!("{setting:?}")));
+        }
+        assert_eq!(Key::named("f7"), Some(Key::F7));
+        assert_eq!(Key::named(&Key::Key5.name()), Some(Key::Key5));
     }
 
     #[test]

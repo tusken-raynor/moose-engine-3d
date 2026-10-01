@@ -292,6 +292,17 @@ pub fn draw_hud(canvas: &mut Canvas, lines: &[String]) {
     }
 }
 
+/// A short note at the bottom of the screen, centered (a hotkey's new setting).
+pub fn draw_toast(canvas: &mut Canvas, text: &str) {
+    let scale = if canvas.height >= 600 { 2 } else { 1 };
+    let line = Canvas::line_height(scale);
+    let pad = 6 * scale;
+    let width = Canvas::text_width(text, scale) + 2 * pad;
+    let (x, y) = (canvas.width.saturating_sub(width) / 2, canvas.height.saturating_sub(line + 2 * pad + 16 * scale));
+    canvas.shade(x, y, width, line + 2 * pad, 140);
+    canvas.text(x + pad, y + pad, text, TEXT, scale);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

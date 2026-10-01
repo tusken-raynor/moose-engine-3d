@@ -1034,6 +1034,12 @@ pub const POSITION: &str = "position";
 /// space (three values). A mesh attribute cannot supply it.
 pub const FACE_NORMAL: &str = "face_normal";
 
+/// Names of the built-in `vertex` values holding the source polygon's tangent and
+/// bitangent in world space (three values each, unit length): the directions its `uv`
+/// attribute's u and v grow along it. Zero for a mesh without `uv`.
+pub const FACE_TANGENT: &str = "face_tangent";
+pub const FACE_BITANGENT: &str = "face_bitangent";
+
 /// Name of the `sampled` value the level of detail built-in ([`LOD`]) is measured from:
 /// two texture coordinates for texture slot 0.
 pub const UV: &str = "uv";
@@ -1190,6 +1196,29 @@ impl PixelContext<'_> {
             let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
             (e * F32s::fill(65536.0)).round_int()
         })
+    }
+}
+
+impl PixelContext<'_> {
+    /// [`PixelContext::light`], with the light from the sample points scaled by `rest`
+    /// (all but the split lights; multiplying the gamma-encoded light) and the split
+    /// lights' total by `all`, before they are blended by how much of the split lights
+    /// reaches each pixel. For bumps, which shade the lights that always reach and all of
+    /// them differently (see `shaders::textured_bump`).
+    #[inline(always)]
+    pub fn light_scaled(&self, light: &[I32s; 3], rest: F32s, all: F32s) -> [I32s; 3] {
+        let rested = light.map(|l| (l.round_float() * rest).round_int());
+        if self.split.count == 0 {
+            return rested;
+        }
+        let scaled = Self {
+            split: Split {
+                total: self.split.total.map(|t| t * all),
+                ..self.split
+            },
+            ..*self
+        };
+        scaled.light(&rested)
     }
 }
 

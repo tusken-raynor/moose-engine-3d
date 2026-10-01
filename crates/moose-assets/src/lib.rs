@@ -7,6 +7,7 @@
 //! its own values for every named attribute. Polygons are planar, convex n-gons
 //! and are never triangulated.
 
+pub mod bump;
 mod error;
 mod geom;
 mod half;

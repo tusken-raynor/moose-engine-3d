@@ -25,6 +25,8 @@ pub struct Assets {
     by_name: HashMap<String, MeshId>,
     textures: Vec<Texture>,
     textures_by_name: HashMap<String, TextureId>,
+    /// Textures whose alpha is a packed normal (see [`Assets::packed_alpha`]).
+    packed_alpha: std::collections::HashSet<String>,
 }
 
 impl Assets {
@@ -37,7 +39,15 @@ impl Assets {
             by_name: HashMap::new(),
             textures: Vec::new(),
             textures_by_name: HashMap::new(),
+            packed_alpha: Default::default(),
         }
+    }
+
+    /// Says texture `name`'s alpha is a packed normal (see [`crate::bump::pack`]), before
+    /// it is loaded: its mip levels' alpha is then made from the normals it packs, not by
+    /// averaging the bytes (see [`crate::bump::repack_mips`]), when loaded or reloaded.
+    pub fn packed_alpha(&mut self, name: &str) {
+        self.packed_alpha.insert(name.to_string());
     }
 
     pub fn root(&self) -> &Path {
@@ -173,6 +183,10 @@ impl Assets {
         let bytes = std::fs::read(&path)
             .map_err(|e| LoadError::new(&path, None, format!("cannot read file: {e}")))?;
         match path.extension().and_then(|e| e.to_str()) {
+            Some("png") if self.packed_alpha.contains(name) => decode_png(&path, name, &bytes).map(|mut t| {
+                crate::bump::repack_mips(&mut t);
+                t
+            }),
             Some("png") => decode_png(&path, name, &bytes),
             _ => Err(LoadError::new(
                 &path,
