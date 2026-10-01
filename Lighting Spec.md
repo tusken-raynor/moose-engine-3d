@@ -165,7 +165,7 @@ Sep 29. Light from far away, like the sun, arriving along one direction everywhe
 - **Softness:** the source's angular size (`angle`, in degrees; the sun is about 0.53). Wedge planes through an edge are turned by the source's angular radius either way.
 - **Shadow slots:** the flashlight has slot 0, and the level's directional lights that cast shadows take slots from 1.
 - **In the app:**
-  - The options menu's Lighting page switches the level's directional lights on and off and sets their size (0, 0.53, 2, 5, 10 degrees; `--sun-angle`, `--no-sun`).
+  - The options menu's Lighting page switches the level's directional lights on and off (`--no-sun`). Their size is the level's, times the shadow softness (below), up to 45 degrees across.
   - Sky surfaces are drawn unlit in their vertex color (`UnlitColor`).
   - Non-reflective floors get the floor texture too.
 - **Test level:** `sunny_rooms.mmp` is two_rooms with room_b's ceiling open to the sky, a sun from the south-west, and a dim sky-blue ambient.
@@ -215,7 +215,7 @@ Shadows are drawn per pixel from a **shadow buffer**. The view works out where e
 **In the app:**
 - Crates cast as themselves, and the mirror ball as a sphere.
 - The options menu's Lighting page switches shadows on and off (`--no-shadows`).
-- The options menu's Flashlight page sets its radius: 0, 2, 5 (default), 10 and 20 cm (`--light-radius`).
+- Its radius is 5 cm (`FLASHLIGHT_RADIUS`), times the dynamic softness (below).
 - Its Mount setting locks the flashlight in place, or puts it back on the shoulder (`--lock-flashlight X,Y,Z,YAW,PITCH`, `--flashlight-at X,Y,Z,DX,DY,DZ`).
 
 **Cost** (Sep 29, averages over 200 frames, on a noisy machine):
@@ -279,7 +279,9 @@ Sep 29. Every level light that casts shadows (point, spot and directional; `shad
   - Vector `ln` and `exp` per pixel were exact but more than doubled raster time.
   - A fast path uses the total light, all split lights included, worked out at the sample points, for any block of 8 pixels all of every split light reaches. Only blocks in shadow or penumbra combine. Most of a partly shadowed surface is fully lit.
 - **shiny_rooms' lamps** are 5 cm across (`radius=0.05`), for soft-edged shadows.
-- **In the app:** the options menu's Lighting page sets a multiple of every level point and spot light's size (level light size: ×0 for hard shadows, ×0.5, ×1 as authored, ×2, ×4; `--light-scale`). The sun and the flashlight have their own size settings. A change rebuilds those lights' cached shadows.
+- **In the app:** each light's size is its own: a level light's `radius=`, the sun's angle in the level, the flashlight's 5 cm. The options menu's Lighting page scales them with two settings, for testing penumbras: shadow softness, for every light (`--softness`), and dynamic softness, for the shadows carved every frame (`--dynamic-softness`). Each steps through hard (×0), ×1, ×2, ×4 and ×6. Dynamic softness doesn't multiply shadow softness: shadow softness is its maximum, so at hard everything is hard.
+  - Dynamic softness covers a dynamic light's shadows (the flashlight's) and moving occluders' (the walker's) from static lights (`ViewConfig::dynamic_softness`, applied in `Carver::prepare`: the ratio of the two settings, since the lights' sizes already carry shadow softness). Cached shadows keep the light's size. At ×0 those shadows are hard, and cost little: walker_rooms' crate view with the flashlight, at shadow softness ×6, took 0.4 ms of view time at dynamic ×0 against 3.7 ms at ×1.
+  - Changing shadow softness rebuilds static lights' cached shadows.
 - **Cost** (shiny_rooms, all 5 lamps with shadows, random views, one thread): 7.1–7.6 ms against 6.1 ms without shadows (+17–25%). The view part is 0.085 ms against 0.016 ms.
 
 

@@ -236,7 +236,7 @@ pub struct Mirror {
 }
 
 /// View processing settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewConfig {
     /// How many reflections deep mirrors are followed: 0 draws reflective polygons as plain
     /// surfaces, 1 shows the level in them, 2 also shows mirrors seen in mirrors, and so
@@ -250,6 +250,10 @@ pub struct ViewConfig {
     /// occluders', and those on moving surfaces. Off, only cached (baked) shadows are drawn:
     /// no carving per frame at all.
     pub dynamic_shadows: bool,
+    /// The size of the light's source for shadows carved every frame, as a multiple of the
+    /// light's size as given (0: hard): all of a dynamic light's, and moving occluders' of
+    /// static lights. Cached (baked) shadows keep the light's size.
+    pub dynamic_softness: f32,
 }
 
 impl Default for ViewConfig {
@@ -258,6 +262,7 @@ impl Default for ViewConfig {
             max_reflections: 1,
             cache_shadows: true,
             dynamic_shadows: true,
+            dynamic_softness: 1.0,
         }
     }
 }
@@ -617,7 +622,7 @@ impl ViewGeometry {
     /// many (light, surface) pairs have a shadow: some of the surface in the light's shadow.
     pub fn bake_shadows(&mut self, world: &World, assets: &Assets) -> usize {
         let carver = &mut self.scratch.carver;
-        carver.prepare(world, assets, world.lights(), false);
+        carver.prepare(world, assets, world.lights(), false, 1.0);
         let geometry = assets.mesh(world.geometry);
         let mut points = Vec::new();
         let mut count = 0;
@@ -710,7 +715,13 @@ impl ViewGeometry {
         self.object_lights.push(0..0); // the level: per sector instead
         self.scratch
             .carver
-            .prepare(world, assets, &self.lights, self.config.dynamic_shadows);
+            .prepare(
+                world,
+                assets,
+                &self.lights,
+                self.config.dynamic_shadows,
+                self.config.dynamic_softness,
+            );
         self.visits.clear();
         self.mirrors.clear();
         self.window_planes.clear();

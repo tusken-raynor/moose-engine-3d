@@ -42,17 +42,15 @@
 //!                         degrees: the cheapest)
 //!   --no-shadows          start with shadows off
 //!   --no-sun              start with the level's directional lights off
-//!   --light-scale K       the level's point and spot lights' source sizes (their shadows'
-//!                         softness) times K (default 1)
+//!   --softness K          every light's source size (its shadows' softness) times K: its
+//!                         own size at 1 (the default), hard shadows at 0
+//!   --dynamic-softness K  the same for shadows carved every frame, dynamic lights' (the
+//!                         flashlight's) and moving occluders', at most --softness (default 1)
 //!   --no-shadow-cache     carve static lights' shadows every frame (to compare)
 //!   --no-dynamic-shadows  only baked shadows: none from the flashlight or moving lights,
 //!                         moving occluders, or on moving surfaces (no carving per frame)
 //!   --hud, --menu PAGE    for --screenshot: draw the debug HUD, or a menu page (main,
 //!                         lighting, flashlight, rendering, sampling, controls), over it
-//!   --sun-angle A         directional lights' source size in degrees, instead of the
-//!                         level's
-//!   --light-radius R      radius of the flashlight's source in meters: its shadows soften
-//!                         over the part of it an occluder covers (default 0.05; 0 is hard)
 //!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
 //!                         degree edge (default 8; 0 is a hard edge)
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
@@ -170,15 +168,14 @@ enum Cone {
 /// How wide its cone fades inside that, in degrees, as the menu steps through them
 /// (`--flashlight-fade`): the inner half-angle is the outer less this. 0 is a hard edge.
 const FLASHLIGHT_FADES: [f32; 6] = [0.0, 2.0, 4.0, 8.0, 14.0, 20.0];
-/// Multiples of the level's point and spot lights' source sizes (their `radius=`) the
-/// menu steps through: 0 casts hard shadows, 1 is as authored.
-const LIGHT_SCALES: [f32; 5] = [0.0, 0.5, 1.0, 2.0, 4.0];
-/// Angular sizes of directional lights' sources the menu steps through, in degrees (the sun is
-/// about 0.53): their shadows soften over the part of it an occluder covers.
-const SUN_ANGLES: [f32; 5] = [0.0, 0.53, 2.0, 5.0, 10.0];
-/// Sizes of its source the menu steps through (radius in meters, `--light-radius`): its shadows
-/// soften over the part of it an occluder covers; 0 casts hard shadows.
-const FLASHLIGHT_RADII: [f32; 5] = [0.0, 0.02, 0.05, 0.1, 0.2];
+/// Multiples of every light's own source size the menu steps through, for all shadows and
+/// again for those carved every frame (`--softness`, `--dynamic-softness`): shadows soften
+/// over the part of the source an occluder covers; 0 casts hard shadows, 1 is the light's
+/// own size. Each light's size is its own: a level light's `radius=`, the sun's angle in
+/// the level, the flashlight's `FLASHLIGHT_RADIUS`.
+const SOFTNESS: [f32; 5] = [0.0, 1.0, 2.0, 4.0, 6.0];
+/// The radius of the flashlight's source, in meters.
+const FLASHLIGHT_RADIUS: f32 = 0.05;
 
 /// Steep surface limits the menu steps through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
@@ -232,14 +229,13 @@ struct Options {
     level_lights: bool,
     no_shadows: bool,
     no_sun: bool,
-    light_scale: f32,
+    softness: f32,
+    dynamic_softness: f32,
     /// For screenshots: draw the debug HUD, or a menu page, over the frame.
     hud: bool,
     menu: Option<Page>,
     no_shadow_cache: bool,
     no_dynamic_shadows: bool,
-    sun_angle: Option<f32>,
-    light_radius: f32,
     flashlight_fade: f32,
     time: f32,
     /// For --screenshot: render the frame this many times more, and report the average.
@@ -309,13 +305,12 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         cone: Cone::Beam,
         no_shadows: false,
         no_sun: false,
-        light_scale: 1.0,
+        softness: 1.0,
+        dynamic_softness: 1.0,
         hud: false,
         menu: None,
         no_shadow_cache: false,
         no_dynamic_shadows: false,
-        sun_angle: None,
-        light_radius: FLASHLIGHT_RADII[2],
         flashlight_fade: FLASHLIGHT_FADES[3],
         level_lights: false,
         time: 0.0,
@@ -402,15 +397,12 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     Page::ALL.map(Page::name).join(", ")
                 ))?);
             }
-            "--light-scale" => {
-                o.light_scale = value()?.parse().map_err(|_| "bad --light-scale")?
+            "--softness" => o.softness = value()?.parse().map_err(|_| "bad --softness")?,
+            "--dynamic-softness" => {
+                o.dynamic_softness = value()?.parse().map_err(|_| "bad --dynamic-softness")?
             }
             "--no-shadow-cache" => o.no_shadow_cache = true,
             "--no-dynamic-shadows" => o.no_dynamic_shadows = true,
-            "--sun-angle" => o.sun_angle = Some(value()?.parse().map_err(|_| "bad --sun-angle")?),
-            "--light-radius" => {
-                o.light_radius = value()?.parse().map_err(|_| "bad --light-radius")?
-            }
             "--flashlight-fade" => {
                 o.flashlight_fade = value()?.parse().map_err(|_| "bad --flashlight-fade")?
             }
@@ -471,13 +463,11 @@ struct Settings {
     shadows: bool,
     /// The level's directional lights (the sun) are on.
     sun: bool,
-    /// Their source's angular size in degrees, if not the level's (one of `SUN_ANGLES`).
-    sun_angle: Option<f32>,
-    /// The level's point and spot lights' source sizes, as a multiple of the level's (one
-    /// of `LIGHT_SCALES`).
-    light_scale: f32,
-    /// The radius of the flashlight's source, in meters (one of `FLASHLIGHT_RADII`).
-    light_radius: f32,
+    /// Every light's source size, as a multiple of its own (one of `SOFTNESS`).
+    softness: f32,
+    /// The same for shadows carved every frame (dynamic lights' and moving occluders'), at
+    /// most `softness`: hard wherever that is.
+    dynamic_softness: f32,
     /// How wide the flashlight's cone fades inside its edge, in degrees (one of
     /// `FLASHLIGHT_FADES`).
     flashlight_fade: f32,
@@ -698,9 +688,8 @@ impl App {
                 level_lights: true,
                 shadows: !options.no_shadows,
                 sun: !options.no_sun,
-                light_scale: options.light_scale.max(0.0),
-                sun_angle: options.sun_angle.map(|a| a.clamp(0.0, 45.0)),
-                light_radius: options.light_radius.max(0.0),
+                softness: options.softness.max(0.0),
+                dynamic_softness: options.dynamic_softness.max(0.0),
                 flashlight_fade: options.flashlight_fade.clamp(0.0, FLASHLIGHT_OUTER),
                 cone: options.cone,
                 flashlight_lock: None,
@@ -1114,10 +1103,15 @@ impl App {
                 ..l
             }
         };
-        // The level's lights (N) and its directional lights (I, with the angle Y sets).
+        // The level's lights (N) and its directional lights (I), their sources' sizes
+        // scaled by the softness setting.
         // Those that cast shadows have fixed shadow slots after the flashlight's (their
         // place in the level plus 1), so their cached shadows stay theirs whatever is on.
         let s = &self.settings;
+        // Shadows carved every frame: their own softness, at most the one for all (the
+        // view scales the lights' sizes below by this).
+        self.geometry.config.dynamic_softness =
+            if s.softness > 0.0 { s.dynamic_softness.min(s.softness) / s.softness } else { 0.0 };
         let mut lights: Vec<Light> = Vec::new();
         for (i, &l) in self.lights.0.iter().enumerate() {
             let mut l = scaled(l);
@@ -1130,13 +1124,14 @@ impl App {
                 if !s.sun {
                     continue;
                 }
-                if let Some(angle) = s.sun_angle {
-                    l.radius = (angle.to_radians() / 2.0).sin();
-                }
+                // Its radius is the sine of its angular radius: the angle is scaled, up to
+                // 22.5 degrees (45 across).
+                let angle = l.radius.clamp(0.0, 1.0).asin() * s.softness;
+                l.radius = angle.min(std::f32::consts::FRAC_PI_8).sin();
             } else if !s.level_lights {
                 continue;
             } else {
-                l.radius *= s.light_scale;
+                l.radius *= s.softness;
             }
             if s.shadows && l.shadows && i + 1 < MAX_SHADOW_SLOTS as usize {
                 l.shadow = Some(i as u8 + 1);
@@ -1147,7 +1142,7 @@ impl App {
             let mut light = scaled(self.flashlight());
             // Shadow slot 0: the view carves its shadows into polygons.
             light.shadow = self.settings.shadows.then_some(0);
-            light.radius = self.settings.light_radius;
+            light.radius = FLASHLIGHT_RADIUS * self.settings.softness;
             light.beam = self.settings.cone == Cone::Beam;
             light.coarse = self.settings.cone == Cone::Soft;
             lights.push(light);
@@ -1234,21 +1229,19 @@ impl App {
         let (s, cfg) = (&self.settings, &self.renderer.config);
         let on = |b: bool| if b { "on" } else { "off" }.to_string();
         let fraction = |t: f32| if t > 0.0 { format!("1/{}", (1.0 / t).round()) } else { "off".into() };
+        let softness = |k: f32| if k > 0.0 { format!("x{k}") } else { "hard".into() };
         match setting {
             Setting::Lit => on(s.lit),
             Setting::LevelLights => {
                 let n = self.lights.0.iter().filter(|l| !l.directional).count();
                 format!("{} ({n})", on(s.level_lights))
             }
-            Setting::LevelLightSize => format!("x{}", s.light_scale),
             Setting::Sun => match self.lights.0.iter().any(|l| l.directional) {
                 true => on(s.sun),
                 false => "none here".into(),
             },
-            Setting::SunSize => match self.lights.0.iter().any(|l| l.directional) {
-                true => format!("{}°", s.sun_angle.unwrap_or(self.level_sun_angle())),
-                false => "-".into(),
-            },
+            Setting::Softness => softness(s.softness),
+            Setting::DynamicSoftness => softness(s.dynamic_softness),
             Setting::SpotPenumbra => format!("x{:.2}", s.penumbra),
             Setting::Shadows => on(s.shadows),
             Setting::DynamicShadows => on(self.geometry.config.dynamic_shadows),
@@ -1256,7 +1249,6 @@ impl App {
             Setting::FlashlightMount => {
                 if s.flashlight_lock.is_some() { "locked here" } else { "shoulder" }.into()
             }
-            Setting::FlashlightSize => format!("{} cm", (s.light_radius * 100.0).round()),
             Setting::FlashlightFade => match (s.cone, s.flashlight_fade) {
                 (Cone::Soft, _) => format!("{FLASHLIGHT_OUTER}° (soft)"),
                 (_, 0.0) => "hard".into(),
@@ -1289,15 +1281,6 @@ impl App {
         }
     }
 
-    /// The level's directional lights' angular size in degrees (0 without any).
-    fn level_sun_angle(&self) -> f32 {
-        self.lights
-            .0
-            .iter()
-            .find(|l| l.directional)
-            .map_or(0.0, |l| (l.radius.asin() * 2.0).to_degrees())
-    }
-
     /// Changes a setting one step (`dir` +1 or -1; on/off settings just toggle).
     fn change(&mut self, setting: Setting, dir: i32) {
         let (s, cfg) = (&mut self.settings, &mut self.renderer.config);
@@ -1305,13 +1288,9 @@ impl App {
         match setting {
             Setting::Lit => s.lit = !s.lit,
             Setting::LevelLights => s.level_lights = !s.level_lights,
-            Setting::LevelLightSize => s.light_scale = cycle(&LIGHT_SCALES, s.light_scale, dir),
             Setting::Sun => s.sun = !s.sun,
-            Setting::SunSize => {
-                let level = self.level_sun_angle();
-                let s = &mut self.settings;
-                s.sun_angle = Some(cycle(&SUN_ANGLES, s.sun_angle.unwrap_or(level), dir));
-            }
+            Setting::Softness => s.softness = cycle(&SOFTNESS, s.softness, dir),
+            Setting::DynamicSoftness => s.dynamic_softness = cycle(&SOFTNESS, s.dynamic_softness, dir),
             Setting::SpotPenumbra => {
                 s.penumbra = if dir > 0 {
                     (s.penumbra * PENUMBRA_STEP).min(64.0)
@@ -1333,7 +1312,6 @@ impl App {
                     None => Some(mount),
                 };
             }
-            Setting::FlashlightSize => s.light_radius = cycle(&FLASHLIGHT_RADII, s.light_radius, dir),
             Setting::FlashlightFade => {
                 s.flashlight_fade = cycle(&FLASHLIGHT_FADES, s.flashlight_fade, dir)
             }
@@ -1443,12 +1421,9 @@ impl App {
         add(format!("--bounces {}", self.geometry.config.max_reflections));
         add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
         add(format!(
-            "--light-radius {} --flashlight-fade {} --light-scale {} --penumbra {}",
-            s.light_radius, s.flashlight_fade, s.light_scale, s.penumbra
+            "--softness {} --dynamic-softness {} --flashlight-fade {} --penumbra {}",
+            s.softness, s.dynamic_softness, s.flashlight_fade, s.penumbra
         ));
-        if let Some(angle) = s.sun_angle {
-            add(format!("--sun-angle {angle}"));
-        }
         add(format!(
             "--min-step {} --light-spacing {} --steep-limit {} --step-threshold {} --penumbra-threshold {}",
             cfg.min_step,
@@ -1754,15 +1729,14 @@ enum Item {
 enum Setting {
     Lit,
     LevelLights,
-    LevelLightSize,
     Sun,
-    SunSize,
+    Softness,
+    DynamicSoftness,
     SpotPenumbra,
     Shadows,
     DynamicShadows,
     Flashlight,
     FlashlightMount,
-    FlashlightSize,
     FlashlightBeam,
     FlashlightFade,
     FlashlightDither,
@@ -1843,16 +1817,15 @@ impl Page {
                 Set(Lit),
                 Set(Shadows),
                 Set(DynamicShadows),
+                Set(Softness),
+                Set(DynamicSoftness),
                 Set(LevelLights),
-                Set(LevelLightSize),
                 Set(Sun),
-                Set(SunSize),
                 Set(SpotPenumbra),
             ],
             Page::Flashlight => &[
                 Set(Flashlight),
                 Set(FlashlightMount),
-                Set(FlashlightSize),
                 Set(FlashlightBeam),
                 Set(FlashlightFade),
                 Set(FlashlightDither),
@@ -1922,15 +1895,14 @@ impl Item {
             Item::Set(s) => match s {
                 Setting::Lit => "All lighting",
                 Setting::LevelLights => "Level lights",
-                Setting::LevelLightSize => "Level light size",
                 Setting::Sun => "Sun",
-                Setting::SunSize => "Sun size",
+                Setting::Softness => "Shadow softness",
+                Setting::DynamicSoftness => "Dynamic softness",
                 Setting::SpotPenumbra => "Spot cone edge",
                 Setting::Shadows => "Shadows",
                 Setting::DynamicShadows => "Dynamic shadows",
                 Setting::Flashlight => "Flashlight",
                 Setting::FlashlightMount => "Mount",
-                Setting::FlashlightSize => "Size",
                 Setting::FlashlightBeam => "Cone",
                 Setting::FlashlightFade => "Fade",
                 Setting::FlashlightDither => "Dither",

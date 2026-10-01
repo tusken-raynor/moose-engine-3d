@@ -504,8 +504,10 @@ pub(crate) struct Carver {
 impl Carver {
     /// Gathers what blocks each shadow-casting light this frame: where portals let it
     /// through, and its occluders' shadow volumes. Without `dynamic`, only static lights'
-    /// (whose shadows are cached; see `ViewConfig::dynamic_shadows`).
-    pub fn prepare(&mut self, world: &World, assets: &Assets, lights: &[Light], dynamic: bool) {
+    /// (whose shadows are cached; see `ViewConfig::dynamic_shadows`). The shadows carved
+    /// every frame, a dynamic light's and moving occluders', are from a source `softness`
+    /// times the light's size (see `ViewConfig::dynamic_softness`).
+    pub fn prepare(&mut self, world: &World, assets: &Assets, lights: &[Light], dynamic: bool, softness: f32) {
         self.casters.clear();
         self.planes.clear();
         self.windows.clear();
@@ -517,6 +519,8 @@ impl Carver {
                 continue;
             };
             let shadows = light.shadows && (dynamic || light.is_static);
+            let carved = Light { radius: light.radius * softness, ..*light };
+            let light = if light.is_static { light } else { &carved };
             let beamed = light.beam && !light.is_point() && !light.directional;
             if !shadows && !beamed {
                 continue;
@@ -611,6 +615,8 @@ impl Carver {
                 }
                 let first = self.volumes.len();
                 let transform = entity.transform();
+                let light = if entity.is_static { light } else { &carved };
+                let source = Source::of(light);
                 let proxy = match entity.occluder {
                     Occluder::None => continue,
                     // Levels of detail aren't loaded yet: the model itself.
