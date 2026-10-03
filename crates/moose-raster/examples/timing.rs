@@ -25,7 +25,7 @@ use glam::Vec3;
 use moose_assets::Assets;
 use moose_raster::shaders::{TexturedFresnel, VertexColor, VertexColorFresnel, Water, filter};
 use moose_raster::{
-    Params, RasterConfig, Renderer, Surface, Target, register_per_filter,
+    MAX_TEXTURES, Params, RasterConfig, Renderer, Surface, Target,
 };
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{PolygonSource, ViewGeometry};
@@ -75,9 +75,8 @@ fn main() {
     let sampler = std::env::var("FILTER").map_or(filter::BILINEAR_MIPMAP_LINEAR, |name| {
         filter::named(&name).expect("FILTER names a sampler")
     });
-    let index = filter::ALL.iter().position(|&f| f == sampler).unwrap();
-    let textured_fresnel = register_per_filter!(renderer, TexturedFresnel)[index];
-    let water = register_per_filter!(renderer, Water)[index];
+    let textured_fresnel = renderer.register_material::<TexturedFresnel>();
+    let water = renderer.register_material::<Water>();
     let use_water = std::env::var("WATER").is_ok_and(|w| w == "1");
     let has_uvs = assets
         .mesh(world.geometry)
@@ -176,6 +175,7 @@ fn main() {
                     };
                     // Water shifts by its texels' size: 2 m tiles of 128 texels.
                     s.params = Params::new(&[f0, 5.0, 2.0 / moose_assets::RIPPLE_SIZE as f32]);
+                    s.filters = [sampler; MAX_TEXTURES];
                     s
                 }
                 _ => Surface::new(shader),

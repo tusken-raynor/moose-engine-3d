@@ -125,6 +125,18 @@ impl AttribData {
         Ok(())
     }
 
+    /// Appends one component given as its numeric value (as [`get_f32`](Self::get_f32)
+    /// reads it): rounded, and clamped to the format's range, for integer formats.
+    pub(crate) fn push_f32(&mut self, x: f32) {
+        match self {
+            Self::U8(v) => v.push(x.round().clamp(0.0, 255.0) as u8),
+            Self::I8(v) => v.push(x.round().clamp(-128.0, 127.0) as i8),
+            Self::I16(v) => v.push(x.round().clamp(-32768.0, 32767.0) as i16),
+            Self::F16(v) => v.push(f32_to_f16_bits(x.clamp(-65504.0, 65504.0))),
+            Self::F32(v) => v.push(x),
+        }
+    }
+
     /// Appends components `range` of `src`, which must have the same format.
     pub(crate) fn extend_from(&mut self, src: &AttribData, range: Range<usize>) {
         match (self, src) {
@@ -169,8 +181,12 @@ impl PolyFlags {
     pub const REFLECTIVE: u32 = 0x1;
     /// Directional lights (the sun) enter its sector through it (level surfaces only).
     pub const SKY: u32 = 0x2;
+    /// Not drawn at all, not even as sky: for a sector's faces that something always
+    /// covers, such as the floor under a terrain (level surfaces only). It still bounds
+    /// the sector.
+    pub const HIDDEN: u32 = 0x4;
     /// Every flag the level format defines.
-    pub const ALL: u32 = Self::REFLECTIVE | Self::SKY;
+    pub const ALL: u32 = Self::REFLECTIVE | Self::SKY | Self::HIDDEN;
     /// A model's shadow proxy: not drawn; its model casts shadows with its proxy polygons
     /// (grouped by bone) instead of the drawn ones. Model polygons only.
     pub const PROXY: u32 = 0x100;
@@ -185,6 +201,10 @@ impl PolyFlags {
 
     pub fn sky(self) -> bool {
         self.0 & Self::SKY != 0
+    }
+
+    pub fn hidden(self) -> bool {
+        self.0 & Self::HIDDEN != 0
     }
 }
 

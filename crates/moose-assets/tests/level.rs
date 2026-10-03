@@ -321,8 +321,8 @@ fn rejects_structure_errors() {
     );
     assert_rejects(
         "0x0    6       0:0",
-        "0x4    6       0:0",
-        "unknown surface flags 0x4",
+        "0x8    6       0:0",
+        "unknown surface flags 0x8",
     );
     assert_rejects(
         "0x0    4       4 3 13 12",
@@ -539,6 +539,16 @@ fn rejects_light_option_and_directional_errors() {
         LEVEL.replacen("   1   0       -1      0x0 ", "   1   0       -1      0x3 ", 1),
         "both reflective and sky",
     );
+    reject(
+        LEVEL.replacen("   1   0       -1      0x0 ", "   1   0       -1      0x6 ", 1),
+        "a hidden surface takes no other flags",
+    );
+    // Hidden on its own loads, and bounds the sector like any surface.
+    let src = LEVEL.replacen("   1   0       -1      0x0 ", "   1   0       -1      0x4 ", 1);
+    let mut a = assets();
+    let level = a.parse_level("two_rooms.mmp", &src).unwrap();
+    let geometry = a.mesh(level.geometry);
+    assert!(geometry.polygons[1].flags.hidden());
 }
 
 #[test]

@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use glam::{Affine3A, Quat, Vec3};
 use moose_assets::{
     Aabb, Assets, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
@@ -23,7 +25,15 @@ pub struct World {
     pub geometry: MeshId,
     pub sectors: Vec<Sector>,
     pub portals: Vec<Portal>,
+    /// Props and actors, and the terrains and view blockers (which aren't drawn as
+    /// themselves: see `terrain` and `blockers`), in the level's order.
     pub entities: Vec<Entity>,
+    /// The terrains, carved by the sectors: drawn piece by piece, each piece with the
+    /// sector it is in.
+    pub terrain: Vec<Terrain>,
+    /// The view blockers' polygons (see `EntityKind::Blocker`), in world space: convex,
+    /// and either side hides what lies wholly behind it.
+    pub blockers: Vec<Vec<Vec3>>,
     pub spawn_points: Vec<SpawnPoint>,
     /// Light that reaches everything (linear RGB; 1 is a surface's full color).
     pub ambient: Vec3,
@@ -83,6 +93,17 @@ impl Entity {
             self.position,
         )
     }
+}
+
+/// A terrain entity's model carved by the sectors (see `moose_assets::Terrain`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Terrain {
+    /// The entity it is (index in `World::entities`).
+    pub entity: u32,
+    /// Its pieces, in world space.
+    pub mesh: MeshId,
+    /// Per sector, its range of the mesh's polygons.
+    pub sectors: Vec<Range<u32>>,
 }
 
 /// A place a player can start.
@@ -151,7 +172,16 @@ impl World {
 
         let mut entities = Vec::new();
         let mut spawn_points = Vec::new();
-        for spawn in level.spawns {
+        // Each terrain's entity, by spawn.
+        let mut entity_of = vec![u32::MAX; level.spawns.len()];
+        for (k, spawn) in level.spawns.into_iter().enumerate() {
+            if spawn.kind != EntityKind::Spawn {
+                entity_of[k] = entities.len() as u32;
+            }
+            // Terrains and blockers cast no shadows; terrains never move.
+            let drawn = spawn.kind.is_drawn();
+            let occluder = if drawn { spawn.occluder } else { Occluder::None };
+            let is_static = spawn.is_static || spawn.kind == EntityKind::Terrain;
             match (spawn.kind, spawn.mesh) {
                 (EntityKind::Spawn, _) => spawn_points.push(SpawnPoint {
                     name: spawn.name,
@@ -170,8 +200,8 @@ impl World {
                     scale: spawn.scale,
                     bounds: Aabb::from_points([]),
                     sectors: Vec::new(),
-                    occluder: spawn.occluder,
-                    is_static: spawn.is_static,
+                    occluder,
+                    is_static,
                     shadow: spawn.shadow,
                     animation: spawn.animation,
                 }),
@@ -185,6 +215,16 @@ impl World {
             sectors: level.sectors,
             portals: level.portals,
             entities,
+            terrain: level
+                .terrain
+                .into_iter()
+                .map(|t| Terrain {
+                    entity: entity_of[t.spawn as usize],
+                    mesh: t.mesh,
+                    sectors: t.sectors,
+                })
+                .collect(),
+            blockers: Vec::new(),
             spawn_points,
             ambient: level.ambient,
             directional: level.directional,
@@ -195,6 +235,15 @@ impl World {
         };
         for i in 0..world.entities.len() {
             world.place_entity(i, assets);
+        }
+        for e in world.entities.iter().filter(|e| e.kind == EntityKind::Blocker) {
+            let mesh = assets.mesh(e.mesh);
+            let model = e.transform();
+            world.blockers.extend(
+                mesh.polygons
+                    .iter()
+                    .map(|p| mesh.polygon_points(p).map(|q| model.transform_point3(q)).collect()),
+            );
         }
         // Directional lights light like the rest (see `Light::directional`).
         let mut lights = level.lights;

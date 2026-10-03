@@ -373,6 +373,7 @@ fn render_ids(
             material: id,
             params: Params::new(&[index]),
             textures: [None; moose_raster::MAX_TEXTURES],
+            filters: Surface::new(id).filters,
             path_override: if p.kind == PolygonKind::World {
                 None
             } else {
@@ -1065,9 +1066,7 @@ fn textured_floors_show_the_texel_under_each_pixel() {
         min_step: 1,
         ..RasterConfig::default()
     });
-    let textured = r.register_material::<
-        moose_raster::shaders::Textured<{ moose_raster::shaders::filter::NEAREST_MIPMAP_NONE }>,
-    >();
+    let textured = r.register_material::<moose_raster::shaders::Textured>();
     let mut out = ViewGeometry::new();
     out.config.max_reflections = 0;
     let floor = |p: &moose_view::ViewPolygon| p.flags.reflective();
@@ -1085,6 +1084,7 @@ fn textured_floors_show_the_texel_under_each_pixel() {
             if floor(p) {
                 Surface {
                     textures: [Some(texture), None],
+                    filters: [moose_raster::shaders::filter::NEAREST_MIPMAP_NONE; moose_raster::MAX_TEXTURES],
                     ..Surface::new(textured)
                 }
             } else {

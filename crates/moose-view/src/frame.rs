@@ -115,6 +115,9 @@ pub enum PolygonKind {
 pub enum PolygonSource {
     World { sector: u32, polygon: u32 },
     Entity { entity: u32, polygon: u32 },
+    /// A piece of a terrain (the entity it is), in `sector`: `polygon` is in its carved
+    /// mesh (see `moose_scene::Terrain`).
+    Terrain { entity: u32, sector: u32, polygon: u32 },
 }
 
 /// A clipped, projected convex polygon, counter-clockwise from the front before projection.
@@ -172,7 +175,9 @@ impl ViewPolygon {
     /// The source polygon's index in its mesh.
     pub fn source_polygon(&self) -> u32 {
         match self.source {
-            PolygonSource::World { polygon, .. } | PolygonSource::Entity { polygon, .. } => polygon,
+            PolygonSource::World { polygon, .. }
+            | PolygonSource::Entity { polygon, .. }
+            | PolygonSource::Terrain { polygon, .. } => polygon,
         }
     }
 }
@@ -283,6 +288,14 @@ pub struct ViewStats {
     pub world_backfacing: u32,
     pub world_outside: u32,
     pub world_drawn: u32,
+    /// Terrain pieces: drawn, facing away, outside their window, and hidden by a view
+    /// blocker.
+    pub terrain_drawn: u32,
+    pub terrain_backfacing: u32,
+    pub terrain_outside: u32,
+    pub terrain_blocked: u32,
+    /// Entities hidden by a view blocker.
+    pub entities_blocked: u32,
     pub entities_culled: u32,
     pub entities_drawn: u32,
     pub entity_polygons_backfacing: u32,
@@ -356,6 +369,7 @@ struct Scratch {
     piece_clipper: Clipper,
     polygon_points: Vec<Vec3>,
     window: WindowScratch,
+    blockers: Blockers,
 }
 
 /// Level positions in clip space, each transformed at most once per space.
@@ -502,7 +516,9 @@ impl ViewGeometry {
     /// out of range of it, or behind it.
     pub fn polygon_lights(&self, p: &ViewPolygon) -> &[u32] {
         let range = match p.source {
-            PolygonSource::World { sector, .. } => self.sector_lights.get(sector as usize),
+            PolygonSource::World { sector, .. } | PolygonSource::Terrain { sector, .. } => {
+                self.sector_lights.get(sector as usize)
+            }
             PolygonSource::Entity { .. } => self.object_lights.get(p.object as usize),
         };
         range.map_or(&[], |r| &self.light_lists[r.start as usize..r.end as usize])
@@ -630,6 +646,9 @@ impl ViewGeometry {
             let sectors = [si as u32];
             for pi in sector.polygons.clone() {
                 let polygon = &geometry.polygons[pi as usize];
+                if polygon.flags.hidden() {
+                    continue;
+                }
                 points.clear();
                 points.extend(geometry.polygon_points(polygon));
                 let receiver = Receiver {
@@ -645,8 +664,31 @@ impl ViewGeometry {
                 count += shadowed(carver, bits, (0, pi, 0));
             }
         }
+        for terrain in &world.terrain {
+            let mesh = assets.mesh(terrain.mesh);
+            for (si, pieces) in terrain.sectors.iter().enumerate() {
+                let sectors = [si as u32];
+                for pi in pieces.clone() {
+                    let polygon = &mesh.polygons[pi as usize];
+                    points.clear();
+                    points.extend(mesh.polygon_points(polygon));
+                    let receiver = Receiver {
+                        sectors: &sectors,
+                        entity: None,
+                        normal: polygon.plane.normal,
+                        point: points[0],
+                        parts: Parts::All,
+                        beams: false,
+                        hard: false,
+                    };
+                    let key = (2, terrain.entity, pi);
+                    let bits = carver.cache(key, &points, &receiver);
+                    count += shadowed(carver, bits, key);
+                }
+            }
+        }
         for (ei, entity) in world.entities.iter().enumerate() {
-            if !entity.is_static {
+            if !entity.is_static || !entity.kind.is_drawn() {
                 continue;
             }
             let mesh = assets.mesh(entity.mesh);
@@ -813,6 +855,7 @@ impl ViewGeometry {
             let space = Space::of(direct, &self.mirrors, group);
             let depth = group.map_or(0, |m| self.mirrors[m as usize].depth);
             s.level.begin(geometry.positions.len());
+            s.blockers.build(&world.blockers, space.eye);
             let level = &mut s.level;
             let mut level_pos = |i: u32| level.get(i, &space, &geometry.positions);
 
@@ -834,6 +877,9 @@ impl ViewGeometry {
                 s.mirror_polygons.clear();
                 for pi in sector.polygons.clone() {
                     let polygon = &geometry.polygons[pi as usize];
+                    if polygon.flags.hidden() {
+                        continue;
+                    }
                     if polygon.plane.distance(space.eye) <= 0.0 {
                         self.stats.world_backfacing += 1;
                         continue;
@@ -887,6 +933,77 @@ impl ViewGeometry {
                     self.stats.world_drawn += 1;
                     if polygon.flags.reflective() && depth < max_reflections {
                         s.mirror_polygons.push((pi, drawn));
+                    }
+                }
+
+                // Terrain pieces in this sector: clipped to the window like its walls, but
+                // sorted in (a terrain's pieces can overlap each other on screen).
+                for terrain in &world.terrain {
+                    let Some(pieces) = terrain.sectors.get(visit.sector as usize) else {
+                        continue;
+                    };
+                    let mesh = assets.mesh(terrain.mesh);
+                    for pi in pieces.clone() {
+                        let polygon = &mesh.polygons[pi as usize];
+                        if polygon.plane.distance(space.eye) <= 0.0 {
+                            self.stats.terrain_backfacing += 1;
+                            continue;
+                        }
+                        s.polygon_points.clear();
+                        s.polygon_points.extend(mesh.polygon_points(polygon));
+                        if s.blockers.hides(&s.polygon_points) {
+                            self.stats.terrain_blocked += 1;
+                            continue;
+                        }
+                        build_record(
+                            &mut s.record,
+                            mesh,
+                            polygon,
+                            space.reversed(),
+                            &mut |i| {
+                                let p = mesh.positions[i as usize];
+                                (space.to_clip(p), p)
+                            },
+                        );
+                        let (clipped, edges) = s.clipper.clip(
+                            &s.record,
+                            RECORD + polygon.vertex_count as usize,
+                            &s.planes,
+                        );
+                        if clipped.is_empty() {
+                            self.stats.terrain_outside += 1;
+                            continue;
+                        }
+                        emit_pieces(
+                            &mut out,
+                            &mut s.carver,
+                            view,
+                            Receiving {
+                                space: &space,
+                                planes: &s.planes,
+                                clipper: &mut s.piece_clipper,
+                                is_static: self.config.cache_shadows,
+                                dynamic: self.config.dynamic_shadows,
+                                polygon: &s.polygon_points,
+                            },
+                            clipped,
+                            edges,
+                            &self.window_lines[range(&visit.window)],
+                            polygon.vertex_count as usize,
+                            terrain.mesh,
+                            0,
+                            PolygonKind::Prop,
+                            PolygonSource::Terrain {
+                                entity: terrain.entity,
+                                sector: visit.sector,
+                                polygon: pi,
+                            },
+                            polygon.flags,
+                            group,
+                            &[visit.sector],
+                            polygon.plane.normal,
+                        );
+                        self.stats.terrain_drawn += 1;
                     }
                 }
 
@@ -1006,9 +1123,17 @@ impl ViewGeometry {
         let near = ClipPlane::near(view.near);
         for group in std::iter::once(None).chain((0..self.mirrors.len() as u32).map(Some)) {
             let space = Space::of(direct, &self.mirrors, group);
+            s.blockers.build(&world.blockers, space.eye);
             for (ei, entity) in world.entities.iter().enumerate() {
-                let corners =
-                    box_corners(entity.bounds.min, entity.bounds.max).map(|c| space.to_clip(c));
+                if !entity.kind.is_drawn() {
+                    continue;
+                }
+                let box_world = box_corners(entity.bounds.min, entity.bounds.max);
+                if s.blockers.hides(&box_world) {
+                    self.stats.entities_blocked += 1;
+                    continue;
+                }
+                let corners = box_world.map(|c| space.to_clip(c));
                 let seen = entity.sectors.iter().any(|&sector| {
                     self.visits
                         .iter()
@@ -1384,7 +1509,7 @@ fn emit_pieces(
         sectors,
         entity: match source {
             PolygonSource::Entity { entity, .. } => Some(entity),
-            PolygonSource::World { .. } => None,
+            PolygonSource::World { .. } | PolygonSource::Terrain { .. } => None,
         },
         normal,
         point: Vec3::from_slice(&records[3..6]),
@@ -1399,6 +1524,7 @@ fn emit_pieces(
     let key = match source {
         PolygonSource::World { polygon, .. } => (0, polygon, 0),
         PolygonSource::Entity { entity, polygon } => (1, entity, polygon),
+        PolygonSource::Terrain { entity, polygon, .. } => (2, entity, polygon),
     };
     let cached = if receiving.is_static {
         receiver.point = receiving.polygon[0];
@@ -1891,6 +2017,64 @@ fn outline<'a>(geometry: &'a Mesh, portal: &'a Portal) -> impl Iterator<Item = V
         .positions
         .iter()
         .map(|&i| geometry.positions[i as usize])
+}
+
+/// What the view blockers hide from one eye: for each blocker polygon not edge-on to it,
+/// the region behind the polygon within the planes through the eye and its edges (planes
+/// keeping `normal · p + d > 0`).
+#[derive(Default)]
+struct Blockers {
+    planes: Vec<(Vec3, f32)>,
+    volumes: Vec<Range<usize>>,
+}
+
+/// How far inside a blocker's region a point must be to count as hidden, in meters.
+const BLOCKED: f32 = 1e-3;
+
+impl Blockers {
+    fn build(&mut self, polygons: &[Vec<Vec3>], eye: Vec3) {
+        self.planes.clear();
+        self.volumes.clear();
+        for points in polygons {
+            if points.len() < 3 {
+                continue;
+            }
+            let center = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+            let Some(normal) = (1..points.len() - 1)
+                .map(|i| (points[i] - points[0]).cross(points[i + 1] - points[0]))
+                .sum::<Vec3>()
+                .try_normalize()
+            else {
+                continue;
+            };
+            // Either side hides: the far side from the eye.
+            let side = normal.dot(eye - center);
+            if side.abs() < BLOCKED {
+                continue;
+            }
+            let start = self.planes.len();
+            let behind = if side > 0.0 { -normal } else { normal };
+            self.planes.push((behind, -behind.dot(center)));
+            for i in 0..points.len() {
+                let (a, b) = (points[i], points[(i + 1) % points.len()]);
+                let Some(n) = (a - eye).cross(b - eye).try_normalize() else {
+                    continue;
+                };
+                let n = if n.dot(center - eye) < 0.0 { -n } else { n };
+                self.planes.push((n, -n.dot(eye)));
+            }
+            self.volumes.push(start..self.planes.len());
+        }
+    }
+
+    /// Whether `points` (the corners of something convex) all lie behind one blocker.
+    fn hides(&self, points: &[Vec3]) -> bool {
+        self.volumes.iter().any(|v| {
+            self.planes[v.clone()]
+                .iter()
+                .all(|&(n, d)| points.iter().all(|&p| n.dot(p) + d > BLOCKED))
+        })
+    }
 }
 
 fn box_corners(min: Vec3, max: Vec3) -> [Vec3; 8] {

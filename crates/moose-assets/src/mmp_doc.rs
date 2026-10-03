@@ -240,12 +240,8 @@ impl LevelDoc {
             if r.tokens.len() < 11 {
                 return Err(c.err(r.no, format!("entity row needs 11 fields, found {}", r.tokens.len())));
             }
-            let kind = match r.tokens[0].as_str() {
-                "spawn" => EntityKind::Spawn,
-                "prop" => EntityKind::Prop,
-                "actor" => EntityKind::Actor,
-                k => return Err(c.err(r.no, format!("unknown entity kind '{k}'"))),
-            };
+            let kind = EntityKind::named(&r.tokens[0])
+                .ok_or_else(|| c.err(r.no, format!("unknown entity kind '{}'", r.tokens[0])))?;
             let (pitch, yaw, roll) = (c.float(r, 6)?, c.float(r, 7)?, c.float(r, 8)?);
             entities.push(EntityDoc {
                 kind,
@@ -405,14 +401,10 @@ impl LevelDoc {
                 .into(),
         );
         for (i, e) in self.entities.iter().enumerate() {
-            let kind = match e.kind {
-                EntityKind::Spawn => "spawn",
-                EntityKind::Prop => "prop",
-                EntityKind::Actor => "actor",
-            };
+            let kind = e.kind.name();
             let (yaw, pitch, roll) = e.rotation.to_euler(EulerRot::YXZ);
             line(format!(
-                "   {i:<3} {kind:<6} {:<7} {:<10} {:<7} {:<7} {:<7} {:<6} {:<6} {:<6} {:<6} {}  {}",
+                "   {i:<3} {kind:<7} {:<7} {:<10} {:<7} {:<7} {:<7} {:<6} {:<6} {:<6} {:<6} {}  {}",
                 e.sector,
                 e.model.as_deref().unwrap_or("-"),
                 number(e.position.x),

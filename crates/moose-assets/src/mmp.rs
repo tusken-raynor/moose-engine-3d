@@ -10,8 +10,9 @@ use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
 use crate::level::{
     DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, ShadowKind, Oscillation, Portal,
-    PortalFlags, Sector,
+    PortalFlags, Sector, Terrain,
 };
+use crate::terrain::{self, Region};
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
 use crate::store::Assets;
 use crate::text::{Line, tokenize};
@@ -356,10 +357,16 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 format!("surface {i}: unknown surface flags 0x{flags:x}"),
             ));
         }
-        if flags & PolyFlags::ALL == PolyFlags::ALL {
+        if flags & (PolyFlags::REFLECTIVE | PolyFlags::SKY) == PolyFlags::REFLECTIVE | PolyFlags::SKY {
             return Err(c.err(
                 r.no,
                 format!("surface {i}: a surface cannot be both reflective and sky"),
+            ));
+        }
+        if flags & PolyFlags::HIDDEN != 0 && flags != PolyFlags::HIDDEN {
+            return Err(c.err(
+                r.no,
+                format!("surface {i}: a hidden surface takes no other flags"),
             ));
         }
         if flags != 0 && adjoin.is_some() {
@@ -479,16 +486,14 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             ));
         }
         let name = r.tokens[10].clone();
-        let kind = match r.tokens[0].as_str() {
-            "spawn" => EntityKind::Spawn,
-            "prop" => EntityKind::Prop,
-            "actor" => EntityKind::Actor,
-            k => {
-                return Err(c.err(
-                    r.no,
-                    format!("entity '{name}': unknown kind '{k}' (expected spawn, prop or actor)"),
-                ));
-            }
+        let Some(kind) = EntityKind::named(&r.tokens[0]) else {
+            return Err(c.err(
+                r.no,
+                format!(
+                    "entity '{name}': unknown kind '{}' (expected spawn, prop, actor, terrain or blocker)",
+                    r.tokens[0]
+                ),
+            ));
         };
         let sector: usize = c.parse(r, 1, "sector index")?;
         if sector >= sectors.len() {
@@ -510,7 +515,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     format!("entity '{name}': spawn points take no model ('-')"),
                 ));
             }
-            (EntityKind::Prop | EntityKind::Actor, None) => {
+            (EntityKind::Prop | EntityKind::Actor | EntityKind::Terrain | EntityKind::Blocker, None) => {
                 return Err(c.err(r.no, format!("entity '{name}': needs a model")));
             }
             _ => {}
@@ -535,6 +540,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             let fail = |m: String| c.err(r.no, format!("entity '{name}': {m}"));
             if kind == EntityKind::Spawn {
                 return Err(fail(format!("spawn points take no options ('{option}')")));
+            }
+            if !kind.is_drawn() {
+                return Err(fail(format!("{} entities take no options ('{option}')", kind.name())));
             }
             match option.split_once('=') {
                 None | Some(("static", "on" | "off")) if option_key(option) == "static" => {
@@ -876,8 +884,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
     }
 
-    // ---- Validation: entities sit inside their sector
-    for e in &entities {
+    // ---- Validation: entities sit inside their sector (a terrain spans many: its origin
+    // can be anywhere)
+    for e in entities.iter().filter(|e| e.kind != EntityKind::Terrain) {
         let s = &sectors[e.sector];
         let tol = TOLERANCE
             * (bounds[e.sector].max - bounds[e.sector].min)
@@ -1023,12 +1032,54 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
     let geometry = assets.add_mesh(builder.finish(&mut outlines));
 
+    // ---- Terrains, carved by the sectors. A portal's two sides cut with the same plane
+    // (the lower surface's, reversed on the other side), so the pieces on both sides share
+    // their points on it exactly.
+    let plane_of = |i: usize| -> Plane {
+        let surf = &surfaces[i];
+        match surf.adjoin.map(|a| adjoins[adjoins[a].mirror].surface) {
+            Some(other) if other < i => {
+                let p = surfaces[other].plane;
+                Plane { normal: -p.normal, d: -p.d }
+            }
+            _ => surf.plane,
+        }
+    };
+    let regions: Vec<Region> = sectors
+        .iter()
+        .enumerate()
+        .map(|(si, s)| Region {
+            planes: (s.first..s.first + s.count).map(plane_of).collect(),
+            bounds: bounds[si],
+        })
+        .collect();
+    let mut terrain = Vec::new();
+    for (k, spawn) in spawns.iter().enumerate() {
+        if spawn.kind != EntityKind::Terrain {
+            continue;
+        }
+        let transform = glam::Affine3A::from_scale_rotation_translation(
+            Vec3::splat(spawn.scale),
+            spawn.rotation,
+            spawn.position,
+        );
+        let model = assets.mesh(spawn.mesh.expect("terrains have models"));
+        let (mesh, ranges, _) =
+            terrain::carve(&format!("{} (carved)", spawn.name), model, transform, spawn.rotation, &regions);
+        terrain.push(Terrain {
+            spawn: k as u32,
+            mesh: assets.add_mesh(mesh),
+            sectors: ranges,
+        });
+    }
+
     Ok(Level {
         name: level_name,
         geometry,
         sectors: sectors_out,
         portals,
         spawns,
+        terrain,
         ambient,
         lights: lights.into_iter().map(|(_, l)| l).collect(),
         directional,

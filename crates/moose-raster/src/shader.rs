@@ -200,29 +200,6 @@ pub mod filter {
     }
 }
 
-/// Registers a material generic over a sampler (its `FILTER` parameter, like
-/// [`Textured`](crate::shaders::Textured)) once per sampler, in [`filter::ALL`] order:
-/// `register_per_filter!(renderer, Textured)` is a `[MaterialId; 12]`.
-#[macro_export]
-macro_rules! register_per_filter {
-    ($renderer:expr, $material:ident) => {{
-        let r = &mut $renderer;
-        [
-            r.register_material::<$material<{ $crate::shader::filter::ALL[0] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[1] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[2] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[3] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[4] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[5] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[6] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[7] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[8] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[9] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[10] }>>(),
-            r.register_material::<$material<{ $crate::shader::filter::ALL[11] }>>(),
-        ]
-    }};
-}
 
 /// Unreal-style texel dithering, as version 1 did it: each pixel's texture coordinates move
 /// by `-e` in u and `+e` in v, with `e` from this matrix at `[x & 3][y & 3]` (screen x and
@@ -621,6 +598,56 @@ pub fn sample_cube<const FILTER: u8>(tex: &Texture, d: [F32s; 3], lod: f32, at: 
         at,
     };
     mip_transition(filter::mip(FILTER), tex.levels.len(), lod, at, &read)
+}
+
+/// [`sample_texture`] with sampler `filter` (one of [`filter::ALL`]) picked at run time: a
+/// `match` on a value the same for a whole polygon, so its branch is always predicted, each
+/// arm the sampler compiled in full. As fast as a copy of the material per sampler
+/// (measured), with one copy.
+#[inline(always)]
+pub fn sample_by(tex: &Texture, u: I32s, v: I32s, lod: I16s, at: Pixels, filter: u8) -> U32s {
+    match filter {
+        filter::NEAREST_MIPMAP_NONE => sample_texture::<{ filter::NEAREST_MIPMAP_NONE }>(tex, u, v, lod, at),
+        filter::BILINEAR_MIPMAP_NONE => sample_texture::<{ filter::BILINEAR_MIPMAP_NONE }>(tex, u, v, lod, at),
+        filter::DITHERED_MIPMAP_NONE => sample_texture::<{ filter::DITHERED_MIPMAP_NONE }>(tex, u, v, lod, at),
+        filter::NEAREST_MIPMAP_NEAREST => sample_texture::<{ filter::NEAREST_MIPMAP_NEAREST }>(tex, u, v, lod, at),
+        filter::NEAREST_MIPMAP_LINEAR => sample_texture::<{ filter::NEAREST_MIPMAP_LINEAR }>(tex, u, v, lod, at),
+        filter::NEAREST_MIPMAP_DITHERED => sample_texture::<{ filter::NEAREST_MIPMAP_DITHERED }>(tex, u, v, lod, at),
+        filter::BILINEAR_MIPMAP_NEAREST => sample_texture::<{ filter::BILINEAR_MIPMAP_NEAREST }>(tex, u, v, lod, at),
+        filter::BILINEAR_MIPMAP_DITHERED => sample_texture::<{ filter::BILINEAR_MIPMAP_DITHERED }>(tex, u, v, lod, at),
+        filter::DITHERED_MIPMAP_NEAREST => sample_texture::<{ filter::DITHERED_MIPMAP_NEAREST }>(tex, u, v, lod, at),
+        filter::DITHERED_MIPMAP_LINEAR => sample_texture::<{ filter::DITHERED_MIPMAP_LINEAR }>(tex, u, v, lod, at),
+        filter::DITHERED_MIPMAP_DITHERED => sample_texture::<{ filter::DITHERED_MIPMAP_DITHERED }>(tex, u, v, lod, at),
+        _ => sample_texture::<{ filter::BILINEAR_MIPMAP_LINEAR }>(tex, u, v, lod, at),
+    }
+}
+
+/// [`sample_cube`] with sampler `filter` picked at run time (see [`sample_by`]).
+#[inline(always)]
+pub fn sample_cube_by(tex: &Texture, d: [F32s; 3], lod: f32, at: Pixels, filter: u8) -> U32s {
+    match filter {
+        filter::NEAREST_MIPMAP_NONE => sample_cube::<{ filter::NEAREST_MIPMAP_NONE }>(tex, d, lod, at),
+        filter::BILINEAR_MIPMAP_NONE => sample_cube::<{ filter::BILINEAR_MIPMAP_NONE }>(tex, d, lod, at),
+        filter::DITHERED_MIPMAP_NONE => sample_cube::<{ filter::DITHERED_MIPMAP_NONE }>(tex, d, lod, at),
+        filter::NEAREST_MIPMAP_NEAREST => sample_cube::<{ filter::NEAREST_MIPMAP_NEAREST }>(tex, d, lod, at),
+        filter::NEAREST_MIPMAP_LINEAR => sample_cube::<{ filter::NEAREST_MIPMAP_LINEAR }>(tex, d, lod, at),
+        filter::NEAREST_MIPMAP_DITHERED => sample_cube::<{ filter::NEAREST_MIPMAP_DITHERED }>(tex, d, lod, at),
+        filter::BILINEAR_MIPMAP_NEAREST => sample_cube::<{ filter::BILINEAR_MIPMAP_NEAREST }>(tex, d, lod, at),
+        filter::BILINEAR_MIPMAP_DITHERED => sample_cube::<{ filter::BILINEAR_MIPMAP_DITHERED }>(tex, d, lod, at),
+        filter::DITHERED_MIPMAP_NEAREST => sample_cube::<{ filter::DITHERED_MIPMAP_NEAREST }>(tex, d, lod, at),
+        filter::DITHERED_MIPMAP_LINEAR => sample_cube::<{ filter::DITHERED_MIPMAP_LINEAR }>(tex, d, lod, at),
+        filter::DITHERED_MIPMAP_DITHERED => sample_cube::<{ filter::DITHERED_MIPMAP_DITHERED }>(tex, d, lod, at),
+        _ => sample_cube::<{ filter::BILINEAR_MIPMAP_LINEAR }>(tex, d, lod, at),
+    }
+}
+
+impl PixelContext<'_> {
+    /// Texture slot `slot`'s color at `uv` (16.16, one repeat being 65536) and level of
+    /// detail `lod` (see [`LOD`]), read with the slot's sampler.
+    #[inline(always)]
+    pub fn texel(&self, slot: usize, uv: &[I32s; 2], lod: I16s) -> U32s {
+        sample_by(self.textures[slot], uv[0], uv[1], lod, self.at, self.filters[slot])
+    }
 }
 
 /// A cube map's level, read with sampler `FILTER`'s texel method.
@@ -1139,6 +1166,9 @@ pub struct PixelContext<'a> {
     /// The screen position of the [`LANES`] pixels.
     pub at: Pixels,
     pub textures: &'a TextureSet<'a>,
+    /// Each texture slot's sampler (one of [`filter::ALL`]), picked per polygon (see
+    /// [`PixelContext::texel`]).
+    pub filters: [u8; MAX_TEXTURES],
     pub params: &'a Params,
     pub focal: f32,
     /// Lights whose shadows cover part of the polygon; see [`PixelContext::light`].
@@ -1397,6 +1427,8 @@ impl<'a> RowBehind<'a> {
 pub struct Draw<'a> {
     pub params: &'a Params,
     pub textures: &'a TextureSet<'a>,
+    /// Each texture slot's sampler (see [`filter`]).
+    pub filters: [u8; MAX_TEXTURES],
     pub eye: Vec3,
     pub focal: f32,
     pub object: &'a Object,
@@ -1685,6 +1717,7 @@ impl Run<'_> {
                 stride: STRIDE,
             },
             textures: self.draw.textures,
+            filters: self.draw.filters,
             params: self.draw.params,
             focal: self.draw.focal,
             split,
@@ -1974,6 +2007,7 @@ mod tests {
                     &Draw {
                         params: &Params::default(),
                         textures: &[&blank, &blank],
+                        filters: [filter::BILINEAR_MIPMAP_LINEAR; MAX_TEXTURES],
                         eye: Vec3::ZERO,
                         focal: 1.0,
                         object: &Object::IDENTITY,

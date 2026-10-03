@@ -319,7 +319,13 @@ Each step ends with every test passing and screenshots checked.
 - [x] `Ny` capped at 8, keeping bands independent (built as 8-row blocks, see above). Raised to 32 on Sep 28, with each band building only the grid rows it needs.
 - [x] Vertex-stage output caching for static geometry deferred.
 
+## Samplers are picked at run time
+
+Oct 1, 2026. Materials were compiled once per sampler (a `FILTER` const parameter, 12 copies each). Now each texture slot's sampler is part of the `Surface` (`Surface::filters`), passed to the shader (`PixelContext::filters`), and read with `PixelContext::texel`: a `match` on a value the same for a whole polygon, so its branch is always predicted, each arm the sampler compiled in full. Measured on two texture-heavy views at 1920×1080: as fast as the compiled copies or faster (within noise), the same pixels, and the app 3.4 MB instead of 5.1. Artists can pin a slot's sampler per material (see the Material Format Spec); compiled copies are left for options that change what a shader computes.
+
 ## Planned: material variants per scenario
+
+(Folded into the Material Format Spec's scenarios.)
 
 Noted Sep 29, to build later. Very likely worth it: mirrors redraw whole sectors, so a cheaper material there saves on every reflective surface without changing the default look. A material can name cheaper materials to draw with in particular scenarios, starting with polygons seen in a reflection.
 

@@ -560,6 +560,9 @@ impl Carver {
                 continue;
             }
             let source = Source::of(light);
+            // Openings that meet sky surfaces the sun comes in through let it through
+            // together with them: no penumbra between them (see `open_air`).
+            let hard = Light { radius: 0.0, ..*light };
             // Windows: out through portals, each clipped to the window it was seen through.
             // A directional light starts at the sky surfaces it shines in through: windows
             // into their sectors.
@@ -570,15 +573,13 @@ impl Carver {
                 // Here for its beam only.
             } else if light.directional {
                 for (s, sector) in world.sectors.iter().enumerate() {
-                    for p in sector.polygons.clone() {
+                    for p in sector.polygons.clone().filter(|&p| lets_in(geometry, light, p)) {
                         let polygon = &geometry.polygons[p as usize];
-                        if !polygon.flags.sky() || polygon.plane.normal.dot(light.direction) <= 0.0
-                        {
-                            continue;
-                        }
+                        let outline = &geometry.vertex_positions[polygon.vertices()];
+                        let open = open_air(geometry, light, sector, outline, Some(p));
                         self.points.clear();
                         self.points.extend(geometry.polygon_points(polygon));
-                        let window = self.add_window(light, slot);
+                        let window = self.add_window(if open { &hard } else { light }, slot);
                         self.stack.push((s as u32, Some(window), 0));
                     }
                 }
@@ -622,7 +623,9 @@ impl Carver {
                             continue;
                         }
                     }
-                    let window = self.add_window(light, slot);
+                    let target = &world.sectors[portal.target as usize];
+                    let open = light.directional && open_air(geometry, light, target, &portal.positions, None);
+                    let window = self.add_window(if open { &hard } else { light }, slot);
                     self.stack.push((portal.target, Some(window), depth + 1));
                 }
             }
@@ -1719,6 +1722,33 @@ fn refine(value: &impl Fn(Vec3, Vec3) -> f32, a: (Vec3, f32), b: (Vec3, f32), de
 }
 
 /// A point on a portal (its first corner).
+/// Whether directional `light` comes into a sector through level polygon `p`: a sky
+/// surface facing away from it.
+fn lets_in(geometry: &Mesh, light: &Light, p: u32) -> bool {
+    let polygon = &geometry.polygons[p as usize];
+    polygon.flags.sky() && polygon.plane.normal.dot(light.direction) > 0.0
+}
+
+/// Whether an opening into `sector` (its outline's position indices: a sky surface of it,
+/// `own`, or a portal into it) meets one of the sector's other sky surfaces that directional
+/// `light` comes in through, at an edge. The two let the light through together, so it has
+/// no soft edge there; carved soft, each would let only part of it through at their shared
+/// edge, leaving a dim seam (as between an open-air sector's walls and ceiling). Such an
+/// opening is carved hard: the edges of openings that show (bounded by solid walls) are
+/// soft as before.
+fn open_air(geometry: &Mesh, light: &Light, sector: &moose_assets::Sector, outline: &[u32], own: Option<u32>) -> bool {
+    sector.polygons.clone().filter(|&q| Some(q) != own && lets_in(geometry, light, q)).any(|q| {
+        let other = &geometry.vertex_positions[geometry.polygons[q as usize].vertices()];
+        (0..outline.len()).any(|i| {
+            let (a, b) = (outline[i], outline[(i + 1) % outline.len()]);
+            (0..other.len()).any(|k| {
+                let (c, d) = (other[k], other[(k + 1) % other.len()]);
+                (c, d) == (b, a) || (c, d) == (a, b)
+            })
+        })
+    })
+}
+
 fn portal_point(geometry: &Mesh, portal: &moose_assets::Portal) -> Vec3 {
     geometry.positions[portal.positions[0] as usize]
 }

@@ -123,6 +123,9 @@ pub struct Surface {
     /// The textures the material samples (see [`TextureSet`]); unbound slots get a 1x1
     /// white one.
     pub textures: [Option<TextureId>; MAX_TEXTURES],
+    /// Each texture slot's sampler (one of [`filter::ALL`](crate::shader::filter::ALL)),
+    /// which the material reads it with: picked at run time, per polygon.
+    pub filters: [u8; MAX_TEXTURES],
 }
 
 impl Surface {
@@ -132,6 +135,7 @@ impl Surface {
             params: Params::default(),
             path_override: None,
             textures: [None; MAX_TEXTURES],
+            filters: [crate::shader::filter::BILINEAR_MIPMAP_LINEAR; MAX_TEXTURES],
         }
     }
 }
@@ -253,6 +257,7 @@ struct PolygonSetup {
     material: MaterialId,
     params: Params,
     textures: [Option<TextureId>; MAX_TEXTURES],
+    filters: [u8; MAX_TEXTURES],
     /// What its sample stage sees: the eye of the space it is seen in, and its object.
     eye: Vec3,
     object: Object,
@@ -998,6 +1003,7 @@ fn setup_polygon(
         material: s.material,
         params: s.params,
         textures: s.textures,
+        filters: s.filters,
         eye: p
             .mirror
             .map_or(geometry.eye, |m| geometry.mirrors[m as usize].eye),
@@ -2257,6 +2263,7 @@ fn shade_points(
     let draw = Draw {
         params: &p.params,
         textures: &textures.set(p.textures),
+        filters: p.filters,
         eye: p.eye,
         focal: textures.focal,
         object: &p.object,

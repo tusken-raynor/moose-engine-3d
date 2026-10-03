@@ -15,6 +15,8 @@ pub struct Level {
     /// Ordered by sector; each sector's portals are a contiguous range.
     pub portals: Vec<Portal>,
     pub spawns: Vec<EntitySpawn>,
+    /// The terrains (`EntityKind::Terrain` spawns), carved by the sectors.
+    pub terrain: Vec<Terrain>,
     /// Light that reaches everything, in linear RGB (1 is a surface's full color).
     pub ambient: Vec3,
     pub lights: Vec<Light>,
@@ -288,6 +290,51 @@ pub enum EntityKind {
     Spawn,
     Prop,
     Actor,
+    /// A static mesh too big and too open for a prop, such as a landscape: carved at load
+    /// into pieces, each inside one sector (see [`Terrain`]). Never drawn whole.
+    Terrain,
+    /// A view blocker: its model's polygons, never drawn, hide from the eye whatever lies
+    /// wholly behind one of them (props, actors, terrain pieces). Placed inside solid
+    /// things, such as a hill, where portals can't help.
+    Blocker,
+}
+
+impl EntityKind {
+    pub const ALL: [EntityKind; 5] =
+        [EntityKind::Spawn, EntityKind::Prop, EntityKind::Actor, EntityKind::Terrain, EntityKind::Blocker];
+
+    /// Its name in level files.
+    pub fn name(self) -> &'static str {
+        match self {
+            EntityKind::Spawn => "spawn",
+            EntityKind::Prop => "prop",
+            EntityKind::Actor => "actor",
+            EntityKind::Terrain => "terrain",
+            EntityKind::Blocker => "blocker",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<EntityKind> {
+        EntityKind::ALL.into_iter().find(|k| k.name() == name)
+    }
+
+    /// Whether it is drawn as itself: a prop or an actor.
+    pub fn is_drawn(self) -> bool {
+        matches!(self, EntityKind::Prop | EntityKind::Actor)
+    }
+}
+
+/// A terrain entity's model carved by the level's sectors: every polygon of it clipped to
+/// each sector it crosses, so each piece lies inside one sector, and what lies outside
+/// every sector dropped. Pieces are in world space, grouped by sector, and share their
+/// corners exactly where they meet (cut points are computed the same way on both sides).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Terrain {
+    /// The entity (index in `Level::spawns`).
+    pub spawn: u32,
+    pub mesh: MeshId,
+    /// Per sector, its range of the mesh's polygons.
+    pub sectors: Vec<Range<u32>>,
 }
 
 /// Placement data for an entity, as read from the level. Creating live

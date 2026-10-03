@@ -379,7 +379,8 @@ impl Editor {
                     .0;
                 Some(Selection::Surface(surface))
             }
-            PolygonSource::Entity { entity, .. } => {
+            // A terrain's pieces stand for the terrain.
+            PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => {
                 // The world's entities are the rows that aren't spawn points, in order.
                 let row = self
                     .doc
@@ -451,7 +452,11 @@ impl Editor {
     /// nearest it, within a few pixels.
     pub fn pick_2d(&self, ortho: &Ortho, world: &World, at: Vec2) -> Option<Selection> {
         let mut best: Option<(f32, Selection)> = None;
+        // Not terrains, which cover everything.
         for (i, e) in world.entities.iter().enumerate() {
+            if e.kind == EntityKind::Terrain {
+                continue;
+            }
             let corners = (0..8).map(|k| {
                 let pick = |bit: usize, lo: f32, hi: f32| if k & bit == 0 { lo } else { hi };
                 ortho.to_screen(Vec3::new(
@@ -609,14 +614,10 @@ impl Editor {
             Some(Selection::Entity(i)) => {
                 let e = &self.doc.entities[i];
                 let (yaw, pitch, roll) = e.rotation.to_euler(EulerRot::YXZ);
-                let kind = match e.kind {
-                    EntityKind::Spawn => "spawn",
-                    EntityKind::Prop => "prop",
-                    EntityKind::Actor => "actor",
-                };
+                // Props and actors switch between each other; other kinds stay as they are.
                 let mut rows = vec![
                     row("Name", e.name.clone(), None),
-                    row("Kind", kind.into(), (e.kind != EntityKind::Spawn).then_some(Field::Kind)),
+                    row("Kind", e.kind.name().into(), e.kind.is_drawn().then_some(Field::Kind)),
                 ];
                 // Its options in effect (its template's, unless it sets its own), each
                 // marked where it comes from the template.
@@ -653,7 +654,7 @@ impl Editor {
                     let on = if is_static(&options) { "on" } else { "off" };
                     rows.push(row("Static", format!("{on}{}", from_template("static")), Some(Field::Static)));
                 }
-                if e.kind != EntityKind::Spawn {
+                if e.kind.is_drawn() {
                     let occluder = value("occluder").unwrap_or("mesh");
                     rows.push(row("Occluder", format!("{occluder}{}", from_template("occluder")), Some(Field::Occluder)));
                     let shadow = value("shadow").unwrap_or("soft");

@@ -359,7 +359,9 @@ fn looking_down_the_hallway_from_spawn() {
     };
     fn p_poly(s: PolygonSource) -> u32 {
         match s {
-            PolygonSource::Entity { polygon, .. } | PolygonSource::World { polygon, .. } => polygon,
+            PolygonSource::Entity { polygon, .. }
+            | PolygonSource::World { polygon, .. }
+            | PolygonSource::Terrain { polygon, .. } => polygon,
         }
     }
     // Straight down the hallway: its crate, and room_b's center crate through both portals.
@@ -760,4 +762,59 @@ fn picking_finds_the_nearest_polygon_under_the_cursor() {
     // High up in the corner, past the crate: the level.
     let (source, _) = out.pick(5.0, 5.0).expect("something in the corner");
     assert!(matches!(source, PolygonSource::World { .. }), "{source:?}");
+}
+
+#[test]
+fn terrain_is_drawn_in_pieces_by_sector_and_blockers_hide_what_is_behind_them() {
+    let (world, assets) = load("canyon_rooms.mmp");
+    let terrain = &world.terrain[0];
+    let mesh = assets.mesh(terrain.mesh);
+    // Carved: every outdoor sector has pieces, the indoor ones none, and each piece lies
+    // inside its sector.
+    for (s, pieces) in terrain.sectors.iter().enumerate() {
+        let name = &world.sectors[s].name;
+        assert_eq!(pieces.is_empty(), name == "house" || name == "roof", "{name}");
+        for p in pieces.clone() {
+            for q in mesh.polygon_points(&mesh.polygons[p as usize]) {
+                assert!(world.sector_contains(s as u32, q), "{name}: {q}");
+            }
+        }
+    }
+
+    // From the spawn point, the mesa's blocker hides the two crates behind it.
+    let spawn = &world.spawn_points[0];
+    let mut cam = Camera::at_spawn(spawn, SMALL);
+    cam.position += Vec3::Y * 1.7;
+    let mut out = ViewGeometry::new();
+    out.build(&world, &assets, &cam.view());
+    let entity = |name: &str| world.entities.iter().position(|e| e.name == name).unwrap() as u32;
+    let drawn = |out: &ViewGeometry, e: u32| {
+        out.polygons.iter().any(|p| matches!(p.source, PolygonSource::Entity { entity, .. } if entity == e))
+    };
+    let hidden = [entity("crate_hidden_1"), entity("crate_hidden_2")];
+    assert_eq!(out.stats.entities_blocked, 2);
+    assert!(hidden.iter().all(|&e| !drawn(&out, e)));
+    assert!(drawn(&out, entity("crate_basin")));
+    // Terrain pieces come from the sectors visited, sorted in like props, and hidden
+    // floors are never drawn.
+    let geometry = assets.mesh(world.geometry);
+    assert!(out.stats.terrain_drawn > 0 && out.stats.terrain_blocked > 0);
+    for p in &out.polygons {
+        match p.source {
+            PolygonSource::Terrain { sector, .. } => {
+                assert_eq!(p.kind, PolygonKind::Prop);
+                assert!(out.visits.iter().any(|v| v.sector == sector));
+            }
+            PolygonSource::World { polygon, .. } => {
+                assert!(!geometry.polygons[polygon as usize].flags.hidden());
+            }
+            _ => {}
+        }
+    }
+
+    // From the far side of the mesa, the crates are in plain view.
+    let far = camera(&world, Vec3::new(70.0, 1.7, 84.0), PI, 0.0, 0.0, SMALL);
+    out.build(&world, &assets, &far.view());
+    assert_eq!(out.stats.entities_blocked, 0);
+    assert!(hidden.iter().all(|&e| drawn(&out, e)));
 }

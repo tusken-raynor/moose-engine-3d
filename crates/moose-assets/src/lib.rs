@@ -23,6 +23,7 @@ mod obj;
 mod ripples;
 mod skin;
 mod store;
+mod terrain;
 mod text;
 mod texture;
 
@@ -30,7 +31,7 @@ pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
     DirectionalLight, EntityKind, EntitySpawn, Level, Light, NO_SECTOR, Occluder, Oscillation, ShadowKind,
-    Portal, PortalFlags, Sector,
+    Portal, PortalFlags, Sector, Terrain,
 };
 pub use mmp_doc::{
     AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,

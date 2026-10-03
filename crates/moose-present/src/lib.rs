@@ -237,6 +237,13 @@ impl Display {
         }
     }
 
+    /// Changes the framebuffer's size, from the next `present`. The window keeps its size:
+    /// frames are scaled to fill it, as ever.
+    pub fn set_size(&mut self, width: u32, height: u32) {
+        self.state.width = width;
+        self.state.height = height;
+    }
+
     pub fn set_max_fps(&mut self, max_fps: u32) {
         self.state.interval =
             (max_fps > 0).then(|| Duration::from_secs_f64(1.0 / max_fps as f64));
