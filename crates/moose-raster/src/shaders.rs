@@ -13,8 +13,6 @@ use crate::shader::{F32s, Fill, I16s, I32s, SampleContext, U32s};
 fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F32s; 3] {
     let a = ctx.ambient;
     let mut light = [F32s::fill(a.x), F32s::fill(a.y), F32s::fill(a.z)];
-    // The split lights' light, for the total.
-    let mut split_light = [F32s::fill(0.0); 3];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
@@ -38,69 +36,42 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
             .min(one);
         let cone = c * c * (F32s::fill(3.0) - c - c);
         let k = t * t * cos * cone;
-        // A light whose shadow covers part of the polygon goes to the engine on its own,
-        // to be added back pixel by pixel as the shadow lets it through.
+        // A light whose shadow covers part of the polygon is in the sum like any other,
+        // and its strength goes to the engine too, which takes it back out pixel by pixel
+        // as much as the shadow covers it.
         if let Some(&j) = ctx.light_split.get(i)
             && let Some(split) = ctx.split.get(j as usize)
         {
             split.set(k);
-            split_light[0] += F32s::fill(l.color.x) * k;
-            split_light[1] += F32s::fill(l.color.y) * k;
-            split_light[2] += F32s::fill(l.color.z) * k;
-            continue;
         }
         light[0] += F32s::fill(l.color.x) * k;
         light[1] += F32s::fill(l.color.y) * k;
         light[2] += F32s::fill(l.color.z) * k;
-    }
-    // With split lights, all the light too, for pixels all of theirs reaches.
-    if !ctx.split.is_empty() {
-        ctx.total.set(std::array::from_fn(|c| light[c] + split_light[c]));
     }
     light
 }
 
 /// The display's gamma: textures, vertex colors and the framebuffer hold gamma-encoded
 /// values, `linear^(1 / GAMMA)`.
+#[cfg(test)]
 pub(crate) const GAMMA: f32 = 2.2;
 
-/// [`GAMMA_LUT`] entries per unit of the square root of the light.
-const LUT_SCALE: f32 = 256.0;
-
-/// `light^(1 / GAMMA)` at `light = (i / LUT_SCALE)^2`, for linear light from 0 to 16:
-/// indexed by the light's square root, which spreads the entries where the curve is steepest
-/// (the darks), so the nearest entry is within a color level everywhere.
-static GAMMA_LUT: std::sync::LazyLock<[f32; 1025]> = std::sync::LazyLock::new(|| {
-    std::array::from_fn(|i| (i as f32 / LUT_SCALE).powf(2.0 / GAMMA))
-});
-
-/// Linear `light` gamma-encoded for a 16.16 `light` output: `light^(1 / GAMMA)`, by
-/// [`GAMMA_LUT`]. A gamma-encoded color times the encoded light is the gamma-encoded color
+/// Linear `light` encoded for a 16.16 `light` output: its square root, gamma 2 (close to the
+/// display's 2.2). A gamma-encoded color times the encoded light is the gamma-encoded color
 /// of the lit surface (a power law commutes with products), so pixels need no conversion;
-/// and the light is interpolated between sample points in the display's own terms, where
-/// its steps are even to the eye.
+/// and the light is interpolated between sample points in nearly the display's own terms,
+/// where its steps are even to the eye. Gamma 2 exactly (not 2.2) so that pixels can take a
+/// light back out of the sum exactly, by squaring, subtracting and taking the root again
+/// (see `PixelContext::light`).
 #[inline(always)]
 fn light_output(light: [F32s; 3]) -> [F32s; 3] {
     light.map(encode_light)
 }
 
-/// Linear light gamma-encoded (see [`light_output`]), as plain values (1 being 1).
-#[inline(always)]
-pub(crate) fn encode_lights(light: [F32s; 3]) -> [F32s; 3] {
-    light.map(encode_light)
-}
-
-/// Linear light gamma-encoded (see [`light_output`]), one channel.
+/// Linear light encoded (see [`light_output`]), one channel.
 #[inline(always)]
 pub(crate) fn encode_light(l: F32s) -> F32s {
-    use crate::shader::LANES;
-    let lut = &*GAMMA_LUT;
-    let last = (lut.len() - 1) as f32;
-    let i = (l.max(F32s::fill(0.0)).sqrt() * F32s::fill(LUT_SCALE) + F32s::fill(0.5))
-        .min(F32s::fill(last))
-        .trunc_int()
-        .to_array();
-    F32s::from(std::array::from_fn::<f32, LANES, _>(|k| lut[i[k] as usize]))
+    l.max(F32s::fill(0.0)).sqrt()
 }
 
 /// XRGB from a `color` output (three 8.8 channels, 0-255) under the 16.16 `light` (see
@@ -1651,7 +1622,6 @@ mod tests {
             ambient: Vec3::ONE,
             light_split: &[],
             split: &[],
-            total: &Default::default(),
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -1800,47 +1770,37 @@ mod tests {
     }
 
     #[test]
-    fn split_lights_add_back_as_their_shadow_lets_through() {
+    fn split_lights_come_out_of_the_sum_as_their_shadow_covers_them() {
         use crate::shader::{Fill, Split};
         let blank = Texture::solid("t", 0);
         let (textures, params) = ([&blank; 2], Params::new(&[]));
         let mut ctx = pixel_ctx(&textures, &params, 0, 1.0);
-        let rest = [I32s::fill(0); 3];
         // No split lights: the light as it is.
         assert_eq!(ctx.light(&full_light()), full_light());
-        // A split light of 1 (linear) over nothing, so all the light is 1 (encoded): all,
-        // half and none of it. Halfway, between the two ends in gamma-2 terms: sqrt(0.5) =
-        // 0.71, close to adding in linear terms (0.5^(1 / GAMMA) = 0.73).
+        // The sum is one split light of 1 (linear; encoded 1 too): all, half and none of it
+        // reaching. Halfway, sqrt(0.5) = 0.71, exactly half the light in gamma-2 terms (and
+        // close to the display's 0.5^(1 / GAMMA) = 0.73).
         let mut split = Split {
             count: 1,
             ..Split::default()
         };
         split.light[0] = [F32s::fill(1.0); 3];
         split.reaches[0] = F32s::from([1.0, 0.5, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
-        split.total = [F32s::fill(1.0); 3];
         ctx.split = split;
         let close = |got: i32, want: f32| (got as f32 - want * 65536.0).abs() <= 65536.0 * 1e-3;
-        let lit = ctx.light(&rest)[0].to_array();
+        let lit = ctx.light(&full_light())[0].to_array();
         assert!(close(lit[0], 1.0), "{}", lit[0]);
         assert!(close(lit[1], 0.5f32.sqrt()), "{}", lit[1]);
         assert!((lit[1] as f32 / 65536.0 - 0.5f32.powf(1.0 / super::GAMMA)).abs() < 0.03);
         assert!(lit[2] < 10, "{}", lit[2]);
-        // Over a light of its own strength (encoded 1), all the light 2 in linear terms:
-        // all of it where all reaches, the rest where none does.
-        let two = 2.0f32.powf(1.0 / super::GAMMA);
-        ctx.split.total = [F32s::fill(two); 3];
-        let both = ctx.light(&full_light())[0].to_array();
-        assert!(close(both[0], two), "{}", both[0]);
-        assert!(close(both[2], 1.0), "{}", both[2]);
-        // None of it anywhere (outside a beam): the rest of the light, exactly.
-        ctx.split.reaches[0] = F32s::fill(0.0);
+        // All of it everywhere: the sum, exactly.
+        ctx.split.reaches[0] = F32s::fill(1.0);
         assert_eq!(ctx.light(&full_light()), full_light());
-        // All or none of it, pixel by pixel (a hard or dithered beam): all the light or the
-        // rest, each exactly.
-        ctx.split.reaches[0] = F32s::from([1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
-        ctx.split.total = [F32s::fill(2.0f32.powf(1.0 / super::GAMMA)); 3];
-        let got = ctx.light(&full_light())[0].to_array();
-        let (all, rest) = ((2.0f32.powf(1.0 / super::GAMMA) * 65536.0).round() as i32, 65536);
-        assert_eq!(got, [all, rest, all, rest, rest, all, all, rest]);
+        // Over another light of the same strength, the sum is 2 (linear, encoded sqrt(2)):
+        // where none of the split one reaches, exactly the other's 1 is left.
+        let sum = [I32s::fill((2.0f32.sqrt() * 65536.0).round() as i32); 3];
+        ctx.split.reaches[0] = F32s::fill(0.0);
+        let rest = ctx.light(&sum)[0].to_array();
+        assert!(close(rest[0], 1.0), "{}", rest[0]);
     }
 }

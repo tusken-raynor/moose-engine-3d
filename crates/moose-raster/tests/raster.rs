@@ -1211,9 +1211,9 @@ fn lit_surfaces_match_exact_lighting() {
                     light += l.color * t * t * cos * cone;
                 }
                 // Colors are gamma-encoded, so the lit color is the color times the light
-                // encoded the same way.
+                // encoded as the engine encodes it: its square root.
                 let lit = |shift: u32, k: usize| {
-                    let encoded = light[k].max(0.0).powf(1.0 / 2.2);
+                    let encoded = light[k].max(0.0).sqrt();
                     (((w.color >> shift) & 255) as f32 * encoded).min(255.0) as u32
                 };
                 let want = lit(16, 0) << 16 | lit(8, 1) << 8 | lit(0, 2);

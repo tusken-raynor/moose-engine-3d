@@ -1496,7 +1496,6 @@ fn sample_context<'a>(
     bins: &'a ThreadBins,
     textures: &Textures<'a>,
     split: &'a [Cell<F32s>],
-    total: &'a Cell<[F32s; 3]>,
 ) -> SampleContext<'a> {
     let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
     SampleContext {
@@ -1506,7 +1505,6 @@ fn sample_context<'a>(
         lights: &bins.lights[lights.clone()],
         light_split: &bins.light_split[lights],
         split,
-        total,
         ambient: textures.ambient,
         focal: textures.focal,
     }
@@ -1810,7 +1808,6 @@ fn build_tiles(
     // The material's outputs, then the split lights' (see `SampleContext::light_split`).
     let (splits, n_material) = (p.splits as usize, n_out - split_outputs(p.splits as usize));
     let split: [Cell<F32s>; MAX_SPLIT] = Default::default();
-    let total: Cell<[F32s; 3]> = Default::default();
     let mut inputs = [F32s::default(); MAX_VARYINGS];
     let mut outputs = [F32s::default(); MAX_VARYINGS];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
@@ -1845,14 +1842,10 @@ fn build_tiles(
             }
             *input = q * inv;
         }
-        let ctx = sample_context(p, b, textures, &split[..splits], &total);
+        let ctx = sample_context(p, b, textures, &split[..splits]);
         (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_material]);
         for (j, strength) in split[..splits].iter().enumerate() {
             outputs[n_material + j] = strength.take();
-        }
-        if splits > 0 {
-            let t = n_material + splits;
-            outputs[t..t + 3].copy_from_slice(&crate::shaders::encode_lights(total.take()));
         }
         for (k, out) in outputs[..n_out].iter().enumerate() {
             let out = out.to_array();

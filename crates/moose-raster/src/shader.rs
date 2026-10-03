@@ -1127,27 +1127,24 @@ pub struct SampleContext<'a> {
     pub lights: &'a [Light],
     pub ambient: Vec3,
     /// Per light, [`NO_SPLIT`], or for a light whose shadow covers part of the polygon,
-    /// which of `split` gets its strength instead of the total getting its light: the
-    /// engine adds its light (its color times that) back pixel by pixel, as much as the
-    /// shadow there lets through (see [`PixelContext::light`]).
+    /// which of `split` gets its strength as well as the sum getting its light: the engine
+    /// takes its light (its color times that) back out pixel by pixel, as much as the
+    /// shadow there covers it (see [`PixelContext::light`]).
     pub light_split: &'a [u8],
     pub split: &'a [Cell<F32s>],
-    /// Where there are split lights: all the light, theirs included (linear), for pixels
-    /// all of theirs reaches.
-    pub total: &'a Cell<[F32s; 3]>,
 }
 
 /// Outputs the engine adds to a polygon's sample points for its `splits` split lights:
-/// each one's strength (its light is its color times that), then all the light.
+/// each one's strength (its light is its color times that).
 pub const fn split_outputs(splits: usize) -> usize {
-    if splits == 0 { 0 } else { splits + 3 }
+    splits
 }
 
 /// In `SampleContext::light_split`: the light is added to the total.
 pub const NO_SPLIT: u8 = u8::MAX;
 
 /// Most lights of one polygon whose shadows are applied pixel by pixel (lights whose
-/// shadow covers part of it; each adds three values to its sample points' outputs).
+/// shadow covers part of it; each adds a value to its sample points' outputs).
 pub const MAX_SPLIT: usize = 4;
 
 /// The lights whose shadows cover part of a polygon, at [`LANES`] pixels: each one's light
@@ -1157,8 +1154,6 @@ pub struct Split {
     pub count: usize,
     pub light: [[F32s; 3]; MAX_SPLIT],
     pub reaches: [F32s; MAX_SPLIT],
-    /// All the light, theirs included, encoded like a `light` output (1 being 1).
-    pub total: [F32s; 3],
 }
 
 /// What `shade_pixel` sees besides its interpolated values.
@@ -1176,79 +1171,62 @@ pub struct PixelContext<'a> {
 }
 
 impl PixelContext<'_> {
-    /// The light at the pixels: a `light` output (16.16, gamma-encoded, from the lights
-    /// the sample stage added up) with the lights whose shadows cover part of the polygon
-    /// added back, each as much as its shadow lets through at each pixel.
+    /// The light at the pixels: a `light` output (16.16, gamma-encoded, the sum of every
+    /// light the sample stage added up) less the lights whose shadows cover part of the
+    /// polygon, each as much as its shadow covers each pixel.
     ///
-    /// Where all of them reach or none, that is exactly the total or the rest, both worked
-    /// out at the sample points. Between, it blends from the rest `e0` to the total `e1`
-    /// (encoded) in gamma-2 terms, `sqrt(e0^2 + (e1^2 - e0^2) f)`, where `f` is how much of
-    /// their light reaches (each one's light as much as reaches, over all of it): close to
-    /// adding in linear terms (the encoding is `light^(1 / 2.2)`), with a square root and
-    /// no tables.
+    /// Where every one of them reaches, that is the sum as it is. Elsewhere their light is
+    /// taken out, `sqrt(e^2 - sum of light * (1 - reaches))` for the encoded sum `e`: exact,
+    /// since the light is encoded as its square root.
     #[inline(always)]
     pub fn light(&self, light: &[I32s; 3]) -> [I32s; 3] {
         if self.split.count == 0 {
             return *light;
         }
-        // Where all of every split light reaches, all the light, as worked out at the
-        // sample points.
         let all = (0..self.split.count)
             .fold(F32s::fill(1.0), |m, j| m.min(self.split.reaches[j]));
         if all.simd_ge(F32s::fill(1.0)).all() {
-            return self.split.total.map(|t| (t * F32s::fill(65536.0)).round_int());
-        }
-        // Where none of any reaches (outside a beam), the rest of the light.
-        let any = (0..self.split.count)
-            .fold(F32s::fill(0.0), |m, j| m.max(self.split.reaches[j]));
-        if any.simd_le(F32s::fill(0.0)).all() {
             return *light;
         }
-        // Where each pixel gets all of every split light or none of any (at a hard beam's
-        // edge, or a dithered one's fade), all the light or the rest, pixel by pixel.
-        let (full, none) = (all.simd_ge(F32s::fill(1.0)), any.simd_le(F32s::fill(0.0)));
-        if (full | none).all() {
-            return std::array::from_fn(|c| {
-                let total = self.split.total[c] * F32s::fill(65536.0);
-                wide::Select::select(full, total, light[c].round_float()).round_int()
-            });
-        }
+        let one = F32s::fill(1.0);
         let scale = F32s::fill(1.0 / 65536.0);
         std::array::from_fn(|c| {
-            let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
+            let mut covered = F32s::fill(0.0);
             for j in 0..self.split.count {
-                all += self.split.light[j][c];
-                reaching += self.split.reaches[j] * self.split.light[j][c];
+                covered += self.split.light[j][c] * (one - self.split.reaches[j]);
             }
-            let f = reaching / all.max(F32s::fill(1e-12));
-            let e0 = light[c].round_float() * scale;
-            let e1 = self.split.total[c];
-            let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
+            let e = light[c].round_float() * scale;
+            let e = (e * e - covered).max(F32s::fill(0.0)).sqrt();
             (e * F32s::fill(65536.0)).round_int()
         })
     }
 }
 
 impl PixelContext<'_> {
-    /// [`PixelContext::light`], with the light from the sample points scaled by `rest`
-    /// (all but the split lights; multiplying the gamma-encoded light) and the split
-    /// lights' total by `all`, before they are blended by how much of the split lights
-    /// reaches each pixel. For bumps, which shade the lights that always reach and all of
-    /// them differently (see `shaders::textured_bump`).
+    /// [`PixelContext::light`], with the light that always reaches (all but the split
+    /// lights) scaled by `rest` (multiplying the gamma-encoded light) and the split lights'
+    /// by `all`, then blended by how much of the split lights reaches each pixel. For
+    /// bumps, which shade the lights that always reach and all of them differently (see
+    /// `shaders::textured_lit`). The light that always reaches is the sum less all of the
+    /// split lights', as in [`PixelContext::light`].
     #[inline(always)]
     pub fn light_scaled(&self, light: &[I32s; 3], rest: F32s, all: F32s) -> [I32s; 3] {
-        let rested = light.map(|l| (l.round_float() * rest).round_int());
         if self.split.count == 0 {
-            return rested;
+            return light.map(|l| (l.round_float() * rest).round_int());
         }
-        let scaled = Self {
-            split: Split {
-                total: self.split.total.map(|t| t * all),
-                ..self.split
-            },
-            ..*self
-        };
-        scaled.light(&rested)
+        let f = self.split_reach();
+        let scale = F32s::fill(1.0 / 65536.0);
+        std::array::from_fn(|c| {
+            let mut split = F32s::fill(0.0);
+            for j in 0..self.split.count {
+                split += self.split.light[j][c];
+            }
+            let e = light[c].round_float() * scale;
+            let e0 = (e * e - split).max(F32s::fill(0.0)).sqrt() * rest;
+            let e1 = e * all;
+            let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
+            (e * F32s::fill(65536.0)).round_int()
+        })
     }
 
     /// How much of the split lights' light reaches each pixel, 0 to 1 (each one's as much
@@ -1353,7 +1331,7 @@ pub struct SpanJob<'a> {
     pub x0: i32,
     /// Lights whose shadows cover part of the polygon: their strength (1 value each, their
     /// light being their color, `split_colors`, times it) follows the material's outputs at
-    /// every point in `outs`, then all the light (3 values, encoded, theirs included), and
+    /// every point in `outs` (their light is in the material's sum too), and
     /// how much of each reaches every pixel of the run is in `reaches` (run by run:
     /// `reaches[j * len + i]` for light `j` at pixel `x0 + i`).
     pub splits: usize,
@@ -1703,12 +1681,6 @@ impl Run<'_> {
                     reaches[px.clamp(0, len as i32 - 1) as usize]
                 }))
             };
-        }
-        if split.count > 0 {
-            let t = split.count;
-            split.total = std::array::from_fn(|c| {
-                f32::lanes(F32s::fill(split_base[t + c]), F32s::fill(split_step[t + c]), offset, STRIDE)
-            });
         }
         let ctx = PixelContext {
             at: Pixels {
