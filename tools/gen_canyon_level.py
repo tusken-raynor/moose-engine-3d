@@ -547,10 +547,12 @@ def level(terrain_model, about):
     for i, (kind, s, model, x, y, z, pitch, yaw, name, options) in enumerate(ENTITIES):
         model = terrain_model if model == "TERRAIN_MODEL" else model
         out.append(f"   {i:<3} {kind:<8} {s:<7} {model:<19} {x:<8.2f} {y:<8.2f} {z:<8.2f} {pitch:<6} {yaw:<7} 0     1.00   {name}  {options}".rstrip())
-    out += ["", "ambient 0.30 0.32 0.38", "",
+    # A dim sky-blue ambient and a strong sun: sunlit flat ground at about 1.67 / 1.60 / 1.49,
+    # shade at a tenth of that.
+    out += ["", "ambient 0.15 0.16 0.20", "",
             "directional 1",
             "#  id  dx     dy     dz     r      g      b      angle",
-            "   0   0.30   -0.85  0.42   1.60   1.50   1.30   0.53", ""]
+            "   0   0.30   -0.85  0.42   1.78   1.69   1.51   0.53", ""]
     return "\n".join(out)
 
 

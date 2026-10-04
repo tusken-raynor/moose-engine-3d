@@ -906,7 +906,8 @@ fn channel(texel: U32s, shift: u32) -> F32s {
 ///   to a power, times the lights' color and a strength, added to the lit color. One
 ///   highlight per group of lights, whatever their number.
 ///
-/// The normal map is read with texture 1's sampler. Params: the highlight's strength
+/// Bumps fade to flat between 4 and 6 meters from the eye (past that the normal map isn't
+/// read). The normal map is read with texture 1's sampler. Params: the highlight's strength
 /// (`values[0]`) and its power's log2 (`values[1]`: 5 is a power of 32).
 pub mod textured_lit {
     use crate::shader::{F32s, Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext};
@@ -920,7 +921,7 @@ pub mod textured_lit {
         vertex { uv: 2, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
         sampled { uv: 2, lod: 1, normal: 3, tangent: 3, bitangent: 3, position: 3 }
         fixed32 { uv: 2, light: 3 }
-        fixed16 { lod: 1 }
+        fixed16 { lod: 1, fade: 1 }
         float { bump: 8, spec: 12 }
     }
 
@@ -932,9 +933,10 @@ pub mod textured_lit {
     pub type TexturedSpecular = TexturedLit<FLAT, true>;
     pub type TexturedNormalSpecular = TexturedLit<NORMAL_MAP, true>;
 
-    /// Bumps past this level of detail (8.8: textures shrunk to a third or less) are
-    /// smaller than pixels: those pixels are lit flat.
-    const FAR: i32 = 400;
+    /// Bumps are whole out to `BUMPS_WHOLE` meters from the eye, and fade (smoothly) to
+    /// flat by `BUMPS_GONE`, past which the normal map isn't read.
+    const BUMPS_WHOLE: f32 = 4.0;
+    const BUMPS_GONE: f32 = 6.0;
 
     /// The half vector between the lights' summed direction (`toward`, any length) and
     /// the way to the eye (`eye`, unit length), unit length: or the way to the eye, where
@@ -991,9 +993,22 @@ pub mod textured_lit {
             } else {
                 [zero; 12]
             };
+            // How much of the bumps there are, by distance: 1 within `BUMPS_WHOLE`, 0 past
+            // `BUMPS_GONE`.
+            let distance = (0..3)
+                .map(|k| {
+                    let d = F32s::fill(ctx.eye[k]) - s.position[k];
+                    d * d
+                })
+                .fold(zero, |a, b| a + b)
+                .sqrt();
+            let t = ((F32s::fill(BUMPS_GONE) - distance) * F32s::fill(1.0 / (BUMPS_GONE - BUMPS_WHOLE)))
+                .max(zero)
+                .min(F32s::fill(1.0));
             Interp {
                 uv: s.uv,
                 lod: s.lod,
+                fade: [t * t * (F32s::fill(3.0) - t - t)],
                 light: super::light_output(super::diffuse(ctx, &s.position, &s.normal)),
                 bump,
                 spec,
@@ -1004,7 +1019,9 @@ pub mod textured_lit {
         fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
             let texel = ctx.texel(0, &a.uv, b.lod[0]);
             let one = F32s::fill(1.0);
-            let far = I32s::from_i16x8(b.lod[0]).simd_gt(I32s::fill(FAR)).all();
+            // How much of the bumps there are (8.8): none at all, far away, reads nothing.
+            let fade = I32s::from_i16x8(b.fade[0]);
+            let far = fade.simd_le(I32s::fill(0)).all();
             // Which lights bump it: those that always reach, if any has a direction (not
             // the ambient light only), and the split ones, if any reaches.
             let rest = match BUMP {
@@ -1023,6 +1040,15 @@ pub mod textured_lit {
                 let n = ctx.texel(1, &a.uv, lod);
                 let k = F32s::fill(1.0 / 127.5);
                 normal = [16, 8, 0].map(|shift| (super::channel(n, shift) - F32s::fill(127.5)) * k);
+                // Toward flat as the bumps fade with distance.
+                let f = (fade.round_float() * F32s::fill(1.0 / 256.0)).min(one);
+                if f.simd_lt(one).any() {
+                    let bent = [normal[0] * f, normal[1] * f, one + (normal[2] - one) * f];
+                    let inv = (bent[0] * bent[0] + bent[1] * bent[1] + bent[2] * bent[2])
+                        .max(F32s::fill(1e-12))
+                        .recip_sqrt();
+                    normal = bent.map(|c| c * inv);
+                }
                 let factor = |g: usize| {
                     let cos = normal[0] * c.bump[g + 1] + normal[1] * c.bump[g + 2] + normal[2] * c.bump[g + 3];
                     c.bump[g] + cos.max(F32s::fill(0.0))

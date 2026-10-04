@@ -190,6 +190,7 @@ The lattice is a fixed screen grid. Grid points are chosen first and hold no dat
   - **One global grid:** spacings are powers of two up to the tile width, so every tile's points lie on the one global grid. Each point on a row belongs to exactly one tile, and a pixel interpolates between the points on either side of it whatever tiles they come from, so tiles leave no seams.
   - **Shared runs:** neighboring tiles with the same spacing share grid rows as one run, so a uniformly sampled surface costs what it did before tiles.
   - **Evaluated together:** all of a polygon's tiles in a block are built at once. Its pixels on each row are found once, and every tile's grid points are evaluated together, 8 at a time.
+  - **Tried and dropped (Oct 2): small polygons lit at their corners.** A polygon smaller than its tiles' cells was shaded at its own corners and its grid points filled from perspective-correct planes through them (Gouraud), instead of from its planes carried past its edges. It cost nothing in accuracy or time, but changed under 1% of pixels on the canyon level's dense terrain, invisibly: the carried planes were already close.
 - The grid belongs to the viewport, not to each polygon. So:
   - neighbors share rows and columns;
   - coarser grids are subsets of finer ones;

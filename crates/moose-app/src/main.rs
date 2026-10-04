@@ -197,10 +197,15 @@ const FLASHLIGHT_RADIUS: f32 = 0.05;
 /// Steep surface limits the menu steps through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
 
-/// Entities with this model are crates, textured with `CRATE_TEXTURE` (in assets/textures):
-/// Jedi Knight's crt4 crate, as version 1 used it.
+/// Entities with this model are crates: their material is a normal map (`CRATE_NORMALS`) and
+/// a highlight over `CRATE_TEXTURE`, whose alpha is its specular map (baked by
+/// `cargo run -p moose-assets --example bake_crate`), in assets/textures.
 const CRATE_MODEL: &str = "crate.obj";
-const CRATE_TEXTURE: &str = "metal_crate.png";
+const CRATE_TEXTURE: &str = "new_crate.png";
+const CRATE_NORMALS: &str = "new_crate_norm.png";
+/// The crates' highlight: its strength (times the specular map) and power.
+const CRATE_SPECULAR: f32 = 0.6;
+const CRATE_SHININESS: f32 = 32.0;
 /// The detail texture multiplied over terrains' vertex colors (in assets/textures; made by
 /// tools/gen_canyon_level.py), for terrains with `uv` and `normal` attributes.
 const TERRAIN_DETAIL: &str = "terrain_detail.png";
@@ -661,8 +666,8 @@ struct App {
     /// normal. And their normal map, if the bricks are loaded.
     brick_shaders: [MaterialId; 3],
     brick_normals: Option<TextureId>,
-    /// The crate model and its texture, if the level has crates.
-    crate_texture: Option<(MeshId, TextureId)>,
+    /// The crate model, its texture and its normal map, if the level has crates.
+    crate_texture: Option<(MeshId, TextureId, TextureId)>,
     /// Terrains' shaders (see [`TerrainDetail`]): texture, noise; and the detail texture, if
     /// there is one.
     terrain_shaders: [MaterialId; 2],
@@ -750,12 +755,10 @@ impl App {
             renderer.register_material::<TexturedNormalSpecular>(),
         ];
         let crate_texture = match assets.mesh_id(CRATE_MODEL) {
-            Some(mesh) => Some((
-                mesh,
-                assets
-                    .load_texture(CRATE_TEXTURE)
-                    .map_err(|e| e.to_string())?,
-            )),
+            Some(mesh) => {
+                let mut load = |name: &str| assets.load_texture(name).map_err(|e| e.to_string());
+                Some((mesh, load(CRATE_TEXTURE)?, load(CRATE_NORMALS)?))
+            }
             None => None,
         };
         let has_uvs = assets
@@ -1890,10 +1893,20 @@ impl App {
                     ..Surface::new(cube_reflection)
                 };
             }
-            // Crates are textured; other entities keep their vertex colors.
-            let texture = crate_texture
-                .filter(|&(mesh, _)| p.mesh == mesh)
-                .map(|(_, texture)| texture);
+            // Crates: a normal map and a highlight, by their specular map (translucent, just
+            // their texture); other entities keep their vertex colors.
+            let crate_maps = crate_texture.filter(|&(mesh, _, _)| p.mesh == mesh);
+            if let Some((_, texture, normals)) = crate_maps
+                && !s.translucent_crates
+            {
+                return Surface {
+                    textures: [Some(texture), Some(normals)],
+                    params: Params::new(&[CRATE_SPECULAR, CRATE_SHININESS.log2().round()]),
+                    path_override: s.per_pixel_crates.then_some(RasterPath::PerPixel),
+                    ..Surface::new(brick_shaders[2])
+                };
+            }
+            let texture = crate_maps.map(|(_, texture, _)| texture);
             let mut surface = Surface::new(match (texture, s.translucent_crates) {
                 (Some(_), true) => textured_translucent,
                 (Some(_), false) => textured,
