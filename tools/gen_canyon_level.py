@@ -16,6 +16,9 @@ Coordinates: x east, z south (so north is -Z, where yaw 0 faces), y up, meters.
 """
 import math, os, sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from materials_rule import assign
+
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "."
 
 FLOOR = -3.0     # outdoor sectors' hidden floors, under the terrain
@@ -566,7 +569,7 @@ for terrain, model, level_file, about in [
     with open(os.path.join(ROOT, "assets/models", model), "w") as f:
         f.write(terrain.obj())
     with open(os.path.join(ROOT, "assets/levels", level_file), "w") as f:
-        f.write(level(model, about))
+        f.write(assign(level(model, about)))
     print(f"wrote {level_file} and {model} ({terrain.nx * terrain.nz * 2} triangles)")
 with open(os.path.join(ROOT, "assets/models/mesa_blocker.obj"), "w") as f:
     f.write(blocker_obj())

@@ -5,21 +5,14 @@
 //! Options (all but the screenshot ones can also be changed in the options menu, Esc):
 //!   --level NAME          level in assets/levels (default shiny_rooms.mmp)
 //!   --size WxH            framebuffer size (default 1280x720)
-//!   --bump SHADER         the brick walls' bumps, the test surface for bump mapping: off
-//!                         (the default) or normal (brick_wall_normal.png, a normal map)
-//!   --bump-sampler NAME   how the bumps are read: nearest, dithered, bilinear (the
-//!                         default) or trilinear
-//!   --terrain-detail D    terrains' grain: texture (the detail texture) or noise (3D
-//!                         noise in world space); default texture
-//!   --sky STYLE           sky surfaces: box (the sky cube map, with the sun; the default)
-//!                         or flat (their vertex colors)
+//!   --bump SHADER         bump mapping, for materials that have it: normal (the default)
+//!                         or off
+//!   --specular ON         specular highlights, for materials that have them: on (the
+//!                         default) or off
+//!   --sky STYLE           sky materials: box (the default) or flat (their simple_sky
+//!                         variant)
 //!   --bloom MODE          glow around light past white: sun (the sun's, the default),
 //!                         bright (and any near-white pixel's), or off
-//!   --specular S          the brick walls' highlight, its strength (default 0: none)
-//!   --shininess P         the highlight's power, a power of two (default 32)
-//!   --filter NAME         texture sampler: METHOD_mipmap_MIP, with METHOD nearest, bilinear
-//!                         or dithered and MIP none, nearest, linear or dithered (default
-//!                         bilinear_mipmap_linear)
 //!   --fps N               frame rate cap (default 60; 0 starts uncapped)
 //!   --screenshot FILE     render one frame from the spawn point to a PNG and exit,
 //!                         without opening a window
@@ -41,9 +34,6 @@
 //!   --f0 X                reflectance of shiny surfaces seen head-on, 0-1 (default 0.15)
 //!   --fade M              how far past a textured shiny surface its reflection fades out,
 //!                         in meters (default 5; 0 for no fade)
-//!   --floor-texture NAME  texture for shiny surfaces, in assets/textures (default
-//!                         metal_tile.png, falling back to test_floor.png); used when the
-//!                         level has uvs
 //!   --water               shiny floors start as water, not plain reflective tiles;
 //!                         water ripples like Half-Life's software renderer's
 //!   --no-flashlight       start with the player's flashlight off
@@ -98,6 +88,7 @@
 //! it is free.
 
 mod editor;
+mod materials;
 mod mesh_edit;
 mod ui;
 mod wire;
@@ -106,18 +97,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use moose_assets::{Assets, LevelDoc, Light, MeshId, ModelDoc, RIPPLE_SIZE, Ripples, Texture, TextureId};
+use moose_assets::{Assets, LevelDoc, Light, MATERIAL_SLOTS, ModelDoc, Ripples, Texture, TextureId};
 use moose_present::{Display, Key, MouseButton};
-use moose_raster::shaders::{
-    CubeReflection, Textured, TexturedFresnel, TexturedNormal, TexturedNormalSpecular, TexturedSpecular,
-    SkyBox, TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel,
-    VertexColorNoise, VertexColorTranslucent, Water,
-    filter,
-};
+use materials::{FrameSettings, Materials, ShaderIds};
 use moose_raster::post::{Bloom, BloomConfig};
-use moose_raster::{
-    MAX_TEXTURES, MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target,
-};
+use moose_raster::{Params, RasterConfig, RasterPath, Renderer, Surface, Target};
 use moose_scene::{Camera, Viewport, World};
 use moose_view::{MAX_SHADOW_SLOTS, PolygonSource, ViewGeometry};
 
@@ -147,20 +131,6 @@ const FADE_RANGE: [f32; 5] = [0.0, 1.0, 2.5, 5.0, 10.0];
 
 /// Heights the Resolution setting steps through (widths from the starting size's shape).
 const HEIGHTS: [u32; 8] = [360, 480, 540, 720, 900, 1080, 1440, 2160];
-/// Texture for shiny surfaces (in levels with uvs), in assets/textures.
-const DEFAULT_FLOOR_TEXTURE: &str = "metal_tile.png";
-/// Wall textures (in levels with uvs), in assets/textures: sector i gets the i-th, cycling,
-/// so the test levels' rooms and hallway each have their own.
-const WALL_TEXTURES: [&str; 3] = ["brick_wall.png", "panel_wall.png", "stone_wall.png"];
-/// The brick walls' texture: the test surface for bump mapping (see [`Bump`]). Plain, it
-/// gets close-up detail noise, `DETAIL` strong, masked by its alpha (none on the mortar).
-const BRICK_TEXTURE: &str = "brick_wall.png";
-const DETAIL: f32 = 0.1;
-/// Where sampler `f` is in `filter::ALL`.
-fn sampler_index(f: u8) -> usize {
-    filter::ALL.iter().position(|&g| g == f).expect("a sampler")
-}
-
 /// Penumbra thresholds the menu steps through (see `RasterConfig::penumbra_threshold`; 0 is
 /// off).
 const PENUMBRA_THRESHOLDS: [f32; 4] = [0.25, 0.125, 0.0625, 0.0];
@@ -202,21 +172,6 @@ const FLASHLIGHT_RADIUS: f32 = 0.05;
 /// Steep surface limits the menu steps through (see `RasterConfig::steep_limit`).
 const STEEP_LIMITS: [f32; 5] = [0.125, 0.25, 0.5, 1.0, f32::INFINITY];
 
-/// Entities with this model are crates: their material is a normal map (`CRATE_NORMALS`) and
-/// a highlight over `CRATE_TEXTURE`, whose alpha is its specular map (baked by
-/// `cargo run -p moose-assets --example bake_crate`), in assets/textures.
-const CRATE_MODEL: &str = "crate.obj";
-const CRATE_TEXTURE: &str = "new_crate.png";
-const CRATE_NORMALS: &str = "new_crate_norm.png";
-/// The crates' highlight: its strength (times the specular map) and power.
-const CRATE_SPECULAR: f32 = 0.6;
-const CRATE_SHININESS: f32 = 32.0;
-/// The detail texture multiplied over terrains' vertex colors (in assets/textures; made by
-/// tools/gen_canyon_level.py), for terrains with `uv` and `normal` attributes.
-const TERRAIN_DETAIL: &str = "terrain_detail.png";
-/// The sky box's faces (in assets/textures, in `CUBE_FACES` order; baked by
-/// `cargo run --release -p moose-assets --example bake_sky`).
-const SKY_FACES: [&str; 6] = ["sky_px.png", "sky_nx.png", "sky_py.png", "sky_ny.png", "sky_pz.png", "sky_nz.png"];
 /// How much wider the sun's disk is drawn than its light's angle (the real sun's 0.53
 /// degrees is two pixels across at 720p).
 const SUN_DISK_SCALE: f32 = 2.5;
@@ -225,14 +180,9 @@ const SUN_DISK_SCALE: f32 = 2.5;
 const BLOOM_STRENGTH: f32 = 1.0;
 const BLOOM_BRIGHT_STRENGTH: f32 = 0.45;
 const BLOOM_THRESHOLD: f32 = 0.85;
-/// Entities with this model are mirror balls: each gets a static cube map of its
-/// surroundings, baked at load.
-const BALL_MODEL: &str = "ball.obj";
-/// Mirror ball cube map faces are this many texels across.
+/// Entities drawn with a material that reads their own cube map (`@cube`, mirror balls)
+/// get one baked at load, of their surroundings, faces this many texels across.
 const CUBE_SIZE: u32 = 128;
-/// Meters per texture repeat on the test levels' floors (`UV_TILE` in
-/// tools/gen_test_assets.py): with the water texture's size, the size of a ripple's shift.
-const WATER_TILE: f32 = 2.0;
 
 #[derive(Clone)]
 struct Options {
@@ -260,16 +210,10 @@ struct Options {
     f0: f32,
     fade: f32,
     fps: u32,
-    /// Index into `filter::ALL`.
-    filter: usize,
     bump: Bump,
-    bump_sampler: usize,
-    specular: f32,
-    shininess: f32,
-    terrain_detail: TerrainDetail,
+    specular: bool,
     sky: SkyStyle,
     bloom: BloomMode,
-    floor_texture: String,
     water: bool,
     no_flashlight: bool,
     fullscreen: bool,
@@ -347,15 +291,10 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         f0: 0.15,
         fade: 5.0,
         fps: MAX_FPS,
-        filter: sampler_index(filter::BILINEAR_MIPMAP_LINEAR),
-        floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
-        bump: Bump::Off,
-        terrain_detail: TerrainDetail::Texture,
+        bump: Bump::Normal,
         sky: SkyStyle::Box,
         bloom: BloomMode::Sun,
-        bump_sampler: 2,
-        specular: 0.0,
-        shininess: 32.0,
+        specular: true,
         water: false,
         no_flashlight: false,
         fullscreen: false,
@@ -427,23 +366,10 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             "--f0" => o.f0 = value()?.parse().map_err(|_| "bad --f0")?,
             "--fade" => o.fade = value()?.parse().map_err(|_| "bad --fade")?,
             "--fps" => o.fps = value()?.parse().map_err(|_| "bad --fps")?,
-            "--filter" => {
-                let name = value()?;
-                o.filter = filter::named(&name).map(sampler_index).ok_or_else(|| {
-                    let names: Vec<_> = filter::ALL.map(filter::name).into();
-                    format!("--filter is one of {}", names.join(", "))
-                })?;
-            }
             "--bump" => {
                 let name = value()?;
                 o.bump = Bump::ALL.into_iter().find(|b| b.name() == name).ok_or_else(|| {
                     format!("--bump is one of {}", Bump::ALL.map(Bump::name).join(", "))
-                })?;
-            }
-            "--terrain-detail" => {
-                let name = value()?;
-                o.terrain_detail = TerrainDetail::ALL.into_iter().find(|d| d.name() == name).ok_or_else(|| {
-                    format!("--terrain-detail is one of {}", TerrainDetail::ALL.map(TerrainDetail::name).join(", "))
                 })?;
             }
             "--sky" => {
@@ -458,15 +384,13 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     format!("--bloom is one of {}", BloomMode::ALL.map(BloomMode::name).join(", "))
                 })?;
             }
-            "--specular" => o.specular = value()?.parse().map_err(|_| "bad --specular")?,
-            "--shininess" => o.shininess = value()?.parse().map_err(|_| "bad --shininess")?,
-            "--bump-sampler" => {
-                let name = value()?;
-                o.bump_sampler = BUMP_SAMPLERS.iter().position(|&s| s == name).ok_or_else(|| {
-                    format!("--bump-sampler is one of {}", BUMP_SAMPLERS.join(", "))
-                })?;
+            "--specular" => {
+                o.specular = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("--specular is on or off".into()),
+                }
             }
-            "--floor-texture" => o.floor_texture = value()?,
             "--water" => o.water = true,
             "--no-flashlight" => o.no_flashlight = true,
             "--fullscreen" => o.fullscreen = true,
@@ -539,21 +463,14 @@ struct Settings {
     reflectance: f32,
     /// Fade range of textured shiny surfaces' reflections, one of `FADE_RANGE`.
     fade_range: f32,
-    /// Texture sampler, an index into `filter::ALL`.
-    filter: usize,
-    /// The brick walls' bump shader, and how it reads the bumps (an index into
-    /// `BUMP_SAMPLERS`).
+    /// Bump mapping and specular highlights, for materials that have them (their
+    /// features).
     bump: Bump,
-    bump_sampler: usize,
-    /// Terrains' grain (see [`TerrainDetail`]).
-    terrain_detail: TerrainDetail,
+    specular: bool,
+    /// Sky materials draw their `simple_sky` variant when flat.
     sky: SkyStyle,
     bloom: BloomMode,
-    /// The brick walls' highlight: its strength (0 for none; one of `SPECULARS`) and its
-    /// power (one of `SHININESS`).
-    specular: f32,
-    shininess: f32,
-    /// Shiny floors are water.
+    /// Materials draw their `water` variant (shiny floors are water).
     water: bool,
     /// Lighting is on (off, surfaces show their full color).
     lit: bool,
@@ -600,12 +517,11 @@ struct CubeMap {
     radius: f32,
 }
 
-/// The brick walls' shader, the test surface for bump mapping: each reads its bumps where
-/// it wants them (see `moose_raster::shaders::textured_lit`).
+/// Bump mapping, for materials with a `bump` feature (see `moose_raster::shaders::textured_lit`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Bump {
     Off,
-    /// A normal map, `BRICK_NORMALS`; the brick texture's alpha is free.
+    /// From the material's normal map.
     Normal,
 }
 
@@ -616,27 +532,6 @@ impl Bump {
         match self {
             Bump::Off => "off",
             Bump::Normal => "normal",
-        }
-    }
-}
-
-/// Where terrains' grain comes from, over their vertex colors (for terrains with normals;
-/// see `moose_raster::shaders`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerrainDetail {
-    /// `TERRAIN_DETAIL`, a texture (with texture coordinates): `VertexColorDetail`.
-    Texture,
-    /// 3D value noise in world space: `VertexColorNoise`.
-    Noise,
-}
-
-impl TerrainDetail {
-    const ALL: [TerrainDetail; 2] = [TerrainDetail::Texture, TerrainDetail::Noise];
-
-    fn name(self) -> &'static str {
-        match self {
-            TerrainDetail::Texture => "texture",
-            TerrainDetail::Noise => "noise",
         }
     }
 }
@@ -683,26 +578,6 @@ impl BloomMode {
     }
 }
 
-/// How strongly the noise grain takes terrains' colors either way (see `VertexColorNoise`).
-const TERRAIN_NOISE: f32 = 0.45;
-
-/// How the bump shaders read the bumps: their normal map's sampler, by name.
-const BUMP_SAMPLERS: [&str; 4] = ["nearest", "dithered", "bilinear", "trilinear"];
-const BUMP_FILTERS: [u8; 4] = [
-    filter::NEAREST_MIPMAP_NEAREST,
-    filter::DITHERED_MIPMAP_NEAREST,
-    filter::BILINEAR_MIPMAP_NEAREST,
-    filter::BILINEAR_MIPMAP_LINEAR,
-];
-
-/// The brick walls' highlight strengths and powers the menu steps through (see
-/// `--specular`, `--shininess`).
-const SPECULARS: [f32; 5] = [0.0, 0.25, 0.5, 1.0, 2.0];
-const SHININESS: [f32; 6] = [4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
-
-/// The brick walls' normal map (baked with the brick texture's alpha by
-/// `cargo run -p moose-assets --example bake_brick`, from `brick_wall_height.png`).
-const BRICK_NORMALS: &str = "brick_wall_normal.png";
 
 
 struct App {
@@ -713,51 +588,23 @@ struct App {
     camera: Camera,
     geometry: ViewGeometry,
     renderer: Renderer,
-    opaque: MaterialId,
-    /// Sky surfaces: their vertex colors, unlit.
-    unlit: MaterialId,
-    translucent: MaterialId,
-    fresnel: MaterialId,
-    /// The textured shaders (their samplers picked per surface: see `Surface::filters`).
-    textured: MaterialId,
-    textured_fresnel: MaterialId,
-    /// The water shader.
-    water: MaterialId,
-    /// The water's ripples, and the floor texture rippled by them with its height map
-    /// (redrawn as they move).
+    /// The shaders materials can name, and the materials (`assets/materials`), checked
+    /// and with their textures loaded.
+    shaders: ShaderIds,
+    materials: Materials,
+    /// Sampler overrides (`filterN=`) of the level's bindings, and of each entity's.
+    level_filters: Vec<[Option<u8>; MATERIAL_SLOTS]>,
+    entity_filters: Vec<[Option<u8>; MATERIAL_SLOTS]>,
+    /// The water's ripples, which the rippling textures (`@water:FILE`) follow.
     ripples: Ripples,
-    water_textures: Option<[TextureId; 2]>,
-    /// The shiny surfaces' texture, if the level has uvs to map it with.
-    floor_texture: Option<TextureId>,
-    /// Per sector, its walls' texture, if the level has uvs.
-    wall_textures: Vec<Option<TextureId>>,
-    /// The texture whose walls get detail noise, if loaded.
-    brick_texture: Option<TextureId>,
     /// Hotkeys: each key does what Enter does on its setting in the menu (see
     /// `App::bind`), kept in `bindings_path()`.
     bindings: Vec<(Key, Setting)>,
     /// A note shown at the bottom of the screen for a moment, and when it was made.
     toast: Option<(String, Instant)>,
-    /// The brick walls' lit shaders (see [`Bump`]): normal, and with a highlight: flat,
-    /// normal. And their normal map, if the bricks are loaded.
-    brick_shaders: [MaterialId; 3],
-    brick_normals: Option<TextureId>,
-    /// The crate model, its texture and its normal map, if the level has crates.
-    crate_texture: Option<(MeshId, TextureId, TextureId)>,
-    /// The sky shader, and the sky cube map and its face size, if its faces are there.
-    sky_shader: MaterialId,
-    sky_cube: Option<(TextureId, u32)>,
     /// The bloom pass, and how long it took last frame (ms).
     bloom: Bloom,
     post_ms: f64,
-    /// Terrains' shaders (see [`TerrainDetail`]): texture, noise; and the detail texture, if
-    /// there is one.
-    terrain_shaders: [MaterialId; 2],
-    terrain_detail: Option<TextureId>,
-    /// The translucent textured shader (crates with T), one per sampler in `filter::ALL`.
-    textured_translucent: MaterialId,
-    /// The mirror ball shader, one per sampler in `filter::ALL`.
-    cube_reflection: MaterialId,
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
     /// Cube map textures no longer used (the level was rebuilt), to draw the next ones in.
@@ -786,6 +633,7 @@ impl App {
     fn new(options: &Options) -> Result<App, String> {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
         let mut assets = Assets::new(root);
+        assets.load_materials().map_err(|e| e.to_string())?;
         let level = assets
             .load_level(&options.level)
             .map_err(|e| e.to_string())?;
@@ -817,74 +665,11 @@ impl App {
                 .unwrap_or(defaults.penumbra_threshold),
             ..defaults
         });
-        let opaque = renderer.register_material::<VertexColor>();
-        let unlit = renderer.register_material::<UnlitColor>();
-        let translucent = renderer.register_material::<VertexColorTranslucent>();
-        let fresnel = renderer.register_material::<VertexColorFresnel>();
-        let textured = renderer.register_material::<Textured>();
-        let textured_fresnel = renderer.register_material::<TexturedFresnel>();
-        let water = renderer.register_material::<Water>();
-        let textured_translucent = renderer.register_material::<TexturedTranslucent>();
-        let cube_reflection = renderer.register_material::<CubeReflection>();
-        let terrain_shaders = [
-            renderer.register_material::<VertexColorDetail>(),
-            renderer.register_material::<VertexColorNoise>(),
-        ];
-        let terrain_detail = assets.load_texture(TERRAIN_DETAIL).ok();
-        let sky_shader = renderer.register_material::<SkyBox>();
-        let sky_cube = load_sky(&mut assets);
-        let brick_shaders = [
-            renderer.register_material::<TexturedNormal>(),
-            renderer.register_material::<TexturedSpecular>(),
-            renderer.register_material::<TexturedNormalSpecular>(),
-        ];
-        let crate_texture = match assets.mesh_id(CRATE_MODEL) {
-            Some(mesh) => {
-                let mut load = |name: &str| assets.load_texture(name).map_err(|e| e.to_string());
-                Some((mesh, load(CRATE_TEXTURE)?, load(CRATE_NORMALS)?))
-            }
-            None => None,
-        };
-        let has_uvs = assets
-            .mesh(world.geometry)
-            .attribs
-            .iter()
-            .any(|a| a.name == "uv");
-        let floor_texture = if has_uvs {
-            let fallback = "test_floor.png";
-            let texture = assets.load_texture(&options.floor_texture).or_else(|e| {
-                if options.floor_texture == DEFAULT_FLOOR_TEXTURE {
-                    eprintln!("{e}; using {fallback}");
-                    assets.load_texture(fallback)
-                } else {
-                    Err(e)
-                }
-            });
-            Some(texture.map_err(|e| e.to_string())?)
-        } else {
-            None
-        };
-        let wall_textures = (0..world.sectors.len())
-            .map(|i| {
-                has_uvs
-                    .then(|| assets.load_texture(WALL_TEXTURES[i % WALL_TEXTURES.len()]))
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        let brick_texture = assets.texture_id(BRICK_TEXTURE);
-        let brick_normals = match brick_texture {
-            Some(_) => Some(assets.load_texture(BRICK_NORMALS).map_err(|e| e.to_string())?),
-            None => None,
-        };
+        let shaders = ShaderIds::register(&mut renderer);
         let ripples = Ripples::new(1);
-        let water_textures = floor_texture.map(|floor| {
-            let water = ripples.texture("water", assets.texture(floor).base());
-            [
-                assets.add_texture(water),
-                assets.add_texture(ripples.heights("water heights")),
-            ]
-        });
+        let materials = Materials::compile(&mut assets, &ripples)?;
+        let materials_names = materials.names().to_vec();
+        let (level_filters, entity_filters) = binding_filters_of(&world)?;
         let cube_maps = vec![None; world.entities.len()];
         let level_path = Path::new(root).join("levels").join(&options.level);
         let level_src = std::fs::read_to_string(&level_path).map_err(|e| e.to_string())?;
@@ -902,34 +687,22 @@ impl App {
                 g
             },
             renderer,
-            opaque,
-            unlit,
-            translucent,
-            fresnel,
-            textured,
-            textured_fresnel,
-            water,
+            shaders,
+            materials,
+            level_filters,
+            entity_filters,
             ripples,
-            water_textures,
-            floor_texture,
-            wall_textures,
-            brick_texture,
-            brick_shaders,
             bindings: load_bindings(),
             toast: None,
-            brick_normals,
-            crate_texture,
-            terrain_shaders,
-            terrain_detail,
-            sky_shader,
-            sky_cube,
             bloom: Bloom::default(),
             post_ms: 0.0,
-            textured_translucent,
-            cube_reflection,
             cube_maps,
             spare_cubes: Vec::new(),
-            editor: editor::Editor::new(doc, level_path),
+            editor: {
+                let mut editor = editor::Editor::new(doc, level_path);
+                editor.materials = materials_names.clone();
+                editor
+            },
             models: model_files(root),
             watched: std::collections::HashMap::new(),
             settings: Settings {
@@ -937,14 +710,10 @@ impl App {
                 per_pixel_crates: options.per_pixel_crates,
                 reflectance: options.f0.clamp(0.0, 1.0),
                 fade_range: options.fade.max(0.0),
-                filter: options.filter,
                 bump: options.bump,
-                bump_sampler: options.bump_sampler,
-                terrain_detail: options.terrain_detail,
                 sky: options.sky,
                 bloom: options.bloom,
-                specular: options.specular.max(0.0),
-                shininess: options.shininess.clamp(1.0, 256.0),
+                specular: options.specular,
                 water: options.water,
                 lit: !options.unlit,
                 penumbra: options.penumbra.clamp(1.0 / 64.0, 64.0),
@@ -1024,18 +793,7 @@ impl App {
             .unwrap_or(0);
         self.world = world;
         self.lights = (self.world.lights().to_vec(), self.world.ambient);
-        while self.wall_textures.len() < self.world.sectors.len() {
-            let i = self.wall_textures.len();
-            let texture = match self.floor_texture {
-                Some(_) => Some(
-                    self.assets
-                        .load_texture(WALL_TEXTURES[i % WALL_TEXTURES.len()])
-                        .map_err(|e| e.to_string())?,
-                ),
-                None => None,
-            };
-            self.wall_textures.push(texture);
-        }
+        (self.level_filters, self.entity_filters) = binding_filters_of(&self.world)?;
         self.spare_cubes
             .extend(self.cube_maps.drain(..).flatten().map(|c| c.texture));
         self.cube_maps = vec![None; self.world.entities.len()];
@@ -1216,11 +974,34 @@ impl App {
         }
     }
 
-    /// Reloads what changed on disk since the last look: models and textures (then
-    /// rebuilds the level, as entities' shapes may have changed), and the level's own file
-    /// unless the editor has changes of its own.
+    /// Reloads what changed on disk since the last look: the materials, models and
+    /// textures (then rebuilds the level, as entities' shapes may have changed), and the
+    /// level's own file unless the editor has changes of its own.
     fn hot_reload(&mut self) {
         let root = self.assets.root().to_path_buf();
+        let material_files: Vec<PathBuf> = std::fs::read_dir(root.join("materials"))
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "mmat"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut materials_changed = false;
+        for path in material_files {
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if self.watched.insert(path, modified).is_some_and(|before| before != modified) {
+                materials_changed = true;
+            }
+        }
+        if materials_changed {
+            match self.reload_materials() {
+                Ok(()) => self.editor.say("reloaded the materials"),
+                Err(e) => self.editor.say(e),
+            }
+        }
         let (models, textures) = self.assets.loaded_files();
         let files = models
             .iter()
@@ -1273,6 +1054,29 @@ impl App {
         }
     }
 
+    /// Reads the material files anew, and rebuilds the level with them; if they are refused
+    /// (or the level is, with them), keeps the materials as they were.
+    fn reload_materials(&mut self) -> Result<(), String> {
+        let old = self.assets.materials().clone();
+        self.assets.load_materials().map_err(|e| e.to_string())?;
+        let result = Materials::compile(&mut self.assets, &self.ripples).and_then(|materials| {
+            let before = std::mem::replace(&mut self.materials, materials);
+            self.rebuild().inspect_err(|_| self.materials = before)
+        });
+        match result {
+            Ok(()) => {
+                self.editor.materials = self.materials.names().to_vec();
+                Ok(())
+            }
+            Err(e) => {
+                self.assets.set_materials(old);
+                // The level as it was (it built with them before).
+                let _ = self.rebuild();
+                Err(e)
+            }
+        }
+    }
+
     /// Writes the editor's tables to the level's file.
     fn save_level(&mut self) {
         let path = self.editor.path.clone();
@@ -1294,14 +1098,16 @@ impl App {
     fn set_time(&mut self, time: f32) {
         self.time = time;
         self.world.animate(&mut self.assets, time);
-        if let (Some([water, heights]), Some(floor)) = (self.water_textures, self.floor_texture)
-            && self.ripples.advance_to(time as f64)
-        {
-            let rippled = self
-                .ripples
-                .texture("water", self.assets.texture(floor).base());
-            *self.assets.texture_mut(water) = rippled;
-            *self.assets.texture_mut(heights) = self.ripples.heights("water heights");
+        // The rippling textures (`@water:FILE`, `@water_heights`), redrawn as the ripples move.
+        let waters = &self.materials.waters;
+        if (!waters.is_empty() || self.materials.heights.is_some()) && self.ripples.advance_to(time as f64) {
+            for &(water, base) in waters {
+                let rippled = self.ripples.texture("water", self.assets.texture(base).base());
+                *self.assets.texture_mut(water) = rippled;
+            }
+            if let Some(heights) = self.materials.heights {
+                *self.assets.texture_mut(heights) = self.ripples.heights("water heights");
+            }
         }
     }
 
@@ -1309,12 +1115,10 @@ impl App {
     /// center, a 90 degree square view down each axis. The ball itself is not in them: from
     /// inside, all of its faces face away.
     fn bake_cube_maps(&mut self) -> Result<(), String> {
-        let Some(ball) = self.assets.mesh_id(BALL_MODEL) else {
-            return Ok(());
-        };
         for i in 0..self.world.entities.len() {
             let e = &self.world.entities[i];
-            if e.mesh != ball {
+            // Those drawn with their own cube map (`@cube`).
+            if !e.binding.as_ref().is_some_and(|b| self.materials.uses_entity_cube(b.material)) {
                 continue;
             }
             let (name, position, sector) = (e.name.clone(), e.position, e.sector);
@@ -1546,17 +1350,10 @@ impl App {
             },
             Setting::FlashlightDither => on(cfg.beam_dither),
             Setting::FlashlightBeam => self.cone_name().into(),
-            Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
             Setting::Bump => s.bump.name().into(),
-            Setting::TerrainDetail => s.terrain_detail.name().into(),
-            Setting::Sky => match self.sky_cube {
-                Some(_) => s.sky.name().into(),
-                None => "flat (no sky box)".into(),
-            },
+            Setting::Sky => s.sky.name().into(),
             Setting::Bloom => s.bloom.name().into(),
-            Setting::BumpSampler => BUMP_SAMPLERS[s.bump_sampler].into(),
-            Setting::Specular => if s.specular > 0.0 { format!("x{}", s.specular) } else { "off".into() },
-            Setting::Shininess => format!("{}", s.shininess),
+            Setting::Specular => on(s.specular),
             Setting::Water => on(s.water),
             Setting::Bounces => self.geometry.config.max_reflections.to_string(),
             Setting::Reflectance => s.reflectance.to_string(),
@@ -1622,7 +1419,6 @@ impl App {
                 s.cone = CONES[wrap(i, CONES.len())];
             }
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
-            Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
             Setting::Sky => {
                 let i = SkyStyle::ALL.iter().position(|&v| v == s.sky).unwrap_or(0);
                 s.sky = SkyStyle::ALL[wrap(i, SkyStyle::ALL.len())];
@@ -1631,17 +1427,11 @@ impl App {
                 let i = BloomMode::ALL.iter().position(|&v| v == s.bloom).unwrap_or(0);
                 s.bloom = BloomMode::ALL[wrap(i, BloomMode::ALL.len())];
             }
-            Setting::TerrainDetail => {
-                let i = TerrainDetail::ALL.iter().position(|&d| d == s.terrain_detail).unwrap_or(0);
-                s.terrain_detail = TerrainDetail::ALL[wrap(i, TerrainDetail::ALL.len())];
-            }
             Setting::Bump => {
                 let i = Bump::ALL.iter().position(|&b| b == s.bump).unwrap_or(0);
                 s.bump = Bump::ALL[wrap(i, Bump::ALL.len())];
             }
-            Setting::BumpSampler => s.bump_sampler = wrap(s.bump_sampler, BUMP_SAMPLERS.len()),
-            Setting::Specular => s.specular = cycle(&SPECULARS, s.specular, dir),
-            Setting::Shininess => s.shininess = cycle(&SHININESS, s.shininess, dir),
+            Setting::Specular => s.specular = !s.specular,
             Setting::Water => s.water = !s.water,
             Setting::Bounces => {
                 let b = &mut self.geometry.config.max_reflections;
@@ -1700,10 +1490,9 @@ impl App {
                 c.pitch.to_degrees(),
             ),
             format!(
-                "{} polygons   {} mirrors   {}{}",
+                "{} polygons   {} mirrors{}",
                 self.geometry.polygons.len(),
                 self.geometry.mirrors.len(),
-                filter::name(filter::ALL[s.filter]),
                 match self.world.terrain.is_empty() && self.world.blockers.is_empty() {
                     true => String::new(),
                     false => {
@@ -1754,21 +1543,17 @@ impl App {
         if let Some((_, p, d)) = s.flashlight_lock {
             add(format!("--flashlight-at {},{},{},{},{},{}", p.x, p.y, p.z, d.x, d.y, d.z));
         }
-        add(format!("--filter {}", filter::name(filter::ALL[s.filter])));
-        if s.bump != Bump::Off {
-            add(format!("--bump {} --bump-sampler {}", s.bump.name(), BUMP_SAMPLERS[s.bump_sampler]));
+        if s.bump != Bump::Normal {
+            add(format!("--bump {}", s.bump.name()));
+        }
+        if !s.specular {
+            add("--specular off".into());
         }
         if s.sky != SkyStyle::Box {
             add(format!("--sky {}", s.sky.name()));
         }
         if s.bloom != BloomMode::Sun {
             add(format!("--bloom {}", s.bloom.name()));
-        }
-        if s.terrain_detail != TerrainDetail::Texture {
-            add(format!("--terrain-detail {}", s.terrain_detail.name()));
-        }
-        if s.specular > 0.0 {
-            add(format!("--specular {} --shininess {}", s.specular, s.shininess));
         }
         add(format!("--bounces {}", self.geometry.config.max_reflections));
         add(format!("--f0 {} --fade {}", s.reflectance, s.fade_range));
@@ -1894,199 +1679,103 @@ impl App {
         let view = camera.view();
         self.geometry.build(&self.world, &self.assets, &view);
         let t1 = Instant::now();
-        let (opaque, unlit, translucent, fresnel, s) =
-            (self.opaque, self.unlit, self.translucent, self.fresnel, &self.settings);
-        let (textured, textured_fresnel, floor_texture) = (self.textured, self.textured_fresnel, self.floor_texture);
-        let (water, water_textures) = (self.water, self.water_textures);
-        // Every texture read with the sampler chosen, but the bricks' normal map with the
-        // bump sampler.
-        let texture_filter = filter::ALL[s.filter];
-        let (wall_textures, brick_texture) = (&self.wall_textures, self.brick_texture);
-        let (brick_normals, bump, bump_sampler) = (self.brick_normals, s.bump, s.bump_sampler);
-        let (specular, shininess) = (s.specular, s.shininess);
-        let brick_shaders = self.brick_shaders;
-        let (crate_texture, textured_translucent) = (self.crate_texture, self.textured_translucent);
-        let (terrain_shaders, terrain_detail, assets) = (self.terrain_shaders, self.terrain_detail, &self.assets);
-        let grain = s.terrain_detail;
-        // The sky: toward the sun, its tint and size, whether there is one, whether to
-        // write how far past white for the bloom, and the cube map's face size.
-        let (sky_shader, sky_cube, sky_style) = (self.sky_shader, self.sky_cube, s.sky);
+        let s = &self.settings;
+        // The sky box's params: toward the sun, its tint and size, whether there is one,
+        // whether to write how far past white for the bloom.
         let sun = self.world.directional.first().filter(|_| s.sun);
-        let sky_params = {
-            let (toward, tint, radius) = match sun {
-                Some(d) => (
-                    -d.direction.normalize(),
-                    d.color / d.color.max_element().max(1e-6),
-                    (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
-                ),
-                None => (Vec3::Y, Vec3::ONE, 0.0),
-            };
-            Params::new(&[
-                toward.x,
-                toward.y,
-                toward.z,
-                tint.x,
-                tint.y,
-                tint.z,
-                radius,
-                if sun.is_some() { 1.0 } else { 0.0 },
-                if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
-                sky_cube.map_or(1.0, |(_, size)| size as f32),
-            ])
+        let (toward, tint, radius) = match sun {
+            Some(d) => (
+                -d.direction.normalize(),
+                d.color / d.color.max_element().max(1e-6),
+                (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
+            ),
+            None => (Vec3::Y, Vec3::ONE, 0.0),
         };
-        let level = self.assets.mesh(self.world.geometry);
-        let (cube_reflection, cube_maps) = (self.cube_reflection, &self.cube_maps);
+        // Each material's surface this frame, under the player's settings.
+        let table = self.materials.table(
+            &self.shaders,
+            &FrameSettings {
+                water: s.water,
+                translucent: s.translucent_crates,
+                simple_sky: s.sky == SkyStyle::Flat,
+                bump: s.bump == Bump::Normal,
+                specular: s.specular,
+                reflectance: s.reflectance,
+                fade: s.fade_range,
+                sun: Params::new(&[
+                    toward.x,
+                    toward.y,
+                    toward.z,
+                    tint.x,
+                    tint.y,
+                    tint.z,
+                    radius,
+                    if sun.is_some() { 1.0 } else { 0.0 },
+                    if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
+                ]),
+            },
+        );
+        let (world, assets, shaders) = (&self.world, &self.assets, &self.shaders);
+        let (level, cube_maps) = (assets.mesh(world.geometry), &self.cube_maps);
+        let (level_filters, entity_filters) = (&self.level_filters, &self.entity_filters);
+        let per_pixel = s.per_pixel_crates;
         let mut target = Target {
             pixels,
             width,
             height,
         };
-        // What each polygon is drawn with; a surface that keeps the default samplers gets
-        // the one chosen, in every slot.
+        // What each polygon is drawn with: its binding's material in its scenario (its
+        // reflection drawn under it, or seen in a mirror), or its vertex colors.
         let surface_of = |p: &moose_view::ViewPolygon| -> Surface {
-            if let PolygonSource::World { sector, polygon } = p.source {
-                if p.flags.sky() {
-                    return match (sky_style, sky_cube) {
-                        // Bilinear: a face texel spans about a pixel or more, so its mips
-                        // are never needed.
-                        (SkyStyle::Box, Some((cube, _))) => Surface {
-                            textures: [Some(cube), None],
-                            params: sky_params,
-                            filters: [filter::BILINEAR_MIPMAP_NONE; MAX_TEXTURES],
-                            ..Surface::new(sky_shader)
-                        },
-                        _ => Surface::new(unlit),
-                    };
+            let (binding, filters, entity) = match p.source {
+                PolygonSource::World { polygon, .. } => {
+                    let b = level.polygons[polygon as usize].material;
+                    (world.bindings.get(b as usize), level_filters.get(b as usize), None)
                 }
-                // Shiny surfaces are textured, if there is a texture to map, and so
-                // are other walls, with their sector's texture.
-                let n = level.polygons[polygon as usize].plane.normal;
-                let wall = wall_textures[sector as usize]
-                    .filter(|_| !p.flags.reflective() && n.y.abs() < 0.5);
-                // Shiny textured floors are water, if it is on: the rippling texture
-                // and its height map.
-                let water_textures =
-                    water_textures.filter(|_| s.water && p.flags.reflective() && n.y > 0.9);
-                let is_water = water_textures.is_some();
-                let textures = match water_textures {
-                    Some([water, heights]) => [Some(water), Some(heights)],
-                    // Floors (shiny or not) get the floor texture.
-                    None => [
-                        floor_texture
-                            .filter(|_| p.flags.reflective() || n.y > 0.9)
-                            .or(wall),
-                        None,
-                    ],
-                };
-                let texture = textures[0];
-                // A shiny surface whose reflection was drawn is drawn over it. Past the
-                // bounce limit (or with its reflection not drawn), it is plain.
-                if p.reflection.is_none() {
-                    // Brick walls, the test surface for bump mapping: the shader
-                    // chosen, with their normal map too.
-                    if wall.is_some() && texture == wall && wall == brick_texture && !is_water {
-                        let shiny = specular > 0.0;
-                        let shader = match (bump, shiny) {
-                            (Bump::Off, false) => None,
-                            (Bump::Normal, false) => Some((brick_shaders[0], [wall, brick_normals])),
-                            (Bump::Off, true) => Some((brick_shaders[1], [wall, None])),
-                            (Bump::Normal, true) => Some((brick_shaders[2], [wall, brick_normals])),
-                        };
-                        if let Some((material, textures)) = shader {
-                            return Surface {
-                                textures,
-                                params: Params::new(&[specular, shininess.log2().round()]),
-                                filters: [texture_filter, BUMP_FILTERS[bump_sampler]],
-                                ..Surface::new(material)
-                            };
+                PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => (
+                    world.entities[entity as usize].binding.as_ref(),
+                    entity_filters.get(entity as usize),
+                    Some(entity as usize),
+                ),
+            };
+            let mut surface = match binding {
+                Some(b) => {
+                    let r = table.get(b.material, p.reflection.is_some(), p.mirror.is_some());
+                    let mesh = assets.mesh(p.mesh);
+                    let mut surface = r.surface;
+                    if r.attribs.iter().any(|&a| mesh.attrib(a).is_none()) {
+                        // A mesh without what its shader reads is drawn plain.
+                        shaders.plain()
+                    } else if r.entity_cube {
+                        // Its own cube map, once baked.
+                        match entity.and_then(|e| cube_maps[e]) {
+                            Some(cube) => {
+                                surface.textures[0] = Some(cube.texture);
+                                surface.params = Params::new(&[cube.radius, CUBE_SIZE as f32]);
+                                surface
+                            }
+                            None => shaders.plain(),
                         }
+                    } else {
+                        surface
                     }
-                    let detail = if wall.is_some() && wall == brick_texture { DETAIL } else { 0.0 };
-                    return Surface {
-                        textures,
-                        params: Params::new(&[detail]),
-                        ..Surface::new(if texture.is_some() { textured } else { opaque })
-                    };
                 }
-                return Surface {
-                    textures,
-                    // Water shifts what is behind it by its texels' size (meters per
-                    // repeat over texels per repeat).
-                    params: Params::new(&[
-                        s.reflectance,
-                        s.fade_range,
-                        WATER_TILE / RIPPLE_SIZE as f32,
-                    ]),
-                    ..Surface::new(match texture {
-                        Some(_) if is_water => water,
-                        Some(_) => textured_fresnel,
-                        None => fresnel,
-                    })
-                };
+                None => shaders.plain(),
+            };
+            if let Some(filters) = filters {
+                for (slot, f) in filters.iter().enumerate() {
+                    if let Some(f) = f {
+                        surface.filters[slot] = *f;
+                    }
+                }
             }
-            // Terrains: their vertex colors, with grain over them and smooth lighting if they
-            // have normals (and texture coordinates, for the detail texture).
-            if let PolygonSource::Terrain { .. } = p.source {
-                let mesh = assets.mesh(p.mesh);
-                let has = |name: &str| mesh.attrib(name).is_some();
-                return match (grain, terrain_detail) {
-                    (TerrainDetail::Noise, _) if has("normal") => Surface {
-                        params: Params::new(&[TERRAIN_NOISE]),
-                        ..Surface::new(terrain_shaders[1])
-                    },
-                    (TerrainDetail::Texture, Some(texture)) if has("normal") && has("uv") => Surface {
-                        textures: [Some(texture), None],
-                        ..Surface::new(terrain_shaders[0])
-                    },
-                    _ => Surface::new(opaque),
-                };
-            }
-            if let PolygonSource::Entity { entity, .. } = p.source
-                && let Some(cube) = cube_maps[entity as usize]
-            {
-                return Surface {
-                    textures: [Some(cube.texture), None],
-                    params: Params::new(&[cube.radius, CUBE_SIZE as f32]),
-                    ..Surface::new(cube_reflection)
-                };
-            }
-            // Crates: a normal map and a highlight, by their specular map (translucent, just
-            // their texture); other entities keep their vertex colors.
-            let crate_maps = crate_texture.filter(|&(mesh, _, _)| p.mesh == mesh);
-            if let Some((_, texture, normals)) = crate_maps
-                && !s.translucent_crates
-            {
-                return Surface {
-                    textures: [Some(texture), Some(normals)],
-                    params: Params::new(&[CRATE_SPECULAR, CRATE_SHININESS.log2().round()]),
-                    path_override: s.per_pixel_crates.then_some(RasterPath::PerPixel),
-                    ..Surface::new(brick_shaders[2])
-                };
-            }
-            let texture = crate_maps.map(|(_, texture, _)| texture);
-            let mut surface = Surface::new(match (texture, s.translucent_crates) {
-                (Some(_), true) => textured_translucent,
-                (Some(_), false) => textured,
-                (None, true) => translucent,
-                (None, false) => opaque,
-            });
-            surface.textures = [texture, None];
-            // Translucent crates' opacity; opaque ones (textured) get no detail.
-            surface.params.values[0] = if s.translucent_crates { 0.5 } else { 0.0 };
-            if s.per_pixel_crates {
+            if per_pixel && entity.is_some() && !matches!(p.source, PolygonSource::Terrain { .. }) {
                 surface.path_override = Some(RasterPath::PerPixel);
             }
             surface
         };
-        let default = Surface::new(opaque).filters;
         self.renderer
-            .render(&mut target, camera.viewport, &self.geometry, &self.assets, |p| {
-                let mut surface = surface_of(p);
-                if surface.filters == default {
-                    surface.filters = [texture_filter; MAX_TEXTURES];
-                }
-                surface
-            })
+            .render(&mut target, camera.viewport, &self.geometry, &self.assets, surface_of)
             .map_err(|e| e.to_string())?;
         let t2 = Instant::now();
         Ok((
@@ -2221,14 +1910,10 @@ enum Setting {
     FlashlightBeam,
     FlashlightFade,
     FlashlightDither,
-    Filter,
     Bump,
-    BumpSampler,
-    TerrainDetail,
     Sky,
     Bloom,
     Specular,
-    Shininess,
     Water,
     Bounces,
     Reflectance,
@@ -2321,12 +2006,8 @@ impl Page {
             ],
             Page::Rendering => &[
                 Set(Resolution),
-                Set(Filter),
                 Set(Bump),
-                Set(BumpSampler),
                 Set(Specular),
-                Set(Shininess),
-                Set(TerrainDetail),
                 Set(Sky),
                 Set(Bloom),
                 Set(Water),
@@ -2404,14 +2085,10 @@ impl Item {
                 Setting::FlashlightBeam => "Cone",
                 Setting::FlashlightFade => "Fade",
                 Setting::FlashlightDither => "Dither",
-                Setting::Filter => "Texture filter",
-                Setting::Bump => "Brick bump shader",
-                Setting::TerrainDetail => "Terrain detail",
+                Setting::Bump => "Bump mapping",
                 Setting::Sky => "Sky",
                 Setting::Bloom => "Bloom",
-                Setting::BumpSampler => "Bump sampler",
-                Setting::Specular => "Brick specular",
-                Setting::Shininess => "Brick shininess",
+                Setting::Specular => "Specular highlights",
                 Setting::Water => "Water floors",
                 Setting::Bounces => "Reflection bounces",
                 Setting::Reflectance => "Floor reflectance",
@@ -2457,19 +2134,22 @@ fn bindings_path() -> Option<PathBuf> {
 }
 
 /// Every setting the menu has.
-/// The sky cube map from `SKY_FACES`, and its face size; none if a face is missing.
-fn load_sky(assets: &mut Assets) -> Option<(TextureId, u32)> {
-    let mut faces: [Vec<u32>; 6] = Default::default();
-    let mut size = 0;
-    for (face, name) in faces.iter_mut().zip(SKY_FACES) {
-        let id = assets.load_texture(name).ok()?;
-        let base = assets.texture(id).base();
-        size = base.width;
-        *face = base.texels.clone();
-    }
-    let cube = Texture::cube("sky", size, faces).ok()?;
-    Some((assets.add_texture(cube), size))
+/// Sampler overrides (`filterN=`) of the level's bindings and of each entity's, by slot.
+fn binding_filters_of(world: &World) -> Result<(Vec<[Option<u8>; MATERIAL_SLOTS]>, Vec<[Option<u8>; MATERIAL_SLOTS]>), String> {
+    let level = world.bindings.iter().map(materials::binding_filters).collect::<Result<Vec<_>, _>>()?;
+    let entities = world
+        .entities
+        .iter()
+        .map(|e| {
+            e.binding
+                .as_ref()
+                .map_or(Ok([None; MATERIAL_SLOTS]), materials::binding_filters)
+                .map_err(|m| format!("entity '{}': {m}", e.name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((level, entities))
 }
+
 
 fn all_settings() -> Vec<Setting> {
     Page::ALL

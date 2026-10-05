@@ -111,7 +111,18 @@ The loader computes each sector's bounds and center; the file does not store the
 | `nverts` | Vertex count, 3 or more |
 | `vert[:attr ...]` | Vertex indices in counter-clockwise order as seen from inside the sector. On solid surfaces, each index is followed by one `:row` per declared attribute, in declaration order (for example `12:3:7` with two attributes). Attribute values belong to the surface vertex, so a point shared by two surfaces can carry different values on each. |
 
-Solid surfaces reference every attribute on every vertex. Portal surfaces list vertex indices only. A portal surface is not drawn; the renderer draws the sector behind it, clipped to the portal polygon.
+Solid surfaces reference every attribute on every vertex. Portal surfaces list vertex indices only.
+
+After its vertices, a solid surface takes options (portal surfaces take none):
+
+| Option | Meaning |
+| --- | --- |
+| `material=NAME` | The material it is drawn with, from `assets/materials/` (see the Material Format Spec). A surface with none is drawn with its vertex colors. |
+| `filterN=SAMPLER` | How texture slot N of its material is read, over the material's own `filterN` (`nearest`, `bilinear`, `trilinear`, `dithered`, or a full sampler name). |
+
+```
+  12   1       -1      0x0    4       8:0 9:1 13:2 12:3  material=brick filter0=nearest
+``` A portal surface is not drawn; the renderer draws the sector behind it, clipped to the portal polygon.
 
 **`adjoins`**
 
@@ -150,10 +161,12 @@ Its options are any of an entity's (below). An entity placed by a template gets 
 | `scale` | Uniform scale |
 | `name` | Identifier, for debugging and scripting |
 
-Options, after `name` (props and actors only; other kinds take none):
+Options, after `name` (props and actors; terrains take only `material=` and `filterN=`; other kinds take none):
 
 | Option | Meaning |
 | --- | --- |
+| `material=NAME` | The material the whole model is drawn with (see the Material Format Spec). Without one, its vertex colors. |
+| `filterN=SAMPLER` | How texture slot N of its material is read, over the material's own (as for surfaces). |
 | `static` | Props only. The prop never moves, so static lights' shadows from it and on it can be worked out once. `static=on` is the same, `static=off` turns off a template's. |
 | `occluder=...` | What the entity casts shadows with. Without it, `mesh`. |
 | `shadow=soft\|blurred\|hard` | How its shadows' edges are drawn, from a light with a size. `soft` (the default) carves their soft edges: exact, and cached for static props. `blurred` carves them hard and blurs them on screen, as wide as their soft edge would be: for figures casting shadows with simple proxies, whose blur hides how simple they are; worked out every frame. `hard` carves them from the light's center: the cheapest. |
@@ -213,7 +226,7 @@ The terrain is the artist's to fit to the blockout:
 
 A **`blocker`** entity places a model whose polygons are never drawn, but hide from the eye whatever lies wholly behind one of them (from either side): props, actors and terrain pieces. It is for a solid thing inside one sector, such as a hill or a mesa, that portals can't help with. A blocker must stay inside solid ground: wherever it shows, it would hide what should be seen. One quad across the inside of the hill is usually enough.
 
-`tools/gen_canyon_level.py` generates `canyon_rooms.mmp`, the test level: a basin with a mesa (and a blocker hiding two crates behind it from the spawn point), a canyon with a bend, and a valley with a house. Its terrain (3,774 triangles) has vertex colors, texture coordinates and smooth normals: the app draws a terrain that has them with `VertexColorDetail`, its colors times the detail texture `terrain_detail.png` at twice its value, lit from the interpolated normals (smooth shading from the sun and every other light). The Rendering page's Terrain detail setting (`--terrain-detail noise`) swaps the texture for `VertexColorNoise`: five octaves of 3D value noise in world space (cells from 1 m down to 6 cm, each fading out where a pixel covers a cell), with no texture coordinates, no seams and no stretching on steep slopes. `canyon_rooms_dense.mmp` is the same level with a terrain of twice the triangles, for timing.
+`tools/gen_canyon_level.py` generates `canyon_rooms.mmp`, the test level: a basin with a mesa (and a blocker hiding two crates behind it from the spawn point), a canyon with a bend, and a valley with a house. Its terrain (3,774 triangles) has vertex colors, texture coordinates and smooth normals: its material, `terrain` (the `terrain_detail` shader, `VertexColorDetail`), draws its colors times the detail texture `terrain_detail.png` at twice its value, lit from the interpolated normals (smooth shading from the sun and every other light). The `terrain_noise` material (`VertexColorNoise`) swaps the texture for five octaves of 3D value noise in world space (cells from 1 m down to 6 cm, each fading out where a pixel covers a cell), with no texture coordinates, no seams and no stretching on steep slopes. `canyon_rooms_dense.mmp` is the same level with a terrain of twice the triangles, for timing.
 
 ## Validation (enforced by the loader)
 
@@ -226,14 +239,13 @@ A **`blocker`** entity places a model whose polygons are never drawn, but hide f
 7. Adjoins are symmetric (`mirror.mirror == self`), each points back to its surface, the mirror surface lists the same vertices in reverse order, the two sides belong to different sectors, and flags use only the defined bits. Surface flags use only the defined bits, a hidden surface has no other, and portal surfaces have none.
 8. Every solid surface vertex references exactly one row per declared attribute; portal surface vertices reference none.
 9. Each entity's origin lies inside its sector: on the inner side of every one of the sector's surface planes. This is an exact test because sectors are convex. A terrain's origin is not checked.
-10. Template names are unique, and each template row has a name and a model. Entity names are unique. Spawn points have no model (`-`) and no options; props, actors, terrains and blockers must have one, and it must load. Terrains and blockers take no options. Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
+10. Template names are unique, and each template row has a name and a model. Entity names are unique. Spawn points have no model (`-`) and no options; props, actors, terrains and blockers must have one, and it must load. Terrains take no options but `material=` and `filterN=`, and blockers none. A `material=` names a loaded material. A `filterN=` comes with a material and names slot 0 or 1 (its sampler's name is checked by the app, which owns the samplers). Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
 11. Ambient light and light colors are not negative. Each light's range is positive, and its position lies inside its sector (as for entities). Each light row has 8 or 13 fields before its options. A spot light's direction is not zero, and its angles satisfy 0 ≤ inner ≤ outer ≤ 180. A light's radius is 0 or more.
 12. Each directional light has 7 fields before its options, a direction that is not zero, a color that is not negative, and an angle from 0 to 45 degrees.
 13. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.
 
 ## Planned extensions
 
-- A material column on surfaces, for the material system. UVs need no format change; they are another attribute (for example `uv f32 2`).
 - More surface flags (for example two-sided, translucent).
 - Portals with a drawn surface (water, glass) for the translucent pass.
 - Per-sector properties (ambient light, fog, tint).

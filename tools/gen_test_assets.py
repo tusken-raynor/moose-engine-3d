@@ -12,6 +12,7 @@ of the cube). CCW-front convention.
 import math, os, struct, sys, zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from materials_rule import assign
 from moose_model import PROXY, quat_axis, write_model
 
 ROOT = sys.argv[1]
@@ -393,7 +394,12 @@ def planar_uv(p, normal):
     return (round(u / UV_TILE, 4), round(v / UV_TILE, 4))
 
 
-def level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=None, lights=(),
+def level_text(*args, **kwargs):
+    """`raw_level_text`'s level, with its materials named (`materials_rule`)."""
+    return assign(raw_level_text(*args, **kwargs))
+
+
+def raw_level_text(title, about, shiny=(), darker=(), uv=False, props=(), ambient=None, lights=(),
                options=None, sky=(), sky_color=(112, 158, 214), directional=(),
                light_options=""):
     """The level as .mmp text. Surfaces listed in `shiny` get the reflective flag (0x1).

@@ -12,6 +12,8 @@ mod error;
 mod geom;
 mod half;
 mod level;
+mod material;
+pub use material::{Binding, MATERIAL_SLOTS, MaterialDef, MaterialLibrary, ParamValue, TextureSource};
 mod mesh;
 mod mmp;
 pub use mmp::{merged_options, option_key};
@@ -39,7 +41,7 @@ pub use mmp_doc::{
     number, occluder_value,
 };
 pub use mmdl_doc::{AnimationDoc, BoneDoc, ModelDoc, ModelPolygonDoc};
-pub use mesh::{Attrib, AttribData, Mesh, PolyFlags, Polygon, StorageFormat};
+pub use mesh::{Attrib, AttribData, Mesh, NO_MATERIAL, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};
 pub use skin::{Animation, Bone, Pose, Skin};

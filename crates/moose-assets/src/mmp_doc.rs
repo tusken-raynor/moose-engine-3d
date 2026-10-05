@@ -52,6 +52,8 @@ pub struct SurfaceDoc {
     pub flags: u32,
     /// Its corners: a vertex index, and one values row per attribute (none on a portal).
     pub corners: Vec<(usize, Vec<usize>)>,
+    /// Its options after its corners (`material=NAME`, `filterN=SAMPLER`).
+    pub options: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,10 +191,11 @@ impl LevelDoc {
             }
             let adjoin: i64 = c.parse(r, 1, "adjoin index")?;
             let n: usize = c.parse(r, 3, "vertex count")?;
-            if r.tokens.len() != 4 + n {
-                return Err(c.err(r.no, format!("surface lists {} vertices, not {n}", r.tokens.len() - 4)));
+            let listed = r.tokens[4..].iter().take_while(|t| !t.contains('=')).count();
+            if listed != n {
+                return Err(c.err(r.no, format!("surface lists {listed} vertices, not {n}")));
             }
-            let corners = r.tokens[4..]
+            let corners = r.tokens[4..4 + n]
                 .iter()
                 .map(|t| {
                     let mut parts = t.split(':').map(str::parse::<usize>);
@@ -209,6 +212,7 @@ impl LevelDoc {
                 adjoin: (adjoin >= 0).then_some(adjoin as usize),
                 flags: c.hex(r, 2)?,
                 corners,
+                options: r.tokens[4 + n..].to_vec(),
             });
         }
         let section = c.section("adjoins", false, Some(3))?;
@@ -371,12 +375,13 @@ impl LevelDoc {
                 .collect();
             let adjoin = s.adjoin.map_or("-1".to_string(), |a| a.to_string());
             line(format!(
-                "   {i:<4} {:<7} {:<7} {:<6} {:<7} {}",
+                "   {i:<4} {:<7} {:<7} {:<6} {:<7} {}  {}",
                 s.sector,
                 adjoin,
                 format!("{:#x}", s.flags),
                 s.corners.len(),
-                corners.join(" ")
+                corners.join(" "),
+                s.options.join(" ")
             ));
         }
         line(String::new());

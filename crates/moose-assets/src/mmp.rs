@@ -12,6 +12,7 @@ use crate::level::{
     DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, ShadowKind, Oscillation, Portal,
     PortalFlags, Sector, Terrain,
 };
+use crate::material::{Binding, binding_of};
 use crate::terrain::{self, Region};
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
 use crate::store::Assets;
@@ -33,6 +34,8 @@ struct SurfaceRec {
     /// Per vertex, one row index per declared attribute. Empty for portals.
     attr_rows: Vec<Vec<usize>>,
     plane: Plane,
+    /// What it is drawn with (`material=` after its vertices).
+    binding: Option<Binding>,
 }
 
 struct AdjoinRec {
@@ -55,6 +58,7 @@ struct EntityRec {
     occluder: OccluderRec,
     shadow: ShadowKind,
     animation: Option<String>,
+    binding: Option<Binding>,
 }
 
 /// An option's key: the part before `=`, or the whole word for a flag.
@@ -376,7 +380,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             ));
         }
         let nverts: usize = c.parse(r, 3, "vertex count")?;
-        let refs = &r.tokens[4..];
+        // Its vertices, then its options (KEY=VALUE).
+        let listed = r.tokens[4..].iter().take_while(|t| !t.contains('=')).count();
+        let refs = &r.tokens[4..4 + listed];
         if refs.len() != nverts {
             return Err(c.err(
                 r.no,
@@ -435,6 +441,15 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         let points: Vec<Vec3> = verts.iter().map(|&v| vertices[v]).collect();
         let plane =
             convex_polygon_plane(&points).map_err(|m| c.err(r.no, format!("surface {i}: {m}")))?;
+        let options = &r.tokens[4 + listed..];
+        if adjoin.is_some() && !options.is_empty() {
+            return Err(c.err(r.no, format!("surface {i}: portal surfaces take no options")));
+        }
+        let (binding, rest) = binding_of(assets.materials(), options)
+            .map_err(|m| c.err(r.no, format!("surface {i}: {m}")))?;
+        if let Some(option) = rest.first() {
+            return Err(c.err(r.no, format!("surface {i}: unknown option '{option}'")));
+        }
         surfaces.push(SurfaceRec {
             line: r.no,
             sector,
@@ -443,6 +458,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             verts,
             attr_rows,
             plane,
+            binding,
         });
     }
 
@@ -536,7 +552,13 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
         let (mut shadow, mut animation) = (ShadowKind::Soft, None);
         let options = merged_options(template.map_or(&[][..], |t| &t.2), &r.tokens[11..]);
-        for option in &options {
+        // What it's drawn with (props, actors and terrains).
+        let (binding, options) = binding_of(assets.materials(), &options)
+            .map_err(|m| c.err(r.no, format!("entity '{name}': {m}")))?;
+        if binding.is_some() && !matches!(kind, EntityKind::Prop | EntityKind::Actor | EntityKind::Terrain) {
+            return Err(c.err(r.no, format!("entity '{name}': {} entities take no material", kind.name())));
+        }
+        for option in options {
             let fail = |m: String| c.err(r.no, format!("entity '{name}': {m}"));
             if kind == EntityKind::Spawn {
                 return Err(fail(format!("spawn points take no options ('{option}')")));
@@ -578,6 +600,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             occluder,
             shadow,
             animation,
+            binding,
         });
     }
 
@@ -937,6 +960,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     }
     // The vertex table becomes the mesh's positions in order; unused entries are dropped at finish.
     let mut builder = MeshBuilder::new(&level_name, vertices, decls.iter().cloned());
+    let mut bindings: Vec<Binding> = Vec::new();
     let mut sectors_out = Vec::with_capacity(sectors.len());
     let mut portals = Vec::with_capacity(adjoins.len());
     for (si, s) in sectors.iter().enumerate() {
@@ -948,6 +972,17 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     builder
                         .push_polygon(&indices, PolyFlags(surf.flags))
                         .map_err(|m| c.err(surf.line, m))?;
+                    if let Some(binding) = &surf.binding {
+                        // Surfaces with the same binding share it.
+                        let index = match bindings.iter().position(|b| b == binding) {
+                            Some(k) => k,
+                            None => {
+                                bindings.push(binding.clone());
+                                bindings.len() - 1
+                            }
+                        };
+                        builder.set_material(index as u32);
+                    }
                     for rows in &surf.attr_rows {
                         for (k, &row) in rows.iter().enumerate() {
                             let n = decls[k].1 as usize;
@@ -1027,6 +1062,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             occluder,
             shadow: e.shadow,
             animation: e.animation,
+            binding: e.binding,
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
@@ -1080,6 +1116,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         portals,
         spawns,
         terrain,
+        bindings,
         ambient,
         lights: lights.into_iter().map(|(_, l)| l).collect(),
         directional,

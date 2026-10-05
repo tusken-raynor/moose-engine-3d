@@ -17,6 +17,9 @@ pub struct Level {
     pub spawns: Vec<EntitySpawn>,
     /// The terrains (`EntityKind::Terrain` spawns), carved by the sectors.
     pub terrain: Vec<Terrain>,
+    /// What the level's surfaces are drawn with: the geometry's polygons name these by
+    /// index (`Polygon::material`).
+    pub bindings: Vec<crate::material::Binding>,
     /// Light that reaches everything, in linear RGB (1 is a surface's full color).
     pub ambient: Vec3,
     pub lights: Vec<Light>,
@@ -358,6 +361,9 @@ pub struct EntitySpawn {
     pub shadow: ShadowKind,
     /// The animation it plays (by name), if its model has a skeleton.
     pub animation: Option<String>,
+    /// What its model is drawn with, if it names a material (`material=`); otherwise its
+    /// vertex colors.
+    pub binding: Option<crate::material::Binding>,
 }
 
 /// How an entity's shadows' edges are drawn, from a light with a size.

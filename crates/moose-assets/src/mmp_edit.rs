@@ -109,6 +109,7 @@ impl LevelDoc {
         let old = &mut lists[s.sector][surface - self.sectors[s.sector].first_surface];
         old.adjoin = Some(a_side);
         old.flags = 0;
+        old.options.clear();
         old.corners = corners.iter().map(|&(v, _)| (v, Vec::new())).collect();
         // The new sector: the opening back (facing into it: reversed), the far end (facing
         // back toward the opening, like the surface), and a side per edge.
@@ -117,12 +118,14 @@ impl LevelDoc {
             adjoin: Some(b_side),
             flags: 0,
             corners: corners.iter().rev().map(|&(v, _)| (v, Vec::new())).collect(),
+            options: Vec::new(),
         }];
         list.push(SurfaceDoc {
             sector: new_sector,
             adjoin: None,
             flags: s.flags & 0x2,
             corners: far.iter().zip(&corners).map(|(&f, (_, rows))| (f, rows.clone())).collect(),
+            options: s.options.clone(),
         });
         let k = corners.len();
         let center = {
@@ -138,7 +141,8 @@ impl LevelDoc {
                 (far[j], b.1.clone()),
                 (far[i], a.1.clone()),
             ];
-            list.push(self.facing_in(side, center));
+            // The sides are drawn as the surface was.
+            list.push(SurfaceDoc { options: s.options.clone(), ..self.facing_in(side, center) });
         }
         lists.push(list);
         self.sectors.push(SectorDoc {
@@ -158,7 +162,7 @@ impl LevelDoc {
         if n.dot(center - points[0]) < 0.0 {
             corners.reverse();
         }
-        SurfaceDoc { sector: 0, adjoin: None, flags: 0, corners }
+        SurfaceDoc { sector: 0, adjoin: None, flags: 0, corners, options: Vec::new() }
     }
 
     /// Splits sector `sector` by the plane through `point` facing `normal` into two, joined
@@ -264,12 +268,14 @@ impl LevelDoc {
             adjoin: Some(cap_front),
             flags: 0,
             corners: on.iter().map(|&v| (v, Vec::new())).collect(),
+            options: Vec::new(),
         });
         back_list.push(SurfaceDoc {
             sector: new_sector,
             adjoin: Some(cap_back),
             flags: 0,
             corners: on.iter().rev().map(|&v| (v, Vec::new())).collect(),
+            options: Vec::new(),
         });
         lists[sector] = front_list;
         lists.push(back_list);
@@ -351,6 +357,7 @@ impl LevelDoc {
             let t = &mut self.surfaces[i];
             t.adjoin = Some(a);
             t.flags = 0;
+            t.options.clear();
             for corner in &mut t.corners {
                 corner.1.clear();
             }

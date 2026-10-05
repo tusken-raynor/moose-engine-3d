@@ -216,7 +216,14 @@ pub struct Polygon {
     pub vertex_count: u16,
     pub plane: Plane,
     pub flags: PolyFlags,
+    /// What it is drawn with: an index into its owner's bindings (a level's
+    /// `Level::bindings`), or [`NO_MATERIAL`].
+    pub material: u32,
 }
+
+/// [`Polygon::material`] of a polygon that names no material (drawn with its vertex
+/// colors).
+pub const NO_MATERIAL: u32 = u32::MAX;
 
 impl Polygon {
     /// Range of this polygon's vertices in `Mesh::vertex_positions` and every attribute.
@@ -329,8 +336,16 @@ impl MeshBuilder {
             vertex_count,
             plane,
             flags,
+            material: NO_MATERIAL,
         });
         Ok(())
+    }
+
+    /// Sets the material of the polygon pushed last (see [`Polygon::material`]).
+    pub fn set_material(&mut self, material: u32) {
+        if let Some(p) = self.mesh.polygons.last_mut() {
+            p.material = material;
+        }
     }
 
     pub fn attrib_data(&mut self, index: usize) -> &mut AttribData {

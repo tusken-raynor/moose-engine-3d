@@ -167,8 +167,7 @@ Sep 29. Light from far away, like the sun, arriving along one direction everywhe
 - **Shadow slots:** the flashlight has slot 0, and the level's directional lights that cast shadows take slots from 1.
 - **In the app:**
   - The options menu's Lighting page switches the level's directional lights on and off (`--no-sun`). Their size is the level's, times the shadow softness (below), up to 45 degrees across.
-  - Sky surfaces are drawn unlit in their vertex color (`UnlitColor`).
-  - Non-reflective floors get the floor texture too.
+  - Sky surfaces are drawn with the `sky` material: the sky box, or with the Sky setting flat, unlit in their vertex color (`UnlitColor`).
 - **Test level:** `sunny_rooms.mmp` is two_rooms with room_b's ceiling open to the sky, a sun from the south-west, and a dim sky-blue ambient.
 - **Cost:** in a courtyard view, the view takes about 0.07 ms against 0.02 ms without the sun, and the raster about 0.25 ms more.
 
@@ -328,7 +327,7 @@ The view time drops because the walker's soft carving goes; the grid costs a rou
 
 ## Bump mapping (experiment)
 
-The brick walls are the test surface for bump mapping and specular highlights. The Rendering page's Brick bump shader (`--bump off|normal`), Brick specular (`--specular`, a strength; off by default) and Brick shininess (`--shininess`) pick the shader configuration bound to them, and its Bump sampler (`--bump-sampler`) how it reads its bumps. Each shader reads its bumps where it wants them. Every other texture keeps its own material. Lighting stays at sample points, and stays agnostic of the lights' kinds: the sample stage works out how the light falls in tangent space, and pixels only weigh that by the texel's bumps.
+The brick walls are the test surface for bump mapping and specular highlights. Their material (`brick`, the `lit` shader; see the Material Format Spec) sets the normal map and how it's read (bilinear), the highlight's strength and shininess; the Rendering page's Bump mapping (`--bump off|normal`) and Specular highlights (`--specular on|off`) settings switch what the material allows on and off. (Until materials were data, the page had Brick bump shader, Brick specular, Brick shininess and Bump sampler settings.) Each shader reads its bumps where it wants them. Every other texture keeps its own material. Lighting stays at sample points, and stays agnostic of the lights' kinds: the sample stage works out how the light falls in tangent space, and pixels only weigh that by the texel's bumps.
 
 **The bricks' bump data** is baked by `cargo run -p moose-assets --example bake_brick` from `brick_wall_height.png` (0 in the mortar, the bricks rising over 2 texels from their edges, made once from the brick texture's old alpha, a mask of the bricks; `bump::bevel_heights`). It runs again to the same bytes.
 - `brick_wall_normal.png`: a tangent-space normal map in its color, `(n + 1) / 2`. The brick texture's alpha stays its own: a mask of the bricks, which its detail noise (on when the bricks are plain) is masked by.

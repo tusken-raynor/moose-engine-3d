@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::LoadError;
 use crate::level::Level;
+use crate::material::MaterialLibrary;
 use crate::mesh::Mesh;
 use crate::texture::{Texture, decode_png};
 use crate::{mmp, obj};
@@ -25,6 +26,9 @@ pub struct Assets {
     by_name: HashMap<String, MeshId>,
     textures: Vec<Texture>,
     textures_by_name: HashMap<String, TextureId>,
+    materials: MaterialLibrary,
+    /// Whether `materials` has been read (levels read it when they need it).
+    materials_read: bool,
 }
 
 impl Assets {
@@ -37,10 +41,30 @@ impl Assets {
             by_name: HashMap::new(),
             textures: Vec::new(),
             textures_by_name: HashMap::new(),
+            materials: MaterialLibrary::default(),
+            materials_read: false,
         }
     }
 
+    /// Reads every material in `root/materials` (see [`MaterialLibrary`]), replacing the
+    /// ones read before. Levels that name materials need them read first.
+    pub fn load_materials(&mut self) -> Result<(), LoadError> {
+        self.materials = MaterialLibrary::load(&self.root.join("materials"))?;
+        self.materials_read = true;
+        Ok(())
+    }
 
+    /// The materials read by [`load_materials`](Self::load_materials).
+    pub fn materials(&self) -> &MaterialLibrary {
+        &self.materials
+    }
+
+    /// Puts back `library` (one [`materials`](Self::materials) returned), as when the
+    /// materials read anew are refused.
+    pub fn set_materials(&mut self, library: MaterialLibrary) {
+        self.materials = library;
+        self.materials_read = true;
+    }
 
     pub fn root(&self) -> &Path {
         &self.root
@@ -193,6 +217,9 @@ impl Assets {
     /// Loads `root/levels/<name>`, loading any models its entities use.
     /// Each call builds a new level and adds a new geometry mesh.
     pub fn load_level(&mut self, name: &str) -> Result<Level, LoadError> {
+        if !self.materials_read {
+            self.load_materials()?;
+        }
         let path = self.root.join("levels").join(name);
         let src = read(&path)?;
         mmp::parse_mmp(self, &path, &src)
@@ -200,6 +227,9 @@ impl Assets {
 
     /// Like [`load_level`](Self::load_level), but parses `src` instead of reading the file.
     pub fn parse_level(&mut self, name: &str, src: &str) -> Result<Level, LoadError> {
+        if !self.materials_read {
+            self.load_materials()?;
+        }
         let path = self.root.join("levels").join(name);
         mmp::parse_mmp(self, &path, src)
     }

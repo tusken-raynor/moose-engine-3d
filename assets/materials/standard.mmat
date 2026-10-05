@@ -1,0 +1,35 @@
+# Moose materials: what surfaces are drawn with. See 'Material Format Spec.md' in the repo root.
+# Shaders and what they read are listed there (the registry); unknown names are errors.
+
+MOOSEMATERIAL 1
+
+materials 19
+#  id  name               shader                    [options]
+# Vertex colors, lit: anything that names no material is drawn this way too.
+   0   vertex_color       vertex_color
+# Sky surfaces: the sky box with the level's sun; its vertex colors with the Sky setting flat.
+   1   sky                sky_box                   texture0=cube:sky filter0=bilinear_mipmap_none variant.simple_sky=sky_flat
+   2   sky_flat           sky
+# Shiny surfaces of levels without texture coordinates: over their reflection, a Fresnel falloff.
+   3   color_shiny        vertex_color              variant.reflected=color_fresnel
+   4   color_fresnel      vertex_color_fresnel      reflectance=setting
+# Metal floors, shiny ones over their reflection, and water with the Water floors setting.
+   5   metal_floor        textured                  texture0=metal_tile.png
+   6   metal_floor_shiny  textured                  texture0=metal_tile.png variant.reflected=metal_fresnel variant.water=water_floor
+   7   metal_shiny        textured                  texture0=metal_tile.png variant.reflected=metal_fresnel
+   8   metal_fresnel      textured_fresnel          texture0=metal_tile.png reflectance=setting fade=setting
+   9   water_floor        textured                  texture0=@water:metal_tile.png variant.reflected=water
+# Shift: a texel's size (2 m per repeat over 128 texels).
+  10   water              water                     texture0=@water:metal_tile.png texture1=@water_heights reflectance=setting fade=setting shift=0.015625
+# Walls. Brick has bumps and a highlight (dull on the mortar, by its alpha) and, flat, detail noise.
+  11   brick              lit                       texture0=brick_wall.png texture1=brick_wall_normal.png filter1=bilinear bump=normal specular=0.25 shininess=32 detail=0.1
+  12   panel              textured                  texture0=panel_wall.png
+  13   stone              textured                  texture0=stone_wall.png
+# Crates: bumps and a highlight by their specular map; with Translucent crates, see-through.
+  14   crate              lit                       texture0=new_crate.png texture1=new_crate_norm.png bump=normal specular=0.6 shininess=32 variant.translucent=crate_glass
+  15   crate_glass        textured_translucent      texture0=new_crate.png opacity=0.5
+# Mirror balls: a cube map of their surroundings, baked at load.
+  16   mirror_ball        cube_reflection           texture0=@cube
+# Terrain: vertex colors times a detail texture, smoothly lit.
+  17   terrain            terrain_detail            texture0=terrain_detail.png
+  18   terrain_noise      terrain_noise             strength=0.45

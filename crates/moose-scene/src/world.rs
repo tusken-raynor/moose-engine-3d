@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use glam::{Affine3A, Quat, Vec3};
 use moose_assets::{
-    Aabb, Assets, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
+    Aabb, Assets, Binding, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
     Sector,
 };
 
@@ -34,6 +34,9 @@ pub struct World {
     /// The view blockers' polygons (see `EntityKind::Blocker`), in world space: convex,
     /// and either side hides what lies wholly behind it.
     pub blockers: Vec<Vec<Vec3>>,
+    /// What the level's surfaces are drawn with: the geometry's polygons name these by
+    /// index (`Polygon::material`).
+    pub bindings: Vec<Binding>,
     pub spawn_points: Vec<SpawnPoint>,
     /// Light that reaches everything (linear RGB; 1 is a surface's full color).
     pub ambient: Vec3,
@@ -81,6 +84,9 @@ pub struct Entity {
     pub shadow: ShadowKind,
     /// The animation it plays (by name), if its model has a skeleton.
     pub animation: Option<String>,
+    /// What its model (or, for a terrain, its pieces) is drawn with, if it names a
+    /// material; otherwise its vertex colors.
+    pub binding: Option<Binding>,
 }
 
 
@@ -204,6 +210,7 @@ impl World {
                     is_static,
                     shadow: spawn.shadow,
                     animation: spawn.animation,
+                    binding: spawn.binding,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }
@@ -225,6 +232,7 @@ impl World {
                 })
                 .collect(),
             blockers: Vec::new(),
+            bindings: level.bindings,
             spawn_points,
             ambient: level.ambient,
             directional: level.directional,

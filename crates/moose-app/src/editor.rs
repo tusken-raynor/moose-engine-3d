@@ -65,6 +65,8 @@ pub enum Field {
     Scale,
     Kind,
     Model,
+    /// What a surface or entity is drawn with (cycles through the materials, and none).
+    Material,
     /// The animation it plays (cycles through its model's, and none).
     Animation,
     Static,
@@ -175,6 +177,8 @@ type Snapshot = (LevelDoc, Option<Selection>);
 pub struct Editor {
     /// Editing (Tab), as opposed to playing.
     pub on: bool,
+    /// The materials' names (`assets/materials`), for the Material fields.
+    pub materials: Vec<String>,
     pub doc: LevelDoc,
     /// Where the level is saved.
     pub path: PathBuf,
@@ -221,6 +225,7 @@ impl Editor {
     pub fn new(doc: LevelDoc, path: PathBuf) -> Editor {
         Editor {
             on: false,
+            materials: Vec::new(),
             saved: doc.clone(),
             doc,
             path,
@@ -574,6 +579,8 @@ impl Editor {
                     }
                     None => {
                         let on = |bit: u32| if s.flags & bit != 0 { "on" } else { "off" }.to_string();
+                        let material = s.options.iter().find_map(|o| o.strip_prefix("material=")).unwrap_or("none");
+                        rows.push(row("Material", material.into(), Some(Field::Material)));
                         rows.push(row("Reflective", on(0x1), Some(Field::Reflective)));
                         rows.push(row("Sky", on(0x2), Some(Field::Sky)));
                         rows.push(row("Extrude by", format!("{} m", n(self.extrude_by)), Some(Field::ExtrudeBy)));
@@ -632,6 +639,10 @@ impl Editor {
                     let model = self.doc.model_file(e).unwrap_or(named).to_string();
                     let shown = if self.doc.template_of(e).is_some() { format!("{named} (template)") } else { named.clone() };
                     rows.push(row("Model", shown, Some(Field::Model)));
+                    if matches!(e.kind, EntityKind::Prop | EntityKind::Actor | EntityKind::Terrain) {
+                        let shown = format!("{}{}", value("material").unwrap_or("none"), from_template("material"));
+                        rows.push(row("Material", shown, Some(Field::Material)));
+                    }
                     let playing = value("anim");
                     if playing.is_some() || self.animations.get(&model).is_some_and(|a| !a.is_empty()) {
                         let shown = format!("{}{}", playing.unwrap_or("none"), from_template("anim"));
@@ -757,6 +768,10 @@ impl Editor {
                 let (sector, far) = self.doc.extrude(i, self.extrude_by)?;
                 self.selection = Some(Selection::Surface(far));
                 Ok(format!("extruded into {} (its far end is selected)", self.doc.sectors[sector].name))
+            }
+            (Some(Selection::Surface(i)), Field::Material) => {
+                let name = cycle_material(&mut self.doc.surfaces[i].options, &self.materials, dir);
+                Ok(format!("surface {i} drawn with {name}"))
             }
             (Some(Selection::Surface(i)), Field::Push) => {
                 self.doc.push_surface(i, -step * dir.signum());
@@ -966,6 +981,7 @@ impl Editor {
                     self.doc.templates.iter().map(|t| t.name.clone()).chain(models.iter().cloned()).collect();
                 let model_files: Vec<(String, String)> =
                     self.doc.templates.iter().map(|t| (t.name.clone(), t.model.clone())).collect();
+                let materials = self.materials.clone();
                 let e = &mut self.doc.entities[i];
                 let turn = |q: Quat, which: usize| {
                     let (mut yaw, mut pitch, mut roll) = q.to_euler(EulerRot::YXZ);
@@ -993,6 +1009,10 @@ impl Editor {
                         if e.kind == EntityKind::Actor {
                             not_static(e, &template);
                         }
+                    }
+                    Field::Material => {
+                        // Its own; none falls back to its template's.
+                        cycle_material(&mut e.options, &materials, dir);
                     }
                     Field::Model => {
                         let now = models.iter().position(|m| Some(m) == e.model.as_ref());
@@ -1443,5 +1463,39 @@ fn not_static(e: &mut moose_assets::EntityDoc, template: &[String]) {
     e.options.retain(|o| moose_assets::option_key(o) != "static");
     if is_static(template) {
         e.options.push("static=off".into());
+    }
+}
+
+/// Steps the `material=` among `options` through `materials` (and none, first), `dir`'s way,
+/// and returns the one now named.
+fn cycle_material(options: &mut Vec<String>, materials: &[String], dir: f32) -> String {
+    let now = options.iter().find_map(|o| o.strip_prefix("material=")).map(String::from);
+    let names: Vec<Option<&String>> = std::iter::once(None).chain(materials.iter().map(Some)).collect();
+    let k = names.iter().position(|n| n.map(String::as_str) == now.as_deref()).unwrap_or(0);
+    let next = names[(k as isize + dir.signum() as isize).rem_euclid(names.len() as isize) as usize];
+    options.retain(|o| !o.starts_with("material="));
+    match next {
+        Some(name) => {
+            options.push(format!("material={name}"));
+            name.clone()
+        }
+        None => "none".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cycle_material;
+
+    #[test]
+    fn material_cycles_through_none_and_the_materials() {
+        let materials = ["brick".to_string(), "stone".to_string()];
+        let mut options = vec!["filter0=nearest".to_string()];
+        assert_eq!(cycle_material(&mut options, &materials, 1.0), "brick");
+        assert_eq!(cycle_material(&mut options, &materials, 1.0), "stone");
+        assert_eq!(options, ["filter0=nearest", "material=stone"]);
+        assert_eq!(cycle_material(&mut options, &materials, 1.0), "none");
+        assert_eq!(options, ["filter0=nearest"]);
+        assert_eq!(cycle_material(&mut options, &materials, -1.0), "stone");
     }
 }
