@@ -6,6 +6,7 @@
 //! spans (never overlapping), props by sorted insertion with an exact two-point test, and
 //! per-pixel actors in a visibility buffer, then shades each visible pixel once, in runs.
 
+pub mod post;
 pub mod shader;
 pub mod shaders;
 
@@ -16,8 +17,8 @@ pub use render::{
 };
 pub use shader::{
     AttribDesc, F32s, Fill, Format, I16s, I32s, LANES, MAX_TEXTURES, Material, MaterialId, Over,
-    Params, PixelContext, Pixels, RowBehind, SampleContext, TextureSet, U32s, VertexContext,
-    high_byte, widen,
+    HDR_RANGE, Params, PixelContext, Pixels, RowBehind, SampleContext, TextureSet, U32s,
+    VertexContext, high_byte, widen,
 };
 /// The portable SIMD crate the lane types come from, for shaders written elsewhere.
 pub use wide;

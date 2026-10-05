@@ -11,6 +11,10 @@
 //!                         default) or trilinear
 //!   --terrain-detail D    terrains' grain: texture (the detail texture) or noise (3D
 //!                         noise in world space); default texture
+//!   --sky STYLE           sky surfaces: box (the sky cube map, with the sun; the default)
+//!                         or flat (their vertex colors)
+//!   --bloom MODE          glow around light past white: sun (the sun's, the default),
+//!                         bright (and any near-white pixel's), or off
 //!   --specular S          the brick walls' highlight, its strength (default 0: none)
 //!   --shininess P         the highlight's power, a power of two (default 32)
 //!   --filter NAME         texture sampler: METHOD_mipmap_MIP, with METHOD nearest, bilinear
@@ -106,10 +110,11 @@ use moose_assets::{Assets, LevelDoc, Light, MeshId, ModelDoc, RIPPLE_SIZE, Rippl
 use moose_present::{Display, Key, MouseButton};
 use moose_raster::shaders::{
     CubeReflection, Textured, TexturedFresnel, TexturedNormal, TexturedNormalSpecular, TexturedSpecular,
-    TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel, VertexColorNoise,
-    VertexColorTranslucent, Water,
+    SkyBox, TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel,
+    VertexColorNoise, VertexColorTranslucent, Water,
     filter,
 };
+use moose_raster::post::{Bloom, BloomConfig};
 use moose_raster::{
     MAX_TEXTURES, MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target,
 };
@@ -209,6 +214,17 @@ const CRATE_SHININESS: f32 = 32.0;
 /// The detail texture multiplied over terrains' vertex colors (in assets/textures; made by
 /// tools/gen_canyon_level.py), for terrains with `uv` and `normal` attributes.
 const TERRAIN_DETAIL: &str = "terrain_detail.png";
+/// The sky box's faces (in assets/textures, in `CUBE_FACES` order; baked by
+/// `cargo run --release -p moose-assets --example bake_sky`).
+const SKY_FACES: [&str; 6] = ["sky_px.png", "sky_nx.png", "sky_py.png", "sky_ny.png", "sky_pz.png", "sky_nz.png"];
+/// How much wider the sun's disk is drawn than its light's angle (the real sun's 0.53
+/// degrees is two pixels across at 720p).
+const SUN_DISK_SCALE: f32 = 2.5;
+/// Bloom: how strong the glow is, of light past white alone and with the bright pass, and
+/// where the bright pass starts (the brightest channel, 0 to 1).
+const BLOOM_STRENGTH: f32 = 1.0;
+const BLOOM_BRIGHT_STRENGTH: f32 = 0.45;
+const BLOOM_THRESHOLD: f32 = 0.85;
 /// Entities with this model are mirror balls: each gets a static cube map of its
 /// surroundings, baked at load.
 const BALL_MODEL: &str = "ball.obj";
@@ -251,6 +267,8 @@ struct Options {
     specular: f32,
     shininess: f32,
     terrain_detail: TerrainDetail,
+    sky: SkyStyle,
+    bloom: BloomMode,
     floor_texture: String,
     water: bool,
     no_flashlight: bool,
@@ -333,6 +351,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         floor_texture: DEFAULT_FLOOR_TEXTURE.into(),
         bump: Bump::Off,
         terrain_detail: TerrainDetail::Texture,
+        sky: SkyStyle::Box,
+        bloom: BloomMode::Sun,
         bump_sampler: 2,
         specular: 0.0,
         shininess: 32.0,
@@ -426,6 +446,18 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                     format!("--terrain-detail is one of {}", TerrainDetail::ALL.map(TerrainDetail::name).join(", "))
                 })?;
             }
+            "--sky" => {
+                let name = value()?;
+                o.sky = SkyStyle::ALL.into_iter().find(|v| v.name() == name).ok_or_else(|| {
+                    format!("--sky is one of {}", SkyStyle::ALL.map(SkyStyle::name).join(", "))
+                })?;
+            }
+            "--bloom" => {
+                let name = value()?;
+                o.bloom = BloomMode::ALL.into_iter().find(|v| v.name() == name).ok_or_else(|| {
+                    format!("--bloom is one of {}", BloomMode::ALL.map(BloomMode::name).join(", "))
+                })?;
+            }
             "--specular" => o.specular = value()?.parse().map_err(|_| "bad --specular")?,
             "--shininess" => o.shininess = value()?.parse().map_err(|_| "bad --shininess")?,
             "--bump-sampler" => {
@@ -515,6 +547,8 @@ struct Settings {
     bump_sampler: usize,
     /// Terrains' grain (see [`TerrainDetail`]).
     terrain_detail: TerrainDetail,
+    sky: SkyStyle,
+    bloom: BloomMode,
     /// The brick walls' highlight: its strength (0 for none; one of `SPECULARS`) and its
     /// power (one of `SHININESS`).
     specular: f32,
@@ -607,6 +641,48 @@ impl TerrainDetail {
     }
 }
 
+/// How sky surfaces are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkyStyle {
+    /// Their vertex colors, unlit.
+    Flat,
+    /// The sky cube map (`SKY_FACES`) seen from the eye, with the sun in it: `SkyBox`.
+    Box,
+}
+
+impl SkyStyle {
+    const ALL: [SkyStyle; 2] = [SkyStyle::Box, SkyStyle::Flat];
+
+    fn name(self) -> &'static str {
+        match self {
+            SkyStyle::Flat => "flat",
+            SkyStyle::Box => "box",
+        }
+    }
+}
+
+/// What glows (see `moose_raster::post::Bloom`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BloomMode {
+    Off,
+    /// Light past white: the sun's.
+    Sun,
+    /// That, and any pixel's brightest channel past `BLOOM_THRESHOLD`.
+    Bright,
+}
+
+impl BloomMode {
+    const ALL: [BloomMode; 3] = [BloomMode::Off, BloomMode::Sun, BloomMode::Bright];
+
+    fn name(self) -> &'static str {
+        match self {
+            BloomMode::Off => "off",
+            BloomMode::Sun => "sun",
+            BloomMode::Bright => "bright",
+        }
+    }
+}
+
 /// How strongly the noise grain takes terrains' colors either way (see `VertexColorNoise`).
 const TERRAIN_NOISE: f32 = 0.45;
 
@@ -668,6 +744,12 @@ struct App {
     brick_normals: Option<TextureId>,
     /// The crate model, its texture and its normal map, if the level has crates.
     crate_texture: Option<(MeshId, TextureId, TextureId)>,
+    /// The sky shader, and the sky cube map and its face size, if its faces are there.
+    sky_shader: MaterialId,
+    sky_cube: Option<(TextureId, u32)>,
+    /// The bloom pass, and how long it took last frame (ms).
+    bloom: Bloom,
+    post_ms: f64,
     /// Terrains' shaders (see [`TerrainDetail`]): texture, noise; and the detail texture, if
     /// there is one.
     terrain_shaders: [MaterialId; 2],
@@ -749,6 +831,8 @@ impl App {
             renderer.register_material::<VertexColorNoise>(),
         ];
         let terrain_detail = assets.load_texture(TERRAIN_DETAIL).ok();
+        let sky_shader = renderer.register_material::<SkyBox>();
+        let sky_cube = load_sky(&mut assets);
         let brick_shaders = [
             renderer.register_material::<TexturedNormal>(),
             renderer.register_material::<TexturedSpecular>(),
@@ -837,6 +921,10 @@ impl App {
             crate_texture,
             terrain_shaders,
             terrain_detail,
+            sky_shader,
+            sky_cube,
+            bloom: Bloom::default(),
+            post_ms: 0.0,
             textured_translucent,
             cube_reflection,
             cube_maps,
@@ -853,6 +941,8 @@ impl App {
                 bump: options.bump,
                 bump_sampler: options.bump_sampler,
                 terrain_detail: options.terrain_detail,
+                sky: options.sky,
+                bloom: options.bloom,
                 specular: options.specular.max(0.0),
                 shininess: options.shininess.clamp(1.0, 256.0),
                 water: options.water,
@@ -1459,6 +1549,11 @@ impl App {
             Setting::Filter => filter::name(filter::ALL[s.filter]).replace("_mipmap_", " / "),
             Setting::Bump => s.bump.name().into(),
             Setting::TerrainDetail => s.terrain_detail.name().into(),
+            Setting::Sky => match self.sky_cube {
+                Some(_) => s.sky.name().into(),
+                None => "flat (no sky box)".into(),
+            },
+            Setting::Bloom => s.bloom.name().into(),
             Setting::BumpSampler => BUMP_SAMPLERS[s.bump_sampler].into(),
             Setting::Specular => if s.specular > 0.0 { format!("x{}", s.specular) } else { "off".into() },
             Setting::Shininess => format!("{}", s.shininess),
@@ -1528,6 +1623,14 @@ impl App {
             }
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
             Setting::Filter => s.filter = wrap(s.filter, filter::ALL.len()),
+            Setting::Sky => {
+                let i = SkyStyle::ALL.iter().position(|&v| v == s.sky).unwrap_or(0);
+                s.sky = SkyStyle::ALL[wrap(i, SkyStyle::ALL.len())];
+            }
+            Setting::Bloom => {
+                let i = BloomMode::ALL.iter().position(|&v| v == s.bloom).unwrap_or(0);
+                s.bloom = BloomMode::ALL[wrap(i, BloomMode::ALL.len())];
+            }
             Setting::TerrainDetail => {
                 let i = TerrainDetail::ALL.iter().position(|&d| d == s.terrain_detail).unwrap_or(0);
                 s.terrain_detail = TerrainDetail::ALL[wrap(i, TerrainDetail::ALL.len())];
@@ -1583,8 +1686,9 @@ impl App {
         let on = |b: bool, name: &str| if b { name.to_string() } else { format!("{name} off") };
         vec![
             format!(
-                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms   present {present_ms:.2} ms",
+                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms   post {:.2} ms   present {present_ms:.2} ms",
                 if s.capped { format!(" (cap {})", s.cap) } else { String::new() },
+                self.post_ms,
             ),
             format!(
                 "{}  ({:.1}, {:.1}, {:.1})  yaw {:.0}  pitch {:.0}",
@@ -1653,6 +1757,12 @@ impl App {
         add(format!("--filter {}", filter::name(filter::ALL[s.filter])));
         if s.bump != Bump::Off {
             add(format!("--bump {} --bump-sampler {}", s.bump.name(), BUMP_SAMPLERS[s.bump_sampler]));
+        }
+        if s.sky != SkyStyle::Box {
+            add(format!("--sky {}", s.sky.name()));
+        }
+        if s.bloom != BloomMode::Sun {
+            add(format!("--bloom {}", s.bloom.name()));
         }
         if s.terrain_detail != TerrainDetail::Texture {
             add(format!("--terrain-detail {}", s.terrain_detail.name()));
@@ -1756,6 +1866,17 @@ impl App {
         let mut pixels = std::mem::take(&mut self.pixels);
         let camera = self.camera.clone();
         let times = self.draw(&camera, &mut pixels, self.width, self.height);
+        // The glow, over the finished frame (not cube maps).
+        let post = Instant::now();
+        if self.settings.bloom != BloomMode::Off {
+            let bright = self.settings.bloom == BloomMode::Bright;
+            let config = BloomConfig {
+                strength: if bright { BLOOM_BRIGHT_STRENGTH } else { BLOOM_STRENGTH },
+                threshold: if bright { BLOOM_THRESHOLD } else { 1.0 },
+            };
+            self.bloom.apply(&mut pixels, self.width as usize, self.height as usize, &config);
+        }
+        self.post_ms = post.elapsed().as_secs_f64() * 1000.0;
         self.pixels = pixels;
         times
     }
@@ -1787,6 +1908,32 @@ impl App {
         let (crate_texture, textured_translucent) = (self.crate_texture, self.textured_translucent);
         let (terrain_shaders, terrain_detail, assets) = (self.terrain_shaders, self.terrain_detail, &self.assets);
         let grain = s.terrain_detail;
+        // The sky: toward the sun, its tint and size, whether there is one, whether to
+        // write how far past white for the bloom, and the cube map's face size.
+        let (sky_shader, sky_cube, sky_style) = (self.sky_shader, self.sky_cube, s.sky);
+        let sun = self.world.directional.first().filter(|_| s.sun);
+        let sky_params = {
+            let (toward, tint, radius) = match sun {
+                Some(d) => (
+                    -d.direction.normalize(),
+                    d.color / d.color.max_element().max(1e-6),
+                    (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
+                ),
+                None => (Vec3::Y, Vec3::ONE, 0.0),
+            };
+            Params::new(&[
+                toward.x,
+                toward.y,
+                toward.z,
+                tint.x,
+                tint.y,
+                tint.z,
+                radius,
+                if sun.is_some() { 1.0 } else { 0.0 },
+                if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
+                sky_cube.map_or(1.0, |(_, size)| size as f32),
+            ])
+        };
         let level = self.assets.mesh(self.world.geometry);
         let (cube_reflection, cube_maps) = (self.cube_reflection, &self.cube_maps);
         let mut target = Target {
@@ -1799,7 +1946,17 @@ impl App {
         let surface_of = |p: &moose_view::ViewPolygon| -> Surface {
             if let PolygonSource::World { sector, polygon } = p.source {
                 if p.flags.sky() {
-                    return Surface::new(unlit);
+                    return match (sky_style, sky_cube) {
+                        // Bilinear: a face texel spans about a pixel or more, so its mips
+                        // are never needed.
+                        (SkyStyle::Box, Some((cube, _))) => Surface {
+                            textures: [Some(cube), None],
+                            params: sky_params,
+                            filters: [filter::BILINEAR_MIPMAP_NONE; MAX_TEXTURES],
+                            ..Surface::new(sky_shader)
+                        },
+                        _ => Surface::new(unlit),
+                    };
                 }
                 // Shiny surfaces are textured, if there is a texture to map, and so
                 // are other walls, with their sector's texture.
@@ -2068,6 +2225,8 @@ enum Setting {
     Bump,
     BumpSampler,
     TerrainDetail,
+    Sky,
+    Bloom,
     Specular,
     Shininess,
     Water,
@@ -2168,6 +2327,8 @@ impl Page {
                 Set(Specular),
                 Set(Shininess),
                 Set(TerrainDetail),
+                Set(Sky),
+                Set(Bloom),
                 Set(Water),
                 Set(Bounces),
                 Set(Reflectance),
@@ -2246,6 +2407,8 @@ impl Item {
                 Setting::Filter => "Texture filter",
                 Setting::Bump => "Brick bump shader",
                 Setting::TerrainDetail => "Terrain detail",
+                Setting::Sky => "Sky",
+                Setting::Bloom => "Bloom",
                 Setting::BumpSampler => "Bump sampler",
                 Setting::Specular => "Brick specular",
                 Setting::Shininess => "Brick shininess",
@@ -2294,6 +2457,20 @@ fn bindings_path() -> Option<PathBuf> {
 }
 
 /// Every setting the menu has.
+/// The sky cube map from `SKY_FACES`, and its face size; none if a face is missing.
+fn load_sky(assets: &mut Assets) -> Option<(TextureId, u32)> {
+    let mut faces: [Vec<u32>; 6] = Default::default();
+    let mut size = 0;
+    for (face, name) in faces.iter_mut().zip(SKY_FACES) {
+        let id = assets.load_texture(name).ok()?;
+        let base = assets.texture(id).base();
+        size = base.width;
+        *face = base.texels.clone();
+    }
+    let cube = Texture::cube("sky", size, faces).ok()?;
+    Some((assets.add_texture(cube), size))
+}
+
 fn all_settings() -> Vec<Setting> {
     Page::ALL
         .iter()
@@ -2779,13 +2956,19 @@ fn run() -> Result<(), String> {
         app.set_time(options.time);
         let (view_ms, raster_ms) = app.frame()?;
         if options.bench > 0 {
-            let (mut view, mut raster) = (0.0, 0.0);
+            let (mut view, mut raster, mut post) = (0.0, 0.0, 0.0);
             for _ in 0..options.bench {
                 let (v, r) = app.frame()?;
-                (view, raster) = (view + v, raster + r);
+                (view, raster, post) = (view + v, raster + r, post + app.post_ms);
             }
             let n = options.bench as f64;
-            println!("{} frames: view {:.3} ms, raster {:.3} ms on average", options.bench, view / n, raster / n);
+            println!(
+                "{} frames: view {:.3} ms, raster {:.3} ms, post {:.3} ms on average",
+                options.bench,
+                view / n,
+                raster / n,
+                post / n
+            );
         }
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
         draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, hud);

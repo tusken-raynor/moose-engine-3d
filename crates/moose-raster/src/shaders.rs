@@ -74,32 +74,105 @@ pub(crate) fn encode_light(l: F32s) -> F32s {
     l.max(F32s::fill(0.0)).sqrt()
 }
 
+/// Where lit colors start to bend toward white (see [`shoulder`]): the brightest channel's
+/// value, 0 to 255.
+const KNEE: f32 = 204.0;
+/// How far very bright light washes toward white, at most (see [`shoulder`]).
+const WASH: f32 = 0.6;
+/// How far past 1 the light goes before the shoulder is fully on: it eases in from 1, so
+/// nothing lit at most fully changes.
+const SHOULDER_RAMP: f32 = 0.25;
+
+/// XRGB from lit channel values (0 up, 255 being white, any past it) under `light` (16.16,
+/// encoded), with a soft shoulder instead of clipping where the light goes past 1: past
+/// [`KNEE`], the brightest channel `m` comes in toward white,
+/// `KNEE + (m - KNEE) / (1 + (m - KNEE) / (255 - KNEE))` (smooth at the knee, never reaching
+/// 255), and the others scale with it, so a bright light keeps a surface's texture and hue
+/// rather than flattening it. As much as it is brought in, it also washes toward white (up
+/// to [`WASH`]), as very bright light does on film. It eases in as the light goes from 1 to
+/// `1 + SHOULDER_RAMP`; under light of 1 or less colors are clipped as ever (they can't pass
+/// white), so a white texel in full light stays white. Blocks where no lane is lit past 1 or
+/// past the knee (most of them) are packed as they are.
+#[inline(always)]
+fn shoulder(ch: [U32s; 3], light: &[I32s; 3]) -> U32s {
+    let byte = U32s::fill(255);
+    let m: I32s = wide::bytemuck::cast(ch[0].max(ch[1]).max(ch[2]));
+    let l = light[0].max(light[1]).max(light[2]);
+    if l.simd_le(I32s::fill(65536)).all() || m.simd_le(I32s::fill(KNEE as i32)).all() {
+        return ch[0].min(byte) << 16_u32 | ch[1].min(byte) << 8_u32 | ch[2].min(byte);
+    }
+    let (scale, wash) = shoulder_lanes(m.round_float(), l.round_float() * F32s::fill(1.0 / 65536.0));
+    let pack = |c: U32s| -> U32s {
+        let c: I32s = wide::bytemuck::cast(c);
+        let c = c.round_float();
+        let v = c * scale;
+        let v = v + (F32s::fill(255.0) - v) * wash;
+        // Eased in from the plain clip.
+        wide::bytemuck::cast(v.round_int().max(I32s::fill(0)).min(I32s::fill(255)))
+    };
+    pack(ch[0]) << 16_u32 | pack(ch[1]) << 8_u32 | pack(ch[2])
+}
+
+/// [`shoulder`]'s scale on every channel and wash toward white for lanes whose brightest
+/// channel is `m` (0 to 255 being white) under light `l` (encoded, 1 being 1); where it is
+/// off, a scale clipping `m` at 255 and no wash.
+#[inline(always)]
+fn shoulder_lanes(m: F32s, l: F32s) -> (F32s, F32s) {
+    let one = F32s::fill(1.0);
+    let mf = m.max(one);
+    let over = (mf - F32s::fill(KNEE)).max(F32s::fill(0.0));
+    let bent = F32s::fill(KNEE) + over / (one + over * F32s::fill(1.0 / (255.0 - KNEE)));
+    let clipped = mf.min(F32s::fill(255.0));
+    let t = ((l - one) * F32s::fill(1.0 / SHOULDER_RAMP)).max(F32s::fill(0.0)).min(one);
+    let t = t * t * (F32s::fill(3.0) - t - t);
+    // The brightest channel's new value, between clipped and bent, over its old one.
+    let target = clipped + (bent - clipped) * t;
+    let scale = mf.simd_gt(F32s::fill(KNEE)).select(target / mf, one);
+    let wash = (one - bent / mf).max(F32s::fill(0.0)) * F32s::fill(WASH) * t;
+    (scale, mf.simd_gt(F32s::fill(KNEE)).select(wash, F32s::fill(0.0)))
+}
+
+/// One lit color as [`shoulder`] packs it, for references in tests: channel values (255
+/// being white, any past it) under light whose brightest channel is `light` (encoded).
+pub fn shoulder_reference(ch: [f32; 3], light: f32) -> [u32; 3] {
+    let m = ch[0].max(ch[1]).max(ch[2]);
+    if light <= 1.0 || m <= KNEE {
+        return ch.map(|c| (c as u32).min(255));
+    }
+    let (scale, wash) = shoulder_lanes(F32s::fill(m.floor()), F32s::fill(light));
+    let (scale, wash) = (scale.to_array()[0], wash.to_array()[0]);
+    ch.map(|c| {
+        let v = c.floor() * scale;
+        (v + (255.0 - v) * wash).round().clamp(0.0, 255.0) as u32
+    })
+}
+
 /// XRGB from a `color` output (three 8.8 channels, 0-255) under the 16.16 `light` (see
-/// [`light_output`]), each channel at most 255. Color and light are interpolated apart and
-/// multiplied per pixel: clamping lit colors at sample points would bend them near edges,
-/// where sample points past the polygon carry values beyond 255 (which the wrapping 8.8
-/// stepping brings back in range inside it).
+/// [`light_output`]), past white brought in by [`shoulder`]. Color and light are
+/// interpolated apart and multiplied per pixel: clamping lit colors at sample points would
+/// bend them near edges, where sample points past the polygon carry values beyond 255
+/// (which the wrapping 8.8 stepping brings back in range inside it).
 #[inline(always)]
 fn lit_rgb(color: &[I16s; 3], light: &[I32s; 3]) -> U32s {
     use crate::shader::high_byte;
-    let byte = U32s::fill(255);
     let channel = |k: usize| {
         let l: U32s = wide::bytemuck::cast(light[k]);
-        ((high_byte(color[k]) * l) >> 16_u32).min(byte)
+        (high_byte(color[k]) * l) >> 16_u32
     };
-    channel(0) << 16 | channel(1) << 8 | channel(2)
+    shoulder([channel(0), channel(1), channel(2)], light)
 }
 
 /// `texel`'s color channels under the 16.16 `light` (see [`light_output`]; 65536 is 1: a
-/// light of exactly 1 leaves the texel as it is), each at most 255; its alpha is kept.
+/// light of exactly 1 leaves the texel as it is), past white brought in by [`shoulder`];
+/// its alpha is kept.
 #[inline(always)]
 fn lit_texel(texel: U32s, light: &[I32s; 3]) -> U32s {
     let byte = U32s::fill(255);
     let channel = |shift: u32, k: usize| {
         let l: U32s = wide::bytemuck::cast(light[k]);
-        (((((texel >> shift) & byte) * l) >> 16_u32).min(byte)) << shift
+        (((texel >> shift) & byte) * l) >> 16_u32
     };
-    (texel & U32s::fill(0xFF00_0000)) | channel(16, 0) | channel(8, 1) | channel(0, 2)
+    (texel & U32s::fill(0xFF00_0000)) | shoulder([channel(16, 0), channel(8, 1), channel(0, 2)], light)
 }
 
 /// The facing term of the Fresnel materials at [`LANES`](crate::shader::LANES) sample
@@ -220,9 +293,9 @@ pub mod vertex_color_detail {
                 // Color times twice the texel (at most 510), then the light.
                 let c = (high_byte(b.color[k]) * ((texel >> shift) & byte)) >> 7_u32;
                 let l: U32s = wide::bytemuck::cast(light[k]);
-                ((c * l) >> 16_u32).min(byte) << shift
+                (c * l) >> 16_u32
             };
-            channel(16, 0) | channel(8, 1) | channel(0, 2)
+            super::shoulder([channel(16, 0), channel(8, 1), channel(0, 2)], &light)
         }
     }
 }
@@ -353,13 +426,12 @@ pub mod vertex_color_noise {
             let scaled: I32s = I32s::fill(256) + (sum >> 19_i32);
             let scale: U32s = wide::bytemuck::cast(scaled.max(I32s::fill(0)));
             let light = ctx.light(&a.light);
-            let byte = U32s::fill(255);
-            let channel = |shift: u32, k: usize| {
+            let channel = |k: usize| {
                 let c = (high_byte(b.color[k]) * scale) >> 8_u32;
                 let l: U32s = wide::bytemuck::cast(light[k]);
-                ((c * l) >> 16_u32).min(byte) << shift
+                (c * l) >> 16_u32
             };
-            channel(16, 0) | channel(8, 1) | channel(0, 2)
+            super::shoulder([channel(0), channel(1), channel(2)], &light)
         }
     }
 }
@@ -1479,6 +1551,109 @@ pub mod cube_reflection {
 }
 
 pub use cube_reflection::CubeReflection;
+
+/// A sky: a cube map seen from where the eye is (texture 0, RGBM: see [`SKY_RANGE`]), so it
+/// shows the same whichever surfaces it is drawn on, with a sun in it: a disk and its glare
+/// toward the level's sun, past white (an HDR material: how far is in the top byte, for a
+/// post pass to make glow; see `Material::HDR`).
+///
+/// Params: the way toward the sun (`values[0..3]`, unit length), its tint (`values[3..6]`),
+/// its angular radius (`values[6]`, radians), how bright its disk and glare are
+/// (`values[7]`, 0 for no sun), whether to write how far past white (`values[8]`, 1 or 0),
+/// and the cube map's face size (`values[9]`, texels).
+pub mod sky_box {
+    use crate::shader::{
+        F32s, Fill, HDR_RANGE, I32s, Material, PixelContext, SampleContext, U32s, VertexContext, sample_cube_by,
+    };
+
+    crate::material_io! {
+        vertex {}
+        sampled { position: 3 }
+        fixed32 {}
+        fixed16 {}
+        float { dir: 3, lod: 1 }
+    }
+
+    /// What an RGBM texel holds at most: its color is its red, green and blue times its
+    /// alpha times this, all over 255 (as `bake_sky` writes them).
+    pub const SKY_RANGE: f32 = 4.0;
+
+    pub struct SkyBox;
+
+    impl Material for SkyBox {
+        crate::material_types!();
+        const HDR: bool = true;
+
+        #[inline(always)]
+        fn shade_vertex(_: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled::default()
+        }
+
+        /// The way from the eye (affine on the polygon, so exact between sample points),
+        /// and the level of detail: face texels per pixel (a face spans pi / 2 of view, a
+        /// pixel about 1 / focal).
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let p = &s.position;
+            let size = ctx.params.values[9];
+            let lod = (2.0 * size / (std::f32::consts::PI * ctx.focal)).log2();
+            Interp {
+                dir: [
+                    p[0] - F32s::fill(ctx.eye.x),
+                    p[1] - F32s::fill(ctx.eye.y),
+                    p[2] - F32s::fill(ctx.eye.z),
+                ],
+                lod: [F32s::fill(lod)],
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(_: &Fixed32, _: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
+            let v = &ctx.params.values;
+            let texel = sample_cube_by(ctx.textures[0], c.dir, c.lod[0].to_array()[0], ctx.at, ctx.filters[0]);
+            let m = super::channel(texel, 24) * F32s::fill(SKY_RANGE / (255.0 * 255.0));
+            let mut color = [16, 8, 0].map(|shift| super::channel(texel, shift) * m);
+            if v[7] > 0.0 {
+                // The sun: a disk (its edge over a pixel) and glare around it, by the angle
+                // from it (from 1 - cos, which is half its square near the sun).
+                let d = &c.dir;
+                let inv = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).max(F32s::fill(1e-12)).recip_sqrt();
+                let cos = (d[0] * F32s::fill(v[0]) + d[1] * F32s::fill(v[1]) + d[2] * F32s::fill(v[2])) * inv;
+                let angle2 = ((F32s::fill(1.0) - cos) * F32s::fill(2.0)).max(F32s::fill(0.0));
+                let pixel = 1.0 / ctx.focal;
+                let disk = ((F32s::fill(v[6]) - angle2.sqrt()) * F32s::fill(1.0 / pixel) + F32s::fill(0.5))
+                    .max(F32s::fill(0.0))
+                    .min(F32s::fill(1.0));
+                // Glare: a tight core and a wide halo (each 1 / (1 + (angle / width)^2)).
+                let glare = |strength: f32, width: f32| {
+                    F32s::fill(strength) / (F32s::fill(1.0) + angle2 * F32s::fill(1.0 / (width * width)))
+                };
+                let sun = (disk * F32s::fill(12.0) + glare(1.5, 0.02) + glare(0.25, 0.25)) * F32s::fill(v[7]);
+                for (k, ch) in color.iter_mut().enumerate() {
+                    *ch += sun * F32s::fill(v[3 + k]);
+                }
+            }
+            // White at most in the color, and how far past white in the top byte.
+            let peak = color[0].max(color[1]).max(color[2]);
+            let over = if v[8] > 0.0 {
+                let m = ((peak - F32s::fill(1.0)) * F32s::fill(255.0 / HDR_RANGE))
+                    .max(F32s::fill(0.0))
+                    .min(F32s::fill(255.0));
+                let m: U32s = wide::bytemuck::cast(m.round_int());
+                m << 24_u32
+            } else {
+                U32s::fill(0)
+            };
+            let byte = |c: F32s| -> U32s {
+                let b: I32s = (c.min(F32s::fill(1.0)) * F32s::fill(255.0)).round_int().max(I32s::fill(0));
+                wide::bytemuck::cast(b)
+            };
+            over | byte(color[0]) << 16_u32 | byte(color[1]) << 8_u32 | byte(color[2])
+        }
+    }
+}
+
+pub use sky_box::SkyBox;
 
 #[cfg(test)]
 mod tests {

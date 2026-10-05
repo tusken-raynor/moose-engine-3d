@@ -1286,6 +1286,10 @@ pub trait Material: 'static {
     const TRANSLUCENT: bool = false;
     /// Shade with `shade_over`. Translucent materials only.
     const READS_BEHIND: bool = false;
+    /// An opaque material whose colors go past white: the top byte of its XRGB is how far
+    /// (see [`HDR_RANGE`]), for a post pass to make glow. Every other opaque material's top
+    /// byte is cleared.
+    const HDR: bool = false;
 
     fn shade_vertex(v: &Self::Vertex, ctx: &VertexContext) -> Self::Sampled;
 
@@ -1486,6 +1490,11 @@ pub fn blend_lanes(src: U32s, dst: U32s) -> U32s {
     }
     out
 }
+
+/// How far past white an HDR material's pixel (see [`Material::HDR`]) can go: its top byte
+/// `m` says its brightest channel is `1 + m / 255 * HDR_RANGE` (display-encoded, 1 being
+/// white), its color the rest of its XRGB scaled up to that.
+pub const HDR_RANGE: f32 = 8.0;
 
 /// Handle to a registered material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1723,6 +1732,8 @@ impl Run<'_> {
         } else {
             M::shade_pixel(&ga, &gb, &gc, &ctx)
         };
+        // Opaque colors' top byte is free: nothing but an HDR material's past-white amount.
+        let out = if M::TRANSLUCENT || M::HDR { out } else { out & U32s::fill(0xFF_FFFF) };
         let lanes = out.to_array();
         let at = (pixels.start - self.x0) as usize;
         let skip = (pixels.start - first) as usize;
@@ -1868,6 +1879,8 @@ mod tests {
         pub struct Raw;
         impl Material for Raw {
             crate::material_types!();
+            // Its output uses all 32 bits: kept whole, as an HDR material's are.
+            const HDR: bool = true;
             fn shade_vertex(_: &Vertex, _: &VertexContext) -> Sampled {
                 Sampled::default()
             }

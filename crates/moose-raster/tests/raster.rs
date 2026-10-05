@@ -1211,12 +1211,14 @@ fn lit_surfaces_match_exact_lighting() {
                     light += l.color * t * t * cos * cone;
                 }
                 // Colors are gamma-encoded, so the lit color is the color times the light
-                // encoded as the engine encodes it: its square root.
-                let lit = |shift: u32, k: usize| {
-                    let encoded = light[k].max(0.0).sqrt();
-                    (((w.color >> shift) & 255) as f32 * encoded).min(255.0) as u32
-                };
-                let want = lit(16, 0) << 16 | lit(8, 1) << 8 | lit(0, 2);
+                // encoded as the engine encodes it (its square root), past white brought in
+                // as the engine's shoulder brings it.
+                let encoded = light.to_array().map(|l| l.max(0.0).sqrt());
+                let lit = |shift: u32, k: usize| ((w.color >> shift) & 255) as f32 * encoded[k];
+                let brightest = encoded[0].max(encoded[1]).max(encoded[2]);
+                let [wr, wg, wb] =
+                    moose_raster::shaders::shoulder_reference([lit(16, 0), lit(8, 1), lit(0, 2)], brightest);
+                let want = wr << 16 | wg << 8 | wb;
                 pixels += 1;
                 let d = channel_diff(g, want);
                 worst = worst.max(d);
