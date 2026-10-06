@@ -64,6 +64,9 @@
 //!   --time T              seconds into the water's animation, for --screenshot
 //!   --bench N             for --screenshot: render the frame N more times and print the
 //!                         average view and raster times (for measuring)
+//!   --views FILE          for --screenshot: first render a frame from each camera in FILE
+//!                         (one X,Y,Z,YAW,PITCH[,ROLL] a line), printing each before it's
+//!                         drawn (for sweeping views for crashes)
 //!   --show-shadow-mesh    overlay the shadow pieces' outlines (F4; see `draw_shadow_mesh`)
 //!   --show-samples        overlay where shading is sampled (sample rows red, sample
 //!                         points green)
@@ -234,6 +237,8 @@ struct Options {
     time: f32,
     /// For --screenshot: render the frame this many times more, and report the average.
     bench: u32,
+    /// For --screenshot: cameras to render a frame from first, one a line.
+    views: Option<String>,
     show_samples: bool,
     /// Draw the shadow pieces' outlines over the frame (F4).
     show_shadow_mesh: bool,
@@ -313,6 +318,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         level_lights: false,
         time: 0.0,
         bench: 0,
+        views: None,
         show_samples: false,
         show_shadow_mesh: false,
         dither_beam: false,
@@ -449,6 +455,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             }
             "--time" => o.time = value()?.parse().map_err(|_| "bad --time")?,
             "--bench" => o.bench = value()?.parse().map_err(|_| "bad --bench")?,
+            "--views" => o.views = Some(value()?),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -2629,6 +2636,18 @@ fn run() -> Result<(), String> {
         model.polygon = polygon;
     }
     if let Some(path) = &options.screenshot {
+        if let Some(file) = &options.views {
+            app.set_time(options.time);
+            let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                println!("view {line}");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+                match app.place_camera(pose(line, "--views")?, "--views") {
+                    Ok(()) => drop(app.frame()?),
+                    Err(e) => println!("skipped: {e}"),
+                }
+            }
+        }
         if let Some(at) = options.at {
             app.place_camera(at, "--at")?;
         }

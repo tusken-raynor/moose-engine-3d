@@ -20,6 +20,10 @@ const MAX_VISITS: usize = 4096;
 /// from the eye give no reliable plane; windows smaller than this in every direction are
 /// treated as invisible.
 const MIN_EDGE_ANGLE: f32 = 1e-5;
+/// A window edge's line shorter than this many pixels is too short to walk a longer edge
+/// along (see `open_window`): its endpoints' rounding, extended far past them, would put
+/// the edge pixels off.
+const MIN_LINE_LENGTH: f32 = 4.0;
 /// Clipped vertices may land past the viewport edge by at most this many pixels before
 /// snapping (float rounding only; checked in debug builds).
 const MAX_OVERSHOOT: f32 = 1e-3;
@@ -1343,9 +1347,16 @@ fn open_window(
                 if normal.length() <= MIN_EDGE_ANGLE * a.length() * b.length() {
                     continue; // seen edge-on: no reliable plane
                 }
-                let line = w.lines[e].unwrap_or_else(|| {
-                    line_between(view, w.window_points[i], w.window_points[(i + 1) % n])
-                });
+                // The wall's line, unless the near plane cut it to a speck while the window
+                // (not near-clipped) runs on along it: then the window's own edge, on the
+                // same line, so the long edges behind it are walked from endpoints that far
+                // apart. The wall then shows at most a pixel or so of that edge.
+                let own = line_between(view, w.window_points[i], w.window_points[(i + 1) % n]);
+                let length = |l: &EdgeLine| (l.x1 - l.x0).hypot(l.y1 - l.y0);
+                let line = match w.lines[e] {
+                    Some(l) if length(&l) >= MIN_LINE_LENGTH || length(&l) >= length(&own) => l,
+                    _ => own,
+                };
                 window_planes.push(ClipPlane::through_eye(normal.normalize()));
                 window_lines.push(line);
             }

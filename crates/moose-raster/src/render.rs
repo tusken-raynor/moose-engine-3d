@@ -1275,9 +1275,13 @@ fn crossings(
         if row < pixel_edge(top) || row >= pixel_edge(bottom) {
             continue;
         }
+        // Within the edge's own ends: exactly, a row it crosses is crossed there, so this
+        // only takes off a carried line's rounding (which, far along a short line, could
+        // put the span past the polygon, and past its lattice's columns).
         let x = lines[i]
             .unwrap_or(EdgeLine::between((a.x, a.y), (c.x, c.y)))
-            .x_at_row(row);
+            .x_at_row(row)
+            .clamp(a.x.min(c.x), a.x.max(c.x));
         if c.y > a.y {
             if left.is_none_or(|(_, lx)| x > lx) {
                 left = Some((i, x));
