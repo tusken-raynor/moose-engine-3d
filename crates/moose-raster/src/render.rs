@@ -1849,7 +1849,7 @@ fn build_tiles(
         let ctx = sample_context(p, b, textures, &split[..splits]);
         (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_material]);
         for (j, strength) in split[..splits].iter().enumerate() {
-            outputs[n_material + j] = strength.take();
+            outputs[n_material + j] = strength.take().max(zero).sqrt();
         }
         for (k, out) in outputs[..n_out].iter().enumerate() {
             let out = out.to_array();

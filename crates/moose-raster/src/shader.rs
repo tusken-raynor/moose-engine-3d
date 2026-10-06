@@ -1135,7 +1135,8 @@ pub struct SampleContext<'a> {
 }
 
 /// Outputs the engine adds to a polygon's sample points for its `splits` split lights:
-/// each one's strength (its light is its color times that).
+/// each one's strength (its light is its color times that), encoded as its square root like
+/// the light sum (see [`PixelContext::light`]).
 pub const fn split_outputs(splits: usize) -> usize {
     splits
 }
@@ -1177,7 +1178,9 @@ impl PixelContext<'_> {
     ///
     /// Where every one of them reaches, that is the sum as it is. Elsewhere their light is
     /// taken out, `sqrt(e^2 - sum of light * (1 - reaches))` for the encoded sum `e`: exact,
-    /// since the light is encoded as its square root.
+    /// since the light is encoded as its square root. Their strengths are interpolated
+    /// between sample points as square roots too, so between them `e^2` (itself less than
+    /// the sum interpolated as it is) never falls short of the light taken out.
     #[inline(always)]
     pub fn light(&self, light: &[I32s; 3]) -> [I32s; 3] {
         if self.split.count == 0 {
@@ -1675,7 +1678,10 @@ impl Run<'_> {
         };
         let len = self.color.len();
         for j in 0..split.count {
-            let strength = f32::lanes(F32s::fill(split_base[j]), F32s::fill(split_step[j]), offset, STRIDE);
+            // Interpolated as its square root, like the light sum it is taken out of (see
+            // `PixelContext::light`).
+            let root = f32::lanes(F32s::fill(split_base[j]), F32s::fill(split_step[j]), offset, STRIDE);
+            let strength = root * root;
             let color = self.job.split_colors[j].to_array();
             split.light[j] = color.map(|c| F32s::fill(c) * strength);
             let reaches = &self.job.reaches[j * len..(j + 1) * len];
