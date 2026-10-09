@@ -2314,7 +2314,7 @@ fn row_in_file(src: &str, line: usize) -> Option<(String, usize)> {
             continue;
         }
         if k + 1 == line {
-            return table.map(|(name, row)| (name, row));
+            return table;
         }
         if let Some((_, row)) = &mut table {
             *row += 1;
