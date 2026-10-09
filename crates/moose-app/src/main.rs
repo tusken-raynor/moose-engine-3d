@@ -4103,8 +4103,10 @@ fn run() -> Result<(), String> {
         // free pointer otherwise.
         // (Not while a face is being picked: there the right button is a click, a mirrored
         // stitch, which needs the pointer where it is.)
+        // (Nor in the material editor, whose right clicks step its rows.)
         let looking = !menu.open
-            && (!app.editor.on || (display.mouse_down(MouseButton::Right) && app.editor.picking.is_none()));
+            && (!app.editor.on
+                || (display.mouse_down(MouseButton::Right) && app.editor.picking.is_none() && app.material_screen.is_none()));
         display.set_cursor_locked(looking);
         if let Some(setting) = menu.binding.filter(|_| menu.open) {
             // Waiting for a key to bind: the first one pressed (Esc cancels, above).
