@@ -3473,7 +3473,10 @@ fn material_input(app: &mut App, display: &Display) {
             run_mact(app, act, scroll.signum() as i32, &textures);
         }
     }
-    let screen = app.material_screen.as_mut().unwrap();
+    // A click may have closed it (< Editor).
+    let Some(screen) = app.material_screen.as_mut() else {
+        return;
+    };
     // Typing: the keys are the text's.
     if let Some((typing, text)) = &mut screen.typing {
         text.push_str(display.text());
