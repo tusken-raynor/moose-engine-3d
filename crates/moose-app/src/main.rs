@@ -24,7 +24,8 @@
 //!   --select NAME         in the editor, start with the entity NAME (or surface:N,
 //!                         sector:N, vertex:N, light:N) selected, in its mode
 //!   --mode M, --panel P   in the editor, the mode (sector, face or vertex) and a menu open
-//!                         on the panel (add, world, controls, lights, meta, materials)
+//!                         on the panel (add, world, controls, lights, meta, materials,
+//!                         material-editor, material-editor:shader, material-editor:texture)
 //!   --edit-model          in the editor, open the mesh editor on the selected entity's
 //!                         model; --polygon N also selects its polygon N
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
@@ -98,6 +99,7 @@ mod editor_keys;
 mod editor_panel;
 mod gui;
 mod material_edit;
+mod material_screen;
 mod materials;
 mod mesh_edit;
 mod ui;
@@ -653,8 +655,8 @@ struct App {
     level: String,
     /// The material being made or changed on the Material page (Esc > Materials).
     material: Option<material_edit::Draft>,
-    /// The editor's material icon was clicked: the frame loop opens the materials.
-    open_materials: bool,
+    /// The material editor (the editor's material icon), while it's open.
+    material_screen: Option<material_screen::MaterialScreen>,
     /// Seconds since the start: for the water's ripples and moving lights.
     time: f32,
     pixels: Vec<u32>,
@@ -682,7 +684,7 @@ impl App {
         };
         let level = assets
             .parse_level(&options.level, &level_src)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| name_the_problem(&level_path, &level_src, &e.to_string()))?;
         let world = World::new(level, &assets);
         let viewport = Viewport {
             x: 0,
@@ -784,7 +786,7 @@ impl App {
             levels: level_files(root),
             level: options.level.clone(),
             material: None,
-            open_materials: false,
+            material_screen: None,
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -1083,6 +1085,26 @@ impl App {
         }
     }
 
+    /// Opens the material editor, on the selected face's material if it has one.
+    fn open_material_screen(&mut self) {
+        let face_material = match self.editor.selection {
+            Some(editor::Selection::Surface(f)) => {
+                self.editor.doc.surfaces[f].options.iter().find_map(|o| o.strip_prefix("material=")).map(String::from)
+            }
+            _ => None,
+        };
+        if let Some(id) = face_material.and_then(|m| self.assets.materials().id(&m)) {
+            self.material = Some(self.material_draft(id));
+        }
+        self.material_screen = Some(material_screen::MaterialScreen::default());
+    }
+
+    /// The library's materials, for the material editor: id, name and shader.
+    fn material_list(&self) -> Vec<(u32, String, String)> {
+        let library = self.assets.materials();
+        (0..library.len() as u32).map(|i| (i, library.get(i).name.clone(), library.get(i).shader.clone())).collect()
+    }
+
     /// The editor's panels, laid out for this frame.
     fn editor_layout(&self) -> editor_panel::Laid {
         self.editor.layout(&editor_panel::Ctx { models: &self.models, width: self.width as usize, height: self.height as usize })
@@ -1090,10 +1112,16 @@ impl App {
 
     /// Makes the previews the panel wants (the picked material's textures) that aren't made.
     fn make_thumbs(&mut self) {
-        let Some(k) = self.editor.material_pick.as_ref().and_then(|m| self.editor.materials.iter().position(|n| n == m)) else {
-            return;
-        };
-        for name in self.editor.material_textures.get(k).cloned().unwrap_or_default() {
+        let mut wanted: Vec<String> = Vec::new();
+        if let Some(screen) = &self.material_screen
+            && let (Some(material_screen::Picker::Texture(_)), Some(pick)) = (screen.picker, &screen.pick)
+        {
+            wanted.push(pick.clone());
+        }
+        if let Some(k) = self.editor.material_pick.as_ref().and_then(|m| self.editor.materials.iter().position(|n| n == m)) {
+            wanted.extend(self.editor.material_textures.get(k).cloned().unwrap_or_default());
+        }
+        for name in wanted {
             if self.editor.thumbs.contains_key(&name) {
                 continue;
             }
@@ -2244,6 +2272,57 @@ impl App {
 
 /// The level files (`.mmp`) in the assets' levels folder, sorted.
 /// The model files in assets/models (sorted).
+/// The level loader's message `why` about the level at `path` (its text `src`), with what
+/// it's about named by number where its line is a table row (`face 40 of sector 3`), for
+/// finding it in the editor (World > Find by number).
+fn name_the_problem(path: &Path, src: &str, why: &str) -> String {
+    let line = why.split(':').find_map(|part| part.trim().parse::<usize>().ok());
+    let Ok(doc) = LevelDoc::parse(path, src) else {
+        return why.to_string();
+    };
+    // The row of the file's line: counted in the file itself, whose comments and blank
+    // lines the tables' own text (`LevelDoc::row_at_line`'s) doesn't have.
+    let Some((section, row)) = line.and_then(|l| row_in_file(src, l)) else {
+        return why.to_string();
+    };
+    let named = match section.as_str() {
+        "surfaces" => match doc.surfaces.get(row) {
+            Some(s) => format!("face {row} of sector {}", s.sector),
+            None => format!("face {row}"),
+        },
+        "sectors" => format!("sector {row}"),
+        "vertices" => format!("vertex {row}"),
+        "entities" => format!("entity {row}"),
+        "lights" => format!("light {row}"),
+        _ => return why.to_string(),
+    };
+    format!("{why} ({named}: find it in the editor, World > Find by number)")
+}
+
+/// The table and row a level file's line `line` (1 first) is in: a table starts at a line
+/// of its name and a count (`surfaces 24`), and its rows are the lines after it that aren't
+/// blank or comments.
+fn row_in_file(src: &str, line: usize) -> Option<(String, usize)> {
+    let mut table: Option<(String, usize)> = None;
+    for (k, text) in src.lines().enumerate().take(line) {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.is_empty() || words[0].starts_with('#') {
+            continue;
+        }
+        if words.len() == 2 && words[0].chars().all(|c| c.is_ascii_alphabetic()) && words[1].parse::<usize>().is_ok() {
+            table = Some((words[0].to_string(), 0));
+            continue;
+        }
+        if k + 1 == line {
+            return table.map(|(name, row)| (name, row));
+        }
+        if let Some((_, row)) = &mut table {
+            *row += 1;
+        }
+    }
+    None
+}
+
 /// Per material named in `names`, the textures in its slots (as a material file writes
 /// them), for the editor's previews.
 fn material_textures(assets: &Assets, names: &[String]) -> Vec<Vec<String>> {
@@ -2260,7 +2339,7 @@ fn material_textures(assets: &Assets, names: &[String]) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// A preview of texture `name` (a file, or a rippled one's file), 64 texels square from its
+/// A preview of texture `name` (a file, or a rippled one's file), 128 texels square from its
 /// mip level nearest that; `None` for one the engine makes (a cube map, the ripples).
 fn thumb_of(assets: &mut Assets, name: &str) -> Option<gui::Thumb> {
     let file = name.strip_prefix("@water:").unwrap_or(name);
@@ -2269,8 +2348,8 @@ fn thumb_of(assets: &mut Assets, name: &str) -> Option<gui::Thumb> {
     }
     let id = assets.load_texture(file).ok()?;
     let texture = assets.texture(id);
-    let level = texture.levels.iter().rev().find(|l| l.width >= 64 && l.height >= 64).or(texture.levels.first())?;
-    let size = 64;
+    let size = 128;
+    let level = texture.levels.iter().rev().find(|l| l.width as usize >= size && l.height as usize >= size).or(texture.levels.first())?;
     let (w, h) = (level.width as usize, level.height as usize);
     let pixels = (0..size * size)
         .map(|k| {
@@ -2751,6 +2830,10 @@ fn draw_ui(
     if app.editor.on {
         app.make_thumbs();
     }
+    // What the material editor shows, read before the frame is drawn on.
+    let screen_data = app.material_screen.is_some().then(|| {
+        (app.material_list(), material_edit::texture_choices(&app.assets.root().join("textures")), app.known())
+    });
     let mut rows = menu.map(|(page, _)| app.rows(page));
     // The row being typed on shows the text so far.
     if let (Some(rows), Some((_, selected)), Some(text)) = (&mut rows, menu, typing)
@@ -2766,7 +2849,21 @@ fn draw_ui(
     if app.settings.shadow_mesh && !(app.editor.on && app.editor.view != editor::ViewMode::Perspective) {
         draw_shadow_mesh(&mut canvas, &app.geometry);
     }
-    if app.editor.on && menu.is_none() {
+    if app.editor.on
+        && menu.is_none()
+        && let (Some(screen), Some((materials, textures, known))) = (&app.material_screen, &screen_data)
+    {
+        let ctx = material_screen::Ctx { materials, draft: app.material.as_ref(), known, textures, width: canvas.width, height: canvas.height };
+        let laid = screen.layout(&ctx);
+        let thumbs = &app.editor.thumbs;
+        let scale = editor_panel::scale_for(canvas.height);
+        canvas.fill(0, 0, canvas.width, canvas.height, 0x0010_1216);
+        gui::draw(&mut canvas, &laid.widgets, cursor, scale, &|name| thumbs.get(name).cloned().flatten());
+        if let Some(status) = app.material.as_ref().and_then(|d| d.status.clone()) {
+            let line = ui::Canvas::line_height(scale);
+            canvas.text(3 * scale, canvas.height.saturating_sub(line), &status, gui::TEXT, scale);
+        }
+    } else if app.editor.on && menu.is_none() {
         let camera = app.camera.view();
         app.editor.draw(&mut canvas, &camera, &app.world, &app.assets);
         let laid = app.editor.layout(&editor_panel::Ctx { models: &app.models, width: canvas.width, height: canvas.height });
@@ -3201,7 +3298,16 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             app.travel(true);
         }
         if display.key_pressed(Key::S) {
-            app.save_level();
+            match &app.editor.broken {
+                // Saved like this, it won't open again until it's mended by hand: asked.
+                Some(why) => {
+                    let text = format!("It won't load ({}). Save anyway?", why.chars().take(48).collect::<String>());
+                    app.editor.confirm = Some(editor_panel::Confirm { text, yes: Act::Save, choice: false });
+                }
+                None => {
+                    app.save_level();
+                }
+            }
         }
         if display.key_pressed(Key::D) {
             app.edit(Field::Duplicate, 1.0);
@@ -3332,6 +3438,184 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     true
 }
 
+/// The material editor's mouse and keys (see `material_screen`): clicks and the wheel on
+/// what's under the pointer; typing; Up/Down and Enter in its list (the material's rows, or
+/// the picker's choices), Left/Right stepping a row.
+fn material_input(app: &mut App, display: &Display) {
+    use material_screen::{MAct, Typing};
+    let materials = app.material_list();
+    let textures = material_edit::texture_choices(&app.assets.root().join("textures"));
+    let known = app.known();
+    let screen = app.material_screen.as_ref().unwrap();
+    let ctx = material_screen::Ctx {
+        materials: &materials,
+        draft: app.material.as_ref(),
+        known: &known,
+        textures: &textures,
+        width: app.width as usize,
+        height: app.height as usize,
+    };
+    let laid = screen.layout(&ctx);
+    let cursor = display.cursor_position();
+    let (clicked, right) = (display.mouse_clicked(MouseButton::Left), display.mouse_clicked(MouseButton::Right));
+    if let Some(at) = cursor {
+        if (clicked || right)
+            && let Some(act) = gui::under(&laid.widgets, at, false).and_then(|w| w.act.clone())
+        {
+            run_mact(app, act, if right { -1 } else { 1 }, &textures);
+        }
+        let scroll = display.scroll();
+        if scroll != 0.0
+            && let Some(act) = gui::under(&laid.widgets, at, true).and_then(|w| w.wheel.clone())
+        {
+            run_mact(app, act, scroll.signum() as i32, &textures);
+        }
+    }
+    let screen = app.material_screen.as_mut().unwrap();
+    // Typing: the keys are the text's.
+    if let Some((typing, text)) = &mut screen.typing {
+        text.push_str(display.text());
+        if display.key_repeated(Key::Backspace) {
+            text.pop();
+        }
+        match typing {
+            Typing::Search => (screen.search, screen.list) = (text.clone(), Default::default()),
+            Typing::PickerSearch => (screen.picker_search, screen.picker_list) = (text.clone(), Default::default()),
+            Typing::Row(_) => {}
+        }
+        if display.key_pressed(Key::Enter) {
+            let (typing, text) = screen.typing.take().unwrap();
+            if let Typing::Row(row) = typing {
+                let names = app.materials.names().to_vec();
+                if let Some(draft) = &mut app.material {
+                    let said = draft.typed(row, &text, &names);
+                    draft.status = Some(said.unwrap_or_else(|e| e)).filter(|s| !s.is_empty());
+                }
+            }
+        }
+        return;
+    }
+    // The list's keys.
+    let n = laid.keys_list.len();
+    let state = if screen.picker.is_some() { &mut screen.picker_list } else { &mut screen.rows };
+    if n > 0 {
+        if display.key_repeated(Key::Down) {
+            state.cursor = Some(state.cursor.map_or(0, |k| (k + 1).min(n - 1)));
+        }
+        if display.key_repeated(Key::Up) {
+            state.cursor = Some(state.cursor.map_or(0, |k| k.saturating_sub(1)));
+        }
+        // Kept in view (the rows a page at most).
+        if let Some(k) = state.cursor {
+            state.scroll = state.scroll.min(k);
+            let page = (app.height as usize / ui::Canvas::line_height(editor_panel::scale_for(app.height as usize))).saturating_sub(5).max(1);
+            if k >= state.scroll + page {
+                state.scroll = k + 1 - page;
+            }
+        }
+    }
+    let at = state.cursor.and_then(|k| laid.keys_list.get(k).cloned());
+    if let Some(act) = at {
+        if display.key_pressed(Key::Enter) {
+            // Enter on a picker's choice takes it.
+            let take = matches!(act, MAct::Pick(_));
+            run_mact(app, act, 1, &textures);
+            if take {
+                run_mact(app, MAct::Select, 1, &textures);
+            }
+        } else if let MAct::Row(row) = act {
+            for (key, dir) in [(Key::Left, -1), (Key::Right, 1)] {
+                if display.key_repeated(key) {
+                    run_mact(app, MAct::Step(row), dir, &textures);
+                }
+            }
+        }
+    }
+}
+
+/// Does what the material editor's widget does (`dir`: 1 for a click, -1 for a right
+/// click, the wheel's way).
+fn run_mact(app: &mut App, act: material_screen::MAct, dir: i32, textures: &[String]) {
+    use material_edit::Row;
+    use material_screen::{MAct, Picker, Typing};
+    let Some(screen) = app.material_screen.as_mut() else {
+        return;
+    };
+    let scroll = |list: &mut editor_panel::ListState| {
+        list.scroll = if dir > 0 { list.scroll.saturating_sub(3) } else { list.scroll + 3 };
+    };
+    match act {
+        MAct::Close => app.material_screen = None,
+        MAct::New => {
+            app.material = Some(material_edit::Draft::new_material(&app.assets.root().join("materials"), app.materials.names()));
+            (screen.picker, screen.rows) = (None, Default::default());
+        }
+        MAct::Open(id) => {
+            (screen.picker, screen.rows) = (None, Default::default());
+            app.material = Some(app.material_draft(id));
+        }
+        MAct::Search => screen.typing = Some((Typing::Search, screen.search.clone())),
+        MAct::PickerSearch => screen.typing = Some((Typing::PickerSearch, screen.picker_search.clone())),
+        MAct::ScrollMaterials => scroll(&mut screen.list),
+        MAct::ScrollPicker => scroll(&mut screen.picker_list),
+        MAct::ScrollRows => scroll(&mut screen.rows),
+        MAct::PickerBack => screen.picker = None,
+        MAct::Pick(choice) => screen.pick = Some(choice),
+        MAct::Select => {
+            let (Some(picker), Some(pick)) = (screen.picker, screen.pick.clone()) else {
+                return;
+            };
+            screen.picker = None;
+            let names = app.materials.names().to_vec();
+            if let Some(draft) = &mut app.material {
+                let said = match picker {
+                    Picker::Shader => {
+                        draft.def.shader = pick.clone();
+                        Ok(format!("shader {pick}"))
+                    }
+                    Picker::Texture(k) => {
+                        draft.typed(Row::Texture(k), if pick == "none" { "" } else { &pick }, &names).map(|_| format!("texture {k}: {pick}"))
+                    }
+                };
+                draft.status = Some(said.unwrap_or_else(|e| e));
+            }
+        }
+        MAct::Step(row) => {
+            if let Some(draft) = &mut app.material {
+                draft.status = draft.step(row, dir, textures).err();
+            }
+        }
+        MAct::Row(row) => {
+            let Some(draft) = &mut app.material else {
+                return;
+            };
+            match row {
+                Row::Shader => {
+                    (screen.picker, screen.pick) = (Some(Picker::Shader), Some(draft.def.shader.clone()));
+                    (screen.picker_search, screen.picker_list) = (String::new(), Default::default());
+                }
+                Row::Texture(k) => {
+                    let now = draft.def.textures[k as usize].as_ref().map_or("none".to_string(), |t| t.to_text());
+                    (screen.picker, screen.pick) = (Some(Picker::Texture(k)), Some(now));
+                    (screen.picker_search, screen.picker_list) = (String::new(), Default::default());
+                }
+                Row::Sampler(_) | Row::Source(_) => draft.status = draft.step(row, dir, textures).err(),
+                Row::Save => {
+                    let said = app.save_material();
+                    if let Some(draft) = &mut app.material {
+                        draft.status = Some(said.unwrap_or_else(|e| e));
+                    }
+                }
+                _ => {
+                    if let Some(text) = draft.typing(row) {
+                        screen.typing = Some((Typing::Row(row), text));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Does what a panel's widget does (`dir`: the wheel's way, or 1 for a click and -1 for a
 /// right click).
 fn run_act(app: &mut App, act: editor_panel::Act, dir: f32) {
@@ -3369,7 +3653,7 @@ fn run_act(app: &mut App, act: editor_panel::Act, dir: f32) {
             }
             fresh_list(e);
         }
-        Act::MaterialEditor => app.open_materials = true,
+        Act::MaterialEditor => app.open_material_screen(),
         Act::Back => {
             e.menus.pop();
             fresh_list(e);
@@ -3438,6 +3722,9 @@ fn run_act(app: &mut App, act: editor_panel::Act, dir: f32) {
             e.confirm = Some(Confirm { text: format!("Delete {what}?"), yes: Act::Edit(Field::Delete), choice: true });
         }
         Act::GoTo(selection) => app.go_to(selection),
+        Act::Save => {
+            app.save_level();
+        }
     }
 }
 
@@ -3617,30 +3904,40 @@ fn run() -> Result<(), String> {
         app.editor.selection = None;
         app.go_to_quietly(selection);
     }
-    if let Some(panel) = &options.panel {
+    if let Some(panel) = options.panel.clone() {
         use editor_panel::{Menu, Owner};
-        let e = &app.editor;
-        let owner = match e.selection {
-            Some(editor::Selection::Sector(s)) => Owner::Sector(s),
-            Some(editor::Selection::Surface(f)) => Owner::Surface(f),
-            _ => Owner::Level,
-        };
-        let excluder = match e.selection {
-            Some(editor::Selection::Sector(s)) => Some((editor::Excluder::Sector, s)),
-            Some(editor::Selection::Surface(f)) => Some((editor::Excluder::Surface, f)),
-            Some(editor::Selection::Entity(k)) => Some((editor::Excluder::Entity, k)),
-            _ => None,
-        };
-        let menu = match panel.as_str() {
-            "add" => Menu::Add,
-            "world" => Menu::World,
-            "controls" => Menu::Controls,
-            "meta" => Menu::Meta(owner),
-            "materials" => Menu::Materials,
-            "lights" => excluder.map(|(t, i)| Menu::Lights(t, i)).ok_or("--panel lights: select a face, sector or entity")?,
-            _ => return Err("--panel is add, world, controls, lights, meta or materials".into()),
-        };
-        run_act(&mut app, editor_panel::Act::Open(menu), 1.0);
+        if let Some(rest) = panel.strip_prefix("material-editor") {
+            // The material editor (with `:shader` or `:texture`, its picker open).
+            app.open_material_screen();
+            if rest == ":shader" || rest == ":texture" {
+                let row = if rest == ":shader" { material_edit::Row::Shader } else { material_edit::Row::Texture(0) };
+                let textures = material_edit::texture_choices(&app.assets.root().join("textures"));
+                run_mact(&mut app, material_screen::MAct::Row(row), 1, &textures);
+            }
+        } else {
+            let e = &app.editor;
+            let owner = match e.selection {
+                Some(editor::Selection::Sector(s)) => Owner::Sector(s),
+                Some(editor::Selection::Surface(f)) => Owner::Surface(f),
+                _ => Owner::Level,
+            };
+            let excluder = match e.selection {
+                Some(editor::Selection::Sector(s)) => Some((editor::Excluder::Sector, s)),
+                Some(editor::Selection::Surface(f)) => Some((editor::Excluder::Surface, f)),
+                Some(editor::Selection::Entity(k)) => Some((editor::Excluder::Entity, k)),
+                _ => None,
+            };
+            let menu = match panel.as_str() {
+                "add" => Menu::Add,
+                "world" => Menu::World,
+                "controls" => Menu::Controls,
+                "meta" => Menu::Meta(owner),
+                "materials" => Menu::Materials,
+                "lights" => excluder.map(|(t, i)| Menu::Lights(t, i)).ok_or("--panel lights: select a face, sector or entity")?,
+                _ => return Err("--panel is add, world, controls, lights, meta, materials or material-editor[:shader|:texture]".into()),
+            };
+            run_act(&mut app, editor_panel::Act::Open(menu), 1.0);
+        }
     }
     if let Some(polygon) = options.edit_model {
         app.edit(editor::Field::EditModel, 1.0);
@@ -3737,7 +4034,12 @@ fn run() -> Result<(), String> {
         if display.key_pressed(Key::Escape) {
             // In the editor, Esc stops a cut, then drops the selection, first; in the mesh
             // editor, drops the polygon, then leaves it. While binding a key, it cancels.
-            if menu.open && menu.binding.is_some() {
+            if !menu.open && app.editor.on && let Some(screen) = &mut app.material_screen {
+                // Typing, then a picker, then the screen itself.
+                if screen.typing.take().is_none() && screen.picker.take().is_none() {
+                    app.material_screen = None;
+                }
+            } else if menu.open && menu.binding.is_some() {
                 menu.binding = None;
             } else if menu.open && menu.typing.is_some() {
                 menu.typing = None;
@@ -3785,7 +4087,8 @@ fn run() -> Result<(), String> {
                 menu.back.clear();
             }
         }
-        if !menu.open && app.editor.typing.is_none() && display.key_pressed(Key::Tab) {
+        let screen_typing = app.material_screen.as_ref().is_some_and(|s| s.typing.is_some());
+        if !menu.open && app.editor.typing.is_none() && !screen_typing && display.key_pressed(Key::Tab) {
             app.editor.on = !app.editor.on;
             app.editor.hover = None;
         }
@@ -3970,6 +4273,11 @@ fn run() -> Result<(), String> {
                     None => menu.open = false,
                 }
             }
+        } else if app.editor.on && app.material_screen.is_some() {
+            // The material editor has the window: the view holds still.
+            display.mouse_delta();
+            look.clear();
+            material_input(&mut app, &display);
         } else if app.editor.on && app.editor.typing.is_some() {
             // Typing a number into the editor's panel: the keys are the text's, the view
             // holds still.
@@ -3993,12 +4301,7 @@ fn run() -> Result<(), String> {
         } else {
             // The editor's mouse and keys; the arrows move its selection, if it has one.
             let editing = app.editor.on && edit_input(&mut app, &display);
-            // The editor's material icon: the materials, on the menu.
-            if std::mem::take(&mut app.open_materials) {
-                menu.open = true;
-                (menu.page, menu.selected) = (Page::Materials, 0);
-                menu.back.clear();
-            }
+
             // A 2D view pans (dragged with the right button, or WASD), and the 3D camera
             // holds still.
             let two_d = app.editor.on && app.editor.view != editor::ViewMode::Perspective;
@@ -4326,6 +4629,38 @@ mod tests {
         app.editor.hover = Some(Selection::Surface(0));
         app.edit(Field::Picked, 1.0);
         assert_eq!((app.editor.picking, &app.editor.doc), (None, &cut));
+    }
+
+    #[test]
+    fn the_material_editor_picks_a_shader_and_textures_from_its_lists() {
+        use material_edit::Row;
+        use material_screen::{MAct, Picker};
+        let mut app = test_app("two_rooms.mmp");
+        app.open_material_screen();
+        let textures = vec!["a.png".to_string(), "b.png".to_string()];
+        run_mact(&mut app, MAct::New, 1, &textures);
+        // The shader's list: picking one shows it, Select takes it.
+        run_mact(&mut app, MAct::Row(Row::Shader), 1, &textures);
+        assert_eq!(app.material_screen.as_ref().unwrap().picker, Some(Picker::Shader));
+        run_mact(&mut app, MAct::Pick("basic_bumpy".into()), 1, &textures);
+        assert_eq!(app.material.as_ref().unwrap().def.shader, "textured", "not yet");
+        run_mact(&mut app, MAct::Select, 1, &textures);
+        assert_eq!(app.material.as_ref().unwrap().def.shader, "basic_bumpy");
+        assert_eq!(app.material_screen.as_ref().unwrap().picker, None);
+        // A texture: the same, and none takes it away.
+        run_mact(&mut app, MAct::Row(Row::Texture(1)), 1, &textures);
+        run_mact(&mut app, MAct::Pick("b.png".into()), 1, &textures);
+        run_mact(&mut app, MAct::Select, 1, &textures);
+        assert_eq!(app.material.as_ref().unwrap().def.textures[1], Some(moose_assets::TextureSource::File("b.png".into())));
+        run_mact(&mut app, MAct::Row(Row::Texture(1)), 1, &textures);
+        run_mact(&mut app, MAct::Pick("none".into()), 1, &textures);
+        run_mact(&mut app, MAct::Select, 1, &textures);
+        assert_eq!(app.material.as_ref().unwrap().def.textures[1], None);
+        // A search narrows the shaders.
+        app.material_screen.as_mut().unwrap().picker_search = "bumpy".into();
+        assert_eq!(app.material_screen.as_ref().unwrap().shaders(), ["basic_bumpy", "reflective_bumpy"]);
+        run_mact(&mut app, MAct::Close, 1, &textures);
+        assert!(app.material_screen.is_none());
     }
 
     #[test]

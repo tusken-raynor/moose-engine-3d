@@ -107,14 +107,15 @@ impl InputType {
     }
 }
 
-/// An input a program reads, by name.
+/// An input a program reads, by name, and what it does (for the material editor).
 pub struct Input {
     pub name: &'static str,
     pub ty: InputType,
+    pub about: &'static str,
 }
 
-const fn input(name: &'static str, ty: InputType) -> Input {
-    Input { name, ty }
+const fn input(name: &'static str, ty: InputType, about: &'static str) -> Input {
+    Input { name, ty, about }
 }
 
 /// A program materials can name: its texture slots, its inputs (in the order it reads
@@ -122,6 +123,8 @@ const fn input(name: &'static str, ty: InputType) -> Input {
 /// takes, and the mesh attributes it reads.
 pub struct ShaderInfo {
     pub name: &'static str,
+    /// What it draws, for the material editor.
+    pub about: &'static str,
     pub kind: Kind,
     pub slots: &'static [&'static str],
     pub inputs: &'static [Input],
@@ -142,7 +145,11 @@ pub enum EngineInput {
     BackLight,
 }
 
-static BACK_LIGHT: Input = input("back_light", Number);
+static BACK_LIGHT: Input = input(
+    "back_light",
+    Number,
+    "How far behind the face a light may be and still light it, in degrees (0 to 90): for bumps that turn past the face, like a curb's rounded edge.",
+);
 
 impl EngineInput {
     pub fn input(self) -> &'static Input {
@@ -185,30 +192,38 @@ use EngineInput::BackLight;
 use InputType::{Number, Unit};
 
 /// The registry (see the Material Format Spec).
+// Inputs several programs share.
+const SHORT: Input = input("short", Number, "Meters from the eye where the bumps start to fade.");
+const FAR: Input = input("far", Number, "Meters from the eye where the bumps are gone (the normal map isn't read past it).");
+const REFLECTANCE: Input = input("reflectance", Unit, "How much it reflects seen head-on (F0, 0-255); more at grazing angles.");
+const FADE: Input = input("fade", Number, "Meters past the surface over which its reflection fades out (0: no fade).");
+const OPACITY: Input = input("opacity", Unit, "How solid it is, 0 (unseen) to 255.");
+const DETAIL: Input = input("detail", Unit, "Fine noise added close up, where the texture is magnified (0: none); the color's alpha masks it.");
+
 pub const SHADERS: [ShaderInfo; 16] = [
-    ShaderInfo { name: "vertex_color", kind: Kind::VertexColor, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
-    ShaderInfo { name: "sky", kind: Kind::Sky, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
-    ShaderInfo { name: "vertex_color_translucent", kind: Kind::VertexColorTranslucent, slots: &[], inputs: &[input("opacity", Unit)], engine: &[], attribs: &["color"] },
-    ShaderInfo { name: "vertex_color_fresnel", kind: Kind::VertexColorFresnel, slots: &[], inputs: &[input("reflectance", Unit)], engine: &[], attribs: &["color"] },
-    ShaderInfo { name: "textured", kind: Kind::Textured, slots: &["color"], inputs: &[input("detail", Unit)], engine: &[], attribs: &["uv"] },
-    ShaderInfo { name: "textured_translucent", kind: Kind::TexturedTranslucent, slots: &["color"], inputs: &[input("opacity", Unit)], engine: &[], attribs: &["uv"] },
-    ShaderInfo { name: "textured_fresnel", kind: Kind::TexturedFresnel, slots: &["color"], inputs: &[input("reflectance", Unit), input("fade", Number)], engine: &[], attribs: &["uv"] },
-    ShaderInfo { name: "water", kind: Kind::Water, slots: &["color", "heights"], inputs: &[input("reflectance", Unit), input("fade", Number), input("shift", Number)], engine: &[], attribs: &["uv"] },
+    ShaderInfo { name: "vertex_color", about: "The mesh's vertex colors, lit.", kind: Kind::VertexColor, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
+    ShaderInfo { name: "sky", about: "The mesh's vertex colors, unlit: shown as they are, whatever the lights.", kind: Kind::Sky, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
+    ShaderInfo { name: "vertex_color_translucent", about: "Vertex colors, lit, seen through at one opacity.", kind: Kind::VertexColorTranslucent, slots: &[], inputs: &[OPACITY], engine: &[], attribs: &["color"] },
+    ShaderInfo { name: "vertex_color_fresnel", about: "Vertex colors over a reflection: nearly solid head-on, reflecting more at grazing angles (Fresnel).", kind: Kind::VertexColorFresnel, slots: &[], inputs: &[REFLECTANCE], engine: &[], attribs: &["color"] },
+    ShaderInfo { name: "textured", about: "A texture, lit, with optional fine detail noise close up.", kind: Kind::Textured, slots: &["color"], inputs: &[DETAIL], engine: &[], attribs: &["uv"] },
+    ShaderInfo { name: "textured_translucent", about: "A texture, lit, seen through at one opacity.", kind: Kind::TexturedTranslucent, slots: &["color"], inputs: &[OPACITY], engine: &[], attribs: &["uv"] },
+    ShaderInfo { name: "textured_fresnel", about: "A texture over a reflection (Fresnel), its alpha the roughness (128 or less smooth, 255 rough); the reflection fades with distance past it.", kind: Kind::TexturedFresnel, slots: &["color"], inputs: &[REFLECTANCE, FADE], engine: &[], attribs: &["uv"] },
+    ShaderInfo { name: "water", about: "Rippling water for shiny floors: the reflection through it wobbles with the ripples' heights.", kind: Kind::Water, slots: &["color", "heights"], inputs: &[REFLECTANCE, FADE, input("shift", Number, "How far the reflection shifts per step of the ripples' height, in meters at a meter away (0: none).")], engine: &[], attribs: &["uv"] },
     // Bumps where the normal map slot is filled; a highlight where specular is above 0.
-    ShaderInfo { name: "lit", kind: Kind::Lit, slots: &["color", "normal map"], inputs: &[input("specular", Unit), input("shininess", Number), input("detail", Unit)], engine: &[BackLight], attribs: &["uv"] },
+    ShaderInfo { name: "lit", about: "A texture with bumps from a normal map and a highlight (the color's alpha dulls it, for mortar and such), and detail noise.", kind: Kind::Lit, slots: &["color", "normal map"], inputs: &[input("specular", Unit, "How bright the highlight is (0: none)."), input("shininess", Number, "How tight the highlight is, as the log2 of its power (5 is a power of 32)."), DETAIL], engine: &[BackLight], attribs: &["uv"] },
     // A road: diffuse with bumps, whole out to `short` meters and gone by `far`.
-    ShaderInfo { name: "basic_bumpy", kind: Kind::BasicBumpy, slots: &["color", "normal map"], inputs: &[input("short", Number), input("far", Number)], engine: &[BackLight], attribs: &["uv"] },
+    ShaderInfo { name: "basic_bumpy", about: "A texture with bumps from a normal map and nothing else (a road): bumps whole up close, fading out with distance.", kind: Kind::BasicBumpy, slots: &["color", "normal map"], inputs: &[SHORT, FAR], engine: &[BackLight], attribs: &["uv"] },
     // A sidewalk: `basic_bumpy` with each repeat (1:1) one of the 4:1 texture's four
     // sections, picked by a hash of the repeat and `seed` (a whole number).
-    ShaderInfo { name: "random_sections", kind: Kind::RandomSections, slots: &["color", "normal map"], inputs: &[input("short", Number), input("far", Number), input("seed", Number)], engine: &[BackLight], attribs: &["uv"] },
+    ShaderInfo { name: "random_sections", about: "basic_bumpy for a texture of four sections side by side (a sidewalk's slabs): each repeat shows one, picked at random.", kind: Kind::RandomSections, slots: &["color", "normal map"], inputs: &[SHORT, FAR, input("seed", Number, "A whole number: another picks the sections differently.")], engine: &[BackLight], attribs: &["uv"] },
     // `basic_bumpy` with puddles where the color's alpha is (255 wet): over a reflection
     // (a reflective surface's), they reflect it by Fresnel, shifted by the turbulence; the
     // ground under them wobbles and the bumps flatten.
-    ShaderInfo { name: "reflective_bumpy", kind: Kind::ReflectiveBumpy, slots: &["color (alpha: wet)", "normal map", "turbulence"], inputs: &[input("short", Number), input("far", Number), input("reflectance", Unit), input("fade", Number), input("shift", Number), input("ripple", Number), input("ripple_size", Number), input("ripple_speed", Number), input("drift", Number)], engine: &[BackLight], attribs: &["uv"] },
-    ShaderInfo { name: "cube_reflection", kind: Kind::CubeReflection, slots: &["cube"], inputs: &[], engine: &[], attribs: &["normal"] },
-    ShaderInfo { name: "terrain_detail", kind: Kind::TerrainDetail, slots: &["detail"], inputs: &[], engine: &[], attribs: &["color", "uv", "normal"] },
-    ShaderInfo { name: "terrain_noise", kind: Kind::TerrainNoise, slots: &[], inputs: &[input("strength", Unit)], engine: &[], attribs: &["color", "normal"] },
-    ShaderInfo { name: "sky_box", kind: Kind::SkyBox, slots: &["cube"], inputs: &[], engine: &[], attribs: &[] },
+    ShaderInfo { name: "reflective_bumpy", about: "basic_bumpy with puddles where the color's alpha is (255 wet): they reflect (Fresnel, rippled by the turbulence), the ground under them wobbles and the bumps flatten.", kind: Kind::ReflectiveBumpy, slots: &["color (alpha: wet)", "normal map", "turbulence"], inputs: &[SHORT, FAR, REFLECTANCE, FADE, input("shift", Number, "How far the reflection shifts per step of turbulence, in meters at a meter away."), input("ripple", Number, "How far the ground under the water moves, in repeats of its texture."), input("ripple_size", Number, "A ground wave's length, in repeats."), input("ripple_speed", Number, "Ground waves a second."), input("drift", Number, "Repeats a second the turbulence slides.")], engine: &[BackLight], attribs: &["uv"] },
+    ShaderInfo { name: "cube_reflection", about: "A mirror finish from a cube map of what's around it (a mirror ball); the engine fills in its inputs.", kind: Kind::CubeReflection, slots: &["cube"], inputs: &[], engine: &[], attribs: &["normal"] },
+    ShaderInfo { name: "terrain_detail", about: "Vertex colors times a detail texture (128 keeps the color), smoothly lit by the mesh's normals: terrain.", kind: Kind::TerrainDetail, slots: &["detail"], inputs: &[], engine: &[], attribs: &["color", "uv", "normal"] },
+    ShaderInfo { name: "terrain_noise", about: "terrain_detail with its grain from 3D noise in the world instead of a texture: no seams, no stretching on slopes.", kind: Kind::TerrainNoise, slots: &[], inputs: &[input("strength", Unit, "How far the grain takes colors either way (0: none).")], engine: &[], attribs: &["color", "normal"] },
+    ShaderInfo { name: "sky_box", about: "A sky from a cube map, with the level's sun in it (a disk and its glare); the engine fills in its inputs.", kind: Kind::SkyBox, slots: &["cube"], inputs: &[], engine: &[], attribs: &[] },
 ];
 
 /// The registered program named `name`.

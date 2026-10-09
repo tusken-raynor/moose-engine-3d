@@ -117,8 +117,11 @@ pub fn draw<A>(canvas: &mut Canvas, widgets: &[Widget<A>], cursor: Option<(f32, 
                 }
                 let color = if *dim || w.act.is_none() && w.wheel.is_none() { DIM } else { TEXT };
                 let pad = 3 * scale;
-                canvas.text(r.x + pad, text_y, label, color, scale);
                 let vw = Canvas::text_width(value, scale);
+                // A label that would run into the value is cut short.
+                let room = r.w.saturating_sub(2 * pad + vw + if vw > 0 { Canvas::text_width(" ", scale) } else { 0 });
+                let label = fit(label, room, scale);
+                canvas.text(r.x + pad, text_y, &label, color, scale);
                 canvas.text((r.x + r.w).saturating_sub(pad + vw), text_y, value, color, scale);
             }
             Look::Button { text, on } => {
@@ -184,6 +187,15 @@ pub fn draw<A>(canvas: &mut Canvas, widgets: &[Widget<A>], cursor: Option<(f32, 
             Look::Frame(color) => outline(canvas, r, *color),
         }
     }
+}
+
+/// `text` cut to fit `room` pixels at `scale`, ending in `..` where it's cut.
+fn fit(text: &str, room: usize, scale: usize) -> String {
+    if Canvas::text_width(text, scale) <= room {
+        return text.to_string();
+    }
+    let chars = (room / Canvas::text_width("m", scale)).saturating_sub(2);
+    format!("{}..", text.chars().take(chars).collect::<String>())
 }
 
 /// A rectangle's one-pixel border.

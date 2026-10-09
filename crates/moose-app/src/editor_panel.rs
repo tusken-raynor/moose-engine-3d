@@ -79,6 +79,8 @@ pub enum Act {
     Delete,
     /// Selects something and brings the view to it.
     GoTo(Selection),
+    /// Saves the level (asked first while it won't load).
+    Save,
 }
 
 /// What's being typed.
