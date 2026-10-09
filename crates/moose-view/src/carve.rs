@@ -627,9 +627,17 @@ impl Carver {
                         }
                     }
                     let lit_by = if open { &hard } else { light };
-                    let window = self.add_window(lit_by, slot, &joined, &inherited);
-                    let edges = self.window_edges_of(lit_by, &joined, &inherited);
-                    self.stack.push((portal.target, Some(window), depth + 1, edges));
+                    // Hard along part of a line and soft along the rest (a building's
+                    // corner, soft, under the edge its opening shares with the opening over
+                    // the building, hard), it is two windows (see `split_mixed`).
+                    let whole = std::mem::take(&mut self.points);
+                    let parts = if Source::of(lit_by).soft() { split_mixed(&whole, &mut joined) } else { vec![whole] };
+                    for part in parts {
+                        self.points = part;
+                        let window = self.add_window(lit_by, slot, &joined, &inherited);
+                        let edges = self.window_edges_of(lit_by, &joined, &inherited);
+                        self.stack.push((portal.target, Some(window), depth + 1, edges));
+                    }
                 }
             }
             let windows_end = self.windows.len() as u32;
@@ -646,15 +654,23 @@ impl Carver {
                 }
                 let center = (entity.bounds.min + entity.bounds.max) * 0.5;
                 let radius = (entity.bounds.max - entity.bounds.min).length() * 0.5;
+                let transform = entity.transform();
+                // A light inside the model casts no shadow of it: tested against its own
+                // box, where it stands. (The sphere round its world box, as before, holds
+                // far more than the model when it is turned: a crate turned 30° dropped its
+                // shadow from a flashlight half a meter from it.)
+                let inside = || {
+                    let local = transform.inverse().transform_point3(light.position);
+                    assets.mesh(entity.mesh).bounds.contains(local)
+                };
                 if !light.directional
                     && (center.distance(light.position) - radius >= light.range
-                        || center.distance(light.position) <= radius
-                        || !light.cone_reaches(center, radius))
+                        || !light.cone_reaches(center, radius)
+                        || inside())
                 {
                     continue;
                 }
                 let first = self.volumes.len();
-                let transform = entity.transform();
                 // Moving occluders' shadows are carved every frame, at the dynamic softness;
                 // blurred and hard ones are carved hard.
                 let sized = if entity.is_static { light } else { &carved };
@@ -848,7 +864,7 @@ impl Carver {
                 soft = false;
                 continue;
             };
-            let along = |&(u, v): &(Vec3, Vec3)| on_line(a, u, v) && on_line(b, u, v);
+            let along = |&line: &(Vec3, Vec3)| along(a, b, line);
             let wedge = if joined.iter().any(along) {
                 None
             } else if let Some(&(_, w)) = inherited.iter().find(|(line, _)| along(line)) {
@@ -1017,7 +1033,7 @@ impl Carver {
             let caster = (a, b);
             // Facing into the shadow: into an occluder's outline, out of a window's.
             let shadow = if window { hard.flip() } else { hard };
-            let along = |&(u, v): &(Vec3, Vec3)| on_line(a, u, v) && on_line(b, u, v);
+            let along = |&line: &(Vec3, Vec3)| along(a, b, line);
             let wedge = if joined.iter().any(along) {
                 Some((shadow, shadow))
             } else if let Some(&(_, w)) = inherited.iter().find(|(line, _)| along(line)) {
@@ -1840,6 +1856,54 @@ fn joined_edges(world: &World, geometry: &Mesh, source: &Source, sector: u32, p:
 }
 
 /// Whether point `p` is on the line through `u` and `v`.
+/// Whether the edge `a`-`b` lies along the edge `u`-`v`: on its line, its middle within it.
+fn along(a: Vec3, b: Vec3, (u, v): (Vec3, Vec3)) -> bool {
+    let d = v - u;
+    let t = ((a + b) * 0.5 - u).dot(d) / d.length_squared().max(1e-12);
+    on_line(a, u, v) && on_line(b, u, v) && (-1e-4..=1.0 + 1e-4).contains(&t)
+}
+
+/// A window's outline cut, at each corner between two of its edges on one line where one
+/// is hard (along an edge of `joined`) and the other soft, across that line: into windows
+/// each hard or soft all along it. A window's region is inside every one of its edges'
+/// planes, and the hard edge's plane (the shadow's edge from the light's center) cut the
+/// soft edge's penumbra off along all of the line. The cuts are joined edges (pushed to
+/// `joined`): what passes one side goes through the one, the other side through the other,
+/// as where two openings meet.
+fn split_mixed(points: &[Vec3], joined: &mut Vec<(Vec3, Vec3)>) -> Vec<Vec<Vec3>> {
+    let mut done = Vec::new();
+    let mut work = vec![points.to_vec()];
+    let mut next = Vec::new();
+    while let Some(part) = work.pop() {
+        let n = part.len();
+        let hard = |i: usize| joined.iter().any(|&line| along(part[i], part[(i + 1) % n], line));
+        let corner = (0..n).find(|&i| {
+            let before = (i + n - 1) % n;
+            on_line(part[(i + 1) % n], part[before], part[i]) && hard(before) != hard(i)
+        });
+        let Some(i) = corner.filter(|_| done.len() + work.len() < 8) else {
+            done.push(part);
+            continue;
+        };
+        let d = (part[(i + 1) % n] - part[i]).normalize();
+        let across = Half { normal: d, offset: -d.dot(part[i]) };
+        for side in [across, across.flip()] {
+            let mut half = part.clone();
+            clip_points(&mut half, &mut next, side);
+            drop_near_duplicates(&mut half);
+            if half.len() < 3 {
+                continue;
+            }
+            let on: Vec<Vec3> = half.iter().copied().filter(|&q| across.distance(q).abs() < 1e-5).collect();
+            if let [a, b] = on[..] {
+                joined.push((a, b));
+            }
+            work.push(half);
+        }
+    }
+    done
+}
+
 fn on_line(p: Vec3, u: Vec3, v: Vec3) -> bool {
     let d = v - u;
     let len2 = d.length_squared();
@@ -2956,6 +3020,55 @@ mod tests {
         assert!((soft - cached_soft).abs() < 1e-3, "{soft} {cached_soft}");
         // Once cached, it isn't carved again: a changed light drops it.
         assert_eq!(c.cache.len(), 1);
+    }
+
+    #[test]
+    fn a_window_hard_along_part_of_a_line_and_soft_along_the_rest_is_two() {
+        // An opening 2 m square (z = 0), its left side two edges on the line x = 0: from
+        // y = 2 to 1 joined to another opening (hard: open air over a building), from 1 to
+        // 0 a wall's corner (soft). One window, inside every edge's plane, took the hard
+        // edge's plane all along the line: the corner's shadow came out hard (cheese_1's
+        // sidewalk). Cut across the line at y = 1, each window is one or the other.
+        let p = |x: f32, y: f32| Vec3::new(x, y, 0.0);
+        let outline = [p(0.0, 0.0), p(2.0, 0.0), p(2.0, 2.0), p(0.0, 2.0), p(0.0, 1.0)];
+        let mut joined = vec![(p(0.0, 2.0), p(0.0, 1.0))];
+        let parts = split_mixed(&outline, &mut joined);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        // The cut is joined: hard on both sides.
+        let cut = (p(0.0, 1.0), p(2.0, 1.0));
+        assert!(joined.iter().any(|&(a, b)| along(a, b, cut) && along(cut.0, cut.1, (a, b))), "{joined:?}");
+        for part in &parts {
+            let n = part.len();
+            let left: Vec<bool> = (0..n)
+                .filter(|&i| part[i].x == 0.0 && part[(i + 1) % n].x == 0.0)
+                .map(|i| joined.iter().any(|&line| along(part[i], part[(i + 1) % n], line)))
+                .collect();
+            assert_eq!(left.len(), 1, "{part:?}");
+        }
+        // Along a joined edge only within it: the corner's edge is on its line, not along it.
+        assert!(!along(p(0.0, 1.0), p(0.0, 0.0), (p(0.0, 2.0), p(0.0, 1.0))));
+        assert!(along(p(0.0, 1.5), p(0.0, 1.2), (p(0.0, 2.0), p(0.0, 1.0))));
+    }
+
+    #[test]
+    fn a_turned_occluder_casts_from_a_light_near_it_but_not_from_one_inside_it() {
+        // two_rooms' crate_a3, a 1 m crate turned 30° about y at (2.5, 0, 5): the sphere
+        // round its world box is about 1.09 m across from its center. A light 1 m from the
+        // center along x is in it, but 0.37 m outside the crate; dropped as inside, its
+        // shadow went (cheese_1's crate and the flashlight).
+        let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+        let level = assets.load_level("two_rooms.mmp").unwrap();
+        let world = World::new(level, &assets);
+        let index = world.entities.iter().position(|e| (e.position - Vec3::new(2.5, 0.0, 5.0)).length() < 1e-3).unwrap();
+        let volumes = |at: Vec3| {
+            let mut light = Light::point(0, at, Vec3::ONE, 10.0);
+            light.shadow = Some(0);
+            let mut c = Carver::default();
+            c.prepare(&world, &assets, &[light], (true, 1.0));
+            c.volumes.iter().filter(|v| v.owner == Some(index as u32)).count()
+        };
+        assert!(volumes(Vec3::new(3.5, 0.5, 5.0)) > 0);
+        assert_eq!(volumes(Vec3::new(2.5, 0.5, 5.0)), 0);
     }
 
     #[test]
