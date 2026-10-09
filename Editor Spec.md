@@ -80,7 +80,7 @@ The editor works on the level's own tables, `moose_assets::LevelDoc`: the `.mmp`
 
 **The panel** beside them shows the active selection (or, with none, "No face selected" in the mode). Its top lines are stats, in smaller type and their own color: what the selection is, not what to change. Rows below are clicked (an action, or a choice to open), scrolled (a number steps), or clicked to type a number (Enter sets it, Esc drops it; positions, sizes, angles, lights' and the level's numbers, extrude and push distances, texture numbers). A submenu (the lights kept off, meta values, the material browser, Add's props) opens in the same frame with **< Back** at the top left; Esc goes back too. Paired texture rows sit two to a line.
 
-**Lists** (lights, materials, models, controls) scroll with the wheel, and with Up/Down (the keys' row is highlighted) and Enter. **Searches** filter as they're typed.
+**Lists** (lights, materials, models, controls) scroll with the wheel, and with Up/Down (the keys' row is highlighted) and Enter while the pointer is over the panel. **Searches** filter as they're typed.
 
 **Deleting** (the Delete row, X, or Del) asks first: Yes or No, clicked, or Left/Right and Enter (Esc: no).
 
@@ -148,7 +148,8 @@ Always (not bound):
 | Click, Shift+click, drag | Select; add or drop; a box (Shift: add), or in 2D on the selection, move it |
 | Right button held | Look (3D) or pan (2D) |
 | Wheel | Change the row under the pointer, or zoom a 2D view |
-| Arrows (3D, or 2D with Shift), PgUp/PgDn | Move the selection along the view's axes (the world axes nearest the 3D view's forward and right); push/pull a face |
+| Arrows | Look around (3D), turn the view (2D) |
+| Shift+arrows, PgUp/PgDn | Move the selection along the view's axes (the world axes nearest the 3D view's forward and right); push/pull a face |
 | `[` `]` | Turn an entity or sectors, or aim a spot light |
 | Del, Backspace | Delete (asked) |
 | Esc | Stop a cut or a pick, back out of a menu, drop the selection, then the menu |

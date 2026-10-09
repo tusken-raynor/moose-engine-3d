@@ -203,7 +203,7 @@ pub const FIXED: [(&str, &str); 14] = [
     ("Drag", "select what's in the box (Shift: add)"),
     ("Right button held", "look (3D) or pan (2D)"),
     ("Wheel", "change the row under the pointer; zoom 2D"),
-    ("Arrows, PgUp/PgDn", "move the selection (2D: Shift+arrows)"),
+    ("Shift+arrows, PgUp/PgDn", "move the selection"),
     ("[ ]", "turn an entity or a sector, aim a spot"),
     ("Del", "delete"),
     ("Esc", "stop, back, drop the selection, menu"),

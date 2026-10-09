@@ -2963,8 +2963,8 @@ fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
 /// (clicks, the wheel, a list's keys), picking by mode (Shift adds; a box dragged; clicking
 /// again in one place of a 2D view picks what's behind), dragging the selection in a 2D
 /// view, cutting, and the editor's keys (`editor_keys`) for edits, views, undo and saving.
-/// Returns whether the arrows (and PageUp/PageDown) were the editor's, rather than turning
-/// the view.
+/// Returns whether the arrows were the editor's (Shift held, moving the selection), rather
+/// than turning the view.
 fn edit_input(app: &mut App, display: &Display) -> bool {
     use editor::{Field, Mode, Selection, ViewMode};
     use editor_keys::Action;
@@ -3030,8 +3030,9 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             run_act(app, act, scroll.signum());
         }
     }
-    // A list's keys (the lights, the materials, the controls): Up/Down choose, Enter does.
-    if !laid.list.is_empty() {
+    // A list's keys (the lights, the materials, the controls): Up/Down choose, Enter does,
+    // while the pointer is over the panel (elsewhere the arrows are the view's).
+    if !laid.list.is_empty() && over_ui {
         let n = laid.list.len();
         let state = &mut app.editor.list;
         let mut moved = false;
@@ -3395,10 +3396,8 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     ) {
         return false;
     }
-    // In a 2D view the arrows turn it; with Shift they move the selection.
-    if two_d && !shift {
-        return false;
-    }
+    // The arrows look around (3D) or turn the view (2D); with Shift they move the
+    // selection. PgUp/PgDn and [ ] move and turn it either way.
     // Along the screen's axes in a 2D view; in the 3D view, along the world axes nearest
     // the view's forward and right.
     let axis_field = |v: glam::Vec3| {
@@ -3431,12 +3430,14 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         (Key::LeftBracket, (Field::Yaw, 1.0)),
         (Key::RightBracket, (Field::Yaw, -1.0)),
     ];
+    let arrow = |key: Key| matches!(key, Key::Up | Key::Down | Key::Left | Key::Right);
     for (key, (field, dir)) in moves {
-        if display.key_repeated(key) {
+        if (shift || !arrow(key)) && display.key_repeated(key) {
             app.edit(field, dir);
         }
     }
-    true
+    // The arrows were the selection's only with Shift.
+    shift
 }
 
 /// The material editor's mouse and keys (see `material_screen`): clicks and the wheel on
