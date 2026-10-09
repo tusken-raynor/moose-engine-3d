@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A};
+use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A, Vec4};
 use moose_assets::{
     Assets, EntityKind, Mesh, MeshId, Plane, Light, PolyFlags, Polygon, Portal,
 };
@@ -323,6 +323,9 @@ pub struct ViewGeometry {
     /// Where shadows fall on polygons; see [`ViewPolygon::split`].
     pub shadow_pieces: Vec<ShadowPiece>,
     pub shadow_vertices: Vec<ShadowVertex>,
+    /// Soft shadow pieces' soft edges (see [`ShadowPiece::first_soft`]), and their wedges.
+    pub shadow_softs: Vec<ShadowSoft>,
+    pub shadow_wedges: Vec<ShadowWedge>,
     /// Where each polygon's mesh is: `[0]` is the level ([`Object::IDENTITY`]), then one per
     /// entity drawn.
     pub objects: Vec<Object>,
@@ -510,7 +513,8 @@ struct Out<'a> {
     polygons: &'a mut Vec<ViewPolygon>,
     shadow_pieces: &'a mut Vec<ShadowPiece>,
     shadow_vertices: &'a mut Vec<ShadowVertex>,
-    values: Vec<(f32, f32)>,
+    shadow_softs: &'a mut Vec<ShadowSoft>,
+    shadow_wedges: &'a mut Vec<ShadowWedge>,
     edges: Vec<PieceEdge>,
 }
 
@@ -746,6 +750,8 @@ impl ViewGeometry {
         self.polygons.clear();
         self.shadow_pieces.clear();
         self.shadow_vertices.clear();
+        self.shadow_softs.clear();
+        self.shadow_wedges.clear();
         self.objects.clear();
         self.objects.push(Object::IDENTITY);
         (self.eye, self.focal) = (view.position, view.focal);
@@ -784,7 +790,8 @@ impl ViewGeometry {
             polygons: &mut self.polygons,
             shadow_pieces: &mut self.shadow_pieces,
             shadow_vertices: &mut self.shadow_vertices,
-            values: Vec::new(),
+            shadow_softs: &mut self.shadow_softs,
+            shadow_wedges: &mut self.shadow_wedges,
             edges: Vec::new(),
         };
         s.entity_objects.clear();
@@ -1558,8 +1565,7 @@ fn emit_pieces(
     let (mut touched, mut dark) = (0u32, u32::MAX);
     for i in 0..pieces {
         let piece = carver.piece(i);
-        out.values.clear();
-        touched |= piece.shadowed | piece.beamed | piece.blurred | carver.soft_values(&piece, &mut out.values);
+        touched |= piece.shadowed | piece.beamed | piece.blurred | carver.soft_slots(&piece);
         dark &= piece.shadowed;
     }
     // And the cached ones.
@@ -1584,20 +1590,17 @@ fn emit_pieces(
     if split != 0 {
         for i in 0..pieces {
             let piece = carver.piece(i);
-            out.values.clear();
-            let soft = carver.soft_values(&piece, &mut out.values);
+            let soft = carver.soft_slots(&piece);
             let slots = (piece.shadowed | piece.beamed | piece.blurred | soft) & split;
-            let per_vertex = soft.count_ones() as usize;
             let (records, edges) = (carver.records(&piece), carver.edges(&piece));
             let mut bits = slots;
             while bits != 0 {
                 let slot = bits.trailing_zeros();
                 bits &= bits - 1;
                 let dark = piece.shadowed >> slot & 1 != 0;
-                // Its value among the vertex's soft values, if soft here and not in the full
-                // shadow of another occluder of the same light.
-                let soft_at = (soft >> slot & 1 != 0 && !dark)
-                    .then(|| (soft & ((1 << slot) - 1)).count_ones() as usize);
+                // In its soft edges, if any, and not in the full shadow of another occluder
+                // of the same light.
+                let in_soft = soft >> slot & 1 != 0 && !dark;
                 // In a blurred caster's hard shadow (and not in full shadow): the renderer
                 // blurs it.
                 let occluded = piece.blurred >> slot & 1 != 0 && !dark;
@@ -1605,16 +1608,22 @@ fn emit_pieces(
                 let beam = (piece.beamed >> slot & 1 != 0 && !dark)
                     .then(|| carver.beam(slot as u8))
                     .flatten();
+                // In soft edges: they're taken at each pixel (see `soft_reach`).
+                let first_soft = out.shadow_softs.len() as u32;
+                if in_soft {
+                    carver.piece_softs(&piece, slot as u8, out.shadow_softs, out.shadow_wedges);
+                }
                 let first_vertex = out.shadow_vertices.len() as u32;
-                for (v, (r, edge)) in records.chunks_exact(stride).zip(edges).enumerate() {
+                for (r, edge) in records.chunks_exact(stride).zip(edges) {
                     let (x, y) = to_screen(view, Vec3::from_slice(r));
                     let world = Vec3::from_slice(&r[3..6]);
                     let vertex = ShadowVertex {
                         x,
                         y,
                         w: 1.0 / r[2],
+                        world,
                         line: edge_line(view, edge, plane_lines),
-                        light: 0.0,
+                        light: if dark { 0.0 } else { 1.0 },
                         ray: beam.map_or(Vec3::ZERO, |b| b.ray(world)),
                         width: if occluded {
                             carver.penumbra_width(slot as u8, world, receiver.entity)
@@ -1622,24 +1631,17 @@ fn emit_pieces(
                             0.0
                         },
                     };
-                    let light = match soft_at {
-                        Some(k) => out.values[v * per_vertex + k],
-                        None if dark => (0.0, 0.0),
-                        None => (1.0, 1.0),
-                    };
-                    push_shadow_vertex(out.shadow_vertices, vertex, light);
+                    out.shadow_vertices.push(vertex);
                 }
-                push_shadow_piece(
-                    out.shadow_vertices,
-                    out.shadow_pieces,
-                    ShadowPiece {
-                        slot: slot as u8,
-                        first_vertex,
-                        vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
-                        beam: beam.map(|b| b.cone),
-                        occluded,
-                    },
-                );
+                out.shadow_pieces.push(ShadowPiece {
+                    slot: slot as u8,
+                    first_vertex,
+                    vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+                    first_soft,
+                    soft_count: (out.shadow_softs.len() as u32 - first_soft) as u16,
+                    beam: beam.map(|b| b.cone),
+                    occluded,
+                });
             }
         }
         // The cached pieces, clipped as the polygon was and projected.
@@ -1753,14 +1755,11 @@ fn emit_cached(
         if clipped.is_empty() {
             continue;
         }
-        let count = clipped.len() / STRIDE;
-        let center = clipped
-            .chunks_exact(STRIDE)
-            .map(|r| Vec3::from_slice(&r[3..6]))
-            .sum::<Vec3>()
-            / count as f32;
+        // In soft edges (taken at each pixel), or in full shadow.
+        let first_soft = out.shadow_softs.len() as u32;
+        cached.softs(soft, out.shadow_softs, out.shadow_wedges);
         let first_vertex = out.shadow_vertices.len() as u32;
-        for (j, (r, &edge)) in clipped.chunks_exact(STRIDE).zip(clip_edges).enumerate() {
+        for (r, &edge) in clipped.chunks_exact(STRIDE).zip(clip_edges) {
             let (x, y) = to_screen(view, Vec3::from_slice(r));
             let line = match edge {
                 Edge::Plane(k) => plane_lines.get(k as usize).copied(),
@@ -1769,34 +1768,26 @@ fn emit_cached(
                     CachedEdge::Line(a, b) => line_through(view, space.to_clip(a), space.to_clip(b)),
                 },
             };
-            let p = Vec3::from_slice(&r[3..6]);
-            let vertex = ShadowVertex {
+            out.shadow_vertices.push(ShadowVertex {
                 x,
                 y,
                 w: 1.0 / r[2],
+                world: Vec3::from_slice(&r[3..6]),
                 line,
-                light: 0.0,
+                light: if soft.is_empty() { 0.0 } else { 1.0 },
                 ray: Vec3::ZERO,
                 width: 0.0,
-            };
-            let light = |along: usize| {
-                let along = Vec3::from_slice(&clipped[along * STRIDE + 3..][..3]);
-                cached.light(soft, p, along, center)
-            };
-            let light = (light((j + count - 1) % count), light((j + 1) % count));
-            push_shadow_vertex(out.shadow_vertices, vertex, light);
+            });
         }
-        push_shadow_piece(
-            out.shadow_vertices,
-            out.shadow_pieces,
-            ShadowPiece {
-                slot,
-                first_vertex,
-                vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
-                beam: None,
-                occluded: false,
-            },
-        );
+        out.shadow_pieces.push(ShadowPiece {
+            slot,
+            first_vertex,
+            vertex_count: (out.shadow_vertices.len() as u32 - first_vertex) as u16,
+            first_soft,
+            soft_count: (out.shadow_softs.len() as u32 - first_soft) as u16,
+            beam: None,
+            occluded: false,
+        });
     }
 }
 
@@ -1864,15 +1855,20 @@ fn edge_line(view: &View, edge: &PieceEdge, plane_lines: &[EdgeLine]) -> Option<
 }
 
 /// A shadow cast on a polygon: part of it (a convex polygon on it, counter-clockwise like
-/// it) that a light's shadow covers, fully or softly. Its vertices (`vertex_count` of
-/// `ViewGeometry::shadow_vertices` from `first_vertex`) carry how much of the light reaches
-/// them, interpolated across it (perspective-correct).
+/// it) that a light's shadow covers, fully or softly. Its vertices are `vertex_count` of
+/// `ViewGeometry::shadow_vertices` from `first_vertex`. In soft edges (`soft_count` of
+/// `ViewGeometry::shadow_softs` from `first_soft`), how much of the light reaches each
+/// pixel is worked out there (see [`soft_reach`]), at the pixel's world position (its
+/// vertices' `world`, interpolated); otherwise it is the same all over (its vertices'
+/// `light`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowPiece {
     /// The light's shadow slot.
     pub slot: u8,
     pub first_vertex: u32,
     pub vertex_count: u16,
+    pub first_soft: u32,
+    pub soft_count: u16,
     /// Part of a beam (see `Light::beam`): the light's cone as `(scale, offset)` (see
     /// `Light::cone`), which fades it further at each pixel by the angle between the
     /// pixel's ray (its vertices' `ray`, interpolated) and the beam's axis (x).
@@ -1883,18 +1879,16 @@ pub struct ShadowPiece {
     pub occluded: bool,
 }
 
-/// A vertex of a [`ShadowPiece`]: where it is on screen (exact, like [`ScreenVertex`]), the
-/// line its edge leaving it is walked along (if not between its own vertices), and how
-/// much of the light reaches it: 0 in full shadow, up to 1 where a soft edge starts.
-///
-/// A corner where an occluder's edge touches the surface has a value along each of its
-/// edges (see the carver's `soft_values`), so it comes as two vertices in the same place:
-/// the edge between them has no length.
+/// A vertex of a [`ShadowPiece`]: where it is on screen (exact, like [`ScreenVertex`]) and
+/// in the world, the line its edge leaving it is walked along (if not between its own
+/// vertices), and, in a piece not in a soft edge, how much of the light reaches it: 0 in
+/// full shadow, 1 (a beam's cone, or a blurred shadow, takes the rest).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowVertex {
     pub x: f32,
     pub y: f32,
     pub w: f32,
+    pub world: Vec3,
     pub line: Option<EdgeLine>,
     pub light: f32,
     /// In a beam's piece: the way from the light to it, in the beam's frame (x along its
@@ -1905,103 +1899,59 @@ pub struct ShadowVertex {
     pub width: f32,
 }
 
-/// Appends a shadow piece's vertex with how much of the light reaches it along the edges
-/// arriving and leaving: as two vertices in the same place if they differ (the first ends
-/// the edge arriving, the second starts the edge leaving).
-fn push_shadow_vertex(
-    out: &mut Vec<ShadowVertex>,
-    vertex: ShadowVertex,
-    (arriving, leaving): (f32, f32),
-) {
-    if (arriving - leaving).abs() > 1e-3 {
-        out.push(ShadowVertex { light: arriving, line: None, ..vertex });
-    }
-    out.push(ShadowVertex { light: leaving, ..vertex });
+/// One soft edge over a shadow piece, for the renderer to take at each pixel: the plane
+/// where it starts to cover the light (`outer`) and where it covers all of it (`inner`),
+/// each `(normal, offset)` in world space (a point's distance is `normal · p + offset`),
+/// facing into the shadow.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShadowWedge {
+    pub outer: Vec4,
+    pub inner: Vec4,
 }
 
-/// How far apart the values at the ends of each triangle's far edge may be in a fan from a
-/// corner with two values (see [`push_shadow_piece`]): the corner has halfway between
-/// them, so a triangle's edges from it are off by at most half this near it.
-const FAN_STEP: f32 = 0.125;
+/// A window's or an occluder's soft edges over a shadow piece: `wedges` of
+/// `ViewGeometry::shadow_wedges`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShadowSoft {
+    pub wedges: Range<u32>,
+    pub window: bool,
+}
 
-/// Pushes a shadow piece, its vertices `piece.first_vertex..` of `vertices`.
-///
-/// One with a corner with two values (where an occluder's edge touches the surface: see
-/// [`push_shadow_vertex`]) is pushed as a fan of triangles from that corner instead: the
-/// rasterizer interpolates a piece's values down its edges, then across each row, so the
-/// corner's rows would split it, the rows above taking one of its values and the rows
-/// below the other, across all of it (a hard line level with the corner). What reaches
-/// the surface is the same along each ray out from the corner, and in a fan each triangle
-/// gets one value at the corner: halfway between those at its far corners, which are
-/// close (the far edges are split so, see `FAN_STEP`).
-fn push_shadow_piece(vertices: &mut Vec<ShadowVertex>, pieces: &mut Vec<ShadowPiece>, piece: ShadowPiece) {
-    let first = piece.first_vertex as usize;
-    let m = vertices.len() - first;
-    let v = &vertices[first..];
-    // The corner: a vertex ending the edge arriving, then one in the same place starting
-    // the edge leaving, with another value.
-    let twofold = |j: usize| {
-        let (a, b) = (v[j], v[(j + 1) % m]);
-        a.line.is_none() && (a.x, a.y) == (b.x, b.y) && (a.light - b.light).abs() > 1e-3
+/// How much of a light reaches world point `p`, past the soft edges `softs` (their wedges
+/// in `wedges`): each edge covers none of it on its outer plane and all of it on its inner
+/// one, eased (smoothstep) between. What the windows let through adds up (capped at all
+/// of it): a ray from the light into a sector comes through one run of openings, so two
+/// windows into it let different parts of the light through, and where their soft edges
+/// meet on one line, together all of it. Within one window, its edges' shares multiply.
+/// What occluders cover adds up (capped at all of it). Taken at each pixel, so it is the
+/// same however the carver cut the pieces.
+#[inline]
+pub fn soft_reach(softs: &[ShadowSoft], wedges: &[ShadowWedge], p: Vec3) -> f32 {
+    let p = p.extend(1.0);
+    let covers = |w: &ShadowWedge| {
+        let (outer, inner) = (w.outer.dot(p), w.inner.dot(p));
+        let span = outer - inner;
+        let c = if span > 1e-6 {
+            (outer / span).clamp(0.0, 1.0)
+        } else if outer > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        c * c * (3.0 - 2.0 * c)
     };
-    let mut corners = (0..m).filter(|&j| twofold(j));
-    let (Some(arriving), None) = (corners.next(), corners.next()) else {
-        pieces.push(piece);
-        return;
-    };
-    if m < 4 {
-        pieces.push(piece);
-        return;
-    }
-    let corner = v[(arriving + 1) % m];
-    // The far corners, from the one after it round to the one before, with more along
-    // each edge between them where their values are far apart: at even steps along it in
-    // the world (perspective-correct, as the rasterizer interpolates along it).
-    let mut far: Vec<ShadowVertex> = Vec::with_capacity(m + 8);
-    let ends: Vec<ShadowVertex> = (2..m).map(|k| v[(arriving + k) % m]).collect();
-    for pair in ends.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        far.push(a);
-        let steps = ((a.light - b.light).abs() / FAN_STEP).ceil().clamp(1.0, 8.0) as u32;
-        let (za, zb) = (1.0 / a.w, 1.0 / b.w);
-        for step in 1..steps {
-            let t = step as f32 / steps as f32;
-            let z = za + (zb - za) * t;
-            far.push(ShadowVertex {
-                x: (a.x * za * (1.0 - t) + b.x * zb * t) / z,
-                y: (a.y * za * (1.0 - t) + b.y * zb * t) / z,
-                w: 1.0 / z,
-                line: a.line,
-                light: a.light + (b.light - a.light) * t,
-                ray: a.ray + (b.ray - a.ray) * t,
-                width: a.width + (b.width - a.width) * t,
-            });
+    let (mut through, mut windows, mut covered) = (0.0, false, 0.0);
+    for soft in softs {
+        let edges = wedges[soft.wedges.start as usize..soft.wedges.end as usize].iter().map(covers);
+        if soft.window {
+            windows = true;
+            through += edges.map(|c| 1.0 - c).product::<f32>();
+        } else {
+            covered += edges.product::<f32>();
         }
     }
-    far.push(ends[ends.len() - 1]);
-    vertices.truncate(first);
-    // The edges out from the corner between triangles, walked along the same line by both.
-    let spoke = |p: &ShadowVertex| Some(EdgeLine::between((corner.x, corner.y), (p.x, p.y)));
-    let last = far.len() - 1;
-    for j in 0..last {
-        let (a, b) = (far[j], far[j + 1]);
-        let first_vertex = vertices.len() as u32;
-        vertices.push(ShadowVertex {
-            light: (a.light + b.light) * 0.5,
-            line: if j == 0 { corner.line } else { spoke(&a) },
-            ..corner
-        });
-        vertices.push(a);
-        vertices.push(ShadowVertex {
-            line: if j + 1 == last { b.line } else { spoke(&b) },
-            ..b
-        });
-        pieces.push(ShadowPiece {
-            first_vertex,
-            vertex_count: 3,
-            ..piece
-        });
-    }
+    let through: f32 = if windows { through.min(1.0) } else { 1.0 };
+    through * (1.0 - covered.min(1.0))
 }
 
 /// The four side planes of the view frustum in clip space: x = -w, x = w, y = -w, y = w.

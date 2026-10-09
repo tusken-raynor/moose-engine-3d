@@ -329,6 +329,11 @@ struct ThreadBins {
     shadow_light: Vec<f32>,
     shadow_rays: Vec<Vec3>,
     shadow_width: Vec<f32>,
+    /// Each vertex's world position, and soft pieces' soft edges and their wedges (see
+    /// `moose_view::soft_reach`).
+    shadow_world: Vec<Vec3>,
+    shadow_softs: Vec<moose_view::ShadowSoft>,
+    shadow_wedges: Vec<moose_view::ShadowWedge>,
 }
 
 /// A polygon's shadow piece, binned: its vertices (`count` from `first`), its light's split
@@ -344,6 +349,9 @@ struct ShadowSetup {
     row_end: i32,
     /// See `ShadowPiece::occluded`.
     occluded: bool,
+    /// Its soft edges (`ThreadBins::shadow_softs`), if it is in any: how much of the light
+    /// reaches each pixel is worked out there.
+    softs: (u32, u32),
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -387,6 +395,8 @@ struct RowScratch {
     /// How much of each split light reaches each pixel of the run being shaded (see
     /// `SpanJob::reaches`).
     reaches: Vec<f32>,
+    /// A soft shadow piece's light across its stretch of the row (see `shadow_run`).
+    soft_row: Vec<f32>,
     /// The framebuffer row being drawn.
     row: i32,
     color: Vec<u32>,
@@ -584,6 +594,9 @@ impl Renderer {
             bins.shadow_light.clear();
             bins.shadow_rays.clear();
             bins.shadow_width.clear();
+            bins.shadow_world.clear();
+            bins.shadow_softs.clear();
+            bins.shadow_wedges.clear();
             bins.bands.resize_with(bands as usize, BandBins::default);
             for band in &mut bins.bands {
                 band.world.clear();
@@ -1049,6 +1062,12 @@ fn setup_polygon(
         let (top, bottom) = vertices
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(t, b), v| (t.min(v.y), b.max(v.y)));
+        let first_soft = bins.shadow_softs.len() as u32;
+        for soft in &geometry.shadow_softs[piece.first_soft as usize..][..piece.soft_count as usize] {
+            let start = bins.shadow_wedges.len() as u32;
+            bins.shadow_wedges.extend_from_slice(&geometry.shadow_wedges[soft.wedges.start as usize..soft.wedges.end as usize]);
+            bins.shadow_softs.push(moose_view::ShadowSoft { wedges: start..bins.shadow_wedges.len() as u32, window: soft.window });
+        }
         bins.shadows.push(ShadowSetup {
             first: bins.shadow_vertices.len() as u32,
             count: piece.vertex_count,
@@ -1057,9 +1076,11 @@ fn setup_polygon(
             row_top: pixel_edge(top),
             row_end: pixel_edge(bottom),
             occluded: piece.occluded,
+            softs: (first_soft, bins.shadow_softs.len() as u32),
         });
         for v in vertices {
             bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
+            bins.shadow_world.push(v.world);
             bins.shadow_rays.push(v.ray);
             bins.shadow_width.push(v.width);
             bins.shadow_lines.push(v.line);
@@ -2095,6 +2116,40 @@ struct Segment {
 /// it is over its entry (plus a half, over 16) at its row and column, modulo 4.
 const BEAM_DITHER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
+/// Pixels between the points where a soft shadow piece's light is worked out (see
+/// `soft_stretch`), and how far from straight between them it may bend, halfway, to be
+/// taken straight across them (well under one level of an 8-bit color).
+const SOFT_STEP: i32 = 8;
+const SOFT_BEND: f32 = 1.0 / 512.0;
+
+/// A soft shadow piece's light at pixels `from..to` of a row into `out`, `at(x)` being it at
+/// pixel `x`: at every `SOFT_STEP`th pixel, and between two of them straight across where
+/// it is that, halfway, to within `SOFT_BEND` (a penumbra's light changes smoothly), or
+/// else at each pixel (a narrow soft edge, a hard one, or two edges meeting). Every value
+/// comes from the edges' planes themselves, so nothing depends on how the carver cut the
+/// pieces.
+fn soft_stretch(out: &mut Vec<f32>, from: i32, to: i32, at: impl Fn(i32) -> f32) {
+    if from >= to {
+        return;
+    }
+    let (mut a, mut fa) = (from, at(from));
+    while a < to - 1 {
+        let b = (a + SOFT_STEP).min(to - 1);
+        let fb = at(b);
+        let straight = b - a < 2 || {
+            let m = a + (b - a) / 2;
+            let between = fa + (fb - fa) * (m - a) as f32 / (b - a) as f32;
+            (at(m) - between).abs() <= SOFT_BEND
+        };
+        out.push(fa);
+        for x in a + 1..b {
+            out.push(if straight { fa + (fb - fa) * (x - a) as f32 / (b - a) as f32 } else { at(x) });
+        }
+        (a, fa) = (b, fb);
+    }
+    out.push(fa);
+}
+
 /// Pixels between the points where the shadow buffer checks a beam's cone (see
 /// `shadow_run`).
 const BEAM_STEP: i32 = 8;
@@ -2129,12 +2184,14 @@ fn shadow_run(
             continue;
         }
         let range = piece.first as usize..piece.first as usize + piece.count as usize;
-        let (verts, lines, light, rays) = (
+        let (verts, lines, light, rays, world) = (
             &bins.shadow_vertices[range.clone()],
             &bins.shadow_lines[range.clone()],
             &bins.shadow_light[range.clone()],
-            &bins.shadow_rays[range],
+            &bins.shadow_rays[range.clone()],
+            &bins.shadow_world[range],
         );
+        let softs = &bins.shadow_softs[piece.softs.0 as usize..piece.softs.1 as usize];
         let Some(((il, xl), (ir, xr))) = crossings(verts, lines, row) else {
             continue;
         };
@@ -2151,27 +2208,42 @@ fn shadow_run(
                 continue;
             }
         }
-        // At each crossing: w, the light times w, and the ray times w (all linear across
-        // the row).
+        // At each crossing: w, the light times w, the ray times w, and the world position
+        // times w (all linear across the row).
         let at = |i: usize| {
             let (w, alpha) = edge_at_row(verts, i, row);
             let k = (i + 1) % verts.len();
             let l = light[i] + (light[k] - light[i]) * alpha;
             let ray = rays[i] + (rays[k] - rays[i]) * alpha;
-            (w, l * w, ray * w)
+            let p = world[i] + (world[k] - world[i]) * alpha;
+            (w, l * w, ray * w, p * w)
         };
-        let ((wl, ql, rl), (wr, qr, rr)) = (at(il), at(ir));
+        let ((wl, ql, rl, pl), (wr, qr, rr, pr)) = (at(il), at(ir));
         let out = &mut s.reaches[piece.split as usize * len..(piece.split as usize + 1) * len];
         let span = (xr - xl).max(1e-6);
         let t = |x: i32| (x as f32 + 0.5 - xl) / span;
-        // The same at every vertex (in full shadow, or only in a beam), the same all over.
-        let flat = light.iter().all(|&l| l == light[0]).then_some(light[0]);
+        // In soft edges: worked out at the pixels' world positions, across its stretch of
+        // the row (see `soft_stretch`). Otherwise the same at every vertex (in full shadow,
+        // or only in a beam), the same all over.
+        let flat = (softs.is_empty() && light.iter().all(|&l| l == light[0])).then_some(light[0]);
+        let soft_row = &mut s.soft_row;
+        soft_row.clear();
+        if !softs.is_empty() {
+            let at = |x: i32| {
+                let t = t(x);
+                let w = wl + (wr - wl) * t;
+                if w > 0.0 { moose_view::soft_reach(softs, &bins.shadow_wedges, (pl + (pr - pl) * t) / w) } else { 0.0 }
+            };
+            soft_stretch(soft_row, from, to, at);
+        }
+        let soft_row = &*soft_row;
         let reach = |x: i32| match flat {
             Some(l) => l,
+            None if !soft_row.is_empty() => soft_row[(x - from) as usize],
             None => {
                 let t = t(x);
-                let (w, q) = (wl + (wr - wl) * t, ql + (qr - ql) * t);
-                if w > 0.0 { (q / w).clamp(0.0, 1.0) } else { 0.0 }
+                let w = wl + (wr - wl) * t;
+                if w > 0.0 { ((ql + (qr - ql) * t) / w).clamp(0.0, 1.0) } else { 0.0 }
             }
         };
         // Lowers the buffer to the piece's value over pixels `a..b`: in bulk where the
@@ -3189,6 +3261,32 @@ mod tests {
         assert_eq!(split_priority(&away, center, up), 0.0);
         let flashlight = Light { id: moose_assets::FLASHLIGHT_ID, ..away };
         assert_eq!(split_priority(&flashlight, center, up), f32::INFINITY);
+    }
+
+    #[test]
+    fn a_soft_stretch_is_taken_every_few_pixels_where_it_is_smooth_and_at_each_where_not() {
+        use std::cell::Cell;
+        // A gentle ramp: taken at every 8th pixel and the halfway points, straight between,
+        // and exact (it is a straight line).
+        let calls = Cell::new(0);
+        let ramp = |x: i32| {
+            calls.set(calls.get() + 1);
+            x as f32 / 100.0
+        };
+        let mut out = Vec::new();
+        soft_stretch(&mut out, 10, 43, ramp);
+        assert_eq!(out.len(), 33);
+        assert!(out.iter().enumerate().all(|(i, &v)| (v - (10 + i as i32) as f32 / 100.0).abs() < 1e-6));
+        assert!(calls.get() <= 12, "{} calls", calls.get());
+        // A hard edge at pixel 27: every pixel exactly, the step where it is.
+        let mut out = Vec::new();
+        soft_stretch(&mut out, 10, 43, |x| if x >= 27 { 1.0 } else { 0.0 });
+        assert!(out.iter().enumerate().all(|(i, &v)| v == if 10 + i as i32 >= 27 { 1.0 } else { 0.0 }), "{out:?}");
+        // One pixel, and none.
+        let mut out = Vec::new();
+        soft_stretch(&mut out, 5, 6, |_| 0.25);
+        soft_stretch(&mut out, 7, 7, |_| 0.5);
+        assert_eq!(out, [0.25]);
     }
 
     #[test]

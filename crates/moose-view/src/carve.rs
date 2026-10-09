@@ -29,6 +29,7 @@ use moose_assets::{ShadowKind, Assets, Light, Mesh, MeshId};
 use moose_scene::{Occluder, World};
 
 use crate::clip::Edge;
+use crate::frame::{ShadowSoft, ShadowWedge};
 
 /// Floats in a record before its weights (clip x, y, w, world x, y, z).
 #[cfg(test)]
@@ -46,16 +47,6 @@ const ON_WINDOW_PLANE: f32 = 1e-3;
 const MAX_DEPTH: u16 = 16;
 /// Most shadow slots (the bits of a shadow mask).
 pub const MAX_SHADOW_SLOTS: u8 = 32;
-/// How close a piece's corner is to a soft edge's line to count as on it: the distance
-/// between the wedge's planes there, against that at the piece's center. (Carved pieces
-/// stop short of an occluder by `CAP_BIAS`, so a corner where it touches a surface is
-/// near the line, not on it.)
-const NEAR_LINE: f32 = 0.01;
-/// How far a cached soft piece's value may be, halfway along an edge, from halfway between
-/// its ends' values before a corner is added there (see [`Carver::cache`]); and how many
-/// times an edge is halved at most.
-const REFINE_OFF: f32 = 0.125;
-const REFINE_DEPTH: u32 = 5;
 
 /// A half-space: points with `normal · p + offset > 0`, in world space.
 #[derive(Clone, Copy, Debug)]
@@ -241,44 +232,10 @@ struct Wedge {
 }
 
 impl Wedge {
-    /// How much of the light the edge covers at `p`, a corner of a piece centered on
-    /// `center`, along the piece's edge from `p` to `along` (see [`Wedge::covers_at`]).
-    ///
-    /// Where an occluder's edge touches the surface its shadow falls on, the corner is on
-    /// the edge's line, where both planes meet: there it has no one value. What it covers
-    /// is the same all along each ray out from the line, from none to all, so it is taken
-    /// along the piece's edge (at `along`, or at `center` if that is on the line too).
-    fn covers(&self, p: Vec3, along: Vec3, center: Vec3) -> f32 {
-        let near = NEAR_LINE * self.span(center);
-        if self.span(p) > near {
-            self.covers_at(p)
-        } else if self.span(along) > near {
-            self.covers_at(along)
-        } else {
-            self.covers_at(center)
-        }
-    }
-
-    /// How much of the light the edge covers at `p`: none on the outer plane (and outside
-    /// it), all on the inner one (and past it), eased (smoothstep) between, by where `p` is
-    /// between them.
-    fn covers_at(&self, p: Vec3) -> f32 {
-        let (outer, inner) = (self.outer.distance(p), self.inner.distance(p));
-        let span = outer - inner;
-        let c = if span > 1e-6 {
-            (outer / span).clamp(0.0, 1.0)
-        } else if outer > 0.0 {
-            1.0
-        } else {
-            0.0
-        };
-        c * c * (3.0 - 2.0 * c)
-    }
-
-    /// How far apart its planes are at `p`: 0 on the edge's line, where they meet, and
-    /// growing in step with the distance from it.
-    fn span(&self, p: Vec3) -> f32 {
-        (self.outer.distance(p) - self.inner.distance(p)).abs()
+    /// Its planes, for the renderer (see [`ShadowWedge`]).
+    fn shadow(&self) -> ShadowWedge {
+        let plane = |h: Half| h.normal.extend(h.offset);
+        ShadowWedge { outer: plane(self.outer), inner: plane(self.inner) }
     }
 }
 
@@ -333,23 +290,17 @@ pub(crate) struct Cached {
 }
 
 impl Cached {
-    /// How much of the light reaches `p`, a corner of a piece centered on `center` (see
-    /// [`Cached::pieces`]), along its edge to `along` (see [`reaching`]), past the soft edges
-    /// it is in: none if it has none (it is in full shadow).
-    pub fn light(&self, soft: &Range<u32>, p: Vec3, along: Vec3, center: Vec3) -> f32 {
-        if soft.is_empty() {
-            return 0.0;
+    /// Piece soft edges `soft` (see [`Cached::pieces`]), appended to `softs` and `wedges`
+    /// for the renderer to take at each pixel.
+    pub fn softs(&self, soft: &Range<u32>, softs: &mut Vec<ShadowSoft>, wedges: &mut Vec<ShadowWedge>) {
+        for &i in &self.piece_soft[soft.start as usize..soft.end as usize] {
+            let (w, window) = &self.soft[i as usize];
+            let start = wedges.len() as u32;
+            wedges.extend(self.wedges[w.start as usize..w.end as usize].iter().map(Wedge::shadow));
+            softs.push(ShadowSoft { wedges: start..wedges.len() as u32, window: *window });
         }
-        reaching(
-            self.piece_soft[soft.start as usize..soft.end as usize]
-                .iter()
-                .map(|&i| {
-                    let (w, window) = &self.soft[i as usize];
-                    (&self.wedges[w.start as usize..w.end as usize], *window)
-                }),
-            (p, along, center),
-        )
     }
+
 }
 
 /// A vertex of a cached shadow piece: where it is, and how the edge leaving it is walked.
@@ -1237,20 +1188,17 @@ impl Carver {
                 full: count > 0,
                 ..Cached::default()
             };
-            let mut values = Vec::new();
             // Soft edges already copied: volume index to index in `cached.soft`.
             let mut copied: HashMap<u32, u32> = HashMap::new();
             for i in 0..count {
                 let piece = self.pieces[i];
-                values.clear();
                 let dark = piece.shadowed & bit != 0;
-                let soft = !dark && self.soft_values(&piece, &mut values) & bit != 0;
+                let soft = !dark && self.soft_slots(&piece) & bit != 0;
                 cached.full &= dark;
                 if !dark && !soft {
                     continue;
                 }
-                // The soft edges it is in, kept with it: a piece clipped on screen gets how
-                // much of the light reaches its new corners worked out there, as when carved.
+                // The soft edges it is in, kept with it (the renderer takes them at each pixel).
                 let first_soft = cached.piece_soft.len() as u32;
                 if soft {
                     let volumes = &self.volume_lists
@@ -1277,8 +1225,7 @@ impl Carver {
                 let piece_edges = self.edges(&piece);
                 let corners: Vec<Vec3> =
                     piece_records.chunks_exact(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
-                let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
-                for (k, (&world, &edge)) in corners.iter().zip(piece_edges).enumerate() {
+                for (&world, &edge) in corners.iter().zip(piece_edges) {
                     let edge = match edge {
                         PieceEdge::Clip(Edge::Input(e)) => CachedEdge::Polygon(e),
                         PieceEdge::Line(a, b) => (0..n)
@@ -1290,17 +1237,6 @@ impl Carver {
                         PieceEdge::Clip(Edge::Plane(_)) => unreachable!("no clip planes here"),
                     };
                     cached.vertices.push(CachedVertex { world, edge });
-                    if soft {
-                        // Corners along the edge where its values don't go evenly from end
-                        // to end: a cut that runs close along a soft edge's outer or inner
-                        // plane from near its line (where the value changes fast) crosses
-                        // all of it in a short way, and the rest of the way is flat.
-                        let next = corners[(k + 1) % corners.len()];
-                        let value = |p: Vec3, along: Vec3| cached.light(&piece_soft, p, along, center);
-                        let mut added = Vec::new();
-                        refine(&value, (world, value(world, next)), (next, value(next, world)), REFINE_DEPTH, &mut added);
-                        cached.vertices.extend(added.into_iter().map(|world| CachedVertex { world, edge }));
-                    }
                 }
                 cached.pieces.push((start..cached.vertices.len() as u32, piece_soft));
             }
@@ -1313,6 +1249,53 @@ impl Carver {
     /// [`Carver::cache`]).
     pub fn cached(&self, slot: u8, key: (u8, u32, u32)) -> Option<&Cached> {
         self.cache.get(&(slot, key))
+    }
+
+    /// The shadow slots of the lights whose soft edges `piece` is in.
+    pub fn soft_slots(&self, piece: &Piece) -> u32 {
+        self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize]
+            .iter()
+            .fold(0u32, |bits, &v| bits | 1 << self.volumes[v as usize].slot)
+    }
+
+    /// How much of each light whose soft edges `piece` is in reaches its corners (as the
+    /// renderer takes it at each pixel, see `soft_reach`), slot by slot in order, each twice
+    /// (as arriving and leaving the corner); returns their slots.
+    #[cfg(test)]
+    pub fn soft_values(&self, piece: &Piece, out: &mut Vec<(f32, f32)>) -> u32 {
+        let slots = self.soft_slots(piece);
+        let (mut softs, mut wedges) = (Vec::new(), Vec::new());
+        for r in self.records(piece).chunks_exact(self.stride) {
+            let p = Vec3::new(r[3], r[4], r[5]);
+            let mut bits = slots;
+            while bits != 0 {
+                let slot = bits.trailing_zeros() as u8;
+                bits &= bits - 1;
+                softs.clear();
+                wedges.clear();
+                self.piece_softs(piece, slot, &mut softs, &mut wedges);
+                let v = crate::frame::soft_reach(&softs, &wedges, p);
+                out.push((v, v));
+            }
+        }
+        slots
+    }
+
+    /// The soft edges of `piece` from the light in shadow slot `slot` (those of the windows
+    /// and occluders it is in the soft edge of), appended to `softs` and `wedges` for the
+    /// renderer to take at each pixel (see [`crate::frame::soft_reach`]).
+    pub fn piece_softs(&self, piece: &Piece, slot: u8, softs: &mut Vec<ShadowSoft>, wedges: &mut Vec<ShadowWedge>) {
+        let volumes =
+            &self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
+        for &v in volumes {
+            let volume = &self.volumes[v as usize];
+            if volume.slot != slot {
+                continue;
+            }
+            let start = wedges.len() as u32;
+            wedges.extend(self.wedges[volume.wedges.start as usize..volume.wedges.end as usize].iter().map(Wedge::shadow));
+            softs.push(ShadowSoft { wedges: start..wedges.len() as u32, window: volume.window });
+        }
     }
 
     /// The `i`-th piece of the last polygon carved.
@@ -1649,63 +1632,6 @@ impl Carver {
         }
     }
 
-    /// How much of each light whose soft shadows a piece is in reaches each of its
-    /// vertices: appends, vertex by vertex, one pair of values per such light (in shadow
-    /// slot order), and returns their shadow slots as bits. Interpolated across the piece,
-    /// the values are exact on its edges: 1 where a shadow's soft edge starts, 0 where its
-    /// full shadow does.
-    ///
-    /// A pair is the value along the edge arriving at the vertex, and along the one leaving
-    /// it (see [`reaching`]). They are the same but at a corner on a soft edge's line, where
-    /// an occluder's edge touches the surface: there the vertex is drawn as two, one ending
-    /// the edge arriving and one starting the edge leaving, each with its own value.
-    ///
-    /// An occluder covers the product of what its wedges cover (near its corners, two at
-    /// once), and a window lets through the product of what its wedges leave uncovered.
-    /// Occluders' parts add up (capped at all of the light), which is exact for occluders
-    /// side by side as seen from the light (stacked crates cover the two halves of it at
-    /// their seam) and too dark where one is behind another; windows' parts multiply.
-    pub fn soft_values(&self, piece: &Piece, out: &mut Vec<(f32, f32)>) -> u32 {
-        let volumes = &self.volume_lists
-            [piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
-        let slots = volumes
-            .iter()
-            .fold(0u32, |bits, &v| bits | 1 << self.volumes[v as usize].slot);
-        if slots == 0 {
-            return 0;
-        }
-        let points: Vec<Vec3> = self
-            .records(piece)
-            .chunks_exact(self.stride)
-            .map(|r| Vec3::new(r[3], r[4], r[5]))
-            .collect();
-        let n = points.len();
-        let center = points.iter().sum::<Vec3>() / n as f32;
-        for (i, &p) in points.iter().enumerate() {
-            let (prev, next) = (points[(i + n - 1) % n], points[(i + 1) % n]);
-            let mut bits = slots;
-            while bits != 0 {
-                let slot = bits.trailing_zeros() as u8;
-                bits &= bits - 1;
-                let soft = || {
-                    volumes
-                        .iter()
-                        .map(|&v| &self.volumes[v as usize])
-                        .filter(move |volume| volume.slot == slot)
-                        .map(|volume| {
-                            let w = volume.wedges.start as usize..volume.wedges.end as usize;
-                            (&self.wedges[w], volume.window)
-                        })
-                };
-                out.push((
-                    reaching(soft(), (p, prev, center)),
-                    reaching(soft(), (p, next, center)),
-                ));
-            }
-        }
-        slots
-    }
-
     /// Splits `piece` by the region inside every plane of `planes` (in `self.planes`):
     /// returns the part inside, if any, and appends the parts outside to `self.rest`.
     fn split_region(&mut self, piece: Piece, planes: Range<u32>, lined: usize) -> Option<Piece> {
@@ -1851,53 +1777,6 @@ enum Tag {
     Cut,
 }
 
-/// How much of a light reaches `p`, a corner of a piece centered on `center`, along the
-/// piece's edge from `p` to `along`, past the soft edges of the windows and occluders it is
-/// in (their wedges, and whether each is a window); see [`Carver::soft_values`].
-///
-/// What the windows let through adds up (capped at all of it): a ray from the light into
-/// a sector comes through one run of openings, so two windows into it (by different ways
-/// round) let different parts of the light through. Where two windows' soft edges meet on
-/// one line (openings sharing an edge, as a room's floor and wall openings at their
-/// corner), each lets part through and together all of it. Within one window, its edges'
-/// shares multiply. What occluders cover adds up (capped at all of it).
-///
-/// Only a wedge whose line `p` is on is taken along the edge (see [`Wedge::covers`]): the
-/// others have their value at `p`, whichever edge it is on.
-fn reaching<'a>(
-    soft: impl Iterator<Item = (&'a [Wedge], bool)>,
-    (p, along, center): (Vec3, Vec3, Vec3),
-) -> f32 {
-    let (mut through, mut windows, mut covered) = (0.0, false, 0.0);
-    for (wedges, window) in soft {
-        let covers = wedges.iter().map(|w| w.covers(p, along, center));
-        if window {
-            windows = true;
-            through += covers.map(|c| 1.0 - c).product::<f32>();
-        } else {
-            covered += covers.product::<f32>();
-        }
-    }
-    let through: f32 = if windows { through.min(1.0) } else { 1.0 };
-    through * (1.0 - covered.min(1.0))
-}
-
-/// Appends the points to add along the edge from `a` to `b` (each with its value) where
-/// the value `value(p, toward)` halfway along it is more than `REFINE_OFF` from halfway
-/// between theirs, in order: halving it, and each half, up to `depth` times.
-fn refine(value: &impl Fn(Vec3, Vec3) -> f32, a: (Vec3, f32), b: (Vec3, f32), depth: u32, out: &mut Vec<Vec3>) {
-    if depth == 0 {
-        return;
-    }
-    let middle = (a.0 + b.0) * 0.5;
-    let m = value(middle, b.0);
-    if (m - (a.1 + b.1) * 0.5).abs() <= REFINE_OFF {
-        return;
-    }
-    refine(value, a, (middle, m), depth - 1, out);
-    out.push(middle);
-    refine(value, (middle, m), b, depth - 1, out);
-}
 
 /// A point on a portal (its first corner).
 /// Whether directional `light` comes into a sector through level polygon `p`: a sky
@@ -2525,67 +2404,25 @@ mod tests {
     }
 
     #[test]
-    fn a_corner_touching_the_surface_has_a_value_along_each_edge() {
-        // A cube resting on the floor, lit from the side by a light of radius 0.2: its
-        // vertical edges' soft edges start at its bottom corners, where how much of the
-        // light reaches has no one value. Along each edge from there it is the same all the
-        // way: what the vertex at the edge's other end has.
-        let center = Vec3::new(2.5, 2.0, 0.7);
-        let mut light = Light::point(0, center, Vec3::ONE, 100.0);
-        light.radius = 0.2;
-        let mut c = Carver::default();
-        for face in cube(Vec3::new(0.0, 0.5, 0.0), 0.5) {
-            let start = c.points.len();
-            c.points.extend_from_slice(&face);
-            c.faces.push(start..c.points.len());
-        }
-        c.add_volume(&light, 0, None);
-        c.casters.push(Caster {
-            bit: 1,
-            is_static: false,
-            source: Source::Point { at: center, radius: 0.0 },
-            range: 100.0,
-            light: Light::point(0, center, Vec3::ONE, 100.0),
-            whole: Some(0),
-            windows: 0..0,
-            volumes: 0..1,
-            shadows: true,
-            beam: None,
-        });
-        let floor = [
-            Vec3::new(-3.0, 0.0, -3.0),
-            Vec3::new(-3.0, 0.0, 3.0),
-            Vec3::new(3.0, 0.0, 3.0),
-            Vec3::new(3.0, 0.0, -3.0),
-        ];
-        let stride = RECORD_FLOATS + 4;
-        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
-        let n = c.carve(&records(&floor), &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
-        let mut corners = 0;
-        for i in 0..n {
-            let p = c.piece(i);
-            let mut values = Vec::new();
-            if p.shadowed != 0 || c.soft_values(&p, &mut values) == 0 {
-                continue;
-            }
-            let points: Vec<Vec3> =
-                c.records(&p).chunks(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
-            let m = points.len();
-            for (k, q) in points.iter().enumerate() {
-                // (Pieces stop just short of the cube: see `CAP_BIAS`.)
-                if (q.x.abs() - 0.5).abs() > 0.002 || (q.z.abs() - 0.5).abs() > 0.002 {
-                    continue;
-                }
-                let (arriving, leaving) = values[k];
-                let (before, after) = (values[(k + m - 1) % m].1, values[(k + 1) % m].0);
-                assert!((arriving - before).abs() < 0.02, "{arriving} after {before} at {q}");
-                assert!((leaving - after).abs() < 0.02, "{leaving} before {after} at {q}");
-                if (arriving - leaving).abs() > 0.5 {
-                    corners += 1;
-                }
-            }
-        }
-        assert!(corners > 0, "soft edges start at the corners");
+    fn soft_edges_are_taken_at_the_point() {
+        use crate::frame::{ShadowSoft, ShadowWedge, soft_reach};
+        use glam::Vec4;
+        // A soft edge along z: covering none of the light at x <= 0 (its outer plane, facing
+        // +x into the shadow), all of it at x >= 1 (its inner one), smoothstep between.
+        let edge = ShadowWedge { outer: Vec4::new(1.0, 0.0, 0.0, 0.0), inner: Vec4::new(1.0, 0.0, 0.0, -1.0) };
+        let wedges = [edge];
+        let window = [ShadowSoft { wedges: 0..1, window: true }];
+        let occluder = [ShadowSoft { wedges: 0..1, window: false }];
+        let at = |softs: &[ShadowSoft], x: f32| soft_reach(softs, &wedges, Vec3::new(x, 0.0, 3.0));
+        // A window lets through what the edge doesn't cover; an occluder takes what it does.
+        assert_eq!((at(&window, -0.5), at(&window, 0.5), at(&window, 1.5)), (1.0, 0.5, 0.0));
+        assert_eq!((at(&occluder, -0.5), at(&occluder, 0.5), at(&occluder, 1.5)), (1.0, 0.5, 0.0));
+        assert!((at(&window, 0.25) - (1.0 - 0.15625)).abs() < 1e-6);
+        // Two windows' parts add up (capped); an occluder takes its part of that.
+        let both = [ShadowSoft { wedges: 0..1, window: true }, ShadowSoft { wedges: 0..1, window: true }];
+        assert_eq!(soft_reach(&both, &wedges, Vec3::new(0.5, 0.0, 0.0)), 1.0);
+        let shaded = [ShadowSoft { wedges: 0..0, window: true }, ShadowSoft { wedges: 0..1, window: false }];
+        assert_eq!(soft_reach(&shaded, &wedges, Vec3::new(0.5, 0.0, 0.0)), 0.5);
     }
 
     #[test]
@@ -3107,8 +2944,10 @@ mod tests {
                 cached_dark += a;
             } else {
                 cached_soft += a;
+                let (mut softs, mut wedges) = (Vec::new(), Vec::new());
+                cached.softs(soft_edges, &mut softs, &mut wedges);
                 for x in v {
-                    let light = cached.light(soft_edges, x.world, x.world, x.world);
+                    let light = crate::frame::soft_reach(&softs, &wedges, x.world);
                     assert!((0.0..=1.0).contains(&light));
                 }
             }
