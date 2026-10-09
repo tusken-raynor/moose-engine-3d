@@ -6,12 +6,16 @@
 //! the edit (an edit it rejects is undone, with the loader's reason). Undo and redo are
 //! snapshots of the tables; saving writes them to the level's file.
 //!
-//! Things are picked in the 3D view or in 2D views (top, front, side; see [`crate::wire`]):
-//! entities and surfaces, or with vertex picking on (V) vertices. A surface's panel selects
-//! its sector. Sector tools: extrude a surface into a new sector, push or pull it, join
-//! or part sectors with openings, cleave a sector along a line drawn in a 2D view, merge
-//! two sectors into one, add a room, delete a sector; vertices move on the grid.
+//! Things are picked in the 3D view or in 2D views (the six along the axes, turned any
+//! way; see [`crate::wire`]), by mode (R, F, V): sectors, faces, or a face's vertices;
+//! entities and lights in any mode. Shift adds to the selection, and a box dragged selects
+//! what's in it. The panel (`editor_panel`) shows the active selection; icons on the right
+//! open the add, world, controls and material menus. Sector tools: extrude a surface into
+//! a new sector, push or pull it, join or part sectors with openings, cleave sectors along
+//! a line drawn in a 2D view, merge sectors, add a room, delete sectors, move and turn
+//! them; vertices move on the grid.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -23,23 +27,62 @@ use moose_view::PolygonSource;
 use crate::ui::Canvas;
 use crate::wire::{self, Axis, Ortho, Projection};
 
-/// What the editor shows: the 3D view, or a 2D view along an axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the editor shows: the 3D view, or a 2D view (along an axis, or turned).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ViewMode {
     Perspective,
     Ortho(Axis),
 }
 
 impl ViewMode {
-    /// The next one (F6): 3D, top, front, side.
+    /// The next one (F6): 3D, then the named 2D views (a turned one goes to the next named
+    /// one after the nearest).
     pub fn next(self) -> ViewMode {
+        let named = Axis::NAMED;
         match self {
-            ViewMode::Perspective => ViewMode::Ortho(Axis::Top),
-            ViewMode::Ortho(Axis::Top) => ViewMode::Ortho(Axis::Front),
-            ViewMode::Ortho(Axis::Front) => ViewMode::Ortho(Axis::Side),
-            ViewMode::Ortho(Axis::Side) => ViewMode::Perspective,
+            ViewMode::Perspective => ViewMode::Ortho(named[0].0),
+            ViewMode::Ortho(axis) => {
+                let k = named.iter().position(|(a, _)| *a == axis);
+                match k.map(|k| k + 1) {
+                    Some(k) if k < named.len() => ViewMode::Ortho(named[k].0),
+                    Some(_) => ViewMode::Perspective,
+                    None => ViewMode::Ortho(named[0].0),
+                }
+            }
         }
     }
+}
+
+/// What clicks pick: sectors, faces, or a selected face's vertices (entities and lights in
+/// any of them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Sector,
+    Face,
+    Vertex,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Sector => "sector",
+            Mode::Face => "face",
+            Mode::Vertex => "vertex",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// A light a surface, sector or entity can be kept from (see `Editor::excluded`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LightRef {
+    /// A light of the level (its row).
+    Level(usize),
+    Flashlight,
+    Sun,
 }
 
 /// What is selected, by its row in the level's tables (so it survives rebuilding the
@@ -163,6 +206,17 @@ pub enum Field {
     ProxyBox,
     /// Mesh editor: removes a bone's proxies.
     RemoveProxies,
+    /// Merges the selected sectors that open onto each other (and are convex together) into
+    /// the active one.
+    MergeSelected,
+    /// Merges the selected faces that touch (and are convex together) into the active one.
+    MergeSelectedFaces,
+    /// Gives the selected faces the material picked in the material browser.
+    SetMaterial,
+    /// Keeps a light off the selection (or lights it again).
+    ToggleLight(LightRef),
+    /// Splits the selected faces into triangles (flat and convex, whatever they were).
+    Triangulate,
 }
 
 /// What Ctrl+C copied.
@@ -173,11 +227,38 @@ pub enum Clip {
 }
 
 impl Field {
-    /// Whether clicking its row types a number into it (rather than changing it).
+    /// Whether clicking its row types a number into it (rather than changing it; the wheel
+    /// still steps it).
     pub fn typed(self) -> bool {
         matches!(
             self,
-            Field::TextureU | Field::TextureV | Field::TextureSizeU | Field::TextureSizeV | Field::TextureTurn
+            Field::TextureU
+                | Field::TextureV
+                | Field::TextureSizeU
+                | Field::TextureSizeV
+                | Field::TextureTurn
+                | Field::ExtrudeBy
+                | Field::Push
+                | Field::X
+                | Field::Y
+                | Field::Z
+                | Field::Yaw
+                | Field::Pitch
+                | Field::Roll
+                | Field::Scale
+                | Field::Red
+                | Field::Green
+                | Field::Blue
+                | Field::Range
+                | Field::Radius
+                | Field::Inner
+                | Field::Outer
+                | Field::AmbientRed
+                | Field::AmbientGreen
+                | Field::AmbientBlue
+                | Field::SunAngle
+                | Field::SunYaw
+                | Field::SunPitch
         )
     }
 
@@ -196,6 +277,12 @@ impl Field {
                 | Field::MergeSector
                 | Field::ExcludeLights
         )
+    }
+
+    /// Whether the edit only moves geometry about, so the editor keeps it even where the
+    /// level won't load (a bent face, a dented sector): the artist goes on fixing it.
+    pub fn moves_geometry(self) -> bool {
+        matches!(self, Field::X | Field::Y | Field::Z | Field::Yaw | Field::Push)
     }
 }
 
@@ -222,7 +309,8 @@ const LEVEL_ROOM: Vec3 = Vec3::new(10.0, 5.0, 10.0);
 /// What a new level's surfaces are drawn with.
 pub const DEFAULT_MATERIAL: &str = "default";
 
-type Snapshot = (LevelDoc, Option<Selection>);
+/// The tables and the selection, to go back to (undo, or an edit refused).
+pub type Snapshot = (LevelDoc, Option<Selection>, Vec<Selection>);
 
 /// What clicking a second surface does (see [`Editor::picking`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -247,6 +335,14 @@ pub enum Excluder {
     Entity,
 }
 
+/// The selection being dragged in a 2D view (see `Editor::dragging`).
+#[derive(Clone, Debug)]
+pub struct Drag {
+    pub from: Vec3,
+    pub moved: Vec3,
+    pub before: Snapshot,
+}
+
 /// A line being dragged across a surface in a 2D view, to cut it (see `Field::CutFace`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FaceCut {
@@ -261,14 +357,53 @@ pub struct Editor {
     pub on: bool,
     /// The materials' names (`assets/materials`), for the Material fields.
     pub materials: Vec<String>,
+    /// Per material (as `materials`), the textures in its slots, for the material
+    /// browser's previews.
+    pub material_textures: Vec<Vec<String>>,
     pub doc: LevelDoc,
     /// Where the level is saved.
     pub path: PathBuf,
+    /// The active selection: the last picked (its panel shows), and the rest selected with
+    /// it (Shift-clicked or boxed).
     pub selection: Option<Selection>,
+    pub multi: Vec<Selection>,
+    /// What clicks pick (R, F, V), and what each mode had selected when it was left.
+    pub mode: Mode,
+    memory: [(Option<Selection>, Vec<Selection>); 3],
+    /// In vertex mode: the faces whose corners can be picked (clicked, or selected in face
+    /// mode before).
+    pub vertex_faces: Vec<usize>,
     /// What the pointer is over.
     pub hover: Option<Selection>,
-    /// Clicks pick vertices (V), not things.
-    pub vertices: bool,
+    /// Clicks in the 3D view pick openings too (they aren't drawn).
+    pub openings: bool,
+    /// The menus open on the panel (an icon's, then the submenus opened from it or from a
+    /// selection's panel), the list on the top one (its scroll and the keys' row), and the
+    /// search typed into it.
+    pub menus: Vec<crate::editor_panel::Menu>,
+    pub list: crate::editor_panel::ListState,
+    pub search: String,
+    /// The material picked in the material browser, to apply.
+    pub material_pick: Option<String>,
+    /// A question waiting for yes or no (deleting).
+    pub confirm: Option<crate::editor_panel::Confirm>,
+    /// The editor's keys and settings (the gear menu), and the action waiting for a key.
+    pub keys: crate::editor_keys::Keys,
+    pub rebinding: Option<crate::editor_keys::Action>,
+    /// A box being dragged to select what's in it: where it started and where it is (on
+    /// screen).
+    pub boxing: Option<(Vec2, Vec2)>,
+    /// The selection being dragged in a 2D view: where the drag started (on the view's
+    /// plane), how far it has moved things so far, and the tables before it (one undo).
+    pub dragging: Option<Drag>,
+    /// Clicking again in one place of a 2D view picks what's behind: the place, when, and
+    /// how many clicks deep.
+    pub click_through: Option<(Vec2, Instant, usize)>,
+    /// The level as the tables are won't load (a move bent a face or dented a sector): why.
+    /// The editor keeps the tables and draws the level as it last loaded.
+    pub broken: Option<String>,
+    /// Texture previews for the panel, by texture name (`None`: it couldn't be read).
+    pub thumbs: HashMap<String, Option<crate::gui::Thumb>>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     /// The tables as last saved (or loaded), to tell if there are unsaved changes.
@@ -284,7 +419,8 @@ pub struct Editor {
     pub ortho_scale: f32,
     /// How far Extrude goes, in meters.
     pub extrude_by: f32,
-    /// While cutting a sector: the points clicked so far (the cut runs through two).
+    /// While cutting (C pressed, with a sector or face selected): the points clicked so far
+    /// (the cut runs through two; a drag makes both).
     pub cutting: Option<Vec<Vec3>>,
     /// While a second surface is to be clicked: the selected surface, and what the click
     /// does with the one clicked (stitch from it, or merge it in).
@@ -292,8 +428,9 @@ pub struct Editor {
     /// While a line is dragged across the selected surface in a 2D view: where it started
     /// and where it is now (snapped), and where the press was on screen.
     pub face_cut: Option<FaceCut>,
-    /// A number being typed into a panel row (clicked), and the text so far.
-    pub typing: Option<(Field, String)>,
+    /// Text being typed (a number into a panel row, a search, a meta value), and the text so
+    /// far.
+    pub typing: Option<(crate::editor_panel::Typing, String)>,
     /// Fine steps (Alt held): scrolling texture rows moves them a little.
     pub fine: bool,
     /// Where new things go: the middle of the 2D view, or in front of the camera. Set by
@@ -320,12 +457,29 @@ impl Editor {
         Editor {
             on: false,
             materials: Vec::new(),
+            material_textures: Vec::new(),
             saved: doc.clone(),
             doc,
             path,
             selection: None,
+            multi: Vec::new(),
+            mode: Mode::Sector,
+            memory: Default::default(),
+            vertex_faces: Vec::new(),
             hover: None,
-            vertices: false,
+            openings: false,
+            menus: Vec::new(),
+            list: Default::default(),
+            search: String::new(),
+            material_pick: None,
+            confirm: None,
+            keys: crate::editor_keys::Keys::default(),
+            rebinding: None,
+            boxing: None,
+            dragging: None,
+            click_through: None,
+            broken: None,
+            thumbs: HashMap::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             status: None,
@@ -381,6 +535,11 @@ impl Editor {
         self.problem = Some((selection, Instant::now()));
     }
 
+    /// What the loader last refused the tables over (shown in red a while).
+    pub fn problem_selection(&self) -> Option<Selection> {
+        self.problem.map(|(selection, _)| selection).filter(|&s| self.exists(s))
+    }
+
     #[cfg(test)]
     pub fn problem_for_tests(&self) -> Option<Selection> {
         self.problem.map(|(selection, _)| selection)
@@ -431,7 +590,7 @@ impl Editor {
 
     /// Before an edit: the tables and selection to put back if it fails, or to undo to.
     pub fn begin(&mut self) -> Snapshot {
-        (self.doc.clone(), self.selection)
+        (self.doc.clone(), self.selection, self.multi.clone())
     }
 
     /// After an edit the level accepted.
@@ -444,7 +603,7 @@ impl Editor {
 
     /// After an edit that failed: puts the tables back.
     pub fn revert(&mut self, before: Snapshot, why: &str) {
-        (self.doc, self.selection) = before;
+        (self.doc, self.selection, self.multi) = before;
         self.tidy();
         self.say(why);
     }
@@ -466,13 +625,195 @@ impl Editor {
         selection.filter(|&s| self.exists(s))
     }
 
+    // ---- The selection
+
+    /// Everything selected: the rest, then the active one.
+    pub fn selected(&self) -> Vec<Selection> {
+        let mut all: Vec<Selection> = self.multi.iter().copied().filter(|&s| self.exists(s)).collect();
+        all.extend(self.current(self.selection));
+        all
+    }
+
+    pub fn is_selected(&self, s: Selection) -> bool {
+        self.selection == Some(s) || self.multi.contains(&s)
+    }
+
+    /// The selected sectors (the active one last).
+    pub fn selected_sectors(&self) -> Vec<usize> {
+        self.selected().into_iter().filter_map(|s| if let Selection::Sector(i) = s { Some(i) } else { None }).collect()
+    }
+
+    /// The selected faces (the active one last).
+    pub fn selected_faces(&self) -> Vec<usize> {
+        self.selected().into_iter().filter_map(|s| if let Selection::Surface(i) = s { Some(i) } else { None }).collect()
+    }
+
+    /// A click on `s` (none: on nothing): with `add` (Shift), it joins the selection as the
+    /// active one, or leaves it if it was in it; without, it's all that's selected. In
+    /// vertex mode a face clicked is one whose corners can be picked (with `add`, one
+    /// more), not a selection.
+    pub fn click(&mut self, s: Option<Selection>, add: bool) {
+        let before = self.selection;
+        self.click_on(s, add);
+        self.selection_changed(before);
+    }
+
+    /// After the active selection changes: its submenus (the lights it's kept from, its meta
+    /// values) close; the material browser stays, for giving the next faces it too.
+    fn selection_changed(&mut self, before: Option<Selection>) {
+        if self.selection != before {
+            use crate::editor_panel::{Menu, Owner};
+            self.menus.retain(|m| !matches!(m, Menu::Lights(..) | Menu::Meta(Owner::Sector(_) | Owner::Surface(_))));
+        }
+    }
+
+    fn click_on(&mut self, s: Option<Selection>, add: bool) {
+        if let (Mode::Vertex, Some(Selection::Surface(f))) = (self.mode, s) {
+            if add {
+                if let Some(k) = self.vertex_faces.iter().position(|&g| g == f) {
+                    self.vertex_faces.remove(k);
+                } else {
+                    self.vertex_faces.push(f);
+                }
+            } else {
+                self.vertex_faces = vec![f];
+                self.selection = None;
+                self.multi.clear();
+            }
+            return;
+        }
+        match (s, add) {
+            (None, true) => {}
+            (None, false) => {
+                self.selection = None;
+                self.multi.clear();
+            }
+            (Some(s), false) => {
+                self.selection = Some(s);
+                self.multi.clear();
+            }
+            (Some(s), true) if self.is_selected(s) => {
+                if self.selection == Some(s) {
+                    self.selection = self.multi.pop();
+                } else {
+                    self.multi.retain(|&m| m != s);
+                }
+            }
+            (Some(s), true) => {
+                if let Some(active) = self.selection.replace(s) {
+                    self.multi.push(active);
+                }
+            }
+        }
+    }
+
+    /// What a box picked (`found`, the last the active one): all that's selected, or with
+    /// `add` (Shift) joining what was.
+    pub fn select_all(&mut self, found: Vec<Selection>, add: bool) {
+        let before = self.selection;
+        self.select_all_of(found, add);
+        self.selection_changed(before);
+    }
+
+    fn select_all_of(&mut self, found: Vec<Selection>, add: bool) {
+        if !add {
+            self.selection = None;
+            self.multi.clear();
+        }
+        for s in found {
+            if !self.is_selected(s)
+                && let Some(active) = self.selection.replace(s)
+            {
+                self.multi.push(active);
+            }
+        }
+    }
+
+    /// Switches what clicks pick. Going up from faces or vertices selects what they are part
+    /// of (a vertex's faces, a face's sector); going down to vertices, the selected faces'
+    /// (or sectors' faces') corners can be picked. Otherwise the mode gets back what it had
+    /// selected when it was left. An entity or light selected stays selected.
+    pub fn set_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        let from = self.mode;
+        let faces: Vec<usize> = match from {
+            Mode::Vertex => self.vertex_faces.clone(),
+            _ => self.selected_faces(),
+        };
+        let sectors = self.selected_sectors();
+        let thing = self.selection.filter(|s| matches!(s, Selection::Entity(_) | Selection::Light(_)));
+        self.memory[from.index()] = (self.selection, std::mem::take(&mut self.multi));
+        let (active, rest) = std::mem::take(&mut self.memory[mode.index()]);
+        self.mode = mode;
+        let dedup = |list: Vec<usize>| {
+            let mut out: Vec<usize> = Vec::new();
+            for i in list {
+                out.retain(|&j| j != i);
+                out.push(i);
+            }
+            out
+        };
+        match (from, mode) {
+            (Mode::Face | Mode::Vertex, Mode::Sector) if !faces.is_empty() => {
+                let up = dedup(faces.iter().map(|&f| self.doc.surfaces[f].sector).collect());
+                self.selection = None;
+                self.select_all(up.into_iter().map(Selection::Sector).collect(), false);
+            }
+            (Mode::Vertex, Mode::Face) if !faces.is_empty() => {
+                self.selection = None;
+                self.select_all(faces.into_iter().map(Selection::Surface).collect(), false);
+            }
+            (_, Mode::Vertex) => {
+                let down = if from == Mode::Face {
+                    faces
+                } else {
+                    sectors.iter().flat_map(|&s| self.doc.sector_surfaces(s)).collect()
+                };
+                if !down.is_empty() {
+                    self.vertex_faces = down;
+                }
+                let corners: Vec<usize> =
+                    self.vertex_faces.iter().flat_map(|&f| self.doc.surfaces[f].corners.iter().map(|c| c.0)).collect();
+                let keep = |s: &Selection| matches!(s, Selection::Vertex(v) if corners.contains(v));
+                self.selection = active.filter(keep);
+                self.multi = rest.into_iter().filter(keep).collect();
+            }
+            _ => (self.selection, self.multi) = (active, rest),
+        }
+        if thing.is_some() {
+            self.selection = thing;
+            self.multi.clear();
+        }
+        self.hover = None;
+    }
+
+    /// What a picked surface stands for in the mode: its sector in sector mode.
+    pub fn in_mode(&self, s: Selection) -> Selection {
+        match (self.mode, s) {
+            (Mode::Sector, Selection::Surface(i)) => Selection::Sector(self.doc.surfaces[i].sector),
+            _ => s,
+        }
+    }
+
     /// After the tables change: drops what pointed at things they no longer have (what
     /// the pointer is over, the selection, a refused edit's outline). What the pointer is
     /// over is picked again next frame.
     pub fn tidy(&mut self) {
         self.hover = None;
-        self.typing = None;
+        if matches!(self.typing, Some((crate::editor_panel::Typing::Number(_), _))) {
+            self.typing = None;
+        }
         self.selection = self.current(self.selection);
+        let multi = std::mem::take(&mut self.multi);
+        self.multi = multi.into_iter().filter(|&s| self.exists(s) && Some(s) != self.selection).collect();
+        let memory = std::mem::take(&mut self.memory);
+        self.memory = memory.map(|(active, rest)| {
+            (active.filter(|&s| self.exists(s)), rest.into_iter().filter(|&s| self.exists(s)).collect())
+        });
+        let faces = self.doc.surfaces.len();
+        self.vertex_faces.retain(|&f| f < faces);
         self.problem = self.problem.filter(|&(s, _)| self.exists(s));
         self.picking = self.picking.filter(|&(i, kind)| match kind {
             Pick::MergeSector | Pick::Exclude(Excluder::Sector) => i < self.doc.sectors.len(),
@@ -492,8 +833,8 @@ impl Editor {
         let Some(state) = from.pop() else {
             return false;
         };
-        to.push((self.doc.clone(), self.selection));
-        (self.doc, self.selection) = state;
+        to.push((self.doc.clone(), self.selection, self.multi.clone()));
+        (self.doc, self.selection, self.multi) = state;
         self.tidy();
         true
     }
@@ -555,9 +896,23 @@ impl Editor {
         used
     }
 
-    /// The vertex nearest screen point `at` through `projection`, within a few pixels.
+    /// The corners that can be picked in vertex mode: the faces in play's.
+    pub fn pickable_vertices(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self
+            .vertex_faces
+            .iter()
+            .filter(|&&f| f < self.doc.surfaces.len())
+            .flat_map(|&f| self.doc.surfaces[f].corners.iter().map(|c| c.0))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// The pickable vertex (see [`Editor::pickable_vertices`]) nearest screen point `at`
+    /// through `projection`, within a few pixels.
     pub fn pick_vertex(&self, projection: &Projection, at: Vec2) -> Option<Selection> {
-        self.used_vertices()
+        self.pickable_vertices()
             .into_iter()
             .filter_map(|v| {
                 let p = projection.point(self.doc.vertices[v])?;
@@ -587,11 +942,16 @@ impl Editor {
             .map(|(_, selection)| selection)
     }
 
-    /// What is under screen point `at` in a 2D view: an entity whose outline (its box on
-    /// screen) holds it, the smallest; otherwise the surface (openings too) with an edge
-    /// nearest it, within a few pixels.
-    pub fn pick_2d(&self, ortho: &Ortho, world: &World, at: Vec2) -> Option<Selection> {
-        let mut best: Option<(f32, Selection)> = None;
+    /// What is under screen point `at` in a 2D view, nearest first: entities whose box on
+    /// screen holds it, and surfaces (openings too) it is inside on screen or within a few
+    /// pixels of an edge of (one seen edge-on is a line). Nearest is along the view: where
+    /// the line of sight through `at` meets each; at one depth, those facing the view first.
+    /// Clicking again in the same place picks the next (see `Editor::click_through`).
+    pub fn pick_2d_all(&self, ortho: &Ortho, world: &World, at: Vec2) -> Vec<Selection> {
+        let forward = ortho.axis.forward();
+        let eye = ortho.to_world(at.x, at.y);
+        // (depth, how much it faces the view, what).
+        let mut found: Vec<(f32, f32, Selection)> = Vec::new();
         // Not terrains, which cover everything.
         for (i, e) in world.entities.iter().enumerate() {
             if e.kind == EntityKind::Terrain {
@@ -605,33 +965,74 @@ impl Editor {
                     pick(4, e.bounds.min.z, e.bounds.max.z),
                 ))
             });
-            let (lo, hi) = corners.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), c| {
-                (lo.min(c), hi.max(c))
-            });
+            let (lo, hi) = corners.fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), c| (lo.min(c), hi.max(c)));
             if at.cmpge(lo).all() && at.cmple(hi).all() {
-                let area = (hi - lo).x * (hi - lo).y;
                 let source = PolygonSource::Entity { entity: i as u32, polygon: 0 };
-                if best.is_none_or(|(a, _)| area < a)
-                    && let Some(selection) = self.selection_of(source)
-                {
-                    best = Some((area, selection));
+                if let Some(selection) = self.selection_of(source) {
+                    let center = (e.bounds.min + e.bounds.max) * 0.5;
+                    found.push(((center - eye).dot(forward), 1.0, selection));
                 }
             }
         }
-        if let Some((_, selection)) = best {
-            return Some(selection);
-        }
-        let mut nearest: Option<(f32, usize)> = None;
         for i in 0..self.doc.surfaces.len() {
-            let points: Vec<Vec2> = self.doc.surface_points(i).into_iter().map(|p| ortho.to_screen(p)).collect();
-            for k in 0..points.len() {
-                let d = distance_to_segment(at, points[k], points[(k + 1) % points.len()]);
-                if d < PICK_RADIUS && nearest.is_none_or(|(n, _)| d < n) {
-                    nearest = Some((d, i));
-                }
+            let points3 = self.doc.surface_points(i);
+            let points: Vec<Vec2> = points3.iter().map(|&p| ortho.to_screen(p)).collect();
+            let n = points.len();
+            let near_edge = (0..n).any(|k| distance_to_segment(at, points[k], points[(k + 1) % n]) < PICK_RADIUS);
+            if !near_edge && !inside_polygon(at, &points) {
+                continue;
+            }
+            let normal = self.doc.surface_normal(i);
+            let facing = -normal.dot(forward);
+            let center = points3.iter().copied().sum::<Vec3>() / n.max(1) as f32;
+            let depth = if facing.abs() > 1e-3 {
+                normal.dot(center - eye) / normal.dot(forward)
+            } else {
+                (center - eye).dot(forward)
+            };
+            found.push((depth, facing, Selection::Surface(i)));
+        }
+        // Nearest first (to a centimeter), facing the view first at one depth.
+        found.sort_by(|a, b| (a.0 * 100.0).round().total_cmp(&(b.0 * 100.0).round()).then(b.1.total_cmp(&a.1)));
+        let mut out: Vec<Selection> = Vec::new();
+        for (_, _, s) in found {
+            let s = self.in_mode(s);
+            if !out.contains(&s) {
+                out.push(s);
             }
         }
-        nearest.map(|(_, i)| Selection::Surface(i))
+        out
+    }
+
+    /// The opening (a surface that is a portal) a ray from `origin` along `dir` meets first,
+    /// facing it, and how far along the ray: openings aren't drawn, so the 3D view's
+    /// picking doesn't see them.
+    pub fn pick_opening(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, s) in self.doc.surfaces.iter().enumerate() {
+            if s.adjoin.is_none() {
+                continue;
+            }
+            let points = self.doc.surface_points(i);
+            let normal = self.doc.surface_normal(i);
+            let along = normal.dot(dir);
+            if along >= -1e-6 {
+                continue;
+            }
+            let t = normal.dot(points[0] - origin) / along;
+            if t <= 0.0 || best.is_some_and(|(_, b)| t >= b) {
+                continue;
+            }
+            let hit = origin + dir * t;
+            let inside = (0..points.len()).all(|k| {
+                let (a, b) = (points[k], points[(k + 1) % points.len()]);
+                (b - a).cross(hit - a).dot(normal) >= -1e-4
+            });
+            if inside {
+                best = Some((i, t));
+            }
+        }
+        best
     }
 
     // ---- The panel
@@ -640,7 +1041,7 @@ impl Editor {
     pub fn panel(&self) -> Vec<PanelRow> {
         let mut rows = self.panel_rows();
         // A row being typed into shows the text so far.
-        if let Some((field, text)) = &self.typing
+        if let Some((crate::editor_panel::Typing::Number(field), text)) = &self.typing
             && let Some(row) = rows.iter_mut().find(|r| r.field == Some(*field))
         {
             row.value = format!("{text}_");
@@ -1038,7 +1439,9 @@ impl Editor {
                 self.say("click the touching face to merge into this one (Esc stops)");
             }
             (Some(Selection::Surface(i)), Field::SelectSector) => {
-                self.selection = Some(Selection::Sector(self.doc.surfaces[i].sector));
+                // Only this face's sector, in sector mode.
+                (self.selection, self.multi) = (Some(Selection::Surface(i)), Vec::new());
+                self.set_mode(Mode::Sector);
             }
             (_, Field::ExtrudeBy) => {
                 let step = self.step();
@@ -1054,9 +1457,19 @@ impl Editor {
                 self.picking = Some((s, Pick::MergeSector));
                 self.say("click a face of the sector to merge into this one, or an opening onto it (Esc stops)");
             }
+            // C again (or Esc) stops.
+            (Some(Selection::Sector(_) | Selection::Surface(_)), Field::Cleave) if self.cutting.is_some() => {
+                self.cutting = None;
+                self.face_cut = None;
+                self.say("cut stopped");
+            }
             (Some(Selection::Sector(_)), Field::Cleave) => {
                 self.cutting = Some(Vec::new());
-                self.say("cleave: click where the cut starts and ends, in a 2D view (Esc: stop)");
+                self.say("cleave: drag the cut, or click its two ends, in a 2D view (C or Esc: stop)");
+            }
+            (Some(Selection::Surface(i)), Field::Cleave) if self.doc.surfaces[i].adjoin.is_none() => {
+                self.cutting = Some(Vec::new());
+                self.say("cut the face: drag the cut, or click its two ends, in a 2D view (C or Esc: stop)");
             }
             _ => {}
         }
@@ -1069,6 +1482,74 @@ impl Editor {
         let step = self.step();
         let n = moose_assets::number;
         match (self.selection, field) {
+            (Some(_), Field::Delete) => self.delete_selected(),
+            (Some(Selection::Light(_) | Selection::Entity(_)), Field::X | Field::Y | Field::Z)
+                if self.multi.is_empty() =>
+            {
+                self.change_thing(field, dir, world, models)
+            }
+            (Some(_), Field::X | Field::Y | Field::Z) => {
+                let axis = axis_of(field);
+                let reference = self.reference().ok_or("nothing to move")?.dot(axis);
+                let delta = axis * (snap(reference + step * dir, step) - reference);
+                self.move_selection(delta, world)
+            }
+            (Some(Selection::Sector(_) | Selection::Surface(_) | Selection::Vertex(_)), Field::Yaw) => {
+                self.turn_selection(TURN * dir)
+            }
+            (Some(_), Field::SetMaterial) => {
+                let name = self.material_pick.clone().ok_or("pick a material in the list first")?;
+                let faces: Vec<usize> =
+                    self.selected_faces().into_iter().filter(|&f| self.doc.surfaces[f].adjoin.is_none()).collect();
+                if faces.is_empty() {
+                    return Err("select the faces to draw with it".into());
+                }
+                for &f in &faces {
+                    let options = &mut self.doc.surfaces[f].options;
+                    options.retain(|o| !o.starts_with("material="));
+                    options.push(format!("material={name}"));
+                }
+                Ok(format!("{} drawn with {name}", count(faces.len(), "face")))
+            }
+            (Some(selection), Field::ToggleLight(light)) => {
+                let (thing, _) = self.excluder(selection).ok_or("this has no lights to keep off")?;
+                let name = match light {
+                    LightRef::Level(i) => self.light_name(i),
+                    LightRef::Flashlight => "flashlight".to_string(),
+                    LightRef::Sun => self.sun_name().ok_or("this level has no sun")?,
+                };
+                // As the active one goes, so does everything selected like it.
+                let (_, i) = self.excluder(selection).unwrap();
+                let off = self.toggle_excluded(thing, i, &name);
+                for other in self.multi.clone() {
+                    if let Some((kind, k)) = self.excluder(other)
+                        && kind == thing
+                        && self.excluded(kind, k).0.contains(&name) != off
+                    {
+                        self.toggle_excluded(kind, k, &name);
+                    }
+                }
+                Ok(format!("{name} {}", if off { "kept off" } else { "lights it again" }))
+            }
+            (Some(_), Field::Triangulate) => {
+                let mut faces = self.selected_faces();
+                faces.sort_unstable_by(|a, b| b.cmp(a));
+                let mut made = 0;
+                for f in faces {
+                    made += self.doc.triangulate_surface(f)?;
+                }
+                Ok(format!("split into {}", count(made, "triangle")))
+            }
+            (Some(_), Field::MergeSelected) => self.merge_selected_sectors(),
+            (Some(_), Field::MergeSelectedFaces) => self.merge_selected_faces(),
+            (Some(Selection::Surface(i)), Field::Adjoin) if self.selected_faces().len() == 2 => {
+                let other = self.selected_faces()[0];
+                let matched = self.doc.adjoin(i)?;
+                if matched != other {
+                    return Err("those two faces don't match each other (corners in the same places)".into());
+                }
+                Ok(format!("opened faces {i} and {other} to each other"))
+            }
             (None, Field::NewRoom) => {
                 let min = (self.anchor - Vec3::new(ROOM.x / 2.0, 1.7, ROOM.z / 2.0)).map(|v| snap(v, step));
                 let sector = self.doc.add_box(min, min + ROOM, "room")?;
@@ -1242,12 +1723,6 @@ impl Editor {
                 self.doc.unadjoin(i)?;
                 Ok("walled up".into())
             }
-            (Some(Selection::Sector(s)), Field::Delete) => {
-                let name = self.doc.sectors[s].name.clone();
-                self.doc.delete_sector(s)?;
-                self.selection = None;
-                Ok(format!("deleted {name}"))
-            }
             (Some(Selection::Sector(s)), Field::Cut) => {
                 let points = self.cutting.take().unwrap_or_default();
                 let ViewMode::Ortho(axis) = self.view else {
@@ -1261,20 +1736,23 @@ impl Editor {
                 if normal.length_squared() < 1e-8 {
                     return Err("the cut's ends are the same point".into());
                 }
-                let new = self.doc.cleave(s, normal, a)?;
-                Ok(format!("cleaved into {} and {}", self.doc.sectors[s].name, self.doc.sectors[new].name))
-            }
-            (Some(Selection::Vertex(v)), Field::X | Field::Y | Field::Z) => {
-                let axis = match field {
-                    Field::X => Vec3::X,
-                    Field::Y => Vec3::Y,
-                    _ => Vec3::Z,
-                };
-                let p = self.doc.vertices[v];
-                let to = snap(p.dot(axis) + step * dir, step);
-                self.doc.move_vertex(v, axis * (to - p.dot(axis)));
-                let p = self.doc.vertices[v];
-                Ok(format!("vertex {v} at {}, {}, {}", n(p.x), n(p.y), n(p.z)))
+                // Every selected sector the cut crosses (new sectors go after the others, so
+                // the ones still to cut keep their numbers).
+                let mut sectors = self.selected_sectors();
+                if sectors.is_empty() {
+                    sectors.push(s);
+                }
+                let (mut cut, mut why) = (Vec::new(), None);
+                for k in sectors {
+                    match self.doc.cleave(k, normal, a) {
+                        Ok(new) => cut.push(format!("{} and {}", self.doc.sectors[k].name, self.doc.sectors[new].name)),
+                        Err(e) => why = Some(e),
+                    }
+                }
+                if cut.is_empty() {
+                    return Err(why.unwrap_or_else(|| "the cut misses the sectors".into()));
+                }
+                Ok(format!("cleaved into {}", cut.join("; ")))
             }
             (None, Field::AddLight | Field::AddProp | Field::AddSpawn) => {
                 let at = self.anchor.map(|v| snap(v, step));
@@ -1365,15 +1843,16 @@ impl Editor {
                 self.selection = Some(Selection::Light(self.doc.lights.len() - 1));
                 Ok("duplicated the light".into())
             }
-            (Some(Selection::Light(i)), Field::Delete) => {
-                // What kept it off forgets it.
-                if let Some(name) = light_option(&self.doc.lights[i], "name").map(str::to_string) {
-                    self.forget_light(&name);
-                }
-                self.doc.lights.remove(i);
-                self.selection = None;
-                Ok("deleted the light".into())
-            }
+            (Some(Selection::Light(_) | Selection::Entity(_)), _) => self.change_thing(field, dir, world, models),
+            _ => Err("that doesn't apply here".into()),
+        }
+    }
+
+    /// Changes the selected light's or entity's `field` (see [`Editor::change`]).
+    fn change_thing(&mut self, field: Field, dir: f32, world: &World, models: &[String]) -> Result<String, String> {
+        let step = self.step();
+        let n = moose_assets::number;
+        match (self.selection, field) {
             (Some(Selection::Light(i)), field) => {
                 let l = &mut self.doc.lights[i];
                 match field {
@@ -1433,17 +1912,6 @@ impl Editor {
                 self.doc.entities.push(copy);
                 self.selection = Some(Selection::Entity(self.doc.entities.len() - 1));
                 Ok(format!("duplicated as {name}"))
-            }
-            (Some(Selection::Entity(i)), Field::Delete) => {
-                let e = &self.doc.entities[i];
-                let spawns = self.doc.entities.iter().filter(|e| e.kind == EntityKind::Spawn).count();
-                if e.kind == EntityKind::Spawn && spawns == 1 {
-                    return Err("a level needs a spawn point".into());
-                }
-                let name = e.name.clone();
-                self.doc.entities.remove(i);
-                self.selection = None;
-                Ok(format!("deleted {name}"))
             }
             (Some(Selection::Entity(i)), field) => {
                 // Its template's options, and the templates it could place instead of a model.
@@ -1561,6 +2029,232 @@ impl Editor {
         }
     }
 
+    /// Adds a prop of `model` where the view is (on the grid), in the sector `world` has
+    /// there, and selects it.
+    pub fn add_prop(&mut self, model: &str, world: &World) -> Result<String, String> {
+        let at = self.anchor.map(|v| snap(v, self.step()));
+        let sector = sector_of(world, at)?;
+        let name = self.unique_name("prop");
+        self.doc.entities.push(EntityDoc {
+            kind: EntityKind::Prop,
+            sector,
+            model: Some(model.to_string()),
+            position: at,
+            rotation: Quat::IDENTITY,
+            scale: 1.0,
+            name: name.clone(),
+            options: vec!["static".into()],
+        });
+        (self.selection, self.multi) = (Some(Selection::Entity(self.doc.entities.len() - 1)), Vec::new());
+        Ok(format!("added {name} ({model})"))
+    }
+
+    /// Deletes everything selected: sectors (their openings walled up; refused for one with
+    /// an entity or light in it), entities (a level keeps a spawn point) and lights (and
+    /// every list that kept them off forgets them). Faces and vertices aren't deleted.
+    fn delete_selected(&mut self) -> Result<String, String> {
+        let selected = self.selected();
+        let of = |pick: fn(Selection) -> Option<usize>| {
+            let mut v: Vec<usize> = selected.iter().filter_map(|&s| pick(s)).collect();
+            v.sort_unstable_by(|a, b| b.cmp(a));
+            v.dedup();
+            v
+        };
+        let sectors = of(|s| if let Selection::Sector(i) = s { Some(i) } else { None });
+        let entities = of(|s| if let Selection::Entity(i) = s { Some(i) } else { None });
+        let lights = of(|s| if let Selection::Light(i) = s { Some(i) } else { None });
+        if sectors.is_empty() && entities.is_empty() && lights.is_empty() {
+            return Err("faces and vertices aren't deleted (wall up an opening, merge faces)".into());
+        }
+        let spawns = self.doc.entities.iter().filter(|e| e.kind == EntityKind::Spawn).count();
+        if entities.iter().filter(|&&e| self.doc.entities[e].kind == EntityKind::Spawn).count() == spawns && spawns > 0 {
+            return Err("a level needs a spawn point".into());
+        }
+        let mut gone = Vec::new();
+        for &i in &lights {
+            // What kept it off forgets it.
+            if let Some(name) = light_option(&self.doc.lights[i], "name").map(str::to_string) {
+                self.forget_light(&name);
+            }
+            self.doc.lights.remove(i);
+        }
+        if !lights.is_empty() {
+            gone.push(count(lights.len(), "light"));
+        }
+        for &i in &entities {
+            gone.push(self.doc.entities.remove(i).name);
+        }
+        for &i in &sectors {
+            let name = self.doc.sectors[i].name.clone();
+            self.doc.delete_sector(i)?;
+            gone.push(name);
+        }
+        self.selection = None;
+        self.multi.clear();
+        Ok(format!("deleted {}", gone.join(", ")))
+    }
+
+    /// Where the active selection is, for moving it on the grid: a vertex, a face's middle,
+    /// the middle of a sector's box, an entity's or a light's position.
+    pub fn reference(&self) -> Option<Vec3> {
+        Some(match self.current(self.selection)? {
+            Selection::Vertex(v) => self.doc.vertices[v],
+            Selection::Surface(f) => {
+                let p = self.doc.surface_points(f);
+                p.iter().copied().sum::<Vec3>() / p.len().max(1) as f32
+            }
+            Selection::Sector(s) => {
+                let (lo, hi) = self.sector_bounds(s);
+                (lo + hi) * 0.5
+            }
+            Selection::Entity(e) => self.doc.entities[e].position,
+            Selection::Light(l) => self.doc.lights[l].position,
+        })
+    }
+
+    /// Sector `s`'s box: its corners' least and greatest.
+    pub fn sector_bounds(&self, s: usize) -> (Vec3, Vec3) {
+        self.doc
+            .sector_surfaces(s)
+            .flat_map(|f| self.doc.surface_points(f))
+            .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), p| (lo.min(p), hi.max(p)))
+    }
+
+    /// The vertices, entities and lights moving with the selection: selected vertices, the
+    /// corners of selected faces and sectors, selected entities and lights, and the
+    /// entities and lights in selected sectors.
+    fn moving(&self) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let (mut vertices, mut entities, mut lights) = (Vec::new(), Vec::new(), Vec::new());
+        let sectors = self.selected_sectors();
+        for s in self.selected() {
+            match s {
+                Selection::Vertex(v) => vertices.push(v),
+                Selection::Surface(f) => vertices.extend(self.doc.surfaces[f].corners.iter().map(|c| c.0)),
+                Selection::Sector(sector) => {
+                    for f in self.doc.sector_surfaces(sector) {
+                        vertices.extend(self.doc.surfaces[f].corners.iter().map(|c| c.0));
+                    }
+                }
+                Selection::Entity(e) => entities.push(e),
+                Selection::Light(l) => lights.push(l),
+            }
+        }
+        entities.extend((0..self.doc.entities.len()).filter(|&e| sectors.contains(&self.doc.entities[e].sector)));
+        lights.extend((0..self.doc.lights.len()).filter(|&l| sectors.contains(&self.doc.lights[l].sector)));
+        for v in [&mut vertices, &mut entities, &mut lights] {
+            v.sort_unstable();
+            v.dedup();
+        }
+        (vertices, entities, lights)
+    }
+
+    /// Moves the selection by `delta` (see [`Editor::moving`]). Vertices other sectors
+    /// share move with them, so connected sectors stay joined; what that bends or dents is
+    /// the artist's to fix (the editor keeps it: see `Field::moves_geometry`). Entities and
+    /// lights moved on their own find their sector in `world`.
+    pub fn move_selection(&mut self, delta: Vec3, world: &World) -> Result<String, String> {
+        let (vertices, entities, lights) = self.moving();
+        let sectors = self.selected_sectors();
+        for &v in &vertices {
+            self.doc.vertices[v] += delta;
+        }
+        for &e in &entities {
+            let e = &mut self.doc.entities[e];
+            e.position += delta;
+            if !sectors.contains(&e.sector) {
+                e.sector = sector_of(world, e.position)?;
+            }
+        }
+        for &l in &lights {
+            let l = &mut self.doc.lights[l];
+            l.position += delta;
+            if !sectors.contains(&l.sector) {
+                l.sector = sector_of(world, l.position)?;
+            }
+        }
+        let n = moose_assets::number;
+        let what = match (self.selection, self.selected().len()) {
+            (Some(Selection::Vertex(v)), 1) => {
+                let p = self.doc.vertices[v];
+                format!("vertex {v} at {}, {}, {}", n(p.x), n(p.y), n(p.z))
+            }
+            (Some(Selection::Entity(e)), 1) => {
+                let e = &self.doc.entities[e];
+                format!("{} at {}, {}, {}", e.name, n(e.position.x), n(e.position.y), n(e.position.z))
+            }
+            (_, k) => format!("moved {} by {}, {}, {}", count(k, "thing"), n(delta.x), n(delta.y), n(delta.z)),
+        };
+        Ok(what)
+    }
+
+    /// Turns the selected sectors, faces or vertices (and the entities and lights in the
+    /// sectors) `degrees` about the world's up, around their middle.
+    fn turn_selection(&mut self, degrees: f32) -> Result<String, String> {
+        let (vertices, entities, lights) = self.moving();
+        if vertices.is_empty() {
+            return Err("nothing to turn".into());
+        }
+        let points: Vec<Vec3> = vertices.iter().map(|&v| self.doc.vertices[v]).collect();
+        let (lo, hi) = points.iter().fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        let center = (lo + hi) * 0.5;
+        let q = Quat::from_rotation_y(degrees.to_radians());
+        for &v in &vertices {
+            self.doc.vertices[v] = center + q * (self.doc.vertices[v] - center);
+        }
+        let sectors = self.selected_sectors();
+        let entities: Vec<usize> = entities.into_iter().filter(|&e| sectors.contains(&self.doc.entities[e].sector)).collect();
+        for &e in &entities {
+            let e = &mut self.doc.entities[e];
+            e.position = center + q * (e.position - center);
+            e.rotation = q * e.rotation;
+        }
+        let lights: Vec<usize> = lights.into_iter().filter(|&l| sectors.contains(&self.doc.lights[l].sector)).collect();
+        for &l in &lights {
+            let l = &mut self.doc.lights[l];
+            l.position = center + q * (l.position - center);
+            if let Some((dir, _, _)) = &mut l.spot {
+                *dir = q * *dir;
+            }
+        }
+        Ok(format!("turned by {}°", moose_assets::number(degrees)))
+    }
+
+    /// Merges the selected sectors that open onto each other: any two that merge (convex
+    /// together), over and over while two do, so a grid of pieces comes back whole whatever
+    /// the order. The active one keeps its name where it's in a merge.
+    fn merge_selected_sectors(&mut self) -> Result<String, String> {
+        let Some(Selection::Sector(active)) = self.selection else {
+            return Err("select the sectors to merge (the active one keeps its name)".into());
+        };
+        let sectors = self.selected_sectors();
+        if sectors.len() < 2 {
+            return Err("select more sectors (Shift+click) to merge them".into());
+        }
+        let (left, active, merged, why) = merge_pairs(sectors, active, |a, b| self.doc.merge_sectors(a, b));
+        if merged == 0 {
+            return Err(why.unwrap_or_default());
+        }
+        self.selection = Some(Selection::Sector(active));
+        self.multi = left.into_iter().filter(|&s| s != active).map(Selection::Sector).collect();
+        let rest = if self.multi.is_empty() { String::new() } else { format!(" ({} left apart: {})", self.multi.len(), why.unwrap_or_default()) };
+        Ok(format!("merged {} into {}{rest}", count(merged, "sector"), self.doc.sectors[active].name))
+    }
+
+    /// Merges the selected faces that touch, any two that merge (in one sector, on one
+    /// plane, convex together), over and over while two do.
+    fn merge_selected_faces(&mut self) -> Result<String, String> {
+        let Some(Selection::Surface(active)) = self.selection else {
+            return Err("select the faces to merge".into());
+        };
+        let (left, active, merged, why) = merge_pairs(self.selected_faces(), active, |a, b| self.doc.merge_surfaces(a, b));
+        if merged == 0 {
+            return Err(why.unwrap_or_default());
+        }
+        self.selection = Some(Selection::Surface(active));
+        self.multi = left.into_iter().filter(|&f| f != active).map(Selection::Surface).collect();
+        Ok(format!("merged {} into face {active}", count(merged, "face")))
+    }
+
     /// While cutting, a click in a 2D view at world point `p` (on the grid). Returns
     /// whether the cut now has both its points.
     /// Where a cut's end goes for the pointer at `at` in 2D view `ortho`: the nearest
@@ -1628,11 +2322,6 @@ impl Editor {
         })
     }
 
-    /// Whether a surface is selected whose texture mapping can be read as numbers.
-    pub fn texture_mapping_selected(&self) -> bool {
-        matches!(self.current(self.selection), Some(Selection::Surface(i)) if self.texture_mapping(i).is_some())
-    }
-
     /// Gives surface `i` texture mapping `m`; with `keep_middle`, moved so the texture at
     /// the middle of the surface stays where it was (sizing and turning about it).
     pub fn set_texture_mapping(&mut self, i: usize, mut m: TextureMapping, keep_middle: bool) {
@@ -1645,10 +2334,108 @@ impl Editor {
         self.doc.set_corner_values(i, "uv", |_, p, _| m.at(flat_coords(p, normal)).to_array().to_vec());
     }
 
-    /// Sets field `field` of the selected surface to typed number `value`.
-    pub fn set_typed(&mut self, field: Field, value: f32) -> Result<String, String> {
+    /// Sets field `field` of the selection to typed number `value`: a position (the active
+    /// one's, the rest of the selection moved with it), a light's or entity's number, the
+    /// level's ambient light or sun, how far to extrude or to push a face, or its texture's
+    /// mapping. `world` finds the sector a moved entity or light is in.
+    pub fn set_typed(&mut self, field: Field, value: f32, world: &World) -> Result<String, String> {
+        let n = moose_assets::number;
+        match (self.current(self.selection), field) {
+            (_, Field::ExtrudeBy) => {
+                if value <= 0.0 {
+                    return Err("extrude by a length".into());
+                }
+                self.extrude_by = value;
+                return Ok(format!("extrude by {} m", n(value)));
+            }
+            (_, Field::AmbientRed | Field::AmbientGreen | Field::AmbientBlue) => {
+                let a = self.doc.ambient.get_or_insert(Vec3::ONE);
+                let c = match field {
+                    Field::AmbientRed => &mut a.x,
+                    Field::AmbientGreen => &mut a.y,
+                    _ => &mut a.z,
+                };
+                *c = value.max(0.0);
+                return Ok(format!("ambient {}, {}, {}", n(a.x), n(a.y), n(a.z)));
+            }
+            (_, Field::SunAngle | Field::SunYaw | Field::SunPitch) => {
+                let sun = self.doc.directional.first_mut().ok_or("the level has no sun")?;
+                let (mut yaw, mut pitch) = aim_of(-sun.direction);
+                match field {
+                    Field::SunAngle => sun.angle = value.clamp(0.0, 45.0),
+                    Field::SunYaw => yaw = value,
+                    _ => pitch = value.clamp(5.0, 90.0),
+                }
+                if field != Field::SunAngle {
+                    sun.direction = -aim(yaw, pitch);
+                }
+                return Ok("sun set".into());
+            }
+            (Some(_), Field::X | Field::Y | Field::Z) => {
+                let axis = axis_of(field);
+                let reference = self.reference().ok_or("nothing selected")?.dot(axis);
+                return self.move_selection(axis * (value - reference), world);
+            }
+            (Some(Selection::Surface(_)), Field::Push) => {
+                let faces = self.selected_faces();
+                for &f in &faces {
+                    self.doc.push_surface(f, -value);
+                }
+                return Ok(format!("{} {} {} m", count(faces.len(), "face"), if value > 0.0 { "pushed out" } else { "pulled in" }, n(value.abs())));
+            }
+            (Some(Selection::Light(i)), _) => {
+                let l = &mut self.doc.lights[i];
+                match field {
+                    Field::Red => l.color.x = value.max(0.0),
+                    Field::Green => l.color.y = value.max(0.0),
+                    Field::Blue => l.color.z = value.max(0.0),
+                    Field::Range => l.range = value.max(0.5),
+                    Field::Radius => set_light_option(l, "radius", (value > 0.0).then(|| n(value))),
+                    Field::Inner | Field::Outer | Field::Yaw | Field::Pitch => {
+                        let Some((dir, inner, outer)) = &mut l.spot else {
+                            return Err("that light isn't a spot light".into());
+                        };
+                        match field {
+                            Field::Inner => *inner = value.clamp(0.0, *outer),
+                            Field::Outer => *outer = value.clamp(*inner, 180.0),
+                            _ => {
+                                let (mut yaw, mut pitch) = aim_of(*dir);
+                                if field == Field::Yaw {
+                                    yaw = value;
+                                } else {
+                                    pitch = value.clamp(-90.0, 90.0);
+                                }
+                                *dir = aim(yaw, pitch);
+                            }
+                        }
+                    }
+                    _ => return Err("that doesn't take a number".into()),
+                }
+                return Ok(format!("light {i} set"));
+            }
+            (Some(Selection::Entity(i)), Field::Yaw | Field::Pitch | Field::Roll | Field::Scale) => {
+                let e = &mut self.doc.entities[i];
+                if field == Field::Scale {
+                    if value <= 0.0 {
+                        return Err("a scale is above 0".into());
+                    }
+                    e.scale = value.min(100.0);
+                } else {
+                    let (mut yaw, mut pitch, mut roll) = e.rotation.to_euler(EulerRot::YXZ);
+                    let v = value.to_radians();
+                    match field {
+                        Field::Yaw => yaw = v,
+                        Field::Pitch => pitch = v,
+                        _ => roll = v,
+                    }
+                    e.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, roll);
+                }
+                return Ok(format!("{} set", e.name));
+            }
+            _ => {}
+        }
         let Some(Selection::Surface(i)) = self.selection else {
-            return Err("select a surface".into());
+            return Err("that doesn't take a number here".into());
         };
         let mut m = self.texture_mapping(i).ok_or("this surface's texture coordinates aren't a flat mapping")?;
         let keep_middle = match field {
@@ -1717,8 +2504,8 @@ impl Editor {
         }
     }
 
-    /// Draws the editor over the frame: in the 3D view its wireframe (F5) and marks, then
-    /// the panel and the status line.
+    /// Draws the editor over the frame: in the 3D view its wireframe (F5) and marks, and the
+    /// status line. (The panels are drawn after, from `Editor::layout`.)
     pub fn draw(&self, canvas: &mut Canvas, camera: &moose_scene::View, world: &World, assets: &Assets) {
         if self.view == ViewMode::Perspective {
             let projection = Projection::Perspective(camera);
@@ -1730,7 +2517,7 @@ impl Editor {
                 None => self.draw_marks(canvas, &projection, world, assets),
             }
         }
-        self.draw_panel(canvas);
+        self.draw_status(canvas);
     }
 
     /// The level's lights (a diamond, with a line where a spot light shines) and spawn
@@ -1738,7 +2525,7 @@ impl Editor {
     /// its color, the selected light's reach as a circle in a 2D view.
     fn draw_markers(&self, canvas: &mut Canvas, projection: &Projection) {
         let color_of = |selection: Selection, normal: u32| {
-            if self.selection == Some(selection) {
+            if self.is_selected(selection) {
                 SELECTED
             } else if self.hover == Some(selection) {
                 HOVER
@@ -1781,24 +2568,35 @@ impl Editor {
         }
     }
 
-    /// The selection and what the pointer is over, outlined; the vertices, with vertex
-    /// picking on; and a cut being drawn.
+    /// What's selected and what the pointer is over, outlined (the active selection
+    /// brightest); in vertex mode the faces whose corners can be picked, and their corners;
+    /// what the loader refused, in red; and a cut being drawn.
     fn draw_marks(&self, canvas: &mut Canvas, projection: &Projection, world: &World, assets: &Assets) {
         self.draw_markers(canvas, projection);
-        if self.vertices {
-            for v in self.used_vertices() {
+        if self.mode == Mode::Vertex {
+            for &f in &self.vertex_faces {
+                if f < self.doc.surfaces.len() {
+                    wire::outline(canvas, projection, &self.doc.surface_points(f), IN_PLAY);
+                }
+            }
+            for v in self.pickable_vertices() {
                 if let Some(p) = projection.point(self.doc.vertices[v]) {
-                    canvas.fill_centered(p.x, p.y, 3, VERTEX);
+                    canvas.fill_centered(p.x, p.y, 5, VERTEX);
                 }
             }
         }
         let problem = self
             .problem
-            .filter(|(_, at)| at.elapsed() < STATUS_TIME)
+            .filter(|(_, at)| at.elapsed() < STATUS_TIME || self.broken.is_some())
             .map(|(selection, _)| selection);
-        for (selection, color) in [(self.hover, HOVER), (self.selection, SELECTED), (problem, PROBLEM)] {
+        let mut marks: Vec<(Selection, u32)> = Vec::new();
+        marks.extend(self.hover.map(|h| (h, HOVER)));
+        marks.extend(self.multi.iter().map(|&m| (m, ALSO)));
+        marks.extend(self.selection.map(|s| (s, SELECTED)));
+        marks.extend(problem.map(|p| (p, PROBLEM)));
+        for (selection, color) in marks {
             // Something the tables no longer have (they changed since it was picked) isn't drawn.
-            match self.current(selection) {
+            match self.current(Some(selection)) {
                 Some(Selection::Surface(i)) => {
                     wire::outline(canvas, projection, &self.doc.surface_points(i), color);
                 }
@@ -1850,124 +2648,52 @@ impl Editor {
         }
     }
 
-    fn draw_panel(&self, canvas: &mut Canvas) {
-        let layout = self.layout(canvas.width, canvas.height);
-        canvas.shade(layout.x, layout.y, layout.width, layout.height, 70);
-        let view = match self.view {
-            ViewMode::Perspective => "3D",
-            ViewMode::Ortho(axis) => axis.name(),
-        };
-        let title = match &self.model {
-            Some(model) => format!("MESH EDITOR  {view}{}", if model.dirty() { "  (unsaved)" } else { "" }),
-            None => format!(
-                "EDITOR  {view}{}{}",
-                if self.vertices { "  vertices" } else { "" },
-                if self.dirty() { "  (unsaved)" } else { "" }
-            ),
-        };
-        canvas.text(layout.x + layout.pad, layout.y + layout.pad, &title, TITLE, layout.scale);
-        let panel = self.panel();
-        for (k, row) in panel.iter().enumerate() {
-            let y = layout.row_y(k);
-            let color = if row.field.is_some() { TEXT } else { DIM };
-            canvas.text(layout.x + layout.pad, y, &row.label, color, layout.scale);
-            let vx = layout.x + layout.width - layout.pad - Canvas::text_width(&row.value, layout.scale);
-            canvas.text(vx, y, &row.value, color, layout.scale);
-        }
-        // The key hints at the bottom, below the rows (a line apart): those that fit.
-        let hints = self.hints();
-        let line = Canvas::line_height(layout.scale);
-        let bottom = layout.y + layout.height - layout.pad;
-        let mut y = (bottom.saturating_sub(hints.len() * line)).max(layout.row_y(panel.len()) + line);
-        for hint in &hints {
-            if y + line > bottom {
-                break;
-            }
-            canvas.text(layout.x + layout.pad, y, hint, DIM, layout.scale);
-            y += line;
+    /// The status line at the bottom left: the last message, and while the tables won't
+    /// load, why (in red).
+    fn draw_status(&self, canvas: &mut Canvas) {
+        let scale = crate::editor_panel::scale_for(canvas.height);
+        let line = Canvas::line_height(scale);
+        let pad = 3 * scale;
+        let mut y = canvas.height.saturating_sub(line + pad);
+        if let Some(why) = &self.broken {
+            let text = format!("won't load: {why}");
+            canvas.shade(0, y - pad / 2, Canvas::text_width(&text, scale) + 2 * pad, line + pad, 90);
+            canvas.text(pad, y, &text, PROBLEM, scale);
+            y = y.saturating_sub(line + pad);
         }
         if let Some((message, at)) = &self.status
             && at.elapsed() < STATUS_TIME
         {
-            let y = canvas.height - line - layout.pad;
-            let w = Canvas::text_width(message, layout.scale) + 2 * layout.pad;
-            canvas.shade(0, y - layout.pad / 2, w, line + layout.pad, 90);
-            canvas.text(layout.pad, y, message, TEXT, layout.scale);
+            let w = Canvas::text_width(message, scale) + 2 * pad;
+            canvas.shade(0, y - pad / 2, w, line + pad, 90);
+            canvas.text(pad, y, message, TEXT, scale);
         }
-    }
-
-    /// The key hints at the bottom of the panel.
-    fn hints(&self) -> [String; 10] {
-        if let Some(model) = &self.model {
-            return model.hints();
-        }
-        [
-            format!("Grid {} m (G)", moose_assets::number(self.step())),
-            "F6: 3D/top/front/side. F5: wire".to_string(),
-            "Click: select. V: pick vertices".to_string(),
-            "Hold right: look (or pan in 2D)".to_string(),
-            "Scroll/click a row (Alt: fine; numbers: type)".to_string(),
-            "Arrows, PgUp/Dn, [ ]: move, turn".to_string(),
-            "Ctrl Z/Y: undo/redo. Ctrl S: save".to_string(),
-            "Ctrl D: duplicate. Ctrl C/V: copy, paste".to_string(),
-            "Del: delete. Ctrl 1-4, 1-4: bookmarks".to_string(),
-            "Tab: play".to_string(),
-        ]
-    }
-
-    /// The panel's place on screen (on the right): as wide as its widest line.
-    pub fn layout(&self, width: usize, height: usize) -> Layout {
-        let scale = if height >= 600 { 2 } else { 1 };
-        let pad = 6 * scale;
-        let gap = Canvas::text_width("  ", scale);
-        let panel = self.panel();
-        let rows = panel
-            .iter()
-            .map(|r| Canvas::text_width(&r.label, scale) + gap + Canvas::text_width(&r.value, scale));
-        let hints = self.hints().map(|h| Canvas::text_width(&h, scale));
-        let panel_w = rows.chain(hints).max().unwrap_or(0) + 2 * pad;
-        Layout {
-            x: width.saturating_sub(panel_w),
-            y: 0,
-            width: panel_w,
-            height,
-            pad,
-            scale,
-        }
-    }
-
-    /// The panel row under framebuffer point `(x, y)`, if any.
-    pub fn row_at(&self, x: f32, y: f32, width: usize, height: usize) -> Option<usize> {
-        let layout = self.layout(width, height);
-        if (x as usize) < layout.x {
-            return None;
-        }
-        let line = Canvas::line_height(layout.scale);
-        let k = ((y as usize).checked_sub(layout.row_y(0))?) / line;
-        (k < self.panel().len()).then_some(k)
-    }
-
-    /// Whether framebuffer point `(x, _)` is over the panel.
-    pub fn over_panel(&self, x: f32, width: usize, height: usize) -> bool {
-        x as usize >= self.layout(width, height).x
+        // The view and mode, top left.
+        let what = format!(
+            "{}  {} mode{}{}",
+            self.view_name(),
+            self.mode.name(),
+            if self.openings { "  openings" } else { "" },
+            if self.dirty() { "  (unsaved)" } else { "" }
+        );
+        canvas.shade(0, 0, Canvas::text_width(&what, scale) + 2 * pad, line + pad, 90);
+        canvas.text(pad, pad / 2, &what, TITLE, scale);
     }
 }
 
-/// Where the panel is.
-pub struct Layout {
-    pub x: usize,
-    pub y: usize,
-    pub width: usize,
-    pub height: usize,
-    pub pad: usize,
-    pub scale: usize,
-}
-
-impl Layout {
-    /// The top of panel row `k`.
-    pub fn row_y(&self, k: usize) -> usize {
-        self.y + self.pad + Canvas::line_height(self.scale) * (2 + k)
+/// Whether `p` is inside polygon `points` (convex, either winding).
+fn inside_polygon(p: Vec2, points: &[Vec2]) -> bool {
+    if points.len() < 3 {
+        return false;
     }
+    let (mut pos, mut neg) = (false, false);
+    for k in 0..points.len() {
+        let (a, b) = (points[k], points[(k + 1) % points.len()]);
+        let s = (b - a).perp_dot(p - a);
+        pos |= s > 0.0;
+        neg |= s < 0.0;
+    }
+    !(pos && neg)
 }
 
 /// How far `p` is from segment `a`-`b`.
@@ -1979,6 +2705,68 @@ fn distance_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
         0.0
     };
     p.distance(a + ab * t)
+}
+
+/// Merges among `items` (rows of a table) any two `merge` takes (`merge(a, b)` merges `b`
+/// into `a`, which it returns as it is numbered after, and takes `b` out: the rows after it
+/// move down one), over and over while two merge; `active` is merged into rather than
+/// away. Returns the rows left (renumbered), `active` as it is numbered now, how many
+/// merged, and why the last refused one was.
+fn merge_pairs(
+    mut items: Vec<usize>,
+    mut active: usize,
+    mut merge: impl FnMut(usize, usize) -> Result<usize, String>,
+) -> (Vec<usize>, usize, usize, Option<String>) {
+    let (mut merged, mut why) = (0, None);
+    'again: loop {
+        for i in 0..items.len() {
+            for j in 0..items.len() {
+                // Into the active one, never it into another.
+                if i == j || items[j] == active {
+                    continue;
+                }
+                let (into, gone) = (items[i], items[j]);
+                match merge(into, gone) {
+                    Ok(now) => {
+                        let was_active = into == active;
+                        items.remove(j);
+                        for k in items.iter_mut() {
+                            if *k > gone {
+                                *k -= 1;
+                            }
+                        }
+                        if active > gone {
+                            active -= 1;
+                        }
+                        let at = items.iter().position(|&k| k == if into > gone { into - 1 } else { into }).unwrap();
+                        items[at] = now;
+                        if was_active {
+                            active = now;
+                        }
+                        merged += 1;
+                        continue 'again;
+                    }
+                    Err(e) => why = Some(e),
+                }
+            }
+        }
+        break;
+    }
+    (items, active, merged, why)
+}
+
+/// `k` things, as words: `1 face`, `3 faces`.
+fn count(k: usize, thing: &str) -> String {
+    if k == 1 { format!("1 {thing}") } else { format!("{k} {thing}s") }
+}
+
+/// The world axis a position field moves along.
+fn axis_of(field: Field) -> Vec3 {
+    match field {
+        Field::X => Vec3::X,
+        Field::Y => Vec3::Y,
+        _ => Vec3::Z,
+    }
 }
 
 /// The sector containing `p`.
@@ -2105,7 +2893,7 @@ fn set_light_option(l: &mut LightDoc, key: &str, value: Option<String>) {
 }
 
 /// A direction's yaw (degrees, turning left from -Z) and pitch (up from level).
-fn aim_of(d: Vec3) -> (f32, f32) {
+pub(crate) fn aim_of(d: Vec3) -> (f32, f32) {
     let d = d.normalize_or_zero();
     let yaw = (-d.x).atan2(-d.z).to_degrees();
     let pitch = d.y.clamp(-1.0, 1.0).asin().to_degrees();
@@ -2125,10 +2913,12 @@ fn snap(v: f32, step: f32) -> f32 {
 
 const TITLE: u32 = 0xFF_D4_7A;
 const TEXT: u32 = 0xD8_D8_D8;
-const DIM: u32 = 0x8C_8C_8C;
-/// Outline colors: the selection, and what the pointer is over.
+/// Outline colors: the active selection, the rest selected, and what the pointer is over;
+/// in vertex mode, the faces whose corners can be picked.
 pub(crate) const SELECTED: u32 = 0xFF_E0_40;
+const ALSO: u32 = 0xC0_90_30;
 pub(crate) const HOVER: u32 = 0x60_A0_FF;
+const IN_PLAY: u32 = 0x50_70_90;
 const VERTEX: u32 = 0xB0_B0_C0;
 const LIGHT: u32 = 0xFF_B0_40;
 const SPAWN: u32 = 0x40_E0_E0;

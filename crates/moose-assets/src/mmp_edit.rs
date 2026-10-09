@@ -519,6 +519,77 @@ impl LevelDoc {
         Ok(surface + 1)
     }
 
+    /// Splits solid surface `surface` into triangles, which are flat and convex whatever it
+    /// was (bent or dented, as a vertex moved in the editor can leave it): cut by ear
+    /// clipping as seen square on (along its corners' summed normal), each triangle keeping
+    /// its winding, options and flags and its corners' attribute values. The first stays
+    /// `surface`, the others follow it. Returns how many triangles it is now (1 if it was
+    /// one already).
+    pub fn triangulate_surface(&mut self, surface: usize) -> Result<usize, String> {
+        let s = self.surfaces[surface].clone();
+        if s.adjoin.is_some() {
+            return Err("an opening isn't split: wall it up first".into());
+        }
+        let k = s.corners.len();
+        if k <= 3 {
+            return Ok(1);
+        }
+        let points: Vec<Vec3> = s.corners.iter().map(|&(v, _)| self.vertices[v]).collect();
+        // Newell's normal: right for a bent polygon too.
+        let normal = (0..k)
+            .map(|i| {
+                let (a, b) = (points[i], points[(i + 1) % k]);
+                Vec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y))
+            })
+            .sum::<Vec3>()
+            .normalize_or_zero();
+        if normal == Vec3::ZERO {
+            return Err("that face has no area to split".into());
+        }
+        let u = normal.any_orthonormal_vector();
+        let v = normal.cross(u);
+        let flat: Vec<(f32, f32)> = points.iter().map(|p| (p.dot(u), p.dot(v))).collect();
+        let cross = |a: usize, b: usize, c: usize| {
+            let (pa, pb, pc) = (flat[a], flat[b], flat[c]);
+            (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0)
+        };
+        let area: f32 = (0..k).map(|i| {
+            let (a, b) = (flat[i], flat[(i + 1) % k]);
+            a.0 * b.1 - b.0 * a.1
+        }).sum();
+        let turn = area.signum();
+        let mut left: Vec<usize> = (0..k).collect();
+        let mut triangles: Vec<[usize; 3]> = Vec::new();
+        while left.len() > 3 {
+            let n = left.len();
+            let ear = (0..n).find(|&i| {
+                let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+                cross(a, b, c) * turn > 1e-9
+                    && left.iter().all(|&q| {
+                        q == a || q == b || q == c || {
+                            let (s1, s2, s3) = (cross(a, b, q) * turn, cross(b, c, q) * turn, cross(c, a, q) * turn);
+                            s1 < 0.0 || s2 < 0.0 || s3 < 0.0
+                        }
+                    })
+            });
+            // None (corners in a line, folded back): a fan from the first.
+            let i = ear.unwrap_or(1);
+            triangles.push([left[(i + n - 1) % n], left[i], left[(i + 1) % n]]);
+            left.remove(i);
+        }
+        triangles.push([left[0], left[1], left[2]]);
+        let made = triangles.len();
+        let mut lists = self.sector_lists();
+        let at = surface - self.sector_surfaces(s.sector).start;
+        let pieces: Vec<SurfaceDoc> = triangles
+            .into_iter()
+            .map(|t| SurfaceDoc { corners: t.iter().map(|&c| s.corners[c].clone()).collect(), ..s.clone() })
+            .collect();
+        lists[s.sector].splice(at..at + 1, pieces);
+        self.set_sector_lists(lists);
+        Ok(made)
+    }
+
     /// Merges solid surface `other` into solid surface `target`, which must be in the same
     /// sector, on one plane facing the same way, and touch along one run of edges, their
     /// union convex: `target` becomes the union (its options and flags; with texture

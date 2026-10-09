@@ -18,10 +18,13 @@
 //!                         without opening a window
 //!   --at X,Y,Z,YAW,PITCH[,ROLL]  camera for --screenshot (degrees)
 //!   --edit                start in the level editor (Tab switches)
-//!   --view V, --wire, --zoom S  the editor's view (3d, top, front or side; F6), wireframe
+//!   --view V, --wire, --zoom S  the editor's view (3d, top, bottom, front, back, left,
+//!                         right, or a 2D view turned YAW,PITCH degrees from front), wireframe
 //!                         over the 3D view (F5), and 2D views' pixels per meter
 //!   --select NAME         in the editor, start with the entity NAME (or surface:N,
-//!                         sector:N, vertex:N, light:N) selected
+//!                         sector:N, vertex:N, light:N) selected, in its mode
+//!   --mode M, --panel P   in the editor, the mode (sector, face or vertex) and a menu open
+//!                         on the panel (add, world, controls, lights, meta, materials)
 //!   --edit-model          in the editor, open the mesh editor on the selected entity's
 //!                         model; --polygon N also selects its polygon N
 //!   --lock-flashlight X,Y,Z,YAW,PITCH  start with the flashlight locked where it would be
@@ -91,6 +94,9 @@
 //! it is free.
 
 mod editor;
+mod editor_keys;
+mod editor_panel;
+mod gui;
 mod material_edit;
 mod materials;
 mod mesh_edit;
@@ -201,6 +207,9 @@ struct Options {
     edit_model: Option<Option<usize>>,
     /// The editor's view, its wireframe over the 3D view, and its 2D views' scale.
     view: editor::ViewMode,
+    /// The editor's mode and the menu open on its panel (`--mode`, `--panel`).
+    mode: Option<String>,
+    panel: Option<String>,
     wire: bool,
     zoom: Option<f32>,
     at: Option<[f32; 6]>,
@@ -285,6 +294,8 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         select: None,
         edit_model: None,
         view: editor::ViewMode::Perspective,
+        mode: None,
+        panel: None,
         wire: false,
         zoom: None,
         at: None,
@@ -345,16 +356,25 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             "--edit" => o.edit = true,
             "--wire" => o.wire = true,
             "--view" => {
-                o.view = match value()?.as_str() {
+                let name = value()?;
+                o.view = match name.as_str() {
                     "3d" => editor::ViewMode::Perspective,
-                    "top" => editor::ViewMode::Ortho(wire::Axis::Top),
-                    "front" => editor::ViewMode::Ortho(wire::Axis::Front),
-                    "side" => editor::ViewMode::Ortho(wire::Axis::Side),
-                    _ => return Err("--view is 3d, top, front or side".into()),
+                    // (`side` as it was: along -X.)
+                    "side" => editor::ViewMode::Ortho(wire::Axis::RIGHT),
+                    _ => editor::ViewMode::Ortho(match wire::Axis::named(&name) {
+                        Some(axis) => axis,
+                        // A turned one: YAW,PITCH (degrees).
+                        None => match numbers(&name, "--view")?[..] {
+                            [yaw, pitch] => wire::Axis::FRONT.turned(yaw, pitch),
+                            _ => return Err("--view is 3d, top, bottom, front, back, left, right or YAW,PITCH".into()),
+                        },
+                    }),
                 }
             }
             "--zoom" => o.zoom = Some(value()?.parse().map_err(|_| "bad --zoom")?),
             "--select" => o.select = Some(value()?),
+            "--mode" => o.mode = Some(value()?),
+            "--panel" => o.panel = Some(value()?),
             "--edit-model" => o.edit_model = Some(None),
             "--polygon" => {
                 o.edit_model = Some(Some(value()?.parse().map_err(|_| "bad --polygon")?));
@@ -633,6 +653,8 @@ struct App {
     level: String,
     /// The material being made or changed on the Material page (Esc > Materials).
     material: Option<material_edit::Draft>,
+    /// The editor's material icon was clicked: the frame loop opens the materials.
+    open_materials: bool,
     /// Seconds since the start: for the water's ripples and moving lights.
     time: f32,
     pixels: Vec<u32>,
@@ -693,6 +715,7 @@ impl App {
         let ripples = Ripples::new(1);
         let materials = Materials::compile(&mut assets, &ripples)?;
         let materials_names = materials.names().to_vec();
+        let textures = material_textures(&assets, &materials_names);
         let (level_filters, entity_filters) = binding_filters_of(&world)?;
         let cube_maps = vec![None; world.entities.len()];
         let doc = LevelDoc::parse(&level_path, &level_src).map_err(|e| e.to_string())?;
@@ -723,6 +746,8 @@ impl App {
             editor: {
                 let mut editor = editor::Editor::new(doc, level_path);
                 editor.materials = materials_names.clone();
+                editor.material_textures = textures;
+                editor.keys = editor_keys::Keys::load();
                 editor
             },
             models: model_files(root),
@@ -759,6 +784,7 @@ impl App {
             levels: level_files(root),
             level: options.level.clone(),
             material: None,
+            open_materials: false,
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -849,16 +875,230 @@ impl App {
             return;
         }
         let before = self.editor.begin();
-        let result = self
-            .editor
-            .change(field, dir, &self.world, &self.models)
-            .and_then(|what| self.rebuild().map(|()| what));
-        match result {
-            Ok(what) => self.editor.commit(before, &what),
+        let changed = self.editor.change(field, dir, &self.world, &self.models);
+        self.settle(before, changed, field.moves_geometry());
+    }
+
+    /// After a change to the editor's tables (`changed`: what it did, or why it couldn't):
+    /// rebuilds the level from them. A change the level loads is kept; one it won't is
+    /// undone with the loader's reason, unless it only moved geometry (`keep`) or the
+    /// tables didn't load before either: those are kept, the level drawn as it last loaded
+    /// and the problem shown (and named, `surface 40`) for the artist to fix.
+    fn settle(&mut self, before: editor::Snapshot, changed: Result<String, String>, keep: bool) {
+        let what = match changed {
+            Ok(what) => what,
+            Err(why) => {
+                self.editor.revert(before, &why);
+                return;
+            }
+        };
+        match self.rebuild() {
+            Ok(()) => {
+                self.editor.broken = None;
+                self.editor.commit(before, &what);
+            }
             Err(why) => {
                 self.editor.find_problem(&why);
-                self.editor.revert(before, &why);
+                if keep || self.editor.broken.is_some() {
+                    self.editor.broken = Some(self.named_problem(&why));
+                    self.editor.commit(before, &format!("{what} (the level won't load until it's fixed)"));
+                } else {
+                    self.editor.revert(before, &why);
+                }
             }
+        }
+    }
+
+    /// The loader's message `why`, with what it's about named (`face 40 of sector 3`) and
+    /// without the file and line it starts with.
+    fn named_problem(&self, why: &str) -> String {
+        let reason = why.rsplit_once(": ").map_or(why, |(_, r)| r).to_string();
+        match self.editor.problem_selection() {
+            Some(editor::Selection::Surface(f)) => {
+                format!("face {f} of sector {}: {reason}", self.editor.doc.surfaces[f].sector)
+            }
+            Some(s) => format!("{}: {reason}", editor_panel::describe(s)),
+            None => reason,
+        }
+    }
+
+    /// An edit made by `f` on the editor (with the world, to find sectors), as `edit`'s.
+    fn edit_with(&mut self, f: impl FnOnce(&mut editor::Editor, &World) -> Result<String, String>) {
+        let before = self.editor.begin();
+        let changed = f(&mut self.editor, &self.world);
+        self.settle(before, changed, false);
+    }
+
+    /// Cuts with the line drawn (`Editor::cutting`'s two points): the selected face, or the
+    /// selected sectors the cut crosses.
+    fn cut(&mut self) {
+        let Some(points) = self.editor.cutting.clone().filter(|p| p.len() == 2) else {
+            return;
+        };
+        if let Some(editor::Selection::Surface(_)) = self.editor.selection {
+            self.editor.cutting = None;
+            self.editor.face_cut = Some(editor::FaceCut { from: points[0], to: points[1], pressed: glam::Vec2::ZERO });
+            self.edit(editor::Field::CutFace, 1.0);
+        } else {
+            self.edit(editor::Field::Cut, 1.0);
+        }
+    }
+
+    /// Moves the selection being dragged by `delta` more, and the level with it (kept where
+    /// it won't load, as a move: see `settle`; the drag is one undo, when it's let go).
+    fn drag_to(&mut self, delta: Vec3) {
+        if let Err(e) = self.editor.move_selection(delta, &self.world) {
+            self.editor.say(e);
+            return;
+        }
+        match self.rebuild() {
+            Ok(()) => self.editor.broken = None,
+            Err(why) => {
+                self.editor.find_problem(&why);
+                self.editor.broken = Some(self.named_problem(&why));
+            }
+        }
+    }
+
+    /// What's in the box from `a` to `b` on screen, by mode: the corners that can be picked,
+    /// the faces, or the sectors, whose middles are in it (in the 3D view, only those drawn
+    /// this frame: what's seen).
+    fn boxed(&self, a: glam::Vec2, b: glam::Vec2, projection: &wire::Projection, two_d: bool) -> Vec<editor::Selection> {
+        use editor::{Mode, Selection};
+        let (lo, hi) = (a.min(b), a.max(b));
+        let inside = |p: Vec3| projection.point(p).is_some_and(|s| s.cmpge(lo).all() && s.cmple(hi).all());
+        let e = &self.editor;
+        let seen: Vec<usize> = if two_d {
+            (0..e.doc.surfaces.len()).collect()
+        } else {
+            let mut seen: Vec<usize> = self
+                .geometry
+                .polygons
+                .iter()
+                .filter(|p| p.mirror.is_none())
+                .filter_map(|p| match e.selection_of(p.source) {
+                    Some(Selection::Surface(i)) => Some(i),
+                    _ => None,
+                })
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            seen
+        };
+        match e.mode {
+            Mode::Vertex => e
+                .pickable_vertices()
+                .into_iter()
+                .filter(|&v| inside(e.doc.vertices[v]))
+                .map(Selection::Vertex)
+                .collect(),
+            Mode::Face => seen
+                .into_iter()
+                .filter(|&f| inside(e.place_of(Selection::Surface(f))))
+                .map(Selection::Surface)
+                .collect(),
+            Mode::Sector => {
+                let mut sectors: Vec<usize> = seen.iter().map(|&f| e.doc.surfaces[f].sector).collect();
+                sectors.sort_unstable();
+                sectors.dedup();
+                sectors
+                    .into_iter()
+                    .filter(|&s| inside(e.place_of(Selection::Sector(s))))
+                    .map(Selection::Sector)
+                    .collect()
+            }
+        }
+    }
+
+    /// Selects `s` (in its mode) and brings the view to it: a 2D view centered on it, the
+    /// 3D view backed off from it along where it looks (or, if that's outside the level,
+    /// turned to it from where it is).
+    fn go_to(&mut self, s: editor::Selection) {
+        use editor::Selection;
+        self.go_to_quietly(s);
+        let e = &mut self.editor;
+        e.menus.clear();
+        let target = e.place_of(s);
+        let size = match s {
+            Selection::Sector(k) => {
+                let (lo, hi) = e.sector_bounds(k);
+                (hi - lo).length()
+            }
+            _ => 2.0,
+        };
+        e.say(editor_panel::describe(s));
+        if e.view != editor::ViewMode::Perspective {
+            e.ortho_center = target;
+            return;
+        }
+        let back = target - self.camera.forward() * (size * 0.8).max(2.5);
+        if let Some(sector) = self.world.find_sector(back) {
+            (self.camera.position, self.camera.sector) = (back, sector);
+        } else {
+            let f = (target - self.camera.position).normalize_or_zero();
+            self.camera.yaw = (-f.x).atan2(-f.z);
+            self.camera.pitch = f.y.clamp(-1.0, 1.0).asin();
+        }
+    }
+
+    /// Selects `s` in its mode, the view left where it is.
+    fn go_to_quietly(&mut self, s: editor::Selection) {
+        use editor::{Mode, Selection};
+        let e = &mut self.editor;
+        let mode = match s {
+            Selection::Sector(_) => Mode::Sector,
+            Selection::Surface(_) => Mode::Face,
+            Selection::Vertex(_) => Mode::Vertex,
+            _ => e.mode,
+        };
+        if let Selection::Vertex(v) = s {
+            e.vertex_faces = (0..e.doc.surfaces.len()).filter(|&f| e.doc.surfaces[f].corners.iter().any(|c| c.0 == v)).collect();
+        }
+        e.set_mode(mode);
+        (e.selection, e.multi) = (Some(s), Vec::new());
+    }
+
+    /// What typing `t` comes to when Enter is pressed on `text`.
+    fn finish_typing(&mut self, t: editor_panel::Typing, text: &str) {
+        use editor_panel::Typing;
+        match t {
+            Typing::Number(field) => self.type_value(field, text),
+            Typing::Search => self.editor.search = text.to_string(),
+            Typing::Find => match self.editor.find(text) {
+                Ok(s) => self.go_to(s),
+                Err(e) => self.editor.say(e),
+            },
+            Typing::MetaKey(k) | Typing::MetaValue(k) => {
+                let owner = meta_owner(&self.editor);
+                let text = text.trim().to_string();
+                let key = matches!(t, Typing::MetaKey(_));
+                self.edit_with(move |e, _| {
+                    if key {
+                        e.set_meta(owner, Some(k), Some(&text), None)
+                    } else {
+                        e.set_meta(owner, Some(k), None, Some(&text))
+                    }
+                });
+            }
+        }
+    }
+
+    /// The editor's panels, laid out for this frame.
+    fn editor_layout(&self) -> editor_panel::Laid {
+        self.editor.layout(&editor_panel::Ctx { models: &self.models, width: self.width as usize, height: self.height as usize })
+    }
+
+    /// Makes the previews the panel wants (the picked material's textures) that aren't made.
+    fn make_thumbs(&mut self) {
+        let Some(k) = self.editor.material_pick.as_ref().and_then(|m| self.editor.materials.iter().position(|n| n == m)) else {
+            return;
+        };
+        for name in self.editor.material_textures.get(k).cloned().unwrap_or_default() {
+            if self.editor.thumbs.contains_key(&name) {
+                continue;
+            }
+            let thumb = thumb_of(&mut self.assets, &name);
+            self.editor.thumbs.insert(name, thumb);
         }
     }
 
@@ -874,12 +1114,15 @@ impl App {
             self.editor.say(format!("'{number}' is not a number"));
             return;
         };
-        let before = self.editor.begin();
-        let result = self.editor.set_typed(field, value).and_then(|what| self.rebuild().map(|()| what));
-        match result {
-            Ok(what) => self.editor.commit(before, &what),
-            Err(why) => self.editor.revert(before, &why),
+        // Not an edit: how far the next extrude goes.
+        if field == editor::Field::ExtrudeBy {
+            let said = self.editor.set_typed(field, value, &self.world);
+            self.editor.say(said.unwrap_or_else(|e| e));
+            return;
         }
+        let before = self.editor.begin();
+        let changed = self.editor.set_typed(field, value, &self.world);
+        self.settle(before, changed, field.moves_geometry());
     }
 
     /// Opens the mesh editor on the selected entity's model, or leaves it. Leaving with
@@ -1013,8 +1256,16 @@ impl App {
             return;
         }
         match self.rebuild() {
-            Ok(()) => self.editor.say(if redo { "redone" } else { "undone" }),
-            Err(e) => self.editor.say(e),
+            Ok(()) => {
+                self.editor.broken = None;
+                self.editor.say(if redo { "redone" } else { "undone" });
+            }
+            Err(why) => {
+                // Back (or on) to tables that don't load: kept, and said why.
+                self.editor.find_problem(&why);
+                self.editor.broken = Some(self.named_problem(&why));
+                self.editor.say(if redo { "redone (the level won't load)" } else { "undone (the level won't load)" });
+            }
         }
     }
 
@@ -1117,6 +1368,8 @@ impl App {
         match result {
             Ok(()) => {
                 self.editor.materials = self.materials.names().to_vec();
+                self.editor.material_textures = material_textures(&self.assets, &self.editor.materials);
+                self.editor.thumbs.clear();
                 Ok(())
             }
             Err(e) => {
@@ -1991,6 +2244,49 @@ impl App {
 
 /// The level files (`.mmp`) in the assets' levels folder, sorted.
 /// The model files in assets/models (sorted).
+/// Per material named in `names`, the textures in its slots (as a material file writes
+/// them), for the editor's previews.
+fn material_textures(assets: &Assets, names: &[String]) -> Vec<Vec<String>> {
+    let library = assets.materials();
+    let defs: Vec<&moose_assets::MaterialDef> = (0..library.len() as u32).map(|i| library.get(i)).collect();
+    names
+        .iter()
+        .map(|name| {
+            defs.iter()
+                .find(|d| d.name == *name)
+                .map(|d| d.textures.iter().flatten().map(|t| t.to_text()).collect())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// A preview of texture `name` (a file, or a rippled one's file), 64 texels square from its
+/// mip level nearest that; `None` for one the engine makes (a cube map, the ripples).
+fn thumb_of(assets: &mut Assets, name: &str) -> Option<gui::Thumb> {
+    let file = name.strip_prefix("@water:").unwrap_or(name);
+    if file.starts_with('@') || file.starts_with("cube:") {
+        return None;
+    }
+    let id = assets.load_texture(file).ok()?;
+    let texture = assets.texture(id);
+    let level = texture.levels.iter().rev().find(|l| l.width >= 64 && l.height >= 64).or(texture.levels.first())?;
+    let size = 64;
+    let (w, h) = (level.width as usize, level.height as usize);
+    let pixels = (0..size * size)
+        .map(|k| {
+            let (x, y) = (k % size * w / size, k / size * h / size);
+            level.texels[y * w + x] & 0xFF_FFFF
+        })
+        .collect();
+    Some(gui::Thumb { size, pixels })
+}
+
+/// The way from the eye through framebuffer point `(x, y)` of `view` (unit length).
+fn screen_ray(view: &moose_scene::View, x: f32, y: f32) -> Vec3 {
+    let d = Vec3::new((x - view.center.x) / view.focal, -(y - view.center.y) / view.focal, -1.0);
+    (view.rotation * d).normalize()
+}
+
 fn model_files(assets: &str) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(Path::new(assets).join("models"))
         .into_iter()
@@ -2450,7 +2746,11 @@ fn draw_ui(
     typing: Option<&str>,
     hud: Option<Vec<String>>,
     back: bool,
+    cursor: Option<(f32, f32)>,
 ) -> Option<ui::MenuLayout> {
+    if app.editor.on {
+        app.make_thumbs();
+    }
     let mut rows = menu.map(|(page, _)| app.rows(page));
     // The row being typed on shows the text so far.
     if let (Some(rows), Some((_, selected)), Some(text)) = (&mut rows, menu, typing)
@@ -2469,6 +2769,10 @@ fn draw_ui(
     if app.editor.on && menu.is_none() {
         let camera = app.camera.view();
         app.editor.draw(&mut canvas, &camera, &app.world, &app.assets);
+        let laid = app.editor.layout(&editor_panel::Ctx { models: &app.models, width: canvas.width, height: canvas.height });
+        let thumbs = &app.editor.thumbs;
+        let scale = editor_panel::scale_for(canvas.height);
+        gui::draw(&mut canvas, &laid.widgets, cursor, scale, &|name| thumbs.get(name).cloned().flatten());
     }
     if let Some(lines) = hud {
         ui::draw_hud(&mut canvas, &lines);
@@ -2557,34 +2861,173 @@ fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
     }
 }
 
-/// The editor's mouse and keys, while it is on and the menu is closed: picking and the
-/// panel with the mouse, and the keys for edits, undo and saving. Returns whether the
-/// arrows (and PageUp/PageDown) move the selection, rather than turn the view.
+/// The editor's mouse and keys, while it is on and the menu is closed: the panels and icons
+/// (clicks, the wheel, a list's keys), picking by mode (Shift adds; a box dragged; clicking
+/// again in one place of a 2D view picks what's behind), dragging the selection in a 2D
+/// view, cutting, and the editor's keys (`editor_keys`) for edits, views, undo and saving.
+/// Returns whether the arrows (and PageUp/PageDown) were the editor's, rather than turning
+/// the view.
 fn edit_input(app: &mut App, display: &Display) -> bool {
-    use editor::{Field, Selection};
+    use editor::{Field, Mode, Selection, ViewMode};
+    use editor_keys::Action;
+    use editor_panel::{Act, Typing};
     let (w, h) = (app.width as usize, app.height as usize);
     let down = |keys: &[Key]| keys.iter().any(|&k| display.key_down(k));
     let ctrl = down(&[Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]);
     let shift = down(&[Key::LeftShift, Key::RightShift]);
     // Alt (Option): texture rows step finely.
     app.editor.fine = down(&[Key::LeftAlt, Key::RightAlt]);
+    let keys = app.editor.keys.clone();
+    let pressed = |a: Action| !ctrl && display.key_pressed(keys.key(a));
+    let repeated = |a: Action| !ctrl && display.key_repeated(keys.key(a));
     let cursor = display.cursor_position();
-    let over_panel = cursor.is_some_and(|(x, _)| app.editor.over_panel(x, w, h));
-    if display.key_pressed(Key::F5) {
-        app.editor.wire = !app.editor.wire;
+    let laid = app.editor_layout();
+    let over_ui = cursor.is_some_and(|c| app.editor.over_ui(&laid, c));
+    let (clicked, right_clicked) = (display.mouse_clicked(MouseButton::Left), display.mouse_clicked(MouseButton::Right));
+    let scroll = display.scroll();
+
+    // Waiting for a key to bind (the gear menu): the first one pressed (Esc cancels).
+    if let Some(action) = app.editor.rebinding {
+        if let Some(key) = display.pressed_keys().into_iter().find(|&k| k != Key::Escape) {
+            let said = app.editor.keys.bind(action, key);
+            app.editor.rebinding = None;
+            match app.editor.keys.save() {
+                Ok(()) => app.editor.say(said),
+                Err(e) => app.editor.say(format!("{said} (not saved: {e})")),
+            }
+        }
+        return true;
+    }
+    // A question: Left/Right choose, Enter answers (Esc: no), or a click.
+    if let Some(confirm) = &mut app.editor.confirm {
+        if display.key_pressed(Key::Left) || display.key_pressed(Key::Right) {
+            confirm.choice = !confirm.choice;
+        }
+        let answer = if display.key_pressed(Key::Enter) {
+            Some(confirm.choice)
+        } else if clicked {
+            cursor.and_then(|c| gui::under(&laid.widgets, c, false)).and_then(|w| match w.act {
+                Some(Act::Confirm(yes)) => Some(yes),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        if let Some(yes) = answer {
+            run_act(app, Act::Confirm(yes), 1.0);
+        }
+        return true;
+    }
+    // The panels: a click does what's under it (a right click its other way), the wheel
+    // steps what's under it.
+    if let Some(at) = cursor.filter(|_| over_ui) {
+        if (clicked || right_clicked)
+            && let Some(act) = gui::under(&laid.widgets, at, false).and_then(|w| w.act.clone())
+        {
+            run_act(app, act, if right_clicked { -1.0 } else { 1.0 });
+        }
+        if scroll != 0.0
+            && let Some(act) = gui::under(&laid.widgets, at, true).and_then(|w| w.wheel.clone())
+        {
+            run_act(app, act, scroll.signum());
+        }
+    }
+    // A list's keys (the lights, the materials, the controls): Up/Down choose, Enter does.
+    if !laid.list.is_empty() {
+        let n = laid.list.len();
+        let state = &mut app.editor.list;
+        let mut moved = false;
+        if display.key_repeated(Key::Down) {
+            state.cursor = Some(state.cursor.map_or(0, |k| (k + 1).min(n - 1)));
+            moved = true;
+        }
+        if display.key_repeated(Key::Up) {
+            state.cursor = Some(state.cursor.map_or(0, |k| k.saturating_sub(1)));
+            moved = true;
+        }
+        if moved && let Some(k) = state.cursor {
+            // Kept in view.
+            if k < state.scroll {
+                state.scroll = k;
+            } else if k >= state.scroll + laid.shown {
+                state.scroll = k + 1 - laid.shown;
+            }
+        }
+        if display.key_pressed(Key::Enter)
+            && let Some(act) = app.editor.list.cursor.and_then(|k| laid.list.get(k).cloned())
+        {
+            run_act(app, act, 1.0);
+        }
+        if moved || display.key_pressed(Key::Enter) {
+            return true;
+        }
+    }
+
+    // Views: the six along the axes and 3D, cycling (F6), turning a 2D view (the arrows,
+    // without Shift).
+    let views = [
+        (Action::ViewTop, wire::Axis::TOP),
+        (Action::ViewBottom, wire::Axis::BOTTOM),
+        (Action::ViewFront, wire::Axis::FRONT),
+        (Action::ViewBack, wire::Axis::BACK),
+        (Action::ViewLeft, wire::Axis::LEFT),
+        (Action::ViewRight, wire::Axis::RIGHT),
+    ];
+    let mut view = app.editor.view;
+    for (action, axis) in views {
+        if pressed(action) {
+            view = ViewMode::Ortho(axis);
+        }
+    }
+    if pressed(Action::View3d) {
+        view = ViewMode::Perspective;
     }
     if display.key_pressed(Key::F6) {
-        if app.editor.view == editor::ViewMode::Perspective {
+        view = view.next();
+    }
+    if view != app.editor.view {
+        if app.editor.view == ViewMode::Perspective {
             app.editor.ortho_center = app.camera.position;
         }
-        app.editor.view = app.editor.view.next();
+        app.editor.view = view;
         app.editor.hover = None;
         app.editor.face_cut = None;
+        app.editor.click_through = None;
     }
-    if !ctrl && display.key_pressed(Key::V) {
-        app.editor.vertices = !app.editor.vertices;
-        app.editor.hover = None;
+    let two_d = app.editor.view != ViewMode::Perspective;
+    if two_d && !shift && let ViewMode::Ortho(axis) = app.editor.view {
+        let step = app.editor.keys.turn_step;
+        let turns = [
+            (Action::TurnLeft, (-step, 0.0)),
+            (Action::TurnRight, (step, 0.0)),
+            (Action::TurnUp, (0.0, step)),
+            (Action::TurnDown, (0.0, -step)),
+        ];
+        for (action, (yaw, pitch)) in turns {
+            if repeated(action) {
+                app.editor.view = ViewMode::Ortho(axis.turned(yaw, pitch));
+            }
+        }
     }
+    if pressed(Action::Wire) {
+        app.editor.wire = !app.editor.wire;
+    }
+    if pressed(Action::Openings) {
+        app.editor.openings = !app.editor.openings;
+        app.editor.say(if app.editor.openings { "clicks in 3D pick openings too" } else { "clicks in 3D pick what's drawn" });
+    }
+    if pressed(Action::Find) {
+        app.editor.menus = vec![editor_panel::Menu::World];
+        app.editor.typing = Some((Typing::Find, String::new()));
+    }
+    if app.editor.model.is_none() {
+        for (action, mode) in [(Action::SectorMode, Mode::Sector), (Action::FaceMode, Mode::Face), (Action::VertexMode, Mode::Vertex)] {
+            if pressed(action) {
+                app.editor.set_mode(mode);
+            }
+        }
+    }
+
     let ortho = app.editor.ortho(w, h);
     let camera = app.camera.view();
     let projection = match &ortho {
@@ -2595,105 +3038,154 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         Some(o) => o.center,
         None => app.camera.position + app.camera.forward() * 3.0,
     };
-    // Where a cleave's end would go (and its preview runs to): on the grid, or with Ctrl
+    // Where a cut's end would go (and its preview runs to): on the grid, or with Ctrl
     // (Cmd) on the nearest vertex.
     app.editor.pointer = match (&ortho, cursor) {
         (Some(o), Some((x, y))) => Some(app.editor.cut_snap(o, glam::Vec2::new(x, y), ctrl)),
         _ => None,
     };
     if app.editor.model.is_some() {
-        model_input(app, display, &projection, ortho.is_some(), cursor, over_panel, (ctrl, shift));
+        model_input(app, display, &projection, ortho.is_some(), cursor, over_ui, (ctrl, shift));
         return false;
     }
-    app.editor.hover = match cursor {
-        Some((x, y)) if !over_panel => {
-            let at = glam::Vec2::new(x, y);
-            if app.editor.vertices {
-                app.editor.pick_vertex(&projection, at)
-            } else if let Some(marker) = app.editor.pick_marker(&projection, at) {
-                Some(marker)
+
+    // What the pointer is over, by mode.
+    let at = cursor.map(|(x, y)| glam::Vec2::new(x, y));
+    let candidates: Vec<Selection> = match at {
+        Some(at) if !over_ui => {
+            let vertex = (app.editor.mode == Mode::Vertex).then(|| app.editor.pick_vertex(&projection, at)).flatten();
+            let marker = app.editor.pick_marker(&projection, at);
+            if let Some(v) = vertex.or(marker) {
+                vec![v]
             } else if let Some(o) = &ortho {
-                app.editor.pick_2d(o, &app.world, at)
+                app.editor.pick_2d_all(o, &app.world, at)
             } else {
-                app.geometry
-                    .pick(x, y)
-                    .and_then(|(source, _)| app.editor.selection_of(source))
+                let drawn = app.geometry.pick(at.x, at.y);
+                let mut found: Vec<Selection> = Vec::new();
+                // Openings aren't drawn: with them on, the nearest along the ray if it's before what's drawn.
+                let ray = screen_ray(&app.camera.view(), at.x, at.y);
+                let opening = app.editor.openings.then(|| app.editor.pick_opening(app.camera.position, ray)).flatten();
+                let depth = |t: f32| t * ray.dot(app.camera.forward());
+                match (drawn, opening) {
+                    (Some((_, w_near)), Some((o, t))) if depth(t) < 1.0 / w_near.max(1e-6) => found.push(Selection::Surface(o)),
+                    (None, Some((o, _))) => found.push(Selection::Surface(o)),
+                    _ => {}
+                }
+                if found.is_empty()
+                    && let Some(s) = drawn.and_then(|(source, _)| app.editor.selection_of(source))
+                {
+                    found.push(s);
+                }
+                found.into_iter().map(|s| app.editor.in_mode(s)).collect()
             }
         }
-        _ => None,
+        _ => Vec::new(),
     };
-    // A line dragged across the selected surface in a 2D view cuts it (Ctrl: its ends on
-    // vertices). The press only starts it; a release without a drag is a click.
-    let mut deferred = false;
-    if let (Some(o), Some((x, y))) = (&ortho, cursor) {
-        let at = glam::Vec2::new(x, y);
-        let snapped = app.editor.cut_snap(o, at, ctrl);
-        let can_cut = matches!(app.editor.selection, Some(Selection::Surface(_)))
-            && app.editor.picking.is_none()
-            && app.editor.cutting.is_none()
-            && !over_panel;
-        if can_cut && display.mouse_clicked(MouseButton::Left) {
-            app.editor.face_cut = Some(editor::FaceCut { from: snapped, to: snapped, pressed: at });
-            deferred = true;
-        } else if let Some(cut) = &mut app.editor.face_cut {
-            if display.mouse_down(MouseButton::Left) {
-                cut.to = snapped;
-            } else if cut.pressed.distance(at) > 4.0 {
-                app.edit(Field::CutFace, 1.0);
+    // Clicking again in one place (of a 2D view) goes one deeper, until a 3 s pause.
+    let depth = match (app.editor.click_through, at) {
+        (Some((place, when, k)), Some(at)) if place.distance(at) < 4.0 && when.elapsed() < Duration::from_secs(3) => k,
+        _ => 0,
+    };
+    let under = |k: usize| (!candidates.is_empty()).then(|| candidates[k % candidates.len()]);
+    app.editor.hover = under(depth);
+
+    // The left button on the view: a cut (C pressed), the second face of a pick, dragging
+    // what's selected (2D), or a box.
+    if !over_ui && let (Some(at), Some(world_at)) = (at, app.editor.pointer) {
+        let cutting = app.editor.cutting.is_some() && ortho.is_some();
+        if clicked {
+            if cutting {
+                app.editor.face_cut = Some(editor::FaceCut { from: world_at, to: world_at, pressed: at });
+            } else if app.editor.picking.is_some() {
+                app.edit(Field::Picked, 1.0);
+            } else if let Some(o) = &ortho
+                && candidates.iter().any(|&c| app.editor.is_selected(c))
+                && !shift
+            {
+                let from = o.to_world(at.x, at.y);
+                let before = app.editor.begin();
+                app.editor.dragging = Some(editor::Drag { from, moved: glam::Vec3::ZERO, before });
             } else {
-                // Not dragged: a click, which selects.
-                app.editor.face_cut = None;
-                app.editor.selection = app.editor.hover;
+                app.editor.boxing = Some((at, at));
+            }
+        }
+    } else if !over_ui && clicked && app.editor.picking.is_some() {
+        app.edit(Field::Picked, 1.0);
+    } else if !over_ui && clicked && app.editor.cutting.is_some() {
+        app.editor.say("cut in a 2D view (1-6)");
+    } else if !over_ui && clicked && let Some(at) = at {
+        app.editor.boxing = Some((at, at));
+    }
+    let held = display.mouse_down(MouseButton::Left);
+    // A cut: dragged, or two clicks.
+    if let (Some(cut), Some(p), Some(at)) = (&mut app.editor.face_cut, app.editor.pointer, at) {
+        if held {
+            cut.to = p;
+        } else {
+            let dragged = cut.pressed.distance(at) > 4.0;
+            let (from, to) = (cut.from, cut.to);
+            app.editor.face_cut = None;
+            if dragged {
+                app.editor.cutting = Some(vec![from, to]);
+                app.cut();
+            } else if app.editor.cut_point(from) {
+                app.cut();
             }
         }
     }
-    // The panel row under the pointer, and what it changes.
-    let row_field = cursor
-        .filter(|_| over_panel)
-        .and_then(|(x, y)| app.editor.row_at(x, y, w, h))
-        .and_then(|k| app.editor.panel()[k].field);
-    if display.mouse_clicked(MouseButton::Left) && !deferred {
-        if over_panel {
-            match row_field {
-                // A number to type (Enter sets it, Esc drops it).
-                Some(field) if field.typed() && app.editor.texture_mapping_selected() => {
-                    app.editor.typing = Some((field, String::new()));
-                    app.editor.say("type a number: Enter sets it, Esc drops it");
-                }
-                Some(field) => app.edit(field, 1.0),
-                None => {}
+    // Dragging the selection: along the screen's axes, on the grid.
+    if let (Some(drag), Some(o), Some(at)) = (&app.editor.dragging, &ortho, at) {
+        let step = app.editor.step();
+        let (right, up) = o.axis.basis();
+        let d = o.to_world(at.x, at.y) - drag.from;
+        let snapped = |v: f32| (v / step).round() * step;
+        let target = right * snapped(d.dot(right)) + up * snapped(d.dot(up));
+        let moved = drag.moved;
+        if target != moved {
+            app.drag_to(target - moved);
+            if let Some(drag) = &mut app.editor.dragging {
+                drag.moved = target;
             }
-        } else if app.editor.picking.is_some() {
-            // The surface clicked is the one to stitch from or merge in.
-            app.edit(Field::Picked, 1.0);
-        } else if app.editor.cutting.is_some() {
-            match (app.editor.pointer, cursor) {
-                (Some(p), Some(_)) => {
-                    if app.editor.cut_point(p) {
-                        app.edit(Field::Cut, 1.0);
-                    }
-                }
-                _ => app.editor.say("cut in a 2D view (F6)"),
+        }
+        if !held {
+            let drag = app.editor.dragging.take().unwrap();
+            if drag.moved != glam::Vec3::ZERO {
+                let what = format!("moved by {} m", moose_assets::number(drag.moved.length()));
+                app.editor.commit(drag.before, &what);
+            } else {
+                // Not moved: a click (on what's selected: just it, or one deeper).
+                let hit = under(depth);
+                app.editor.click(hit, false);
+                app.editor.click_through = hit.is_some().then(|| (at, Instant::now(), depth + 1));
             }
-        } else if cursor.is_some() {
-            app.editor.selection = app.editor.hover;
+        }
+    }
+    // A box: let go, it selects what's in it; not dragged, it was a click.
+    if let (Some((from, _)), Some(at)) = (app.editor.boxing, at) {
+        if held {
+            app.editor.boxing = Some((from, at));
+        } else {
+            app.editor.boxing = None;
+            if from.distance(at) <= 4.0 {
+                let hit = under(depth);
+                app.editor.click(hit, shift);
+                app.editor.click_through = (ortho.is_some() && hit.is_some()).then(|| (at, Instant::now(), depth + 1));
+            } else {
+                let found = app.boxed(from, at, &projection, ortho.is_some());
+                let k = found.len();
+                app.editor.select_all(found, shift);
+                app.editor.say(format!("{k} in the box"));
+            }
         }
     }
     // Choosing the face to stitch from, a right click stitches mirrored (rather than
     // starting to look around).
-    if display.mouse_clicked(MouseButton::Right) && !over_panel && cursor.is_some() && app.editor.picking.is_some() {
+    if right_clicked && !over_ui && cursor.is_some() && app.editor.picking.is_some() {
         app.edit(Field::PickedMirrored, 1.0);
-    }
-    let scroll = display.scroll();
-    if scroll != 0.0
-        && let Some(field) = row_field
-        && !matches!(field, Field::Duplicate | Field::Delete)
-    {
-        app.edit(field, scroll.signum());
     }
     // A 2D view zooms about the pointer.
     if scroll != 0.0
-        && !over_panel
+        && !over_ui
         && let (Some(o), Some((x, y))) = (&ortho, cursor)
     {
         let before = o.to_world(x, y);
@@ -2720,35 +3212,68 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         if display.key_pressed(Key::V) {
             app.edit(Field::Paste, 1.0);
         }
+        // Camera places: Ctrl+Shift+1-4 keeps one, Ctrl+1-4 goes back to it.
         for (k, key) in [Key::Key1, Key::Key2, Key::Key3, Key::Key4].into_iter().enumerate() {
-            if display.key_pressed(key) {
+            if !display.key_pressed(key) {
+                continue;
+            }
+            if shift {
                 let c = &app.camera;
                 app.editor.bookmarks[k] = Some((c.position, c.yaw, c.pitch));
                 app.editor.say(format!("bookmark {}: here", k + 1));
+            } else if let Some((position, yaw, pitch)) = app.editor.bookmarks[k]
+                && let Some(sector) = app.world.find_sector(position)
+            {
+                let c = &mut app.camera;
+                (c.position, c.sector, c.yaw, c.pitch) = (position, sector, yaw, pitch);
+                app.editor.ortho_center = position;
             }
         }
         return false;
     }
-    for (k, key) in [Key::Key1, Key::Key2, Key::Key3, Key::Key4].into_iter().enumerate() {
-        if display.key_pressed(key)
-            && let Some((position, yaw, pitch)) = app.editor.bookmarks[k]
-            && let Some(sector) = app.world.find_sector(position)
-        {
-            let c = &mut app.camera;
-            (c.position, c.sector, c.yaw, c.pitch) = (position, sector, yaw, pitch);
-            app.editor.ortho_center = position;
-        }
-    }
-    if display.key_pressed(Key::M) {
-        app.edit(Field::EditModel, 1.0);
-    }
-    if display.key_pressed(Key::G) {
+    if pressed(Action::Grid) {
         app.editor.step = (app.editor.step + 1) % editor::STEPS.len();
         let step = app.editor.step();
         app.editor.say(format!("grid {} m", moose_assets::number(step)));
     }
-    if display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
-        app.edit(Field::Delete, 1.0);
+    // What the selection's keys do.
+    match app.editor.selection {
+        Some(Selection::Sector(_)) => {
+            if pressed(Action::Cleave) {
+                app.edit(Field::Cleave, 1.0);
+            }
+            if pressed(Action::MergeSectors) {
+                let multi = app.editor.selected_sectors().len() > 1;
+                app.edit(if multi { Field::MergeSelected } else { Field::MergeSector }, 1.0);
+            }
+            if pressed(Action::DeleteSector) {
+                run_act(app, Act::Delete, 1.0);
+            }
+        }
+        Some(Selection::Surface(_)) => {
+            if pressed(Action::CutFace) {
+                app.edit(Field::Cleave, 1.0);
+            }
+            if pressed(Action::Extrude) {
+                app.edit(Field::Extrude, 1.0);
+            }
+            if pressed(Action::OpenToMatch) {
+                app.edit(Field::Adjoin, 1.0);
+            }
+        }
+        Some(Selection::Entity(_)) => {
+            if pressed(Action::MeshEditor) {
+                app.edit(Field::EditModel, 1.0);
+            }
+            if pressed(Action::DeleteEntity) {
+                run_act(app, Act::Delete, 1.0);
+            }
+        }
+        Some(Selection::Light(_)) if pressed(Action::DeleteLight) => run_act(app, Act::Delete, 1.0),
+        _ => {}
+    }
+    if (display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace)) && app.editor.selection.is_some() {
+        run_act(app, Act::Delete, 1.0);
     }
     if let Some(Selection::Surface(_)) = app.editor.selection {
         for (key, dir) in [(Key::PageUp, 1.0), (Key::PageDown, -1.0)] {
@@ -2759,13 +3284,17 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     }
     if !matches!(
         app.editor.selection,
-        Some(Selection::Entity(_) | Selection::Vertex(_) | Selection::Light(_))
+        Some(Selection::Entity(_) | Selection::Vertex(_) | Selection::Light(_) | Selection::Sector(_))
     ) {
+        return false;
+    }
+    // In a 2D view the arrows turn it; with Shift they move the selection.
+    if two_d && !shift {
         return false;
     }
     // Along the screen's axes in a 2D view; in the 3D view, along the world axes nearest
     // the view's forward and right.
-    let axis_field = |v: Vec3| {
+    let axis_field = |v: glam::Vec3| {
         let a = v.abs();
         if a.x >= a.y && a.x >= a.z {
             (Field::X, v.x.signum())
@@ -2782,7 +3311,7 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         }
         None => {
             let f = app.camera.forward();
-            (axis_field(Vec3::new(f.x, 0.0, f.z)), axis_field(Vec3::new(-f.z, 0.0, f.x)))
+            (axis_field(glam::Vec3::new(f.x, 0.0, f.z)), axis_field(glam::Vec3::new(-f.z, 0.0, f.x)))
         }
     };
     let moves = [
@@ -2803,22 +3332,139 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     true
 }
 
-/// The mesh editor's mouse and keys (see [`edit_input`]): picking the model's polygons in
-/// the 3D view, the panel, undo and saving.
+/// Does what a panel's widget does (`dir`: the wheel's way, or 1 for a click and -1 for a
+/// right click).
+fn run_act(app: &mut App, act: editor_panel::Act, dir: f32) {
+    use editor::Field;
+    use editor_panel::{Act, Confirm, Typing};
+    let e = &mut app.editor;
+    let fresh_list = |e: &mut editor::Editor| {
+        e.list = Default::default();
+        e.search.clear();
+        if matches!(e.typing, Some((Typing::Search, _))) {
+            e.typing = None;
+        }
+    };
+    match act {
+        Act::Edit(field) => app.edit(field, dir),
+        Act::Type(field) => {
+            e.typing = Some((Typing::Number(field), String::new()));
+            e.say("type a number: Enter sets it, Esc drops it");
+        }
+        Act::Open(menu) => {
+            e.menus.push(menu);
+            fresh_list(e);
+            if menu == editor_panel::Menu::Materials {
+                e.material_pick = e
+                    .selection
+                    .and_then(|s| if let editor::Selection::Surface(f) = s { Some(f) } else { None })
+                    .and_then(|f| e.doc.surfaces[f].options.iter().find_map(|o| o.strip_prefix("material=")).map(String::from));
+            }
+        }
+        Act::Icon(menu) => {
+            if e.menus.first() == Some(&menu) {
+                e.menus.clear();
+            } else {
+                e.menus = vec![menu];
+            }
+            fresh_list(e);
+        }
+        Act::MaterialEditor => app.open_materials = true,
+        Act::Back => {
+            e.menus.pop();
+            fresh_list(e);
+        }
+        Act::Mode(mode) => e.set_mode(mode),
+        Act::PickMaterial(name) => e.material_pick = Some(name),
+        Act::Add(field) => {
+            (e.selection, e.multi) = (None, Vec::new());
+            app.edit(field, 1.0);
+        }
+        Act::AddModel(k) => {
+            if let Some(model) = app.models.get(k).cloned() {
+                app.edit_with(move |e, world| e.add_prop(&model, world));
+            }
+        }
+        Act::Rebind(action) => {
+            e.rebinding = Some(action);
+            e.say(format!("press the key for {}", action.label()));
+        }
+        Act::TurnStep => {
+            let steps = editor_keys::TURN_STEPS;
+            let k = steps.iter().position(|&s| s == e.keys.turn_step).unwrap_or(3) as i32;
+            e.keys.turn_step = steps[(k + dir.signum() as i32).rem_euclid(steps.len() as i32) as usize];
+            let said = format!("2D views turn {}° a press", e.keys.turn_step);
+            match e.keys.save() {
+                Ok(()) => e.say(said),
+                Err(err) => e.say(format!("{said} (not saved: {err})")),
+            }
+        }
+        Act::MetaAdd => {
+            let owner = meta_owner(e);
+            let taken: Vec<String> = e.meta_values(owner).into_iter().map(|(k, _)| k).collect();
+            let key = (1..).map(|n| if n == 1 { "key".to_string() } else { format!("key_{n}") }).find(|k| !taken.contains(k)).unwrap();
+            let k = taken.len();
+            app.edit_with(move |e, _| e.set_meta(owner, None, Some(&key), Some("0")));
+            let e = &mut app.editor;
+            e.typing = Some((Typing::MetaKey(k), e.typing_start(Typing::MetaKey(k))));
+        }
+        Act::MetaKey(k) => e.typing = Some((Typing::MetaKey(k), e.typing_start(Typing::MetaKey(k)))),
+        Act::MetaValue(k) => e.typing = Some((Typing::MetaValue(k), e.typing_start(Typing::MetaValue(k)))),
+        Act::MetaRemove(k) => {
+            let owner = meta_owner(e);
+            app.edit_with(move |e, _| e.set_meta(owner, Some(k), None, None));
+        }
+        Act::Search => e.typing = Some((Typing::Search, e.search.clone())),
+        Act::Find => e.typing = Some((Typing::Find, String::new())),
+        Act::Scroll => {
+            // The wheel up scrolls up.
+            let list = &mut e.list;
+            list.scroll = if dir > 0.0 { list.scroll.saturating_sub(3) } else { list.scroll + 3 };
+        }
+        Act::Confirm(yes) => {
+            if let Some(confirm) = e.confirm.take()
+                && yes
+            {
+                run_act(app, confirm.yes, 1.0);
+            }
+        }
+        Act::Delete => {
+            let selected = e.selected();
+            let what = match selected.len() {
+                0 => return,
+                1 => editor_panel::describe(selected[0]),
+                k => format!("{k} things"),
+            };
+            e.confirm = Some(Confirm { text: format!("Delete {what}?"), yes: Act::Edit(Field::Delete), choice: true });
+        }
+        Act::GoTo(selection) => app.go_to(selection),
+    }
+}
+
+/// Whose meta values the top menu shows.
+fn meta_owner(e: &editor::Editor) -> editor_panel::Owner {
+    match e.menus.last() {
+        Some(editor_panel::Menu::Meta(owner)) => *owner,
+        _ => editor_panel::Owner::Level,
+    }
+}
+
+/// The mesh editor's mouse and keys (see [`edit_input`], which has its panel): picking the
+/// model's polygons in the 3D view, its keys, undo and saving.
 fn model_input(
     app: &mut App,
     display: &Display,
     projection: &wire::Projection,
     two_d: bool,
     cursor: Option<(f32, f32)>,
-    over_panel: bool,
+    over_ui: bool,
     (ctrl, shift): (bool, bool),
 ) {
     use editor::Field;
-    let (w, h) = (app.width as usize, app.height as usize);
+    use editor_keys::Action;
     let model = app.editor.model.as_ref().unwrap();
     let hover = match cursor {
-        Some((x, y)) if !over_panel && !two_d => {
+        Some((x, y)) if !over_ui && !two_d => {
             if model.proxies {
                 model.pick_proxy(projection, app.camera.position, glam::Vec2::new(x, y), &app.world, &app.assets)
             } else {
@@ -2833,27 +3479,12 @@ fn model_input(
         _ => None,
     };
     app.editor.model.as_mut().unwrap().hover = hover;
-    let row_field = cursor
-        .filter(|_| over_panel)
-        .and_then(|(x, y)| app.editor.row_at(x, y, w, h))
-        .and_then(|k| app.editor.panel()[k].field);
-    if display.mouse_clicked(MouseButton::Left) {
-        if over_panel {
-            if let Some(field) = row_field {
-                app.edit(field, 1.0);
-            }
-        } else if two_d {
-            app.editor.say("pick the model's polygons in the 3D view (F6)");
+    if display.mouse_clicked(MouseButton::Left) && !over_ui {
+        if two_d {
+            app.editor.say("pick the model's polygons in the 3D view (7)");
         } else if cursor.is_some() {
             app.editor.model.as_mut().unwrap().polygon = hover;
         }
-    }
-    let scroll = display.scroll();
-    if scroll != 0.0
-        && let Some(field) = row_field
-        && !matches!(field, Field::Delete | Field::EditModel | Field::ProxyBox | Field::RemoveProxies)
-    {
-        app.edit(field, scroll.signum());
     }
     if ctrl {
         if display.key_pressed(Key::Z) {
@@ -2867,13 +3498,16 @@ fn model_input(
         }
         return;
     }
-    if display.key_pressed(Key::P) {
+    let keys = &app.editor.keys;
+    let (proxies, leave, delete) =
+        (keys.key(Action::PickProxies), keys.key(Action::LeaveMesh), keys.key(Action::DeletePolygon));
+    if display.key_pressed(proxies) {
         app.edit(Field::PickProxies, 1.0);
     }
-    if display.key_pressed(Key::M) {
+    if display.key_pressed(leave) {
         app.edit(Field::EditModel, 1.0);
     }
-    if display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
+    if display.key_pressed(delete) || display.key_pressed(Key::Delete) || display.key_pressed(Key::Backspace) {
         app.edit(Field::Delete, 1.0);
     }
 }
@@ -2970,6 +3604,44 @@ fn run() -> Result<(), String> {
             ),
         });
     }
+    if let Some(mode) = &options.mode {
+        app.editor.set_mode(match mode.as_str() {
+            "sector" => editor::Mode::Sector,
+            "face" => editor::Mode::Face,
+            "vertex" => editor::Mode::Vertex,
+            _ => return Err("--mode is sector, face or vertex".into()),
+        });
+    }
+    if let Some(selection) = app.editor.selection {
+        // In its mode (a vertex: with the faces it's a corner of).
+        app.editor.selection = None;
+        app.go_to_quietly(selection);
+    }
+    if let Some(panel) = &options.panel {
+        use editor_panel::{Menu, Owner};
+        let e = &app.editor;
+        let owner = match e.selection {
+            Some(editor::Selection::Sector(s)) => Owner::Sector(s),
+            Some(editor::Selection::Surface(f)) => Owner::Surface(f),
+            _ => Owner::Level,
+        };
+        let excluder = match e.selection {
+            Some(editor::Selection::Sector(s)) => Some((editor::Excluder::Sector, s)),
+            Some(editor::Selection::Surface(f)) => Some((editor::Excluder::Surface, f)),
+            Some(editor::Selection::Entity(k)) => Some((editor::Excluder::Entity, k)),
+            _ => None,
+        };
+        let menu = match panel.as_str() {
+            "add" => Menu::Add,
+            "world" => Menu::World,
+            "controls" => Menu::Controls,
+            "meta" => Menu::Meta(owner),
+            "materials" => Menu::Materials,
+            "lights" => excluder.map(|(t, i)| Menu::Lights(t, i)).ok_or("--panel lights: select a face, sector or entity")?,
+            _ => return Err("--panel is add, world, controls, lights, meta or materials".into()),
+        };
+        run_act(&mut app, editor_panel::Act::Open(menu), 1.0);
+    }
     if let Some(polygon) = options.edit_model {
         app.edit(editor::Field::EditModel, 1.0);
         let model = app.editor.model.as_mut().ok_or("--edit-model: select an entity with a .mmdl model")?;
@@ -3016,7 +3688,7 @@ fn run() -> Result<(), String> {
                 app.materials.names(),
             ));
         }
-        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, None, hud, options.menu.is_some_and(|p| p != Page::Main));
+        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, None, hud, options.menu.is_some_and(|p| p != Page::Main), None);
         app.save_png(Path::new(path))?;
         println!(
             "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
@@ -3075,6 +3747,11 @@ fn run() -> Result<(), String> {
                 } else {
                     app.edit(editor::Field::EditModel, 1.0);
                 }
+            } else if app.editor.on && !menu.open && app.editor.rebinding.is_some() {
+                app.editor.rebinding = None;
+                app.editor.say("not bound");
+            } else if app.editor.on && !menu.open && app.editor.confirm.is_some() {
+                app.editor.confirm = None;
             } else if app.editor.on && !menu.open && app.editor.typing.is_some() {
                 app.editor.typing = None;
                 app.editor.say("not set");
@@ -3087,8 +3764,21 @@ fn run() -> Result<(), String> {
             } else if app.editor.on && !menu.open && app.editor.cutting.is_some() {
                 app.editor.cutting = None;
                 app.editor.say("cut stopped");
-            } else if app.editor.on && !menu.open && app.editor.selection.is_some() {
+            } else if app.editor.on && !menu.open && app.editor.dragging.is_some() {
+                // Back where the drag started.
+                let drag = app.editor.dragging.take().unwrap();
+                app.editor.revert(drag.before, "drag stopped");
+                if let Err(e) = app.rebuild() {
+                    app.editor.say(e);
+                }
+            } else if app.editor.on && !menu.open && app.editor.boxing.is_some() {
+                app.editor.boxing = None;
+            } else if app.editor.on && !menu.open && !app.editor.menus.is_empty() {
+                app.editor.menus.pop();
+                app.editor.list = Default::default();
+            } else if app.editor.on && !menu.open && (app.editor.selection.is_some() || !app.editor.multi.is_empty()) {
                 app.editor.selection = None;
+                app.editor.multi.clear();
             } else {
                 menu.open = !menu.open;
                 (menu.page, menu.selected) = (Page::Main, 0);
@@ -3285,19 +3975,30 @@ fn run() -> Result<(), String> {
             // holds still.
             display.mouse_delta();
             look.clear();
-            if let Some((_, text)) = &mut app.editor.typing {
+            if let Some((typing, text)) = &mut app.editor.typing {
                 text.push_str(display.text());
                 if display.key_repeated(Key::Backspace) {
                     text.pop();
                 }
+                // A search finds as it's typed.
+                if *typing == editor_panel::Typing::Search {
+                    app.editor.search = text.clone();
+                    app.editor.list = Default::default();
+                }
             }
             if display.key_pressed(Key::Enter) && !alt {
-                let (field, text) = app.editor.typing.take().unwrap();
-                app.type_value(field, &text);
+                let (typing, text) = app.editor.typing.take().unwrap();
+                app.finish_typing(typing, &text);
             }
         } else {
             // The editor's mouse and keys; the arrows move its selection, if it has one.
             let editing = app.editor.on && edit_input(&mut app, &display);
+            // The editor's material icon: the materials, on the menu.
+            if std::mem::take(&mut app.open_materials) {
+                menu.open = true;
+                (menu.page, menu.selected) = (Page::Materials, 0);
+                menu.back.clear();
+            }
             // A 2D view pans (dragged with the right button, or WASD), and the 3D camera
             // holds still.
             let two_d = app.editor.on && app.editor.view != editor::ViewMode::Perspective;
@@ -3312,8 +4013,11 @@ fn run() -> Result<(), String> {
                     .into_iter()
                     .any(|k| display.key_down(k));
                 if !ctrl {
+                    let keys = &app.editor.keys;
+                    use editor_keys::Action;
                     let speed = 600.0 * dt / o.scale;
-                    pan += (right * (key(Key::D) - key(Key::A)) + up * (key(Key::W) - key(Key::S))) * speed;
+                    let along = |a: Action, b: Action| key(keys.key(a)) - key(keys.key(b));
+                    pan += (right * along(Action::StrafeRight, Action::StrafeLeft) + up * along(Action::Forward, Action::Backward)) * speed;
                 }
                 app.editor.ortho_center += pan;
                 look.clear();
@@ -3336,10 +4040,11 @@ fn run() -> Result<(), String> {
                         c.pitch -= turn;
                     }
                 }
-                if display.key_down(Key::Q) {
+                // (Not in the editor, whose keys are its own.)
+                if !app.editor.on && display.key_down(Key::Q) {
                     c.roll += ROLL_SPEED * dt;
                 }
-                if display.key_down(Key::E) {
+                if !app.editor.on && display.key_down(Key::E) {
                     c.roll -= ROLL_SPEED * dt;
                 }
                 // Mouse look is always on (no button), as in v1, smoothed over time: this
@@ -3375,9 +4080,19 @@ fn run() -> Result<(), String> {
                     .into_iter()
                     .any(|k| display.key_down(k));
                 let key = |k| if display.key_down(k) && !ctrl { 1.0 } else { 0.0 };
-                local.z -= key(Key::W) - key(Key::S);
-                local.x += key(Key::D) - key(Key::A);
-                let up = key(Key::Space) - key(Key::C);
+                // The editor flies on its own keys (see `editor_keys`).
+                let (forward, backward, left, right, rise, sink) = if app.editor.on {
+                    use editor_keys::Action;
+                    let k = |a| app.editor.keys.key(a);
+                    (k(Action::Forward), k(Action::Backward), k(Action::StrafeLeft), k(Action::StrafeRight), k(Action::Ascend), k(Action::Descend))
+                } else {
+                    (Key::W, Key::S, Key::A, Key::D, Key::Space, Key::C)
+                };
+                // Typing in the editor holds still.
+                let key = |k| if app.editor.typing.is_some() { 0.0 } else { key(k) };
+                local.z -= key(forward) - key(backward);
+                local.x += key(right) - key(left);
+                let up = key(rise) - key(sink);
                 let fast = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
                 let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
                 let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
@@ -3452,7 +4167,8 @@ fn run() -> Result<(), String> {
         }
         let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2, stats.3));
         let typing = menu.typing.as_ref().map(|(_, text)| text.as_str());
-        menu.layout = draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud, !menu.back.is_empty());
+        let cursor = display.cursor_position();
+        menu.layout = draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud, !menu.back.is_empty(), cursor);
         display.set_size(app.width, app.height);
         display.present(&app.pixels)?;
         let t = display.present_times();
@@ -3505,7 +4221,7 @@ mod tests {
         app.editor.on = true;
         let before = app.editor.doc.clone();
         // The far wall (2, at z = 8) in the front view, a line down its middle.
-        app.editor.view = ViewMode::Ortho(Axis::Front);
+        app.editor.view = ViewMode::Ortho(Axis::FRONT);
         app.editor.selection = Some(Selection::Surface(2));
         let (w, h) = (app.width as usize, app.height as usize);
         let o = app.editor.ortho(w, h).unwrap();
@@ -3587,7 +4303,7 @@ mod tests {
         let mut app = test_app("shiny_rooms.mmp");
         app.editor.on = true;
         // The far wall cut in two (front view), then its halves merged back.
-        app.editor.view = ViewMode::Ortho(wire::Axis::Front);
+        app.editor.view = ViewMode::Ortho(wire::Axis::FRONT);
         app.editor.selection = Some(Selection::Surface(2));
         let (from, to) = (Vec3::new(0.0, -1.0, 8.0), Vec3::new(0.0, 5.0, 8.0));
         app.editor.face_cut = Some(FaceCut { from, to, pressed: glam::Vec2::ZERO });
@@ -3613,13 +4329,147 @@ mod tests {
     }
 
     #[test]
+    fn modes_pick_their_own_and_infer_up_from_what_is_selected() {
+        use editor::{Mode, Selection};
+        let mut app = test_app("shiny_rooms.mmp");
+        let e = &mut app.editor;
+        e.set_mode(Mode::Face);
+        let (a, b) = (e.doc.sector_surfaces(1).start, e.doc.sector_surfaces(1).start + 1);
+        // Shift adds and drops; a plain click is all that's selected.
+        e.click(Some(Selection::Surface(a)), false);
+        e.click(Some(Selection::Surface(b)), true);
+        assert_eq!(e.selected_faces(), [a, b]);
+        e.click(Some(Selection::Surface(a)), true);
+        assert_eq!(e.selected_faces(), [b]);
+        // Up: the face's sector. Back down: the face mode's own.
+        e.set_mode(Mode::Sector);
+        assert_eq!(e.selection, Some(Selection::Sector(1)));
+        e.set_mode(Mode::Face);
+        assert_eq!(e.selected_faces(), [b]);
+        // Down to vertices: the face's corners can be picked; a face clicked there is the
+        // one whose corners can be, not a selection.
+        e.set_mode(Mode::Vertex);
+        assert_eq!(e.vertex_faces, [b]);
+        let v = e.doc.surfaces[b].corners[0].0;
+        assert!(e.pickable_vertices().contains(&v));
+        e.click(Some(Selection::Vertex(v)), false);
+        e.click(Some(Selection::Surface(a)), false);
+        assert_eq!((e.vertex_faces.clone(), e.selection), (vec![a], None));
+        e.click(Some(Selection::Surface(b)), true);
+        assert_eq!(e.vertex_faces, [a, b]);
+        // Up from vertices: their faces.
+        e.set_mode(Mode::Face);
+        assert_eq!(e.selected_faces(), [a, b]);
+    }
+
+    #[test]
+    fn several_sectors_cleave_at_once_and_merge_back() {
+        use editor::{Field, Selection, ViewMode};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        let original = app.editor.doc.clone();
+        app.editor.view = ViewMode::Ortho(wire::Axis::TOP);
+        app.editor.selection = Some(Selection::Sector(1));
+        app.editor.cutting = Some(vec![Vec3::new(0.25, 0.0, -20.0), Vec3::new(0.25, 0.0, 5.0)]);
+        app.edit(Field::Cut, 1.0);
+        let halves = app.editor.doc.sectors.len();
+        assert_eq!(halves, original.sectors.len() + 1);
+        // Both halves selected, cut across: each is.
+        let (lo, hi) = app.editor.sector_bounds(1);
+        let z = (lo.z + hi.z) / 2.0 + 0.125;
+        app.editor.select_all(vec![Selection::Sector(halves - 1), Selection::Sector(1)], false);
+        app.editor.cutting = Some(vec![Vec3::new(lo.x - 1.0, 0.0, z), Vec3::new(hi.x + 1.0, 0.0, z)]);
+        app.edit(Field::Cut, 1.0);
+        assert_eq!(app.editor.doc.sectors.len(), halves + 2);
+        // All four merged back into one (each pair convex together), as it was.
+        let four = vec![Selection::Sector(halves - 1), Selection::Sector(halves), Selection::Sector(halves + 1), Selection::Sector(1)];
+        app.editor.select_all(four, false);
+        app.edit(Field::MergeSelected, 1.0);
+        assert_eq!(app.editor.doc.sectors.len(), original.sectors.len(), "{:?}", app.editor.selected());
+        assert_eq!(app.editor.selection, Some(Selection::Sector(1)));
+        assert!(app.editor.multi.is_empty());
+    }
+
+    #[test]
+    fn a_moved_sector_takes_the_corners_it_shares_and_the_things_in_it() {
+        use editor::Selection;
+        let mut app = test_app("shiny_rooms.mmp");
+        let e = &mut app.editor;
+        let corners: Vec<usize> = e.doc.sector_surfaces(1).flat_map(|f| e.doc.surfaces[f].corners.iter().map(|c| c.0)).collect();
+        let shared = corners.iter().filter(|&&v| e.doc.sector_surfaces(0).any(|f| e.doc.surfaces[f].corners.iter().any(|c| c.0 == v))).count();
+        assert!(shared > 0, "the hallway opens onto room_a");
+        let before = e.doc.clone();
+        e.select_all(vec![Selection::Sector(1)], false);
+        let delta = Vec3::new(0.0, 0.5, 0.0);
+        e.move_selection(delta, &app.world).unwrap();
+        for &v in &corners {
+            assert_eq!(app.editor.doc.vertices[v], before.vertices[v] + delta);
+        }
+        for (l, light) in app.editor.doc.lights.iter().enumerate() {
+            let moved = if light.sector == 1 { delta } else { Vec3::ZERO };
+            assert_eq!(light.position, before.lights[l].position + moved);
+        }
+    }
+
+    #[test]
+    fn meta_values_are_added_renamed_and_removed_and_found_by_number() {
+        use editor::Selection;
+        use editor_panel::Owner;
+        let mut app = test_app("two_rooms.mmp");
+        let owner = Owner::Sector(0);
+        app.edit_with(|e, _| e.set_meta(owner, None, Some("wet"), Some("200")));
+        assert!(app.editor.doc.sectors[0].options.contains(&"$wet=200".to_string()));
+        app.edit_with(|e, _| e.set_meta(owner, Some(0), Some("damp"), None));
+        app.edit_with(|e, _| e.set_meta(owner, Some(0), None, Some("10,20,30")));
+        assert_eq!(app.editor.meta_values(owner), [("damp".to_string(), "10,20,30".to_string())]);
+        assert!(app.editor.set_meta(owner, Some(0), Some("has space"), None).is_err());
+        assert!(app.editor.set_meta(owner, Some(0), None, Some("wet")).is_err());
+        app.edit_with(|e, _| e.set_meta(owner, Some(0), None, None));
+        assert!(app.editor.meta_values(owner).is_empty());
+        assert!(app.editor.broken.is_none());
+        // Find by number (or name).
+        let e = &app.editor;
+        assert_eq!(e.find("sector 1"), Ok(Selection::Sector(1)));
+        assert_eq!(e.find("f3"), Ok(Selection::Surface(3)));
+        assert_eq!(e.find("vertex 2"), Ok(Selection::Vertex(2)));
+        assert_eq!(e.find(&e.doc.entities[0].name.clone()), Ok(Selection::Entity(0)));
+        assert!(e.find("sector 999").is_err() && e.find("nothing like it").is_err());
+    }
+
+    #[test]
+    fn clicking_again_in_a_2d_view_goes_down_through_what_is_there() {
+        use editor::{Mode, Selection, ViewMode};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.set_size(640, 360);
+        let e = &mut app.editor;
+        e.set_mode(Mode::Face);
+        e.view = ViewMode::Ortho(wire::Axis::TOP);
+        let (lo, hi) = e.sector_bounds(0);
+        e.ortho_center = (lo + hi) * 0.5;
+        let o = e.ortho(640, 360).unwrap();
+        let found = e.pick_2d_all(&o, &app.world, glam::Vec2::new(320.0, 180.0));
+        // Seen from above: the ceiling first (nearest), then the floor.
+        let normal_y = |s: &Selection| match s {
+            Selection::Surface(f) => e.doc.surface_normal(*f).y,
+            _ => 0.0,
+        };
+        assert!(found.len() >= 2, "{found:?}");
+        assert!(normal_y(&found[0]) < -0.9, "{found:?}");
+        assert!(found.iter().any(|s| normal_y(s) > 0.9));
+        // In sector mode, the same place is the sector, once.
+        e.set_mode(Mode::Sector);
+        let sectors = e.pick_2d_all(&o, &app.world, glam::Vec2::new(320.0, 180.0));
+        assert_eq!(sectors.iter().filter(|s| **s == Selection::Sector(0)).count(), 1);
+    }
+
+    #[test]
     fn a_cleaved_sector_merged_back_through_the_panel() {
         use editor::{Field, Pick, Selection, ViewMode};
         let mut app = test_app("shiny_rooms.mmp");
         app.editor.on = true;
         let original = app.editor.doc.clone();
         // The hallway cleaved lengthwise in the top view, then its new part merged back.
-        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.editor.view = ViewMode::Ortho(wire::Axis::TOP);
         app.editor.selection = Some(Selection::Sector(1));
         app.editor.cutting = Some(vec![Vec3::new(0.25, 0.0, -20.0), Vec3::new(0.25, 0.0, 5.0)]);
         app.edit(Field::Cut, 1.0);
@@ -3723,17 +4573,17 @@ mod tests {
         app.travel(false);
         assert_eq!(app.editor.doc.surfaces.len(), surfaces);
         assert_eq!(app.editor.hover, None);
-        draw_ui(&mut app, None, None, None, None, false);
+        draw_ui(&mut app, None, None, None, None, false, None);
         app.editor.panel();
         // Redone, the room is back, but what pointed into it isn't kept.
         app.travel(true);
         assert_eq!(app.editor.doc.surfaces.len(), surfaces + 6);
-        draw_ui(&mut app, None, None, None, None, false);
+        draw_ui(&mut app, None, None, None, None, false, None);
         // A stale one set by hand isn't drawn or listed either.
         app.travel(false);
         app.editor.hover = Some(Selection::Surface(last));
         app.editor.selection = Some(Selection::Vertex(10_000));
-        draw_ui(&mut app, None, None, None, None, false);
+        draw_ui(&mut app, None, None, None, None, false, None);
         app.editor.panel();
     }
 
@@ -3751,7 +4601,7 @@ mod tests {
             app.editor.selection = Some(Selection::Vertex(d.vertices.len() - 1));
         };
         let draw = |app: &mut App| {
-            draw_ui(app, None, None, None, None, false);
+            draw_ui(app, None, None, None, None, false, None);
             app.editor.panel();
         };
         // The edits the level accepted.
@@ -4019,7 +4869,7 @@ mod tests {
         assert!(matches!(app.editor.selection, Some(Selection::Surface(i)) if i != back));
         // Cut room_a in two in the top view, along x = 0.
         app.editor.selection = Some(Selection::Sector(0));
-        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.editor.view = ViewMode::Ortho(wire::Axis::TOP);
         app.edit(Field::Cleave, 1.0);
         assert!(!app.editor.cut_point(Vec3::new(0.0, 1.0, -5.0)));
         assert!(app.editor.cut_point(Vec3::new(0.0, 1.0, 20.0)));
@@ -4044,7 +4894,7 @@ mod tests {
         let mut app = test_app("two_rooms.mmp");
         app.editor.on = true;
         // room_a (x from -4 to 4, z from 0 to 8) in the top view, the finest grid.
-        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.editor.view = ViewMode::Ortho(wire::Axis::TOP);
         app.editor.ortho_center = Vec3::new(0.0, 0.0, 4.0);
         app.editor.step = 0;
         let (w, h) = (app.width as usize, app.height as usize);
@@ -4184,14 +5034,40 @@ mod tests {
     }
 
     #[test]
-    fn a_vertex_that_would_bend_a_surface_stays() {
+    fn a_vertex_that_bends_a_surface_is_kept_named_and_mended_by_splitting() {
         use editor::{Field, Selection};
         let mut app = test_app("two_rooms.mmp");
-        // Vertex 0 is a corner of room_a's floor (-4, 0, 8): raised, the floor bends.
+        // Vertex 0 is a corner of room_a's floor (-4, 0, 8): raised, the floor bends. The
+        // move is the artist's: kept, the level drawn as it last loaded, the problem named.
         app.editor.selection = Some(Selection::Vertex(0));
         let before = app.editor.doc.clone();
+        let polygons = app.assets.mesh(app.world.geometry).polygons.len();
         app.edit(Field::Y, 1.0);
-        assert_eq!(app.editor.doc, before, "refused: the floor isn't flat any more");
+        assert_ne!(app.editor.doc, before);
+        let why = app.editor.broken.clone().expect("the level won't load");
+        assert_eq!(why, "face 0 of sector 0: polygon is not planar");
+        // Undone, it loads again.
+        app.travel(false);
+        assert_eq!(app.editor.doc, before);
+        assert!(app.editor.broken.is_none());
+        // Redone, then the bent faces split into triangles: flat, and it loads.
+        app.travel(true);
+        let bent: Vec<usize> = (0..app.editor.doc.surfaces.len())
+            .filter(|&f| app.editor.doc.surfaces[f].corners.iter().any(|c| c.0 == 0) && app.editor.doc.surfaces[f].corners.len() > 3)
+            .collect();
+        app.editor.selection = None;
+        app.editor.select_all(bent.iter().map(|&f| Selection::Surface(f)).collect(), false);
+        app.edit(Field::Triangulate, 1.0);
+        // Every face is flat now (the floor raised there leaves the spawn point under it,
+        // which is the next thing to fix: the loader says so).
+        assert!(bent.iter().all(|&f| app.editor.doc.surfaces[f].corners.len() == 3));
+        let why = app.editor.broken.clone().unwrap_or_default();
+        assert!(!why.contains("planar"), "{why}");
+        // Lowered back, it all loads, in triangles.
+        app.editor.select_all(vec![Selection::Vertex(0)], false);
+        app.edit(Field::Y, -1.0);
+        assert!(app.editor.broken.is_none(), "{:?}", app.editor.broken);
+        assert!(app.assets.mesh(app.world.geometry).polygons.len() > polygons);
     }
 
     #[test]

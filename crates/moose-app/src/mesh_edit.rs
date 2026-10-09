@@ -142,21 +142,6 @@ impl ModelEdit {
         rows
     }
 
-    pub fn hints(&self) -> [String; 10] {
-        [
-            "Proxies are outlined in pink".to_string(),
-            "Click: pick a polygon".to_string(),
-            "P: pick proxies or drawn".to_string(),
-            "Scroll a row to change it".to_string(),
-            "Hold right: look".to_string(),
-            "Del: delete the polygon".to_string(),
-            "Ctrl Z/Y: undo/redo".to_string(),
-            "Ctrl S: save the model".to_string(),
-            "Esc or M: back to the level".to_string(),
-            "Tab: play".to_string(),
-        ]
-    }
-
     // ---- Changes
 
     /// Carries out `field` when it isn't an edit.

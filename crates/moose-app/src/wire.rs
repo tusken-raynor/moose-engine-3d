@@ -1,40 +1,82 @@
 //! Wireframes for the editor: every edge of the level and its entities, drawn through the
-//! 3D view (over the rendered frame) or through a 2D orthographic view (top, front or
-//! side) on a grid, as classic level editors show them.
+//! 3D view (over the rendered frame) or through a 2D orthographic view (top, bottom,
+//! front, back, left, right, or turned any way between) on a grid, as classic level
+//! editors show them.
 
-use glam::{Vec2, Vec3};
+use glam::{EulerRot, Quat, Vec2, Vec3};
 use moose_assets::Assets;
 use moose_scene::{View, World};
 
 use crate::ui::Canvas;
 
-/// Which way a 2D view looks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Axis {
-    /// Down, north (-Z) up the screen.
-    Top,
-    /// Along -Z.
-    Front,
-    /// Along -X.
-    Side,
+/// Which way a 2D view looks: turned `yaw` degrees about the world's up (left, from
+/// looking along -Z) and `pitch` degrees up (-90 looks straight down), as the camera turns.
+/// The six views along the world's axes have names (keys 1 to 6); the arrows turn a view
+/// from there, for looking at things from an angle (isometric views).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Axis {
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 impl Axis {
+    /// Down, north (-Z) up the screen.
+    pub const TOP: Axis = Axis { yaw: 0.0, pitch: -90.0 };
+    /// Up, south (+Z) up the screen.
+    pub const BOTTOM: Axis = Axis { yaw: 0.0, pitch: 90.0 };
+    /// Along -Z.
+    pub const FRONT: Axis = Axis { yaw: 0.0, pitch: 0.0 };
+    /// Along +Z.
+    pub const BACK: Axis = Axis { yaw: 180.0, pitch: 0.0 };
+    /// Along +X.
+    pub const LEFT: Axis = Axis { yaw: -90.0, pitch: 0.0 };
+    /// Along -X.
+    pub const RIGHT: Axis = Axis { yaw: 90.0, pitch: 0.0 };
+    /// The named views, in key order (1 to 6).
+    pub const NAMED: [(Axis, &'static str); 6] = [
+        (Axis::TOP, "top"),
+        (Axis::BOTTOM, "bottom"),
+        (Axis::FRONT, "front"),
+        (Axis::BACK, "back"),
+        (Axis::LEFT, "left"),
+        (Axis::RIGHT, "right"),
+    ];
+
+    fn rotation(self) -> Quat {
+        Quat::from_euler(EulerRot::YXZ, self.yaw.to_radians(), self.pitch.to_radians(), 0.0)
+    }
+
     /// The world directions of the screen's right and up.
     pub fn basis(self) -> (Vec3, Vec3) {
-        match self {
-            Axis::Top => (Vec3::X, Vec3::NEG_Z),
-            Axis::Front => (Vec3::X, Vec3::Y),
-            Axis::Side => (Vec3::NEG_Z, Vec3::Y),
+        let q = self.rotation();
+        (q * Vec3::X, q * Vec3::Y)
+    }
+
+    /// The way it looks (into the screen).
+    pub fn forward(self) -> Vec3 {
+        self.rotation() * Vec3::NEG_Z
+    }
+
+    /// Turned by `yaw` and `pitch` degrees (pitch kept within straight down and up).
+    pub fn turned(self, yaw: f32, pitch: f32) -> Axis {
+        Axis { yaw: (self.yaw + yaw).rem_euclid(360.0), pitch: (self.pitch + pitch).clamp(-90.0, 90.0) }
+    }
+
+    /// Its name: a named view's, or its angles.
+    pub fn name(self) -> String {
+        let same = |a: Axis| {
+            let d = (a.yaw - self.yaw).rem_euclid(360.0);
+            (!(0.01..=359.99).contains(&d) || a.pitch.abs() == 90.0) && (a.pitch - self.pitch).abs() < 0.01
+        };
+        match Axis::NAMED.iter().find(|(a, _)| same(*a)) {
+            Some((_, name)) => (*name).to_string(),
+            None => format!("2D {}° {}°", self.yaw.round(), self.pitch.round()),
         }
     }
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Axis::Top => "top",
-            Axis::Front => "front",
-            Axis::Side => "side",
-        }
+    /// The named view called `name`.
+    pub fn named(name: &str) -> Option<Axis> {
+        Axis::NAMED.iter().find(|(_, n)| *n == name).map(|&(a, _)| a)
     }
 }
 
@@ -163,36 +205,53 @@ pub fn outline(canvas: &mut Canvas, projection: &Projection, points: &[Vec3], co
 /// far enough apart to see, brighter every meter, and brightest along the world axes.
 pub fn draw_grid(canvas: &mut Canvas, ortho: &Ortho, step: f32) {
     canvas.fill(0, 0, canvas.width, canvas.height, 0x0010_1216);
-    let (right, up) = ortho.axis.basis();
-    let lo = ortho.to_world(0.0, ortho.height);
-    let hi = ortho.to_world(ortho.width, 0.0);
-    let span = |axis: Vec3| {
-        let (a, b) = (lo.dot(axis), hi.dot(axis));
-        (a.min(b), a.max(b))
+    // On the world plane that faces the view most squarely, through the view's center:
+    // the view's own plane when it looks along an axis, the floor seen from an angle.
+    let forward = ortho.axis.forward();
+    let a = forward.abs();
+    let (normal, u, v) = if a.y >= a.x && a.y >= a.z {
+        (Vec3::Y, Vec3::X, Vec3::Z)
+    } else if a.x >= a.z {
+        (Vec3::X, Vec3::Z, Vec3::Y)
+    } else {
+        (Vec3::Z, Vec3::X, Vec3::Y)
     };
-    for (axis, vertical) in [(right, true), (up, false)] {
-        let (a, b) = span(axis);
-        let mut step = step;
-        while step * ortho.scale < 6.0 {
-            step *= 2.0;
-        }
+    let facing = forward.dot(normal);
+    if facing.abs() < 0.2 {
+        // Edge-on: no grid to see.
+        return;
+    }
+    let level = ortho.center.dot(normal);
+    // The screen's corners on the plane, along the view.
+    let on_plane = |x: f32, y: f32| {
+        let p = ortho.to_world(x, y);
+        p + forward * ((level - p.dot(normal)) / facing)
+    };
+    let corners = [on_plane(0.0, 0.0), on_plane(ortho.width, 0.0), on_plane(0.0, ortho.height), on_plane(ortho.width, ortho.height)];
+    let span = |axis: Vec3| {
+        corners.iter().map(|c| c.dot(axis)).fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), t| (lo.min(t), hi.max(t)))
+    };
+    let (su, sv) = (span(u), span(v));
+    // As far apart on screen as the plane is foreshortened.
+    let mut step = step;
+    while step * ortho.scale * facing.abs() < 6.0 {
+        step *= 2.0;
+    }
+    for (along, (a, b), across) in [(u, su, sv), (v, sv, su)] {
         let mut k = (a / step).floor();
         while k * step <= b {
-            let v = k * step;
-            let color = if v.abs() < 1e-4 {
+            let t = k * step;
+            let color = if t.abs() < 1e-4 {
                 0x40_48_60
-            } else if (v - v.round()).abs() < 1e-4 {
+            } else if (t - t.round()).abs() < 1e-4 {
                 0x28_2C_34
             } else {
                 0x1A_1D_22
             };
-            let p = ortho.center + axis * (v - ortho.center.dot(axis));
-            let s = ortho.to_screen(p);
-            if vertical {
-                canvas.line(s.x, 0.0, s.x, ortho.height, color);
-            } else {
-                canvas.line(0.0, s.y, ortho.width, s.y, color);
-            }
+            let other = if along == u { v } else { u };
+            let base = normal * level + along * t;
+            let (from, to) = (ortho.to_screen(base + other * across.0), ortho.to_screen(base + other * across.1));
+            canvas.line(from.x, from.y, to.x, to.y, color);
             k += 1.0;
         }
     }
@@ -204,7 +263,7 @@ mod tests {
 
     #[test]
     fn two_d_views_map_the_world_both_ways() {
-        for axis in [Axis::Top, Axis::Front, Axis::Side] {
+        for axis in Axis::NAMED.map(|(a, _)| a).into_iter().chain([Axis::FRONT.turned(30.0, -35.0)]) {
             let o = Ortho {
                 axis,
                 center: Vec3::new(1.0, 2.0, 3.0),
@@ -218,6 +277,23 @@ mod tests {
             // Up the screen is up the view.
             let (_, up) = axis.basis();
             assert!(o.to_screen(o.center + up).y < 180.0);
+            // Into the screen is square to both.
+            let (right, up) = axis.basis();
+            assert!(axis.forward().dot(right).abs() < 1e-5 && axis.forward().dot(up).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn the_named_views_look_along_the_axes_and_turn_from_there() {
+        assert!((Axis::TOP.forward() - Vec3::NEG_Y).length() < 1e-5);
+        assert!((Axis::TOP.basis().1 - Vec3::NEG_Z).length() < 1e-5);
+        assert!((Axis::RIGHT.forward() - Vec3::NEG_X).length() < 1e-5);
+        assert!((Axis::LEFT.forward() - Vec3::X).length() < 1e-5);
+        assert!((Axis::BACK.forward() - Vec3::Z).length() < 1e-5);
+        assert!((Axis::BOTTOM.forward() - Vec3::Y).length() < 1e-5);
+        assert_eq!(Axis::FRONT.name(), "front");
+        assert_eq!(Axis::FRONT.turned(6.0, 0.0).name(), "2D 6° 0°");
+        assert_eq!(Axis::TOP.turned(0.0, -30.0), Axis::TOP);
+        assert_eq!(Axis::named("left"), Some(Axis::LEFT));
     }
 }
