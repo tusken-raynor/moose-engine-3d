@@ -91,6 +91,7 @@
 //! it is free.
 
 mod editor;
+mod material_edit;
 mod materials;
 mod mesh_edit;
 mod ui;
@@ -100,7 +101,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use moose_assets::{Assets, LevelDoc, Light, MATERIAL_SLOTS, ModelDoc, Ripples, Texture, TextureId};
+use moose_assets::{Assets, LevelDoc, Light, MATERIAL_SLOTS, MaterialLibrary, ModelDoc, Ripples, Texture, TextureId};
 use moose_present::{Display, Key, MouseButton};
 use materials::{FrameSettings, Materials, ShaderIds};
 use moose_raster::post::{Bloom, BloomConfig};
@@ -627,6 +628,8 @@ struct App {
     /// The levels in assets/levels (file names, sorted), and the one loaded.
     levels: Vec<String>,
     level: String,
+    /// The material being made or changed on the Material page (Esc > Materials).
+    material: Option<material_edit::Draft>,
     /// Seconds since the start: for the water's ripples and moving lights.
     time: f32,
     pixels: Vec<u32>,
@@ -638,11 +641,22 @@ struct App {
 
 impl App {
     fn new(options: &Options) -> Result<App, String> {
+        App::open(options, None)
+    }
+
+    /// The app on `options.level`: its file in assets/levels, or `src` (a new level, not
+    /// saved yet, to be saved there).
+    fn open(options: &Options, src: Option<String>) -> Result<App, String> {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
         let mut assets = Assets::new(root);
         assets.load_materials().map_err(|e| e.to_string())?;
+        let level_path = Path::new(root).join("levels").join(&options.level);
+        let level_src = match src {
+            Some(src) => src,
+            None => std::fs::read_to_string(&level_path).map_err(|e| format!("{}: {e}", level_path.display()))?,
+        };
         let level = assets
-            .load_level(&options.level)
+            .parse_level(&options.level, &level_src)
             .map_err(|e| e.to_string())?;
         let world = World::new(level, &assets);
         let viewport = Viewport {
@@ -678,8 +692,6 @@ impl App {
         let materials_names = materials.names().to_vec();
         let (level_filters, entity_filters) = binding_filters_of(&world)?;
         let cube_maps = vec![None; world.entities.len()];
-        let level_path = Path::new(root).join("levels").join(&options.level);
-        let level_src = std::fs::read_to_string(&level_path).map_err(|e| e.to_string())?;
         let doc = LevelDoc::parse(&level_path, &level_src).map_err(|e| e.to_string())?;
         let mut app = App {
             assets,
@@ -742,6 +754,7 @@ impl App {
             time: 0.0,
             levels: level_files(root),
             level: options.level.clone(),
+            material: None,
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -842,6 +855,26 @@ impl App {
                 self.editor.find_problem(&why);
                 self.editor.revert(before, &why);
             }
+        }
+    }
+
+    /// Sets editor field `field` to the number typed, `text` (a unit after it, `m` or `°`,
+    /// is let be), as an edit: undone in one step, refused if the level refuses it.
+    fn type_value(&mut self, field: editor::Field, text: &str) {
+        let number = text.trim().trim_end_matches(['m', '°']).trim();
+        if number.is_empty() {
+            self.editor.say("not set");
+            return;
+        }
+        let Some(value) = number.parse::<f32>().ok().filter(|v| v.is_finite()) else {
+            self.editor.say(format!("'{number}' is not a number"));
+            return;
+        };
+        let before = self.editor.begin();
+        let result = self.editor.set_typed(field, value).and_then(|what| self.rebuild().map(|()| what));
+        match result {
+            Ok(what) => self.editor.commit(before, &what),
+            Err(why) => self.editor.revert(before, &why),
         }
     }
 
@@ -1064,8 +1097,15 @@ impl App {
     /// Reads the material files anew, and rebuilds the level with them; if they are refused
     /// (or the level is, with them), keeps the materials as they were.
     fn reload_materials(&mut self) -> Result<(), String> {
+        let library = MaterialLibrary::load(&self.assets.root().join("materials")).map_err(|e| e.to_string())?;
+        self.apply_materials(library)
+    }
+
+    /// Draws with `library` from now on, and rebuilds the level with it; if it is refused
+    /// (or the level is, with it), keeps the materials as they were.
+    fn apply_materials(&mut self, library: MaterialLibrary) -> Result<(), String> {
         let old = self.assets.materials().clone();
-        self.assets.load_materials().map_err(|e| e.to_string())?;
+        self.assets.set_materials(library);
         let result = Materials::compile(&mut self.assets, &self.ripples).and_then(|materials| {
             let before = std::mem::replace(&mut self.materials, materials);
             self.rebuild().inspect_err(|_| self.materials = before)
@@ -1084,20 +1124,72 @@ impl App {
         }
     }
 
-    /// Writes the editor's tables to the level's file.
-    fn save_level(&mut self) {
+    /// Saves the Material page's draft as its file, `NAME.mmat`: checked first with every
+    /// other material (the files beside it), as they would be with it (an error leaves the
+    /// files as they were), then drawn with from then on.
+    fn save_material(&mut self) -> Result<String, String> {
+        let draft = self.material.as_ref().ok_or("no material to save")?;
+        let (def, comments, new) = (draft.cleaned(), draft.comments.clone(), draft.new);
+        moose_assets::check_material_name(&def.name)?;
+        if new && def.file.exists() {
+            return Err(format!("there is already a material '{}' ({})", def.name, def.file.display()));
+        }
+        let text = def.to_text(&comments);
+        let mut library = MaterialLibrary::default();
+        let dir = def.file.parent().unwrap_or(Path::new("."));
+        for file in material_files_in(dir).into_iter().filter(|f| *f != def.file) {
+            let src = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            library.add_file(&file, &src).map_err(|e| e.to_string())?;
+        }
+        library.add_file(&def.file, &text).map_err(|e| e.to_string())?;
+        self.apply_materials(library)?;
+        std::fs::write(&def.file, &text).map_err(|e| format!("{}: {e}", def.file.display()))?;
+        // Not a change to reload.
+        if let Ok(modified) = std::fs::metadata(&def.file).and_then(|m| m.modified()) {
+            self.watched.insert(def.file.clone(), modified);
+        }
+        // The draft as the file now has it.
+        let library = self.assets.materials();
+        let saved = library.get(library.id(&def.name).ok_or("the material went missing")?);
+        let said = format!("saved {}.mmat", saved.name);
+        self.material = Some(material_edit::Draft::of(saved, comments));
+        Ok(said)
+    }
+
+    /// A draft of material `id`, for the Material page, with its file's top comments.
+    fn material_draft(&self, id: u32) -> material_edit::Draft {
+        let def = self.assets.materials().get(id);
+        let comments = std::fs::read_to_string(&def.file).map(|src| moose_assets::material_comments(&src)).unwrap_or_default();
+        material_edit::Draft::of(def, comments)
+    }
+
+    /// The meta keys and light names the level has, for the Material page's hints.
+    fn known(&self) -> material_edit::Known {
+        let keys = &self.world.meta_keys;
+        material_edit::Known {
+            keys: (0..keys.len() as u16).map(|k| keys.name(k).to_string()).collect(),
+            lights: self.world.light_names.iter().flatten().cloned().collect(),
+        }
+    }
+
+    /// Writes the editor's tables to the level's file, and says how it went.
+    fn save_level(&mut self) -> String {
         let path = self.editor.path.clone();
-        match std::fs::write(&path, self.editor.doc.to_text()) {
+        let said = match std::fs::write(&path, self.editor.doc.to_text()) {
             Ok(()) => {
                 // Not a change to reload.
                 if let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) {
                     self.watched.insert(path.clone(), modified);
                 }
                 self.editor.mark_saved();
-                self.editor.say(format!("saved {}", path.display()));
+                // A new level is in the list now.
+                self.levels = level_files(&self.assets.root().to_string_lossy());
+                format!("saved {}", path.display())
             }
-            Err(e) => self.editor.say(format!("cannot save {}: {e}", path.display())),
-        }
+            Err(e) => format!("cannot save {}: {e}", path.display()),
+        };
+        self.editor.say(said.clone());
+        said
     }
 
     /// Moves the animated models and the water to `time` seconds, redrawing the water's
@@ -1222,6 +1314,7 @@ impl App {
             light.radius = FLASHLIGHT_RADIUS * self.settings.softness;
             light.beam = self.settings.cone == Cone::Beam;
             light.coarse = self.settings.cone == Cone::Soft;
+            light.id = moose_assets::FLASHLIGHT_ID;
             lights.push(light);
         }
         self.world.set_lights(lights, self.lights.1);
@@ -1275,6 +1368,27 @@ impl App {
         self.items(page)
             .iter()
             .map(|&item| match item {
+                Item::NewLevel => ui::Row { label: "New level".into(), value: Some("10x5x10 m room".into()) },
+                Item::SaveLevel => {
+                    let file = self.editor.path.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+                    let state = if !self.editor.path.exists() {
+                        "new, not saved"
+                    } else if self.editor.dirty() {
+                        "unsaved changes"
+                    } else {
+                        "saved"
+                    };
+                    ui::Row { label: format!("Save level ({file})"), value: Some(state.into()) }
+                }
+                Item::NewMaterial => ui::Row { label: "New material".into(), value: None },
+                Item::EditMaterial(i) => {
+                    let def = self.assets.materials().get(i as u32);
+                    ui::Row { label: def.name.clone(), value: Some(def.shader.clone()) }
+                }
+                Item::MaterialRow(row) => match &self.material {
+                    Some(draft) => ui::Row { label: draft.label(row), value: draft.value(row, &self.known()) },
+                    None => ui::Row { label: String::new(), value: None },
+                },
                 Item::Load(i) => {
                     let name = &self.levels[i as usize];
                     ui::Row {
@@ -1299,7 +1413,17 @@ impl App {
     /// A menu page's items: the page's own, or for the level list, one per level file.
     fn items(&self, page: Page) -> Vec<Item> {
         match page {
-            Page::Levels => (0..self.levels.len() as u16).map(Item::Load).collect(),
+            Page::Levels => [Item::NewLevel, Item::SaveLevel]
+                .into_iter()
+                .chain((0..self.levels.len() as u16).map(Item::Load))
+                .collect(),
+            Page::Materials => std::iter::once(Item::NewMaterial)
+                .chain((0..self.assets.materials().len() as u16).map(Item::EditMaterial))
+                .collect(),
+            Page::Material => self
+                .material
+                .as_ref()
+                .map_or(Vec::new(), |d| d.rows().into_iter().map(Item::MaterialRow).collect()),
             _ => page.items().to_vec(),
         }
     }
@@ -1673,6 +1797,51 @@ impl App {
         times
     }
 
+    /// What the player's settings say this frame, for resolving materials.
+    fn frame_settings(&self) -> FrameSettings {
+        let s = &self.settings;
+        // The sky box's params: toward the sun, its tint and size, whether there is one,
+        // whether to write how far past white for the bloom.
+        let sun = self.world.directional.first().filter(|_| s.sun);
+        let (toward, tint, radius) = match sun {
+            Some(d) => (
+                -d.direction.normalize(),
+                d.color / d.color.max_element().max(1e-6),
+                (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
+            ),
+            None => (Vec3::Y, Vec3::ONE, 0.0),
+        };
+        FrameSettings {
+            water: s.water,
+            translucent: s.translucent_crates,
+            simple_sky: s.sky == SkyStyle::Flat,
+            bump: s.bump == Bump::Normal,
+            specular: s.specular,
+            reflectance: s.reflectance,
+            fade: s.fade_range,
+            sun: Params::new(&[
+                toward.x,
+                toward.y,
+                toward.z,
+                tint.x,
+                tint.y,
+                tint.z,
+                radius,
+                if sun.is_some() { 1.0 } else { 0.0 },
+                if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
+            ]),
+            // The level's lights as they are now: black while they're off (the sun with
+            // its own setting).
+            lights: self
+                .lights
+                .0
+                .iter()
+                .take(self.world.light_names.len())
+                .map(|l| if s.lit && if l.directional { s.sun } else { s.level_lights } { l.color } else { Vec3::ZERO })
+                .collect(),
+        }
+    }
+
     /// Renders what `camera` sees into `pixels` (`width` x `height`, holding the camera's
     /// viewport), returning (view ms, raster ms).
     fn draw(
@@ -1687,41 +1856,8 @@ impl App {
         self.geometry.build(&self.world, &self.assets, &view);
         let t1 = Instant::now();
         let s = &self.settings;
-        // The sky box's params: toward the sun, its tint and size, whether there is one,
-        // whether to write how far past white for the bloom.
-        let sun = self.world.directional.first().filter(|_| s.sun);
-        let (toward, tint, radius) = match sun {
-            Some(d) => (
-                -d.direction.normalize(),
-                d.color / d.color.max_element().max(1e-6),
-                (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
-            ),
-            None => (Vec3::Y, Vec3::ONE, 0.0),
-        };
         // Each material's surface this frame, under the player's settings.
-        let table = self.materials.table(
-            &self.shaders,
-            &FrameSettings {
-                water: s.water,
-                translucent: s.translucent_crates,
-                simple_sky: s.sky == SkyStyle::Flat,
-                bump: s.bump == Bump::Normal,
-                specular: s.specular,
-                reflectance: s.reflectance,
-                fade: s.fade_range,
-                sun: Params::new(&[
-                    toward.x,
-                    toward.y,
-                    toward.z,
-                    tint.x,
-                    tint.y,
-                    tint.z,
-                    radius,
-                    if sun.is_some() { 1.0 } else { 0.0 },
-                    if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
-                ]),
-            },
-        );
+        let table = self.materials.table(&self.shaders, &self.frame_settings(), &self.world);
         let (world, assets, shaders) = (&self.world, &self.assets, &self.shaders);
         let (level, cube_maps) = (assets.mesh(world.geometry), &self.cube_maps);
         let (level_filters, entity_filters) = (&self.level_filters, &self.entity_filters);
@@ -1734,22 +1870,32 @@ impl App {
         // What each polygon is drawn with: its binding's material in its scenario (its
         // reflection drawn under it, or seen in a mirror), or its vertex colors.
         let surface_of = |p: &moose_view::ViewPolygon| -> Surface {
-            let (binding, filters, entity) = match p.source {
-                PolygonSource::World { polygon, .. } => {
+            // Its binding, and where it is (for the inputs read there).
+            let (binding, filters, entity, place) = match p.source {
+                PolygonSource::World { polygon, sector } => {
                     let b = level.polygons[polygon as usize].material;
-                    (world.bindings.get(b as usize), level_filters.get(b as usize), None)
+                    let place = materials::Place { face: Some(polygon), sector: Some(sector), entity: None };
+                    (world.bindings.get(b as usize), level_filters.get(b as usize), None, place)
                 }
-                PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => (
-                    world.entities[entity as usize].binding.as_ref(),
-                    entity_filters.get(entity as usize),
-                    Some(entity as usize),
-                ),
+                PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => {
+                    let sector = match p.source {
+                        PolygonSource::Terrain { sector, .. } => sector,
+                        _ => world.entities[entity as usize].sector,
+                    };
+                    let place = materials::Place { face: None, sector: Some(sector), entity: Some(entity) };
+                    (
+                        world.entities[entity as usize].binding.as_ref(),
+                        entity_filters.get(entity as usize),
+                        Some(entity as usize),
+                        place,
+                    )
+                }
             };
             let mut surface = match binding {
                 Some(b) => {
                     let r = table.get(b.material, p.reflection.is_some(), p.mirror.is_some());
                     let mesh = assets.mesh(p.mesh);
-                    let mut surface = r.surface;
+                    let mut surface = table.surface(r, place, world);
                     if r.attribs.iter().any(|&a| mesh.attrib(a).is_none()) {
                         // A mesh without what its shader reads is drawn plain.
                         shaders.plain()
@@ -1776,11 +1922,18 @@ impl App {
                     }
                 }
             }
+            // The lights it isn't lit by: its face's (with its sector's), or its entity's.
+            surface.excluded_lights = match (place.face, entity) {
+                (Some(f), _) => world.face_excluded_lights.get(f as usize).copied().unwrap_or(0),
+                (None, Some(e)) => world.entities[e].excluded_lights,
+                (None, None) => 0,
+            };
             if per_pixel && entity.is_some() && !matches!(p.source, PolygonSource::Terrain { .. }) {
                 surface.path_override = Some(RasterPath::PerPixel);
             }
             surface
         };
+        self.renderer.time = self.time;
         self.renderer
             .render(&mut target, camera.viewport, &self.geometry, &self.assets, surface_of)
             .map_err(|e| e.to_string())?;
@@ -1837,6 +1990,19 @@ fn model_files(assets: &str) -> Vec<String> {
     names
 }
 
+/// The material files (`.mmat`) in `dir`, sorted.
+fn material_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "mmat"))
+        .collect();
+    files.sort();
+    files
+}
+
 fn level_files(assets: &str) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(Path::new(assets).join("levels"))
         .into_iter()
@@ -1882,6 +2048,10 @@ fn cycle(list: &[f32], now: f32, dir: i32) -> f32 {
 enum Page {
     Main,
     Levels,
+    /// The materials, to change one or make a new one.
+    Materials,
+    /// The material creator, on `App::material`.
+    Material,
     Lighting,
     Flashlight,
     Rendering,
@@ -1899,6 +2069,14 @@ enum Item {
     Set(Setting),
     /// Load a level: an index into `App::levels`.
     Load(u16),
+    /// Make a new level (named by typing), and save the one loaded.
+    NewLevel,
+    SaveLevel,
+    /// Open the material creator on a new material, or on one in the library (an id).
+    NewMaterial,
+    EditMaterial(u16),
+    /// A row of the material creator.
+    MaterialRow(material_edit::Row),
 }
 
 /// A setting the menu shows and changes.
@@ -1941,9 +2119,11 @@ enum Setting {
 }
 
 impl Page {
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 9] = [
         Page::Main,
         Page::Levels,
+        Page::Materials,
+        Page::Material,
         Page::Lighting,
         Page::Flashlight,
         Page::Rendering,
@@ -1955,6 +2135,8 @@ impl Page {
         match self {
             Page::Main => "main",
             Page::Levels => "levels",
+            Page::Materials => "materials",
+            Page::Material => "material",
             Page::Lighting => "lighting",
             Page::Flashlight => "flashlight",
             Page::Rendering => "rendering",
@@ -1971,6 +2153,8 @@ impl Page {
         match self {
             Page::Main => "Moose",
             Page::Levels => "Levels",
+            Page::Materials => "Materials",
+            Page::Material => "Material",
             Page::Lighting => "Lighting",
             Page::Flashlight => "Flashlight",
             Page::Rendering => "Rendering",
@@ -1986,6 +2170,7 @@ impl Page {
             Page::Main => &[
                 Resume,
                 Open(Page::Levels),
+                Open(Page::Materials),
                 Open(Page::Lighting),
                 Open(Page::Flashlight),
                 Open(Page::Rendering),
@@ -2035,8 +2220,9 @@ impl Page {
                 Set(PenumbraThreshold),
             ],
             Page::Controls => &[Set(MouseSmoothing), Set(Hud)],
-            // The levels found in assets/levels (see `App::items`).
-            Page::Levels => &[],
+            // The levels found in assets/levels, the materials, and a material's rows (see
+            // `App::items`).
+            Page::Levels | Page::Materials | Page::Material => &[],
         }
     }
 
@@ -2056,7 +2242,18 @@ impl Page {
                 "to see its shadows. U does it from anywhere.",
             ],
             Page::Sampling => &["How shading is sampled: for tuning and debugging."],
-            Page::Levels => &["Settings carry over; you start at its spawn."],
+            Page::Levels => &[
+                "Settings carry over; you start at its spawn.",
+                "Ctrl+S in the editor (Tab) saves the level too.",
+            ],
+            Page::Materials => &["Enter opens one in the material creator."],
+            Page::Material => &[
+                "A material is its own file, NAME.mmat.",
+                "Left/Right steps an input's source: a number, a setting,",
+                "or a face's, sector's, entity's, the level's or a light's",
+                "value; Enter types its value, key or light's name.",
+                "Renamed, a material is saved as a new one (a copy).",
+            ],
             _ => &[],
         }
     }
@@ -2069,6 +2266,10 @@ impl Item {
             Item::Respawn => "Back to spawn",
             Item::Quit => "Quit",
             Item::Load(_) => "Load level",
+            Item::NewLevel => "New level",
+            Item::SaveLevel => "Save level",
+            Item::NewMaterial => "New material",
+            Item::EditMaterial(_) | Item::MaterialRow(_) => "Material",
             Item::Open(page) => match page {
                 Page::Lighting => "Lighting",
                 Page::Flashlight => "Flashlight",
@@ -2076,6 +2277,8 @@ impl Item {
                 Page::Sampling => "Sampling (debug)",
                 Page::Controls => "Controls",
                 Page::Levels => "Levels",
+                Page::Materials => "Materials",
+                Page::Material => "Material",
                 Page::Main => "Back",
             },
             Item::Set(s) => match s {
@@ -2140,9 +2343,12 @@ fn bindings_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/moose/keys.txt"))
 }
 
+/// Per binding, its slots' samplers (`None`: the material's).
+type BindingFilters = Vec<[Option<u8>; MATERIAL_SLOTS]>;
+
 /// Every setting the menu has.
 /// Sampler overrides (`filterN=`) of the level's bindings and of each entity's, by slot.
-fn binding_filters_of(world: &World) -> Result<(Vec<[Option<u8>; MATERIAL_SLOTS]>, Vec<[Option<u8>; MATERIAL_SLOTS]>), String> {
+fn binding_filters_of(world: &World) -> Result<(BindingFilters, BindingFilters), String> {
     let level = world.bindings.iter().map(materials::binding_filters).collect::<Result<Vec<_>, _>>()?;
     let entities = world
         .entities
@@ -2207,11 +2413,25 @@ struct Menu {
     back: Vec<(Page, usize)>,
     /// The setting waiting for a key to bind (B pressed on it).
     binding: Option<Setting>,
+    /// A row being typed on (Enter on it), and the text so far.
+    typing: Option<(Item, String)>,
 }
 
 /// Draws the menu page or the HUD over the app's frame, as the settings say.
-fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, binding: Option<Setting>, hud: Option<Vec<String>>) {
-    let rows = menu.map(|(page, _)| app.rows(page));
+fn draw_ui(
+    app: &mut App,
+    menu: Option<(Page, usize)>,
+    binding: Option<Setting>,
+    typing: Option<&str>,
+    hud: Option<Vec<String>>,
+) {
+    let mut rows = menu.map(|(page, _)| app.rows(page));
+    // The row being typed on shows the text so far.
+    if let (Some(rows), Some((_, selected)), Some(text)) = (&mut rows, menu, typing)
+        && let Some(row) = rows.get_mut(selected)
+    {
+        row.value = Some(format!("{text}_"));
+    }
     let mut canvas = ui::Canvas {
         pixels: &mut app.pixels,
         width: app.width as usize,
@@ -2229,13 +2449,17 @@ fn draw_ui(app: &mut App, menu: Option<(Page, usize)>, binding: Option<Setting>,
     }
     if let (Some((page, selected)), Some(rows)) = (menu, rows) {
         let hint = match (page, binding) {
+            _ if typing.is_some() => "Type   Enter done   Esc cancel".into(),
             (_, Some(setting)) => format!("Press a key for {}   Esc cancels", Item::Set(setting).label()),
             (Page::Main, _) => "Up/Down choose   Enter pick   Esc close".into(),
             (Page::Levels, _) => "Up/Down choose   Enter load   Backspace back".into(),
+            (Page::Materials, _) => "Up/Down choose   Enter open   Backspace back".into(),
+            (Page::Material, _) => "Up/Down choose   Left/Right change   Enter type   Backspace back".into(),
             _ => "Up/Down choose   Left/Right change   B bind a key   Backspace back".into(),
         };
         ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), &hint);
-    } else if let Some((text, at)) = &app.toast
+    }
+    if let Some((text, at)) = &app.toast
         && at.elapsed() < Duration::from_secs(2)
     {
         ui::draw_toast(&mut canvas, text);
@@ -2314,6 +2538,8 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     let down = |keys: &[Key]| keys.iter().any(|&k| display.key_down(k));
     let ctrl = down(&[Key::LeftCtrl, Key::RightCtrl, Key::LeftSuper, Key::RightSuper]);
     let shift = down(&[Key::LeftShift, Key::RightShift]);
+    // Alt (Option): texture rows step finely.
+    app.editor.fine = down(&[Key::LeftAlt, Key::RightAlt]);
     let cursor = display.cursor_position();
     let over_panel = cursor.is_some_and(|(x, _)| app.editor.over_panel(x, w, h));
     if display.key_pressed(Key::F5) {
@@ -2325,6 +2551,7 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         }
         app.editor.view = app.editor.view.next();
         app.editor.hover = None;
+        app.editor.face_cut = None;
     }
     if !ctrl && display.key_pressed(Key::V) {
         app.editor.vertices = !app.editor.vertices;
@@ -2340,8 +2567,10 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         Some(o) => o.center,
         None => app.camera.position + app.camera.forward() * 3.0,
     };
+    // Where a cleave's end would go (and its preview runs to): on the grid, or with Ctrl
+    // (Cmd) on the nearest vertex.
     app.editor.pointer = match (&ortho, cursor) {
-        (Some(o), Some((x, y))) => Some(o.to_world(x, y)),
+        (Some(o), Some((x, y))) => Some(app.editor.cut_snap(o, glam::Vec2::new(x, y), ctrl)),
         _ => None,
     };
     if app.editor.model.is_some() {
@@ -2365,16 +2594,50 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         }
         _ => None,
     };
+    // A line dragged across the selected surface in a 2D view cuts it (Ctrl: its ends on
+    // vertices). The press only starts it; a release without a drag is a click.
+    let mut deferred = false;
+    if let (Some(o), Some((x, y))) = (&ortho, cursor) {
+        let at = glam::Vec2::new(x, y);
+        let snapped = app.editor.cut_snap(o, at, ctrl);
+        let can_cut = matches!(app.editor.selection, Some(Selection::Surface(_)))
+            && app.editor.picking.is_none()
+            && app.editor.cutting.is_none()
+            && !over_panel;
+        if can_cut && display.mouse_clicked(MouseButton::Left) {
+            app.editor.face_cut = Some(editor::FaceCut { from: snapped, to: snapped, pressed: at });
+            deferred = true;
+        } else if let Some(cut) = &mut app.editor.face_cut {
+            if display.mouse_down(MouseButton::Left) {
+                cut.to = snapped;
+            } else if cut.pressed.distance(at) > 4.0 {
+                app.edit(Field::CutFace, 1.0);
+            } else {
+                // Not dragged: a click, which selects.
+                app.editor.face_cut = None;
+                app.editor.selection = app.editor.hover;
+            }
+        }
+    }
     // The panel row under the pointer, and what it changes.
     let row_field = cursor
         .filter(|_| over_panel)
         .and_then(|(x, y)| app.editor.row_at(x, y, w, h))
         .and_then(|k| app.editor.panel()[k].field);
-    if display.mouse_clicked(MouseButton::Left) {
+    if display.mouse_clicked(MouseButton::Left) && !deferred {
         if over_panel {
-            if let Some(field) = row_field {
-                app.edit(field, 1.0);
+            match row_field {
+                // A number to type (Enter sets it, Esc drops it).
+                Some(field) if field.typed() && app.editor.texture_mapping_selected() => {
+                    app.editor.typing = Some((field, String::new()));
+                    app.editor.say("type a number: Enter sets it, Esc drops it");
+                }
+                Some(field) => app.edit(field, 1.0),
+                None => {}
             }
+        } else if app.editor.picking.is_some() {
+            // The surface clicked is the one to stitch from or merge in.
+            app.edit(Field::Picked, 1.0);
         } else if app.editor.cutting.is_some() {
             match (app.editor.pointer, cursor) {
                 (Some(p), Some(_)) => {
@@ -2387,6 +2650,11 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
         } else if cursor.is_some() {
             app.editor.selection = app.editor.hover;
         }
+    }
+    // Choosing the face to stitch from, a right click stitches mirrored (rather than
+    // starting to look around).
+    if display.mouse_clicked(MouseButton::Right) && !over_panel && cursor.is_some() && app.editor.picking.is_some() {
+        app.edit(Field::PickedMirrored, 1.0);
     }
     let scroll = display.scroll();
     if scroll != 0.0
@@ -2589,6 +2857,50 @@ fn main() {
     }
 }
 
+/// Swaps `app` for a new one on `level` (its file, or `src` for a new level not saved
+/// yet), with this one's settings.
+fn switch_level(
+    app: &mut App,
+    options: &mut Options,
+    level: String,
+    src: Option<String>,
+    display: &mut Display,
+) -> Result<(), String> {
+    let mut next = options.clone();
+    next.level = level;
+    (next.at, next.lock_flashlight, next.flashlight_at) = (None, None, None);
+    let mut loaded = App::open(&next, src)?;
+    loaded.settings = Settings {
+        flashlight_lock: None,
+        ..app.settings
+    };
+    loaded.renderer.config = app.renderer.config;
+    loaded.geometry.config = app.geometry.config;
+    loaded.start_size = app.start_size;
+    loaded.set_size(app.width, app.height);
+    *app = loaded;
+    *options = next;
+    display.set_title(&format!("Moose - {}", app.world.name));
+    Ok(())
+}
+
+/// Starts a new level named `name` (its file `name.mmp` in assets/levels, written when it
+/// is saved): one room of the default material (see `editor::new_level_doc`).
+fn new_level(app: &mut App, options: &mut Options, name: &str, display: &mut Display) -> Result<(), String> {
+    let name = name.trim().trim_end_matches(".mmp");
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
+        return Err("a level's name is letters, digits, '_' and '-'".into());
+    }
+    let file = format!("{name}.mmp");
+    if app.assets.root().join("levels").join(&file).exists() {
+        return Err(format!("there is already a level {file}"));
+    }
+    let src = editor::new_level_doc(name)?.to_text();
+    switch_level(app, options, file.clone(), Some(src), display)?;
+    app.toast = Some((format!("new level {file}: not saved yet (Levels > Save level)"), Instant::now()));
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut options = parse_args()?;
     let mut app = App::new(&options)?;
@@ -2670,7 +2982,13 @@ fn run() -> Result<(), String> {
             );
         }
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
-        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, hud);
+        if options.menu == Some(Page::Material) {
+            app.material = Some(material_edit::Draft::new_material(
+                &app.assets.root().join("materials"),
+                app.materials.names(),
+            ));
+        }
+        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, None, hud);
         app.save_png(Path::new(path))?;
         println!(
             "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
@@ -2696,6 +3014,7 @@ fn run() -> Result<(), String> {
         selected: 0,
         back: Vec::new(),
         binding: None,
+        typing: None,
     };
     // Frame rate and times, averaged over half a second for the HUD.
     let (mut stats_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
@@ -2718,12 +3037,23 @@ fn run() -> Result<(), String> {
             // editor, drops the polygon, then leaves it. While binding a key, it cancels.
             if menu.open && menu.binding.is_some() {
                 menu.binding = None;
+            } else if menu.open && menu.typing.is_some() {
+                menu.typing = None;
             } else if app.editor.on && !menu.open && let Some(model) = &mut app.editor.model {
                 if model.polygon.is_some() {
                     model.polygon = None;
                 } else {
                     app.edit(editor::Field::EditModel, 1.0);
                 }
+            } else if app.editor.on && !menu.open && app.editor.typing.is_some() {
+                app.editor.typing = None;
+                app.editor.say("not set");
+            } else if app.editor.on && !menu.open && app.editor.face_cut.is_some() {
+                app.editor.face_cut = None;
+                app.editor.say("cut stopped");
+            } else if app.editor.on && !menu.open && app.editor.picking.is_some() {
+                app.editor.picking = None;
+                app.editor.say("stopped");
             } else if app.editor.on && !menu.open && app.editor.cutting.is_some() {
                 app.editor.cutting = None;
                 app.editor.say("cut stopped");
@@ -2735,7 +3065,7 @@ fn run() -> Result<(), String> {
                 menu.back.clear();
             }
         }
-        if !menu.open && display.key_pressed(Key::Tab) {
+        if !menu.open && app.editor.typing.is_none() && display.key_pressed(Key::Tab) {
             app.editor.on = !app.editor.on;
             app.editor.hover = None;
         }
@@ -2748,7 +3078,10 @@ fn run() -> Result<(), String> {
         }
         // Mouse look while playing, and in the editor while the right button is held; a
         // free pointer otherwise.
-        let looking = !menu.open && (!app.editor.on || display.mouse_down(MouseButton::Right));
+        // (Not while a face is being picked: there the right button is a click, a mirrored
+        // stitch, which needs the pointer where it is.)
+        let looking = !menu.open
+            && (!app.editor.on || (display.mouse_down(MouseButton::Right) && app.editor.picking.is_none()));
         display.set_cursor_locked(looking);
         if let Some(setting) = menu.binding.filter(|_| menu.open) {
             // Waiting for a key to bind: the first one pressed (Esc cancels, above).
@@ -2759,11 +3092,47 @@ fn run() -> Result<(), String> {
                 app.toast = Some((said, Instant::now()));
                 menu.binding = None;
             }
+        } else if menu.open && let Some((item, text)) = &mut menu.typing {
+            // Typing on a row: Enter takes it, Esc drops it (above).
+            display.mouse_delta();
+            look.clear();
+            text.push_str(display.text());
+            if display.key_repeated(Key::Backspace) {
+                text.pop();
+            }
+            if display.key_pressed(Key::Enter) && !alt {
+                let (item, text) = (*item, std::mem::take(text));
+                menu.typing = None;
+                match item {
+                    Item::NewLevel => match new_level(&mut app, &mut options, &text, &mut display) {
+                        Ok(()) => {
+                            menu.open = false;
+                            look.clear();
+                        }
+                        Err(e) => app.toast = Some((e, Instant::now())),
+                    },
+                    Item::MaterialRow(row) => {
+                        let names = app.materials.names().to_vec();
+                        if let Some(draft) = &mut app.material {
+                            let said = draft.typed(row, &text, &names);
+                            draft.status = Some(said.unwrap_or_else(|e| e)).filter(|s| !s.is_empty());
+                        }
+                    }
+                    _ => {}
+                }
+            }
         } else if menu.open {
             // The menu has the keys; the view holds still (the pointer's motion is dropped).
             display.mouse_delta();
             look.clear();
             let items = app.items(menu.page);
+            if items.is_empty() {
+                // A page with nothing on it (the material creator without a material).
+                (menu.page, menu.selected) = menu.back.pop().unwrap_or((Page::Main, 0));
+                continue;
+            }
+            // Rows come and go on the material page (its shaders read different things).
+            menu.selected = menu.selected.min(items.len() - 1);
             if display.key_repeated(Key::Up) {
                 menu.selected = (menu.selected + items.len() - 1) % items.len();
             }
@@ -2780,6 +3149,12 @@ fn run() -> Result<(), String> {
             };
             if let (Item::Set(setting), true) = (item, dir != 0) {
                 app.change(setting, dir);
+            }
+            if let (Item::MaterialRow(row), true) = (item, dir != 0) {
+                let textures = material_edit::texture_choices(&app.assets.root().join("textures"));
+                if let Some(draft) = &mut app.material {
+                    draft.status = draft.step(row, dir, &textures).err();
+                }
             }
             // B binds a key to the setting (as Enter on it), Delete unbinds it.
             if let Item::Set(setting) = item {
@@ -2804,27 +3179,50 @@ fn run() -> Result<(), String> {
                     }
                     Item::Set(setting) => app.change(setting, 1),
                     Item::Load(i) => {
-                        // A new app on the level, with this one's settings.
-                        let mut next = options.clone();
-                        next.level = app.levels[i as usize].clone();
-                        (next.at, next.lock_flashlight, next.flashlight_at) = (None, None, None);
-                        match App::new(&next) {
-                            Ok(mut loaded) => {
-                                loaded.settings = Settings {
-                                    flashlight_lock: None,
-                                    ..app.settings
-                                };
-                                loaded.renderer.config = app.renderer.config;
-                                loaded.geometry.config = app.geometry.config;
-                                loaded.start_size = app.start_size;
-                                loaded.set_size(app.width, app.height);
-                                app = loaded;
-                                options = next;
-                                display.set_title(&format!("Moose - {}", app.world.name));
+                        let level = app.levels[i as usize].clone();
+                        match switch_level(&mut app, &mut options, level.clone(), None, &mut display) {
+                            Ok(()) => {
                                 menu.open = false;
                                 look.clear();
                             }
-                            Err(e) => eprintln!("cannot load {}: {e}", next.level),
+                            Err(e) => {
+                                eprintln!("cannot load {level}: {e}");
+                                app.toast = Some((format!("cannot load {level}"), Instant::now()));
+                            }
+                        }
+                    }
+                    Item::NewLevel => {
+                        let name = (1..)
+                            .map(|n| if n == 1 { "new_level".to_string() } else { format!("new_level_{n}") })
+                            .find(|n| !app.levels.contains(&format!("{n}.mmp")))
+                            .unwrap();
+                        menu.typing = Some((item, name));
+                    }
+                    Item::SaveLevel => {
+                        let said = app.save_level();
+                        app.toast = Some((said, Instant::now()));
+                    }
+                    Item::NewMaterial | Item::EditMaterial(_) => {
+                        app.material = Some(match item {
+                            Item::EditMaterial(i) => app.material_draft(i as u32),
+                            _ => material_edit::Draft::new_material(&app.assets.root().join("materials"), app.materials.names()),
+                        });
+                        menu.back.push((menu.page, menu.selected));
+                        (menu.page, menu.selected) = (Page::Material, 0);
+                    }
+                    Item::MaterialRow(material_edit::Row::Save) => {
+                        let said = app.save_material();
+                        if let Some(draft) = &mut app.material {
+                            draft.status = Some(said.unwrap_or_else(|e| e));
+                        }
+                    }
+                    Item::MaterialRow(row) => {
+                        let textures = material_edit::texture_choices(&app.assets.root().join("textures"));
+                        if let Some(draft) = &mut app.material {
+                            match draft.typing(row) {
+                                Some(text) => menu.typing = Some((item, text)),
+                                None => draft.status = draft.step(row, 1, &textures).err(),
+                            }
                         }
                     }
                 }
@@ -2834,6 +3232,21 @@ fn run() -> Result<(), String> {
                     Some((page, selected)) => (menu.page, menu.selected) = (page, selected),
                     None => menu.open = false,
                 }
+            }
+        } else if app.editor.on && app.editor.typing.is_some() {
+            // Typing a number into the editor's panel: the keys are the text's, the view
+            // holds still.
+            display.mouse_delta();
+            look.clear();
+            if let Some((_, text)) = &mut app.editor.typing {
+                text.push_str(display.text());
+                if display.key_repeated(Key::Backspace) {
+                    text.pop();
+                }
+            }
+            if display.key_pressed(Key::Enter) && !alt {
+                let (field, text) = app.editor.typing.take().unwrap();
+                app.type_value(field, &text);
             }
         } else {
             // The editor's mouse and keys; the arrows move its selection, if it has one.
@@ -2961,7 +3374,18 @@ fn run() -> Result<(), String> {
             println!("{}", app.command_line(&options, time));
         }
         app.set_time(time);
-        let (view_ms, raster_ms) = app.frame()?;
+        // A frame that can't be drawn says why (once, and on screen) and the app carries on.
+        let (view_ms, raster_ms) = match app.frame() {
+            Ok(times) => times,
+            Err(e) => {
+                if app.toast.as_ref().is_none_or(|(said, _)| *said != e) {
+                    eprintln!("cannot draw the frame: {e}");
+                }
+                app.editor.say(e.clone());
+                app.toast = Some((e, Instant::now()));
+                (0.0, 0.0)
+            }
+        };
         if display.key_pressed(Key::F12) {
             shots += 1;
             let path = format!("moose-{shots}.png");
@@ -2979,7 +3403,8 @@ fn run() -> Result<(), String> {
             (stats_at, frames, view_sum, raster_sum, present_sum) = (Instant::now(), 0, 0.0, 0.0, 0.0);
         }
         let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2, stats.3));
-        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, hud);
+        let typing = menu.typing.as_ref().map(|(_, text)| text.as_str());
+        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud);
         display.set_size(app.width, app.height);
         display.present(&app.pixels)?;
         let t = display.present_times();
@@ -2996,6 +3421,500 @@ mod tests {
     fn test_app(level: &str) -> App {
         let args = ["--level", level, "--size", "64x36"].map(String::from);
         App::new(&parse_options(args).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_new_level_is_a_room_of_the_default_material_and_saves() {
+        let args = ["--level", "moose_new_level_test.mmp", "--size", "64x36"].map(String::from);
+        let options = parse_options(args).unwrap();
+        let src = editor::new_level_doc("moose_new_level_test").unwrap().to_text();
+        let mut app = App::open(&options, Some(src)).unwrap();
+        assert_eq!(app.world.sectors.len(), 1);
+        assert_eq!(app.editor.doc.surfaces.len(), 6);
+        assert!(app.editor.doc.surfaces.iter().all(|s| s.options == ["material=default"]));
+        // Not saved yet: its file isn't there.
+        assert!(app.editor.dirty());
+        app.frame().unwrap();
+        // The flashlight shows the wall ahead: neither black nor one flat color.
+        let lit = app.pixels.iter().filter(|&&p| p & 0xFF_FF_FF > 0x10_10_10).count();
+        assert!(lit > app.pixels.len() / 4, "{lit} of {} pixels lit", app.pixels.len());
+        // Saved (here to a scratch file), it loads back the same.
+        let path = std::env::temp_dir().join("moose_new_level_test.mmp");
+        app.editor.path = path.clone();
+        assert!(app.save_level().starts_with("saved"), "{}", app.save_level());
+        assert!(!app.editor.dirty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(LevelDoc::parse(&path, &text).unwrap(), app.editor.doc);
+        App::open(&options, Some(text)).unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_line_dragged_across_a_surface_in_2d_cuts_only_it() {
+        use editor::{FaceCut, Field, Selection, ViewMode};
+        use wire::Axis;
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        let before = app.editor.doc.clone();
+        // The far wall (2, at z = 8) in the front view, a line down its middle.
+        app.editor.view = ViewMode::Ortho(Axis::Front);
+        app.editor.selection = Some(Selection::Surface(2));
+        let (w, h) = (app.width as usize, app.height as usize);
+        let o = app.editor.ortho(w, h).unwrap();
+        // Ends on the grid, or with Ctrl on the vertex nearest (within a few pixels).
+        let corner = o.to_screen(Vec3::new(4.0, 4.0, 8.0));
+        // (Any vertex there on screen: the cut is a line on screen, square to the view.)
+        let snapped = app.editor.cut_snap(&o, corner + glam::Vec2::new(3.0, 3.0), true);
+        assert!(o.to_screen(snapped).distance(corner) < 1e-3, "{snapped}");
+        let free = app.editor.cut_snap(&o, corner + glam::Vec2::new(3.0, 3.0), false);
+        assert_eq!(free, free.map(|v| (v / app.editor.step()).round() * app.editor.step()));
+        let (from, to) = (Vec3::new(0.0, -1.0, 8.0), Vec3::new(0.0, 5.0, 8.0));
+        app.editor.face_cut = Some(FaceCut { from, to, pressed: glam::Vec2::ZERO });
+        app.edit(Field::CutFace, 1.0);
+        assert_eq!(app.editor.face_cut, None);
+        assert_eq!(app.editor.doc.surfaces.len(), before.surfaces.len() + 1);
+        assert_eq!(app.editor.doc.sectors.len(), before.sectors.len());
+        assert_eq!(app.world.sectors.len(), before.sectors.len());
+        app.frame().unwrap();
+        // One undo puts it back; a line that misses the surface is refused.
+        app.travel(false);
+        assert_eq!(app.editor.doc, before);
+        let (from, to) = (Vec3::new(9.0, -1.0, 8.0), Vec3::new(9.0, 5.0, 8.0));
+        app.editor.face_cut = Some(FaceCut { from, to, pressed: glam::Vec2::ZERO });
+        app.edit(Field::CutFace, 1.0);
+        assert_eq!(app.editor.doc, before);
+    }
+
+    #[test]
+    fn a_wall_stitched_to_the_floor_takes_its_material_and_texture() {
+        use editor::{Field, Selection};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        let before = app.editor.doc.clone();
+        // Stitch the far wall (2): then click the floor (0), the pointer over it.
+        app.editor.selection = Some(Selection::Surface(2));
+        app.edit(Field::Stitch, 1.0);
+        assert_eq!(app.editor.picking, Some((2, editor::Pick::Stitch)));
+        assert!(app.editor.panel().iter().any(|r| r.label == "Stitch from a touching face" && r.value == "click a face (right: mirrored)"));
+        app.editor.hover = Some(Selection::Surface(0));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!(app.editor.picking, None);
+        assert!(app.editor.doc.surfaces[2].options.contains(&"material=metal_floor_shiny".to_string()));
+        assert_eq!(app.editor.selection, Some(Selection::Surface(2)));
+        app.frame().unwrap();
+        // One undo puts it back.
+        app.travel(false);
+        assert_eq!(app.editor.doc, before);
+        // Right-clicked: mirrored, the floor's texture reflected up the wall (v = (8 - h) / 2
+        // for a corner h up, where continued it is (8 + h) / 2).
+        app.edit(Field::Stitch, 1.0);
+        assert!(app.editor.panel().iter().any(|r| r.label == "Stitch from a touching face" && r.value.contains("right: mirrored")));
+        app.editor.hover = Some(Selection::Surface(0));
+        app.edit(Field::PickedMirrored, 1.0);
+        let uv = app.editor.doc.attributes.iter().position(|a| a.name == "uv").unwrap();
+        for (v, rows) in &app.editor.doc.surfaces[2].corners {
+            let (p, t) = (app.editor.doc.vertices[*v], &app.editor.doc.attributes[uv].values[rows[uv]]);
+            let down: f32 = t[1].parse().unwrap();
+            assert!((down - (8.0 - p.y) / 2.0).abs() < 1e-3, "{p}: {down}");
+        }
+        app.travel(false);
+        assert_eq!(app.editor.doc, before);
+        // A merge has no mirrored kind: a right click leaves it waiting for a left one.
+        app.edit(Field::Merge, 1.0);
+        app.editor.hover = Some(Selection::Surface(3));
+        app.edit(Field::PickedMirrored, 1.0);
+        assert_eq!(app.editor.picking, Some((2, editor::Pick::Merge)));
+        app.editor.picking = None;
+        assert_eq!(app.editor.doc, before);
+        // A face that doesn't touch (the hallway's floor) is refused, and the stitch ends.
+        app.edit(Field::Stitch, 1.0);
+        app.editor.hover = Some(Selection::Surface(9));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!((app.editor.picking, &app.editor.doc), (None, &before));
+    }
+
+    #[test]
+    fn a_face_merged_with_its_neighbor_through_the_panel() {
+        use editor::{FaceCut, Field, Pick, Selection, ViewMode};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        // The far wall cut in two (front view), then its halves merged back.
+        app.editor.view = ViewMode::Ortho(wire::Axis::Front);
+        app.editor.selection = Some(Selection::Surface(2));
+        let (from, to) = (Vec3::new(0.0, -1.0, 8.0), Vec3::new(0.0, 5.0, 8.0));
+        app.editor.face_cut = Some(FaceCut { from, to, pressed: glam::Vec2::ZERO });
+        app.edit(Field::CutFace, 1.0);
+        let cut = app.editor.doc.clone();
+        app.edit(Field::Merge, 1.0);
+        assert_eq!(app.editor.picking, Some((2, Pick::Merge)));
+        assert!(app.editor.panel().iter().any(|r| r.label == "Merge with a touching face" && r.value == "click a face"));
+        app.editor.hover = Some(Selection::Surface(3));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!(app.editor.picking, None);
+        assert_eq!(app.editor.doc.surfaces.len(), cut.surfaces.len() - 1);
+        assert_eq!(app.editor.selection, Some(Selection::Surface(2)));
+        app.frame().unwrap();
+        // One undo brings the halves back; a face on another plane (the floor) is refused.
+        app.travel(false);
+        assert_eq!(app.editor.doc, cut);
+        app.editor.selection = Some(Selection::Surface(2));
+        app.edit(Field::Merge, 1.0);
+        app.editor.hover = Some(Selection::Surface(0));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!((app.editor.picking, &app.editor.doc), (None, &cut));
+    }
+
+    #[test]
+    fn a_cleaved_sector_merged_back_through_the_panel() {
+        use editor::{Field, Pick, Selection, ViewMode};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        let original = app.editor.doc.clone();
+        // The hallway cleaved lengthwise in the top view, then its new part merged back.
+        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.editor.selection = Some(Selection::Sector(1));
+        app.editor.cutting = Some(vec![Vec3::new(0.25, 0.0, -20.0), Vec3::new(0.25, 0.0, 5.0)]);
+        app.edit(Field::Cut, 1.0);
+        let cut = app.editor.doc.clone();
+        assert_eq!(cut.sectors.len(), original.sectors.len() + 1);
+        let new = cut.sectors.len() - 1;
+        app.editor.selection = Some(Selection::Sector(1));
+        app.edit(Field::MergeSector, 1.0);
+        assert_eq!(app.editor.picking, Some((1, Pick::MergeSector)));
+        assert!(app.editor.panel().iter().any(|r| r.label == "Merge with a sector" && r.value == "click a face of it"));
+        app.editor.hover = Some(Selection::Surface(cut.sector_surfaces(new).start));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!(app.editor.picking, None);
+        assert_eq!(app.editor.selection, Some(Selection::Sector(1)));
+        assert_eq!(app.editor.doc.sectors.len(), original.sectors.len());
+        assert_eq!(app.editor.doc.surfaces.len(), original.surfaces.len());
+        app.frame().unwrap();
+        // One undo brings the parts back; room_a with room_b (no opening between) is refused.
+        app.travel(false);
+        assert_eq!(app.editor.doc, cut);
+        app.editor.selection = Some(Selection::Sector(0));
+        app.edit(Field::MergeSector, 1.0);
+        app.editor.hover = Some(Selection::Surface(cut.sector_surfaces(2).start));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!((app.editor.picking, &app.editor.doc), (None, &cut));
+    }
+
+    #[test]
+    fn a_light_kept_off_a_sector_and_a_face_through_the_panel() {
+        use editor::{Excluder, Field, Pick, Selection};
+        // A new level's room, lit by the flashlight: kept off the room, it's as if the
+        // flashlight were off; one undo lights it again.
+        let args = ["--level", "moose_exclusion_test.mmp", "--size", "64x36"].map(String::from);
+        let src = editor::new_level_doc("moose_exclusion_test").unwrap().to_text();
+        let mut app = App::open(&parse_options(args).unwrap(), Some(src)).unwrap();
+        app.editor.on = true;
+        // (The editor's panel and overlay off while measuring.)
+        let brightness = |app: &mut App| {
+            app.editor.on = false;
+            app.frame().unwrap();
+            app.editor.on = true;
+            app.pixels.iter().map(|&p| (p >> 16 & 255) + (p >> 8 & 255) + (p & 255)).sum::<u32>()
+        };
+        let lit = brightness(&mut app);
+        app.editor.selection = Some(Selection::Sector(0));
+        assert!(app.editor.panel().iter().any(|r| r.label == "Lit by the flashlight" && r.value == "on"));
+        app.edit(Field::FlashlightLights, 1.0);
+        assert_eq!(app.editor.doc.sectors[0].options, ["exclude_lights=flashlight"]);
+        assert!(app.editor.panel().iter().any(|r| r.label == "Lit by the flashlight" && r.value == "off"));
+        // As dark as with the flashlight off (the room has only it and the ambient light).
+        let dark = brightness(&mut app);
+        app.settings.flashlight = false;
+        let off = brightness(&mut app);
+        app.settings.flashlight = true;
+        assert!(dark < lit && dark == off, "{dark}, {off} with it off, of {lit}");
+        app.travel(false);
+        assert_eq!(brightness(&mut app), lit);
+
+        // shiny_rooms: a face picks a level light to keep off, which is named for it;
+        // clicked again, it lights the face again. Deleting a light takes it off the lists.
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        app.editor.selection = Some(Selection::Surface(2));
+        app.edit(Field::ExcludeLights, 1.0);
+        assert_eq!(app.editor.picking, Some((2, Pick::Exclude(Excluder::Surface))));
+        app.editor.hover = Some(Selection::Light(1));
+        app.edit(Field::Picked, 1.0);
+        assert!(app.editor.doc.lights[1].options.contains(&"name=light".to_string()));
+        assert!(app.editor.doc.surfaces[2].options.contains(&"exclude_lights=light".to_string()));
+        assert_eq!(app.world.face_excluded_lights[2], 1 << 1);
+        // Still picking: the next click lights it again. (An edit drops what the pointer
+        // is over; the next frame picks it again.)
+        assert_eq!(app.editor.picking, Some((2, Pick::Exclude(Excluder::Surface))));
+        app.editor.hover = Some(Selection::Light(1));
+        app.edit(Field::Picked, 1.0);
+        assert!(!app.editor.doc.surfaces[2].options.iter().any(|o| o.starts_with("exclude_lights")));
+        app.editor.hover = Some(Selection::Light(1));
+        app.edit(Field::Picked, 1.0);
+        assert_eq!(app.world.face_excluded_lights[2], 1 << 1);
+        app.editor.picking = None;
+        app.editor.selection = Some(Selection::Light(1));
+        app.edit(Field::Delete, 1.0);
+        assert!(!app.editor.doc.surfaces[2].options.iter().any(|o| o.starts_with("exclude_lights")));
+        assert_eq!(app.world.face_excluded_lights[2], 0);
+        app.frame().unwrap();
+    }
+
+    #[test]
+    fn undoing_what_the_pointer_is_over_drops_it() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        app.editor.on = true;
+        let surfaces = app.editor.doc.surfaces.len();
+        app.edit(Field::NewRoom, 1.0);
+        assert_eq!(app.editor.doc.surfaces.len(), surfaces + 6);
+        // The pointer over the new room's last surface, its sector selected: then undone in
+        // the same frame (as Ctrl+Z is, after the pointer is picked), and drawn.
+        let last = app.editor.doc.surfaces.len() - 1;
+        app.editor.hover = Some(Selection::Surface(last));
+        app.editor.selection = Some(Selection::Sector(app.editor.doc.sectors.len() - 1));
+        app.travel(false);
+        assert_eq!(app.editor.doc.surfaces.len(), surfaces);
+        assert_eq!(app.editor.hover, None);
+        draw_ui(&mut app, None, None, None, None);
+        app.editor.panel();
+        // Redone, the room is back, but what pointed into it isn't kept.
+        app.travel(true);
+        assert_eq!(app.editor.doc.surfaces.len(), surfaces + 6);
+        draw_ui(&mut app, None, None, None, None);
+        // A stale one set by hand isn't drawn or listed either.
+        app.travel(false);
+        app.editor.hover = Some(Selection::Surface(last));
+        app.editor.selection = Some(Selection::Vertex(10_000));
+        draw_ui(&mut app, None, None, None, None);
+        app.editor.panel();
+    }
+
+    #[test]
+    fn undo_and_redo_all_the_way_through_edits_that_add_and_remove_surfaces() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        app.editor.on = true;
+        // Before every step, the pointer over the level's last surface and its last vertex
+        // selected (as a frame picks them); after it, drawn (as the frame then is). What the
+        // step took away must not be drawn.
+        let aim = |app: &mut App| {
+            let d = &app.editor.doc;
+            app.editor.hover = Some(Selection::Surface(d.surfaces.len() - 1));
+            app.editor.selection = Some(Selection::Vertex(d.vertices.len() - 1));
+        };
+        let draw = |app: &mut App| {
+            draw_ui(app, None, None, None, None);
+            app.editor.panel();
+        };
+        // The edits the level accepted.
+        let mut made = 0;
+        let mut edit = |app: &mut App, selection: Option<Selection>, field: Field| {
+            aim(app);
+            app.editor.selection = selection.or(app.editor.selection);
+            let before = app.editor.doc.clone();
+            app.edit(field, 1.0);
+            made += (app.editor.doc != before) as usize;
+            draw(app);
+        };
+        for k in 0..4 {
+            edit(&mut app, None, Field::NewRoom);
+            // Extrude a wall of the new room (selected first: New room selects the room).
+            app.editor.selection = None;
+            let room = app.editor.doc.sectors.len() - 1;
+            let wall = app.editor.doc.sector_surfaces(room).start + 1;
+            edit(&mut app, Some(Selection::Surface(wall)), Field::Extrude);
+            // Every other time, delete the extension.
+            if k % 2 == 1 {
+                let last = app.editor.doc.sectors.len() - 1;
+                edit(&mut app, Some(Selection::Sector(last)), Field::Delete);
+            }
+        }
+        let start = test_app("two_rooms.mmp").editor.doc;
+        let mut undone = 0;
+        while app.editor.dirty() {
+            aim(&mut app);
+            app.travel(false);
+            draw(&mut app);
+            undone += 1;
+        }
+        assert_eq!(app.editor.doc, start);
+        assert_eq!(undone, made);
+        assert!(made >= 6, "{made} edits made");
+        for _ in 0..undone {
+            aim(&mut app);
+            app.travel(true);
+            draw(&mut app);
+        }
+    }
+
+    #[test]
+    fn every_material_draws_on_a_new_level_whatever_its_mesh_lacks() {
+        // A new level's surfaces have texture coordinates only: no vertex colors or
+        // normals. Each material, on all of them, still draws (what the mesh lacks reads 0).
+        let args = ["--level", "moose_every_material_test.mmp", "--size", "64x36"].map(String::from);
+        let options = parse_options(args).unwrap();
+        let mut app = App::open(&options, Some(editor::new_level_doc("cheese").unwrap().to_text())).unwrap();
+        for name in app.materials.names().to_vec() {
+            for s in &mut app.editor.doc.surfaces {
+                s.options = vec![format!("material={name}")];
+            }
+            app.rebuild().unwrap_or_else(|e| panic!("{name}: {e}"));
+            app.frame().unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_material_creator_saves_a_material_as_its_own_file() {
+        use material_edit::{Draft, Row};
+        let mut app = test_app("two_rooms.mmp");
+        // A scratch copy of the material files, so the real ones stay as they are.
+        let dir = std::env::temp_dir().join("moose_material_creator_test");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in material_files_in(&app.assets.root().join("materials")) {
+            std::fs::copy(&file, dir.join(file.file_name().unwrap())).unwrap();
+        }
+        let mut draft = Draft::new_material(&dir, app.materials.names());
+        draft.typed(Row::Name, "road", &[]).unwrap();
+        draft.def.shader = "basic_bumpy".into();
+        draft.step(Row::Source(0), 1, &[]).unwrap();
+        draft.typed(Row::Value(0), "4", &[]).unwrap();
+        draft.step(Row::Source(1), 1, &[]).unwrap();
+        draft.step(Row::Source(1), 1, &[]).unwrap();
+        draft.typed(Row::Value(1), "bump_far", &[]).unwrap();
+        draft.typed(Row::Fallback(1), "6", &[]).unwrap();
+        app.material = Some(draft);
+        assert_eq!(app.save_material().unwrap(), "saved road.mmat");
+        let text = std::fs::read_to_string(dir.join("road.mmat")).unwrap();
+        assert!(text.starts_with("MOOSEMATERIAL 2\nshader             basic_bumpy\n"), "{text}");
+        assert!(text.contains("short              4\nfar                face:bump_far|6\n"), "{text}");
+        assert!(app.materials.names().contains(&"road".to_string()));
+        // Saved again it is written over; a new one by the same name is refused.
+        assert!(!app.material.as_ref().unwrap().new);
+        app.material.as_mut().unwrap().typed(Row::Value(0), "3", &[]).unwrap();
+        app.save_material().unwrap();
+        assert!(std::fs::read_to_string(dir.join("road.mmat")).unwrap().contains("short              3"));
+        let mut twin = Draft::new_material(&dir, &[]);
+        twin.typed(Row::Name, "road", &[]).unwrap();
+        app.material = Some(twin);
+        assert!(app.save_material().unwrap_err().contains("already a material 'road'"));
+        // One that can't be drawn is refused, and the file stays as it was.
+        let before = std::fs::read_to_string(dir.join("road.mmat")).unwrap();
+        let id = app.materials.names().iter().position(|n| n == "road").unwrap() as u32;
+        app.material = Some(app.material_draft(id));
+        app.material.as_mut().unwrap().def.textures[1] = Some(moose_assets::TextureSource::File("nope.png".into()));
+        assert!(app.save_material().is_err());
+        assert_eq!(std::fs::read_to_string(dir.join("road.mmat")).unwrap(), before);
+        // A material from a file keeps the comments at its top.
+        let brick = app.materials.names().iter().position(|n| n == "brick").unwrap() as u32;
+        assert!(app.material_draft(brick).comments[0].starts_with("# Walls."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `library` with a material `name` added, from its file's text.
+    fn with_material(library: &mut MaterialLibrary, name: &str, body: &str) {
+        library.add_file(Path::new(&format!("{name}.mmat")), &format!("MOOSEMATERIAL 2\n{body}\n")).unwrap();
+    }
+
+    #[test]
+    fn inputs_are_read_from_faces_sectors_entities_the_level_and_lights() {
+        use materials::Place;
+        let mut app = test_app("two_rooms.mmp");
+        // Materials whose input reads each source (`textured`'s detail: 0-255, over 255).
+        let mut library = app.assets.materials().clone();
+        for (name, source) in [
+            ("by_face", "face:dirt|10"),
+            ("by_sector", "sector:dirt|20"),
+            ("by_entity", "entity:dirt|30"),
+            ("by_level", "level:dirt|40"),
+            ("by_light", "light:lamp|50"),
+        ] {
+            with_material(&mut library, name, &format!("shader textured\ntexture0 default.png\ndetail {source}"));
+        }
+        app.apply_materials(library).unwrap();
+        let id = |name: &str| app.materials.names().iter().position(|n| n == name).unwrap() as u32;
+        // Values on face 2, sector 1, entity 0 and the level (as a script will set them).
+        let key = app.world.meta_keys.intern("dirt");
+        app.world.faces[2].set(key, vec![102.0]);
+        app.world.sectors[1].meta.set(key, vec![153.0]);
+        app.world.entities[0].meta.set(key, vec![204.0]);
+        app.world.meta.set(key, vec![255.0]);
+        let table = app.materials.table(&app.shaders, &app.frame_settings(), &app.world);
+        let detail = |name: &str, place: Place| {
+            let r = table.get(id(name), false, false);
+            (table.surface(r, place, &app.world).params.values[0] * 255.0).round()
+        };
+        let at = |face, sector, entity| Place { face, sector, entity };
+        assert_eq!(detail("by_face", at(Some(2), Some(0), None)), 102.0);
+        assert_eq!(detail("by_face", at(Some(3), Some(0), None)), 10.0);
+        assert_eq!(detail("by_face", at(None, Some(0), Some(0))), 10.0);
+        assert_eq!(detail("by_sector", at(None, Some(1), None)), 153.0);
+        assert_eq!(detail("by_sector", at(None, Some(0), None)), 20.0);
+        assert_eq!(detail("by_entity", at(None, Some(0), Some(0))), 204.0);
+        assert_eq!(detail("by_entity", at(None, Some(0), Some(1))), 30.0);
+        assert_eq!(detail("by_level", at(None, None, None)), 255.0);
+        // No light is named lamp: its fallback.
+        assert_eq!(detail("by_light", at(None, None, None)), 50.0);
+    }
+
+    #[test]
+    fn back_light_is_an_engine_input_bump_programs_take_and_their_shaders_never_see() {
+        use materials::Place;
+        let mut app = test_app("two_rooms.mmp");
+        let mut library = app.assets.materials().clone();
+        let bumpy = "texture0 default.png\ntexture1 default.png";
+        with_material(&mut library, "curb", &format!("shader basic_bumpy\n{bumpy}\nshort 4\nback_light 30"));
+        with_material(&mut library, "by_face", &format!("shader random_sections\n{bumpy}\nback_light face:corner|0"));
+        with_material(&mut library, "bricks", &format!("shader lit\n{bumpy}\nback_light 10"));
+        app.apply_materials(library.clone()).unwrap();
+        let id = |app: &App, name: &str| app.materials.names().iter().position(|n| n == name).unwrap() as u32;
+        let key = app.world.meta_keys.intern("corner");
+        app.world.faces[2].set(key, vec![90.0]);
+        let table = app.materials.table(&app.shaders, &app.frame_settings(), &app.world);
+        // As the sine of its angle, and the shader's own inputs as they were.
+        let curb = &table.get(id(&app, "curb"), false, false).surface;
+        assert!((curb.back_light - 0.5).abs() < 1e-6);
+        assert_eq!(curb.params.values[0], 4.0);
+        let bricks = &table.get(id(&app, "bricks"), false, false).surface;
+        assert!((bricks.back_light - 10f32.to_radians().sin()).abs() < 1e-6);
+        // From a face's meta value, as any input can be.
+        let r = table.get(id(&app, "by_face"), false, false);
+        let face = |f| table.surface(r, Place { face: Some(f), ..Place::default() }, &app.world).back_light;
+        assert_eq!((face(2), face(3)), (1.0, 0.0));
+        // The creator offers it after the shader's own inputs, and only where it's taken.
+        let draft = app.material_draft(id(&app, "curb"));
+        assert_eq!(draft.label(material_edit::Row::Source(2)), "Engine: back_light (number, degrees)");
+        assert!(!draft.rows().contains(&material_edit::Row::Source(3)));
+        let plain = app.materials.names().iter().position(|n| n == "default").unwrap() as u32;
+        assert!(!app.material_draft(plain).rows().contains(&material_edit::Row::Source(1)));
+        // A program that doesn't bump doesn't take it; an angle past 90 degrees is refused.
+        let mut flat = library.clone();
+        with_material(&mut flat, "flat", "shader textured\ntexture0 default.png\nback_light 10");
+        let error = app.apply_materials(flat).unwrap_err();
+        assert!(error.contains("doesn't take 'back_light' (only lit, basic_bumpy, random_sections, reflective_bumpy)"), "{error}");
+        with_material(&mut library, "bent", &format!("shader basic_bumpy\n{bumpy}\nback_light 95"));
+        assert!(app.apply_materials(library).unwrap_err().contains("0 to 90 degrees"));
+    }
+
+    #[test]
+    fn a_named_lights_brightness_reaches_a_material() {
+        let mut app = test_app("two_rooms.mmp");
+        let mut library = app.assets.materials().clone();
+        with_material(&mut library, "lamp_glow", "shader textured\ntexture0 default.png\ndetail light:lamp|50");
+        app.apply_materials(library).unwrap();
+        let id = app.materials.names().iter().position(|n| n == "lamp_glow").unwrap() as u32;
+        // A light named lamp, as the level's first, at half strength.
+        app.world.light_names = vec![Some("lamp".into())];
+        app.lights.0.insert(0, moose_assets::Light::point(0, Vec3::ZERO, Vec3::new(0.5, 0.25, 0.0), 5.0));
+        let value = |app: &App| {
+            let table = app.materials.table(&app.shaders, &app.frame_settings(), &app.world);
+            table.get(id, false, false).surface.params.values[0]
+        };
+        app.settings.level_lights = true;
+        assert_eq!(value(&app), 0.5);
+        // Off, it's dark.
+        app.settings.level_lights = false;
+        assert_eq!(value(&app), 0.0);
     }
 
     #[test]
@@ -3069,6 +3988,37 @@ mod tests {
             app.travel(false);
         }
         assert_eq!(app.world.sectors.len(), sectors);
+    }
+
+    #[test]
+    fn a_cleaves_ends_snap_to_vertices_with_ctrl() {
+        use editor::{Field, Selection, ViewMode};
+        let mut app = test_app("two_rooms.mmp");
+        app.editor.on = true;
+        // room_a (x from -4 to 4, z from 0 to 8) in the top view, the finest grid.
+        app.editor.view = ViewMode::Ortho(wire::Axis::Top);
+        app.editor.ortho_center = Vec3::new(0.0, 0.0, 4.0);
+        app.editor.step = 0;
+        let (w, h) = (app.width as usize, app.height as usize);
+        let o = app.editor.ortho(w, h).unwrap();
+        // A few pixels off two opposite corners: on the grid, a little off them; with Ctrl,
+        // on them.
+        let off = glam::Vec2::new(2.0, -2.0);
+        let (a, b) = (Vec3::new(-4.0, 0.0, 8.0), Vec3::new(4.0, 0.0, 0.0));
+        let near = |p: Vec3| o.to_screen(p) + off;
+        let grid = app.editor.cut_snap(&o, near(a), false);
+        assert!(o.to_screen(grid).distance(o.to_screen(a)) > 0.5, "{grid}");
+        let (sa, sb) = (app.editor.cut_snap(&o, near(a), true), app.editor.cut_snap(&o, near(b), true));
+        assert!(o.to_screen(sa).distance(o.to_screen(a)) < 1e-3 && o.to_screen(sb).distance(o.to_screen(b)) < 1e-3);
+        // Cleaved from corner to corner: through the room's own corners, so no new vertex.
+        let (sectors, vertices) = (app.editor.doc.sectors.len(), app.editor.doc.vertices.len());
+        app.editor.selection = Some(Selection::Sector(0));
+        app.edit(Field::Cleave, 1.0);
+        assert!(!app.editor.cut_point(sa));
+        assert!(app.editor.cut_point(sb));
+        app.edit(Field::Cut, 1.0);
+        assert_eq!(app.editor.doc.sectors.len(), sectors + 1);
+        assert_eq!(app.editor.doc.vertices.len(), vertices);
     }
 
     #[test]
@@ -3284,6 +4234,94 @@ mod tests {
             .map(|row| row.iter().map(|t| t.parse().unwrap()).collect())
             .collect();
         assert_eq!(flat, made);
+        // Flipped across, u mirrors about the middle and v stays; flipped down, the other
+        // way round; each twice, as it was.
+        let numbers = |app: &App| -> Vec<[f32; 2]> {
+            uvs(app).iter().map(|r| [r[0].parse().unwrap(), r[1].parse().unwrap()]).collect()
+        };
+        let start = numbers(&app);
+        let middle = start.iter().fold([0.0, 0.0], |m, t| [m[0] + t[0], m[1] + t[1]]).map(|c| c / start.len() as f32);
+        for (field, k) in [(Field::TextureFlipAcross, 0), (Field::TextureFlipDown, 1)] {
+            app.edit(field, 1.0);
+            for (a, b) in start.iter().zip(numbers(&app)) {
+                assert!((b[k] - (2.0 * middle[k] - a[k])).abs() < 1e-3, "{a:?} became {b:?}");
+                assert!((b[1 - k] - a[1 - k]).abs() < 1e-3, "{a:?} became {b:?}");
+            }
+            app.edit(field, 1.0);
+            for (a, b) in start.iter().zip(numbers(&app)) {
+                assert!((a[0] - b[0]).abs() < 1e-3 && (a[1] - b[1]).abs() < 1e-3, "{a:?} came back {b:?}");
+            }
+        }
+        assert!(app.editor.panel().iter().any(|r| r.label == "Texture flip across"));
+        assert!(app.editor.panel().iter().any(|r| r.label == "Texture flip down"));
+    }
+
+    #[test]
+    fn texture_numbers_read_back_and_take_typed_values_and_fine_steps() {
+        use editor::{Field, Selection};
+        let mut app = test_app("shiny_rooms.mmp");
+        let wall = 2;
+        app.editor.selection = Some(Selection::Surface(wall));
+        // Mapped flat (as the test levels are): no offset, 2 m a repeat, square, unturned.
+        let m = app.editor.texture_mapping(wall).unwrap();
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        assert!(close(m.offset.x, 0.0) && close(m.offset.y, 0.0), "{m:?}");
+        assert!(close(m.size.x, 2.0) && close(m.size.y, 2.0) && close(m.turn, 0.0) && close(m.shear, 0.0), "{m:?}");
+        let row = |app: &App, label: &str| app.editor.panel().into_iter().find(|r| r.label == label).unwrap().value;
+        assert_eq!(row(&app, "Texture size across"), "2.0000 m");
+        // Typed: sizes and the turn about the middle, offsets as they are.
+        let middle = |app: &App| {
+            let m = app.editor.texture_mapping(wall).unwrap();
+            let d = &app.editor.doc;
+            let points = d.surface_points(wall);
+            let n = d.surface_normal(wall);
+            let q = points.iter().map(|&p| editor_flat(p, n)).sum::<glam::Vec2>() / points.len() as f32;
+            m.at(q)
+        };
+        let start = middle(&app);
+        app.type_value(Field::TextureSizeU, "1.5 m");
+        app.type_value(Field::TextureTurn, "30°");
+        let m = app.editor.texture_mapping(wall).unwrap();
+        assert!(close(m.size.x, 1.5) && close(m.size.y, 2.0) && close(m.turn, 30.0), "{m:?}");
+        assert!(middle(&app).distance(start) < 1e-3);
+        app.type_value(Field::TextureU, "0.3");
+        assert!(close(app.editor.texture_mapping(wall).unwrap().offset.x, 0.3));
+        assert_eq!(row(&app, "Texture turn"), "30.00°");
+        // Not a number, or a zero size: nothing changes.
+        let before = app.editor.doc.clone();
+        app.type_value(Field::TextureSizeV, "big");
+        app.type_value(Field::TextureSizeV, "0");
+        assert_eq!(app.editor.doc, before);
+        // Fine steps (Alt): a 128th of a repeat, a degree.
+        app.editor.fine = true;
+        app.edit(Field::TextureU, 1.0);
+        let m = app.editor.texture_mapping(wall).unwrap();
+        assert!(close(m.offset.x, 0.3 + 1.0 / 128.0), "{m:?}");
+        app.edit(Field::TextureTurn, 1.0);
+        let m = app.editor.texture_mapping(wall).unwrap();
+        assert!(close(m.turn, 31.0), "{m:?}");
+        // Flipped (a negative size), read and written back as it is: nothing moves.
+        app.editor.fine = false;
+        app.edit(Field::TextureFlipDown, 1.0);
+        let uvs = app.editor.doc.clone();
+        let m = app.editor.texture_mapping(wall).unwrap();
+        app.editor.set_texture_mapping(wall, m, false);
+        let uv_at = |d: &moose_assets::LevelDoc| -> Vec<[f32; 2]> {
+            d.surfaces[wall].corners.iter().map(|(_, r)| {
+                let t = &d.attributes[1].values[r[1]];
+                [t[0].parse().unwrap(), t[1].parse().unwrap()]
+            }).collect()
+        };
+        for (x, y) in uv_at(&uvs).iter().zip(uv_at(&app.editor.doc)) {
+            assert!(close(x[0], y[0]) && close(x[1], y[1]), "{x:?} became {y:?}");
+        }
+    }
+
+    /// A point's flat coordinates (meters) on a surface facing `normal`, as the editor's.
+    fn editor_flat(p: Vec3, normal: Vec3) -> glam::Vec2 {
+        let a = normal.abs();
+        let (u, v) = if a.y >= a.x && a.y >= a.z { (p.x, p.z) } else if a.x >= a.z { (p.z, -p.y) } else { (p.x, -p.y) };
+        glam::Vec2::new(u, v)
     }
 
     #[test]
@@ -3375,8 +4413,11 @@ mod tests {
     fn every_page_is_reachable_and_named() {
         for page in Page::ALL {
             assert_eq!(Page::named(page.name()), Some(page));
-            assert!(page == Page::Levels || !page.items().is_empty());
-            if page != Page::Main {
+            // The level list, the materials and the material creator are made by the app.
+            let made = matches!(page, Page::Levels | Page::Materials | Page::Material);
+            assert!(made || !page.items().is_empty());
+            // The material creator opens from the materials.
+            if !matches!(page, Page::Main | Page::Material) {
                 assert!(Page::Main.items().contains(&Item::Open(page)), "{page:?}");
             }
         }

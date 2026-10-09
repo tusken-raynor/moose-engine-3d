@@ -715,8 +715,16 @@ pub struct AttribDesc {
     pub count: u8,
 }
 
-/// Most textures a polygon can bind (see [`TextureSet`]).
-pub const MAX_TEXTURES: usize = 2;
+/// Most textures a polygon can bind (see [`TextureSet`]). Only a number for the per-polygon
+/// arrays: a program reads the slots it declares.
+pub const MAX_TEXTURES: usize = 8;
+
+/// Conditions a program's copies are compiled for, which `material_io!` can mark values
+/// with (`name: N if !MIRRORED`): the copy for polygons seen in a mirror.
+#[allow(clippy::upper_case_acronyms)]
+pub enum Condition {
+    MIRRORED,
+}
 
 /// The textures a polygon is drawn with, as its shader sees them: `[0]` is its main texture
 /// (the one [`LOD`] and the other footprint varyings measure), `[1]` a second one for shaders
@@ -834,9 +842,11 @@ pub trait Group: Copy + Default {
     const LEN: usize;
     /// The group's lines within one sample interval: see [`Line`].
     type Line: Copy;
+    /// Number of values the copy `mirrored` says keeps (see [`Material::MIRRORED`]).
+    fn len(mirrored: bool) -> usize;
     /// The lines with values `base` at an interval's first pixel and `step` per pixel (this
-    /// group's, in layout order).
-    fn line(base: &[f32], step: &[f32]) -> Self::Line;
+    /// group's, in layout order: the copy's own values); values it drops are 0.
+    fn line(base: &[f32], step: &[f32], mirrored: bool) -> Self::Line;
     /// The group for [`LANES`] pixels `offset + j * stride` pixels along `line`.
     fn lanes(line: &Self::Line, offset: i32, stride: i32) -> Self;
 }
@@ -851,6 +861,22 @@ pub struct Line<E: Elem, const N: usize> {
 }
 
 impl<E: Elem, const N: usize> Line<E, N> {
+    /// Every value 0.
+    #[inline(always)]
+    pub fn zero() -> Self {
+        Self {
+            base: [E::Lanes::default(); N],
+            step: [E::Lanes::default(); N],
+        }
+    }
+
+    /// Value `k` starts at `base` and changes by `step` per pixel.
+    #[inline(always)]
+    pub fn set(&mut self, k: usize, base: f32, step: f32) {
+        self.base[k] = E::splat(E::from_f32(base));
+        self.step[k] = E::splat(E::from_f32(step));
+    }
+
     #[inline(always)]
     pub fn new(base: &[f32], step: &[f32]) -> Self {
         let mut line = Self {
@@ -865,10 +891,10 @@ impl<E: Elem, const N: usize> Line<E, N> {
     }
 }
 
-/// Declares one group struct. Used by [`varyings!`](crate::varyings).
+/// Declares one group struct. Used by [`material_io!`](crate::material_io).
 #[macro_export]
 macro_rules! varying_group {
-    ($group:ident, $elem:ty; $($field:ident: $n:literal),*) => {
+    ($group:ident, $elem:ty; $($field:ident: $n:literal $(if !$cond:ident)?),*) => {
         #[derive(Clone, Copy, Default, Debug)]
         pub struct $group {
             $(pub $field: [<$elem as $crate::shader::Elem>::Lanes; $n]),*
@@ -880,8 +906,28 @@ macro_rules! varying_group {
             type Line = $crate::shader::Line<$elem, { 0 $(+ $n)* }>;
 
             #[inline(always)]
-            fn line(base: &[f32], step: &[f32]) -> Self::Line {
-                $crate::shader::Line::new(base, step)
+            #[allow(unused_variables)]
+            fn len(mirrored: bool) -> usize {
+                0 $(+ if $crate::dropped!(mirrored $(, $cond)?) { 0 } else { $n })*
+            }
+
+            #[inline(always)]
+            #[allow(unused_variables, unused_mut, unused_assignments)]
+            fn line(base: &[f32], step: &[f32], mirrored: bool) -> Self::Line {
+                // The engine holds only the copy's own values; dropped ones stay 0.
+                let mut line = $crate::shader::Line::<$elem, { 0 $(+ $n)* }>::zero();
+                let (mut k, mut i) = (0, 0);
+                $(
+                    let dropped = $crate::dropped!(mirrored $(, $cond)?);
+                    for _ in 0..$n {
+                        if !dropped {
+                            line.set(k, base[i], step[i]);
+                            i += 1;
+                        }
+                        k += 1;
+                    }
+                )*
+                line
             }
 
             #[inline(always)]
@@ -904,11 +950,25 @@ macro_rules! varying_group {
     };
 }
 
+/// Whether a value marked `if !COND` (or unmarked: never) is dropped from a copy of a
+/// program: `mirrored` says whether the copy is the one for polygons seen in a mirror.
+/// Used by [`material_io!`](crate::material_io).
+#[macro_export]
+macro_rules! dropped {
+    ($mirrored:expr) => {
+        false
+    };
+    ($mirrored:expr, $cond:ident) => {{
+        let _ = $crate::shader::Condition::$cond;
+        $mirrored
+    }};
+}
+
 /// Declares a struct of f32 arrays (one per named value) and its [`Values`] impl. Used by
 /// [`material_io!`](crate::material_io).
 #[macro_export]
 macro_rules! value_struct {
-    ($name:ident; $($f:ident: $n:literal),* $(,)?) => {
+    ($name:ident; $($f:ident: $n:literal $(if !$cond:ident)?),* $(,)?) => {
         #[derive(Clone, Copy, Default, Debug, PartialEq)]
         pub struct $name {
             $(pub $f: [f32; $n]),*
@@ -919,10 +979,12 @@ macro_rules! value_struct {
 
             #[inline(always)]
             #[allow(unused_variables, unused_mut, unused_assignments)]
-            fn from_flat(flat: &[f32]) -> Self {
+            fn from_flat(flat: &[f32], mirrored: bool) -> Self {
                 let mut i = 0;
                 Self {
-                    $($f: {
+                    $($f: if $crate::dropped!(mirrored $(, $cond)?) {
+                        [0.0; $n]
+                    } else {
                         let a: [f32; $n] = std::array::from_fn(|k| flat[i + k]);
                         i += $n;
                         a
@@ -932,11 +994,13 @@ macro_rules! value_struct {
 
             #[inline(always)]
             #[allow(unused_variables, unused_mut, unused_assignments)]
-            fn write_flat(&self, out: &mut [f32]) {
+            fn write_flat(&self, out: &mut [f32], mirrored: bool) {
                 let mut i = 0;
                 $(
-                    out[i..i + $n].copy_from_slice(&self.$f);
-                    i += $n;
+                    if !$crate::dropped!(mirrored $(, $cond)?) {
+                        out[i..i + $n].copy_from_slice(&self.$f);
+                        i += $n;
+                    }
                 )*
             }
         }
@@ -947,7 +1011,7 @@ macro_rules! value_struct {
 /// and its [`LaneValues`] impl. Used by [`material_io!`](crate::material_io).
 #[macro_export]
 macro_rules! lane_struct {
-    ($name:ident; $($f:ident: $n:literal),* $(,)?) => {
+    ($name:ident; $($f:ident: $n:literal $(if !$cond:ident)?),* $(,)?) => {
         #[derive(Clone, Copy, Default, Debug, PartialEq)]
         pub struct $name {
             $(pub $f: [$crate::shader::F32s; $n]),*
@@ -957,11 +1021,19 @@ macro_rules! lane_struct {
             const LEN: usize = 0 $(+ $n)*;
 
             #[inline(always)]
+            #[allow(unused_variables)]
+            fn len(mirrored: bool) -> usize {
+                0 $(+ if $crate::dropped!(mirrored $(, $cond)?) { 0 } else { $n })*
+            }
+
+            #[inline(always)]
             #[allow(unused_variables, unused_mut, unused_assignments)]
-            fn from_lanes(lanes: &[$crate::shader::F32s]) -> Self {
+            fn from_lanes(lanes: &[$crate::shader::F32s], mirrored: bool) -> Self {
                 let mut i = 0;
                 Self {
-                    $($f: {
+                    $($f: if $crate::dropped!(mirrored $(, $cond)?) {
+                        Default::default()
+                    } else {
                         let a: [$crate::shader::F32s; $n] = std::array::from_fn(|k| lanes[i + k]);
                         i += $n;
                         a
@@ -971,11 +1043,13 @@ macro_rules! lane_struct {
 
             #[inline(always)]
             #[allow(unused_variables, unused_mut, unused_assignments)]
-            fn write_lanes(&self, out: &mut [$crate::shader::F32s]) {
+            fn write_lanes(&self, out: &mut [$crate::shader::F32s], mirrored: bool) {
                 let mut i = 0;
                 $(
-                    out[i..i + $n].copy_from_slice(&self.$f);
-                    i += $n;
+                    if !$crate::dropped!(mirrored $(, $cond)?) {
+                        out[i..i + $n].copy_from_slice(&self.$f);
+                        i += $n;
+                    }
                 )*
             }
         }
@@ -994,6 +1068,11 @@ macro_rules! lane_struct {
 ///   order) and pixels get, interpolated linearly between sample points in 16.16, 8.8 and
 ///   f32: the groups `Fixed32`, `Fixed16` and `Floats`.
 ///
+/// A `sampled`, `fixed32`, `fixed16` or `float` value written `name: N if !MIRRORED` is
+/// dropped from the copy of the program for polygons seen in a mirror ([`Material::MIRRORED`]):
+/// `IO_MIRRORED` counts it 0, so the engine never stores or interpolates it, and the copy's
+/// struct field stays 0.
+///
 /// ```ignore
 /// material_io! {
 ///     vertex { color: 3 }
@@ -1007,18 +1086,18 @@ macro_rules! lane_struct {
 macro_rules! material_io {
     (
         vertex { $($v:ident: $vn:literal),* $(,)? }
-        sampled { $($s:ident: $sn:literal),* $(,)? }
-        fixed32 { $($a:ident: $an:literal),* $(,)? }
-        fixed16 { $($b:ident: $bn:literal),* $(,)? }
-        float { $($c:ident: $cn:literal),* $(,)? }
+        sampled { $($s:ident: $sn:literal $(if !$sc:ident)?),* $(,)? }
+        fixed32 { $($a:ident: $an:literal $(if !$ac:ident)?),* $(,)? }
+        fixed16 { $($b:ident: $bn:literal $(if !$bc:ident)?),* $(,)? }
+        float { $($c:ident: $cn:literal $(if !$cc:ident)?),* $(,)? }
     ) => {
         $crate::value_struct!(Vertex; $($v: $vn),*);
-        $crate::value_struct!(Sampled; $($s: $sn),*);
-        $crate::lane_struct!(SampledLanes; $($s: $sn),*);
-        $crate::lane_struct!(Interp; $($a: $an,)* $($b: $bn,)* $($c: $cn),*);
-        $crate::varying_group!(Fixed32, i32; $($a: $an),*);
-        $crate::varying_group!(Fixed16, i16; $($b: $bn),*);
-        $crate::varying_group!(Floats, f32; $($c: $cn),*);
+        $crate::value_struct!(Sampled; $($s: $sn $(if !$sc)?),*);
+        $crate::lane_struct!(SampledLanes; $($s: $sn $(if !$sc)?),*);
+        $crate::lane_struct!(Interp; $($a: $an $(if !$ac)?,)* $($b: $bn $(if !$bc)?,)* $($c: $cn $(if !$cc)?),*);
+        $crate::varying_group!(Fixed32, i32; $($a: $an $(if !$ac)?),*);
+        $crate::varying_group!(Fixed16, i16; $($b: $bn $(if !$bc)?),*);
+        $crate::varying_group!(Floats, f32; $($c: $cn $(if !$cc)?),*);
 
         pub const IO: $crate::shader::MaterialIo = $crate::shader::MaterialIo {
             vertex: &[
@@ -1031,6 +1110,33 @@ macro_rules! material_io {
                 $($crate::shader::AttribDesc { name: stringify!($a), format: $crate::shader::Format::Fixed32, count: $an },)*
                 $($crate::shader::AttribDesc { name: stringify!($b), format: $crate::shader::Format::Fixed16, count: $bn },)*
                 $($crate::shader::AttribDesc { name: stringify!($c), format: $crate::shader::Format::Float, count: $cn },)*
+            ],
+        };
+
+        /// [`IO`] for the copy seen in a mirror: values marked `if !MIRRORED` count 0.
+        pub const IO_MIRRORED: $crate::shader::MaterialIo = $crate::shader::MaterialIo {
+            vertex: IO.vertex,
+            sampled: &[$($crate::shader::AttribDesc {
+                name: stringify!($s),
+                format: $crate::shader::Format::Float,
+                count: if $crate::dropped!(true $(, $sc)?) { 0 } else { $sn },
+            },)*],
+            interp: &[
+                $($crate::shader::AttribDesc {
+                    name: stringify!($a),
+                    format: $crate::shader::Format::Fixed32,
+                    count: if $crate::dropped!(true $(, $ac)?) { 0 } else { $an },
+                },)*
+                $($crate::shader::AttribDesc {
+                    name: stringify!($b),
+                    format: $crate::shader::Format::Fixed16,
+                    count: if $crate::dropped!(true $(, $bc)?) { 0 } else { $bn },
+                },)*
+                $($crate::shader::AttribDesc {
+                    name: stringify!($c),
+                    format: $crate::shader::Format::Float,
+                    count: if $crate::dropped!(true $(, $cc)?) { 0 } else { $cn },
+                },)*
             ],
         };
     };
@@ -1048,7 +1154,8 @@ macro_rules! material_types {
         type Fixed32 = Fixed32;
         type Fixed16 = Fixed16;
         type Floats = Floats;
-        const IO: $crate::shader::MaterialIo = IO;
+        const IO: $crate::shader::MaterialIo =
+            if <Self as $crate::shader::Material>::MIRRORED { IO_MIRRORED } else { IO };
     };
 }
 
@@ -1083,9 +1190,11 @@ pub const LOD: &str = "lod";
 pub trait Values: Copy + Default {
     /// Number of f32 values.
     const LEN: usize;
-    /// From `LEN` values in declaration order.
-    fn from_flat(flat: &[f32]) -> Self;
-    fn write_flat(&self, out: &mut [f32]);
+    /// From the values in declaration order, those of the copy `mirrored` says (see
+    /// [`Material::MIRRORED`]): values it drops are 0.
+    fn from_flat(flat: &[f32], mirrored: bool) -> Self;
+    /// The values the copy keeps, in declaration order.
+    fn write_flat(&self, out: &mut [f32], mirrored: bool);
 }
 
 /// A material's values of one kind for [`LANES`] sample points, generated by
@@ -1093,8 +1202,12 @@ pub trait Values: Copy + Default {
 pub trait LaneValues: Copy + Default {
     /// Number of values (each [`LANES`] wide).
     const LEN: usize;
-    fn from_lanes(lanes: &[F32s]) -> Self;
-    fn write_lanes(&self, out: &mut [F32s]);
+    /// Number of values the copy `mirrored` says keeps (see [`Material::MIRRORED`]).
+    fn len(mirrored: bool) -> usize;
+    /// From the copy's values in declaration order: values it drops are 0.
+    fn from_lanes(lanes: &[F32s], mirrored: bool) -> Self;
+    /// The values the copy keeps, in declaration order.
+    fn write_lanes(&self, out: &mut [F32s], mirrored: bool);
 }
 
 /// What flows between a material's stages, by name: see [`material_io!`](crate::material_io).
@@ -1132,6 +1245,9 @@ pub struct SampleContext<'a> {
     /// shadow there covers it (see [`PixelContext::light`]).
     pub light_split: &'a [u8],
     pub split: &'a [Cell<F32s>],
+    /// How far behind the polygon's plane its lights may be and still bump it: the sine of
+    /// the angle (its surface's `back_light`; 0, none). See `Surface::back_light`.
+    pub back: f32,
 }
 
 /// Outputs the engine adds to a polygon's sample points for its `splits` split lights:
@@ -1155,6 +1271,9 @@ pub struct Split {
     pub count: usize,
     pub light: [[F32s; 3]; MAX_SPLIT],
     pub reaches: [F32s; MAX_SPLIT],
+    /// Which of them is the player's flashlight, if it is one: its own channel for bumps
+    /// (see `shaders::bumps`).
+    pub flashlight: Option<usize>,
 }
 
 /// What `shade_pixel` sees besides its interpolated values.
@@ -1167,6 +1286,9 @@ pub struct PixelContext<'a> {
     pub filters: [u8; MAX_TEXTURES],
     pub params: &'a Params,
     pub focal: f32,
+    /// The frame's time in seconds, for what moves with it (a puddle's ripples): one
+    /// clock for every polygon, so a frame drawn twice is the same.
+    pub time: f32,
     /// Lights whose shadows cover part of the polygon; see [`PixelContext::light`].
     pub split: Split,
 }
@@ -1206,43 +1328,63 @@ impl PixelContext<'_> {
 }
 
 impl PixelContext<'_> {
-    /// [`PixelContext::light`], with the light that always reaches (all but the split
-    /// lights) scaled by `rest` (multiplying the gamma-encoded light) and the split lights'
-    /// by `all`, then blended by how much of the split lights reaches each pixel. For
-    /// bumps, which shade the lights that always reach and all of them differently (see
-    /// `shaders::textured_lit`). The light that always reaches is the sum less all of the
-    /// split lights', as in [`PixelContext::light`].
+    /// [`PixelContext::light`] with bumps, by channel: the light that always reaches (the
+    /// sum less all of the split lights', as there) scaled by `rest`, the shadowed lamps'
+    /// (the split lights but the flashlight) by `lamps`, and the flashlight's by `flash`
+    /// (each multiplying the gamma-encoded light; see `shaders::bumps`), each split light as
+    /// much as it reaches each pixel, per channel. Exact for the light: what reaches is each
+    /// light's own, in its own color, and only the lights that reach a pixel bump it.
     #[inline(always)]
-    pub fn light_scaled(&self, light: &[I32s; 3], rest: F32s, all: F32s) -> [I32s; 3] {
+    pub fn light_scaled(&self, light: &[I32s; 3], rest: F32s, lamps: F32s, flash: F32s) -> [I32s; 3] {
         if self.split.count == 0 {
             return light.map(|l| (l.round_float() * rest).round_int());
         }
-        let f = self.split_reach();
         let scale = F32s::fill(1.0 / 65536.0);
+        let (rest, lamps, flash) = (rest * rest, lamps * lamps, flash * flash);
+        let zero = F32s::fill(0.0);
         std::array::from_fn(|c| {
-            let mut split = F32s::fill(0.0);
+            let (mut all, mut lit, mut flashlit) = (zero, zero, zero);
             for j in 0..self.split.count {
-                split += self.split.light[j][c];
+                let l = self.split.light[j][c];
+                all += l;
+                if self.split.flashlight == Some(j) {
+                    flashlit += l * self.split.reaches[j];
+                } else {
+                    lit += l * self.split.reaches[j];
+                }
             }
             let e = light[c].round_float() * scale;
-            let e0 = (e * e - split).max(F32s::fill(0.0)).sqrt() * rest;
-            let e1 = e * all;
-            let e = (e0 * e0 + (e1 * e1 - e0 * e0) * f).max(F32s::fill(0.0)).sqrt();
+            let e = ((e * e - all).max(zero) * rest + lit * lamps + flashlit * flash).max(zero).sqrt();
             (e * F32s::fill(65536.0)).round_int()
         })
     }
 
-    /// How much of the split lights' light reaches each pixel, 0 to 1 (each one's as much
-    /// as its shadow lets through, over all of theirs; on green, the brightest channel):
-    /// 0 without split lights.
+    /// Whether any of the split lights of one channel (the flashlight's, `flashlight`, or
+    /// the shadowed lamps') reaches any of these pixels.
     #[inline(always)]
-    pub fn split_reach(&self) -> F32s {
-        let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
-        for j in 0..self.split.count {
-            all += self.split.light[j][1];
-            reaching += self.split.reaches[j] * self.split.light[j][1];
-        }
-        reaching / all.max(F32s::fill(1e-12))
+    pub fn split_reaches(&self, flashlight: bool) -> bool {
+        (0..self.split.count)
+            .filter(|&j| (self.split.flashlight == Some(j)) == flashlight)
+            .any(|j| self.split.reaches[j].simd_gt(F32s::fill(0.0)).any())
+    }
+
+    /// How much of one channel's split lights' light (the flashlight's, `flashlight`, or the
+    /// shadowed lamps') reaches each pixel, 0 to 1, per channel (each light's as much as its
+    /// shadow lets through, over all of theirs): 0 without any. Per channel, so that where
+    /// one reaches and another doesn't, what's let through is the color of the one that
+    /// reaches. (One number for all three, on green, let the summed color of all of them
+    /// through instead: a red porch light on a face the flashlight's beam was partly on
+    /// turned the flashlight's white there.)
+    #[inline(always)]
+    pub fn split_reach(&self, flashlight: bool) -> [F32s; 3] {
+        std::array::from_fn(|c| {
+            let (mut all, mut reaching) = (F32s::fill(0.0), F32s::fill(0.0));
+            for j in (0..self.split.count).filter(|&j| (self.split.flashlight == Some(j)) == flashlight) {
+                all += self.split.light[j][c];
+                reaching += self.split.reaches[j] * self.split.light[j][c];
+            }
+            reaching / all.max(F32s::fill(1e-12))
+        })
     }
 }
 
@@ -1283,6 +1425,10 @@ pub trait Material: 'static {
     type Fixed16: Group<Elem = i16>;
     type Floats: Group<Elem = f32>;
     const IO: MaterialIo;
+    /// This is the program's copy for polygons seen in a mirror: values its `material_io!`
+    /// marks `if !MIRRORED` are dropped from its layout (never stored or interpolated), and
+    /// its stages can test it to do less (the other copy's branches compile out).
+    const MIRRORED: bool = false;
     /// Most pixels between sample points this material wants, in both directions;
     /// perspective may ask for less.
     const SAMPLE_SPACING: i32 = MAX_STEP;
@@ -1318,7 +1464,7 @@ pub trait Material: 'static {
 }
 
 /// Most values (as f32) of one kind any material may declare.
-pub const MAX_VARYINGS: usize = 32;
+pub const MAX_VARYINGS: usize = 48;
 
 /// Everything needed to shade one run of pixels of one polygon on one row, its values
 /// already worked out at the row's sample points.
@@ -1343,6 +1489,8 @@ pub struct SpanJob<'a> {
     /// `reaches[j * len + i]` for light `j` at pixel `x0 + i`).
     pub splits: usize,
     pub split_colors: [Vec3; MAX_SPLIT],
+    /// Which split light is the player's flashlight, if one is (see `Split::flashlight`).
+    pub split_flashlight: Option<u8>,
     pub reaches: &'a [f32],
     /// The framebuffer row.
     pub row: i32,
@@ -1416,6 +1564,8 @@ pub struct Draw<'a> {
     pub filters: [u8; MAX_TEXTURES],
     pub eye: Vec3,
     pub focal: f32,
+    /// The frame's time in seconds (see `PixelContext::time`).
+    pub time: f32,
     pub object: &'a Object,
 }
 
@@ -1462,7 +1612,7 @@ impl MaterialEntry {
 }
 
 fn vertex_stage<M: Material>(input: &[f32], ctx: &VertexContext, out: &mut [f32]) {
-    M::shade_vertex(&M::Vertex::from_flat(input), ctx).write_flat(out);
+    M::shade_vertex(&M::Vertex::from_flat(input, M::MIRRORED), ctx).write_flat(out, M::MIRRORED);
 }
 
 /// Blends an ARGB color over an existing one by its alpha: `src * a + dst * (1 - a)` per
@@ -1536,7 +1686,7 @@ pub fn span<M: Material, const STRIDE: i32>(
     draw: &Draw,
 ) {
     let (x0, x1) = (job.x0, job.x0 + color.len() as i32);
-    let n_material = M::Interp::LEN;
+    let n_material = M::Interp::len(M::MIRRORED);
     let n_out = n_material + split_outputs(job.splits);
     let n = job.xs.len();
     debug_assert_eq!(job.outs.len(), n * n_out);
@@ -1597,7 +1747,7 @@ pub fn span<M: Material, const STRIDE: i32>(
 pub type SampleFn = fn(inputs: &[F32s], ctx: &SampleContext, out: &mut [F32s]);
 
 fn sample_stage<M: Material>(inputs: &[F32s], ctx: &SampleContext, out: &mut [F32s]) {
-    M::shade_sample(&M::SampledLanes::from_lanes(inputs), ctx).write_lanes(out);
+    M::shade_sample(&M::SampledLanes::from_lanes(inputs, M::MIRRORED), ctx).write_lanes(out, M::MIRRORED);
 }
 
 /// The lines of all three groups within one sample interval.
@@ -1615,12 +1765,12 @@ fn lines<M: Material>(base: &[f32], step: &[f32]) -> Lines<M> {
     fn split(v: &[f32], f32s: usize, f16s: usize) -> (&[f32], &[f32], &[f32]) {
         (&v[..f32s], &v[f32s..f32s + f16s], &v[f32s + f16s..])
     }
-    let (f32s, f16s) = (M::Fixed32::LEN, M::Fixed16::LEN);
+    let (f32s, f16s) = (M::Fixed32::len(M::MIRRORED), M::Fixed16::len(M::MIRRORED));
     let ((b32, b16, bf), (s32, s16, sf)) = (split(base, f32s, f16s), split(step, f32s, f16s));
     (
-        M::Fixed32::line(b32, s32),
-        M::Fixed16::line(b16, s16),
-        M::Floats::line(bf, sf),
+        M::Fixed32::line(b32, s32, M::MIRRORED),
+        M::Fixed16::line(b16, s16, M::MIRRORED),
+        M::Floats::line(bf, sf, M::MIRRORED),
     )
 }
 
@@ -1674,6 +1824,7 @@ impl Run<'_> {
         // pixel, clamped to the run).
         let mut split = Split {
             count: self.job.splits,
+            flashlight: self.job.split_flashlight.map(usize::from),
             ..Split::default()
         };
         let len = self.color.len();
@@ -1707,6 +1858,7 @@ impl Run<'_> {
             filters: self.draw.filters,
             params: self.draw.params,
             focal: self.draw.focal,
+            time: self.draw.time,
             split,
         };
         let out = if M::READS_BEHIND {
@@ -1985,6 +2137,7 @@ mod tests {
                     x0: x,
                     splits: 0,
                     split_colors: [Vec3::ZERO; MAX_SPLIT],
+                    split_flashlight: None,
                     reaches: &[],
                     row: 0,
                     half_rate,
@@ -1997,10 +2150,11 @@ mod tests {
                     Behind::default(),
                     &Draw {
                         params: &Params::default(),
-                        textures: &[&blank, &blank],
+                        textures: &[&blank; MAX_TEXTURES],
                         filters: [filter::BILINEAR_MIPMAP_LINEAR; MAX_TEXTURES],
                         eye: Vec3::ZERO,
                         focal: 1.0,
+                        time: 0.0,
                         object: &Object::IDENTITY,
                     },
                 );

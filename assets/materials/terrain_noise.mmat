@@ -1,0 +1,4 @@
+MOOSEMATERIAL 2
+# Terrain: vertex colors times a detail texture, smoothly lit.
+shader             terrain_noise
+strength           115

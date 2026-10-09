@@ -767,3 +767,388 @@ fn animations_must_be_the_models() {
     let bad = src.replace("anim=walk", "anim=walk static");
     assert!(assets.parse_level("bad.mmp", &bad).is_err());
 }
+
+#[test]
+fn loads_meta_values_and_light_names_and_writes_them_back() {
+    // The level's own, a sector's, a surface's, a template's (one entity overriding it) and
+    // a named light.
+    let src = LEVEL
+        .replacen("name \"Two Rooms\"", "name \"Two Rooms\" $fog=10", 1)
+        .replacen("   1   hallway   9              6", "   1   hallway   9              6   $wet=200", 1)
+        .replacen("material=vertex_color  # far wall", "material=vertex_color $shine=5  # far wall", 1)
+        .replacen("crate.obj  -2.50   0.00    2.00", "box  -2.50   0.00    2.00", 1)
+        .replacen("crate.obj  -2.50   1.00    2.00", "box  -2.50   1.00    2.00", 1)
+        .replacen("1.00   crate_a2_stacked", "1.00   crate_a2_stacked $team=1,2,3", 1)
+        .replacen("entities ", "templates 1\n   0   box  crate.obj  $team=204,51,51\n\nentities ", 1);
+    let mut a = assets();
+    let level = a.parse_level("two_rooms.mmp", &src).unwrap();
+    let key = |name: &str| level.meta_keys.id(name).unwrap();
+    assert_eq!(level.meta.get(key("fog")), Some(&[10.0][..]));
+    assert_eq!(level.sectors[1].meta.get(key("wet")), Some(&[200.0][..]));
+    assert_eq!(level.sectors[0].meta.get(key("wet")), None);
+    // The far wall is room_a's third solid surface.
+    assert_eq!(level.faces[2].get(key("shine")), Some(&[5.0][..]));
+    assert_eq!(level.faces.len(), 20);
+    assert_eq!(level.spawns[1].meta.get(key("team")), Some(&[204.0, 51.0, 51.0][..]));
+    assert_eq!(level.spawns[2].meta.get(key("team")), Some(&[1.0, 2.0, 3.0][..]));
+    assert!(level.light_names.is_empty());
+    // The editor's tables keep them as written.
+    let path = std::path::Path::new("two_rooms.mmp");
+    let doc = moose_assets::LevelDoc::parse(path, &src).unwrap();
+    assert_eq!(doc.name_options, ["$fog=10"]);
+    assert_eq!(doc.sectors[1].options, ["$wet=200"]);
+    let again = a.parse_level("two_rooms.mmp", &doc.to_text()).unwrap();
+    assert_eq!((again.meta, again.sectors[1].meta.clone(), again.faces), (level.meta, level.sectors[1].meta.clone(), level.faces));
+    // Bad ones are refused where they are.
+    let bad = src.replacen("$wet=200", "$wet=soaked", 1);
+    let msg = assets().parse_level("two_rooms.mmp", &bad).err().unwrap().to_string();
+    assert!(msg.contains("sector 1: $wet: 'soaked' is not a number"), "{msg}");
+    let bad = src.replacen("$wet=200", "wet=200", 1);
+    let msg = assets().parse_level("two_rooms.mmp", &bad).err().unwrap().to_string();
+    assert!(msg.contains("unknown option 'wet=200' (meta values are $KEY=VALUE)"), "{msg}");
+}
+
+#[test]
+fn lights_take_names() {
+    let src = include_str!("../../../assets/levels/shiny_rooms.mmp");
+    let named = src.replacen("6.00   radius=0.05", "6.00   radius=0.05 name=lamp", 1);
+    let level = assets().parse_level("shiny_rooms.mmp", &named).unwrap();
+    assert_eq!(level.light_names[0].as_deref(), Some("lamp"));
+    assert_eq!(level.light_names.len(), level.lights.len());
+    let twice = named.replacen("5.00   radius=0.05", "5.00   radius=0.05 name=lamp", 1);
+    let msg = assets().parse_level("shiny_rooms.mmp", &twice).err().unwrap().to_string();
+    assert!(msg.contains("another light is named 'lamp'"), "{msg}");
+}
+
+#[test]
+fn stitching_continues_a_surfaces_material_and_texture_across_the_edge() {
+    use moose_assets::LevelDoc;
+    let path = std::path::Path::new("shiny_rooms.mmp");
+    let src = include_str!("../../../assets/levels/shiny_rooms.mmp");
+    let mut doc = LevelDoc::parse(path, src).unwrap();
+    let uv = doc.attributes.iter().position(|a| a.name == "uv").unwrap();
+    let uvs = |doc: &LevelDoc, surface: usize| -> Vec<(moose_assets::glam::Vec3, [f32; 2])> {
+        doc.surfaces[surface]
+            .corners
+            .iter()
+            .map(|(v, rows)| {
+                let t = &doc.attributes[uv].values[rows[uv]];
+                (doc.vertices[*v], [t[0].parse().unwrap(), t[1].parse().unwrap()])
+            })
+            .collect()
+    };
+    // The far wall (2) from room_a's floor (0): the floor's material, and its texture
+    // folded up the wall.
+    let (floor, wall) = (0, 2);
+    assert!(doc.stitch(wall, floor, false).unwrap());
+    assert!(doc.surfaces[wall].options.contains(&"material=metal_floor_shiny".to_string()));
+    let (on_floor, on_wall) = (uvs(&doc, floor), uvs(&doc, wall));
+    // On the edge they share, the same coordinates.
+    let mut shared = 0;
+    for (p, t) in &on_wall {
+        if let Some((_, f)) = on_floor.iter().find(|(q, _)| q.distance(*p) < 1e-4) {
+            assert!((t[0] - f[0]).abs() < 1e-4 && (t[1] - f[1]).abs() < 1e-4, "{t:?} vs {f:?} at {p}");
+            shared += 1;
+        }
+    }
+    assert_eq!(shared, 2);
+    // Up the wall, not stretched: the floor's half a tile a meter (2 m a tile), every way.
+    for (p, t) in &on_wall {
+        for (q, u) in &on_wall {
+            let (d, du) = (p.distance(*q), ((t[0] - u[0]).powi(2) + (t[1] - u[1]).powi(2)).sqrt());
+            assert!((du - d * 0.5).abs() < 1e-3, "{d} m apart, {du} apart in uv");
+        }
+    }
+    // Mirrored: the same on the edge, and a point h up the wall takes the floor's texture
+    // h back from the edge (the floor's u = x / 2, v = z / 2; the wall is at z = 8): v =
+    // (8 - h) / 2, where continued it would be (8 + h) / 2.
+    assert!(doc.stitch(wall, floor, true).unwrap());
+    for (p, t) in uvs(&doc, wall) {
+        assert!((t[0] - p.x / 2.0).abs() < 1e-3 && (t[1] - (8.0 - p.y) / 2.0).abs() < 1e-3, "{p}: {t:?}");
+    }
+    assert!(doc.stitch(wall, floor, false).unwrap());
+    for (p, t) in uvs(&doc, wall) {
+        assert!((t[1] - (8.0 + p.y) / 2.0).abs() < 1e-3, "{p}: {t:?}");
+    }
+    // A coplanar surface (the hallway's floor, 9) continues the room's as it is: the
+    // levels are textured flat already, so nothing moves.
+    let before = uvs(&doc, 9);
+    assert!(doc.stitch(9, floor, false).unwrap());
+    for ((_, a), (_, b)) in before.iter().zip(uvs(&doc, 9)) {
+        assert!((a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4, "{a:?} became {b:?}");
+    }
+    // The level loads with them.
+    assets().parse_level("shiny_rooms.mmp", &doc.to_text()).unwrap();
+    // What can't be stitched.
+    assert!(doc.stitch(floor, floor, false).unwrap_err().contains("another surface"));
+    let ceiling = 1;
+    assert!(doc.stitch(ceiling, floor, false).unwrap_err().contains("don't share an edge"));
+    let portal = doc.surfaces.iter().position(|s| s.adjoin.is_some()).unwrap();
+    assert!(doc.stitch(portal, floor, false).unwrap_err().contains("openings"));
+}
+
+#[test]
+fn cutting_a_surface_splits_only_it_and_its_neighbors_take_the_new_corners() {
+    use moose_assets::glam::Vec3;
+    use moose_assets::LevelDoc;
+    let path = std::path::Path::new("shiny_rooms.mmp");
+    let src = include_str!("../../../assets/levels/shiny_rooms.mmp");
+    let mut doc = LevelDoc::parse(path, src).unwrap();
+    let (surfaces, sectors, adjoins) = (doc.surfaces.len(), doc.sectors.len(), doc.adjoins.len());
+    let corners = |doc: &LevelDoc, i: usize| doc.surfaces[i].corners.len();
+    let (floor, ceiling) = (corners(&doc, 0), corners(&doc, 1));
+    // room_a's far wall (2, at z = 8, x from -4 to 4), down the middle.
+    let behind = doc.cut_surface(2, Vec3::X, Vec3::ZERO).unwrap();
+    assert_eq!(behind, 3);
+    assert_eq!((doc.surfaces.len(), doc.sectors.len(), doc.adjoins.len()), (surfaces + 1, sectors, adjoins));
+    assert_eq!(doc.sectors[0].surface_count, 10);
+    for half in [2, 3] {
+        assert_eq!(corners(&doc, half), 4);
+        assert_eq!(doc.surfaces[half].options, ["material=brick"]);
+    }
+    // The floor and ceiling share the cut edges' ends: each takes the new corner.
+    assert_eq!((corners(&doc, 0), corners(&doc, 1)), (floor + 1, ceiling + 1));
+    // Texture coordinates run on: the bottom middle (0, 0, 8) is halfway between its ends.
+    let uv = doc.attributes.iter().position(|a| a.name == "uv").unwrap();
+    let at = |doc: &LevelDoc, surface: usize, p: Vec3| {
+        let (_, rows) = doc.surfaces[surface].corners.iter().find(|(v, _)| doc.vertices[*v].distance(p) < 1e-4).unwrap();
+        let t = &doc.attributes[uv].values[rows[uv]];
+        [t[0].parse::<f32>().unwrap(), t[1].parse::<f32>().unwrap()]
+    };
+    let (a, b, m) = (at(&doc, 3, Vec3::new(-4.0, 0.0, 8.0)), at(&doc, 2, Vec3::new(4.0, 0.0, 8.0)), at(&doc, 2, Vec3::new(0.0, 0.0, 8.0)));
+    assert!((m[0] - (a[0] + b[0]) / 2.0).abs() < 1e-4 && (m[1] - (a[1] + b[1]) / 2.0).abs() < 1e-4, "{a:?} {m:?} {b:?}");
+    assets().parse_level("shiny_rooms.mmp", &doc.to_text()).unwrap();
+    // The lintel over the doorway (now 8: x from -1 to 1, y from 3 to 4), down the middle:
+    // its bottom edge is the opening's top, so the opening, its mirror in the hallway and
+    // the hallway's ceiling all take the new corner, and the level still loads.
+    let lintel = doc.surfaces.iter().position(|s| {
+        let p: Vec<Vec3> = s.corners.iter().map(|(v, _)| doc.vertices[*v]).collect();
+        s.adjoin.is_none() && p.iter().all(|q| q.z.abs() < 1e-4 && q.y >= 3.0 - 1e-4 && q.x.abs() <= 1.0 + 1e-4)
+    });
+    let lintel = lintel.unwrap();
+    let openings: Vec<usize> = doc.adjoins[..2].iter().map(|a| corners(&doc, a.surface)).collect();
+    doc.cut_surface(lintel, Vec3::X, Vec3::ZERO).unwrap();
+    let after: Vec<usize> = doc.adjoins[..2].iter().map(|a| corners(&doc, a.surface)).collect();
+    assert_eq!(after, openings.iter().map(|n| n + 1).collect::<Vec<_>>());
+    assets().parse_level("shiny_rooms.mmp", &doc.to_text()).unwrap();
+    // What can't be cut.
+    assert!(doc.cut_surface(0, Vec3::X, Vec3::new(100.0, 0.0, 0.0)).unwrap_err().contains("doesn't cross"));
+    let portal = doc.adjoins[0].surface;
+    assert!(doc.cut_surface(portal, Vec3::X, Vec3::ZERO).unwrap_err().contains("opening"));
+}
+
+#[test]
+fn merging_faces_takes_one_plane_touching_and_convex() {
+    use moose_assets::glam::Vec3;
+    use moose_assets::LevelDoc;
+    let path = std::path::Path::new("shiny_rooms.mmp");
+    let src = include_str!("../../../assets/levels/shiny_rooms.mmp");
+    let mut doc = LevelDoc::parse(path, src).unwrap();
+    let surfaces = doc.surfaces.len();
+    let uv = doc.attributes.iter().position(|a| a.name == "uv").unwrap();
+    // room_a's far wall cut down the middle, then merged back: one surface again, with the
+    // cut's two corners kept (the floor and ceiling use them now), its material, and
+    // coordinates that run on (each corner's the flat mapping's, as before).
+    let behind = doc.cut_surface(2, Vec3::X, Vec3::ZERO).unwrap();
+    assert_eq!(doc.merge_surfaces(2, behind).unwrap(), 2);
+    assert_eq!(doc.surfaces.len(), surfaces);
+    assert_eq!(doc.surfaces[2].corners.len(), 6);
+    assert_eq!(doc.surfaces[2].options, ["material=brick"]);
+    for (v, rows) in &doc.surfaces[2].corners {
+        let p = doc.vertices[*v];
+        let t = &doc.attributes[uv].values[rows[uv]];
+        let (u, w) = (t[0].parse::<f32>().unwrap(), t[1].parse::<f32>().unwrap());
+        assert!((u - p.x / 2.0).abs() < 1e-3 && (w + p.y / 2.0).abs() < 1e-3, "{p}: {u}, {w}");
+    }
+    assets().parse_level("shiny_rooms.mmp", &doc.to_text()).unwrap();
+    // room_b's floor in quarters (x = 0, z = -16): two side by side merge; a third would
+    // make an L.
+    // The piece of room_b's floor whose middle is nearest (x, z).
+    let floor_of = |doc: &LevelDoc, x: f32, z: f32| {
+        let middle = |s: &moose_assets::SurfaceDoc| {
+            s.corners.iter().map(|(v, _)| doc.vertices[*v]).sum::<Vec3>() / s.corners.len() as f32
+        };
+        (0..doc.surfaces.len())
+            .filter(|&i| {
+                let s = &doc.surfaces[i];
+                s.adjoin.is_none() && s.sector == 2 && s.corners.iter().all(|(v, _)| doc.vertices[*v].y.abs() < 1e-4)
+            })
+            .min_by(|&i, &j| {
+                let d = |k: usize| middle(&doc.surfaces[k]).distance(Vec3::new(x, 0.0, z));
+                d(i).total_cmp(&d(j))
+            })
+    };
+    let floor = floor_of(&doc, 1.0, -14.0).unwrap();
+    doc.cut_surface(floor, Vec3::X, Vec3::ZERO).unwrap();
+    for x in [1.0, -1.0] {
+        let half = floor_of(&doc, x, -14.0).unwrap();
+        doc.cut_surface(half, Vec3::Z, Vec3::new(0.0, 0.0, -16.0)).unwrap();
+    }
+    let (a, b, c) = (floor_of(&doc, 1.0, -14.0).unwrap(), floor_of(&doc, -1.0, -14.0).unwrap(), floor_of(&doc, 1.0, -18.0).unwrap());
+    // Corner to corner, they meet at a point only.
+    let diagonal = floor_of(&doc, -1.0, -18.0).unwrap();
+    assert!(doc.merge_surfaces(a, diagonal).unwrap_err().contains("don't share an edge"));
+    let half = doc.merge_surfaces(a, b).unwrap();
+    let c = if b < c { c - 1 } else { c };
+    assert!(doc.merge_surfaces(half, c).unwrap_err().contains("convex"));
+    assets().parse_level("shiny_rooms.mmp", &doc.to_text()).unwrap();
+    // Not one plane (the floor and a wall, the left and right walls); in other sectors (the
+    // hallway's floor); itself.
+    assert!(doc.merge_surfaces(0, 2).unwrap_err().contains("one plane"));
+    let hallway_floor = doc.surfaces.iter().position(|s| s.sector == 1 && s.adjoin.is_none()).unwrap();
+    assert!(doc.merge_surfaces(0, hallway_floor).unwrap_err().contains("different sectors"));
+    let (left, right) = (3, 4);
+    assert!(doc.merge_surfaces(left, right).unwrap_err().contains("one plane"));
+    assert!(doc.merge_surfaces(2, 2).unwrap_err().contains("another surface"));
+}
+
+/// Sector `s`'s surfaces as what they look like: each one's corners (where they are, and
+/// their texture coordinates), whether it is an opening, and its options, in a set.
+fn looks(doc: &moose_assets::LevelDoc, s: usize) -> Vec<String> {
+    let uv = doc.attributes.iter().position(|a| a.name == "uv");
+    let mut out: Vec<String> = doc
+        .sector_surfaces(s)
+        .map(|i| {
+            let t = &doc.surfaces[i];
+            let mut corners: Vec<String> = t
+                .corners
+                .iter()
+                .map(|(v, rows)| {
+                    let p = doc.vertices[*v];
+                    let uv = uv.and_then(|k| Some(doc.attributes[k].values[*rows.get(k)?].iter().map(|x| format!("{:.3}", x.parse::<f32>().unwrap())).collect::<Vec<_>>()));
+                    format!("({:.3},{:.3},{:.3}){uv:?}", p.x, p.y, p.z)
+                })
+                .collect();
+            corners.sort();
+            format!("{} {:?} {:?} {}", t.adjoin.is_some(), t.options, t.flags, corners.join(" "))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_cleaved_sector_merged_back_is_as_it_was() {
+    // shiny_rooms' hallway lengthwise (the cut crosses both doorways, splitting them and
+    // room_a's and room_b's walls around them), then merged back: the same surfaces,
+    // textures and openings, on both sides of the doorways.
+    let original = doc("shiny_rooms.mmp");
+    let mut d = original.clone();
+    let hallway = d.sectors.iter().position(|s| s.name == "hallway").unwrap();
+    let new = d.cleave(hallway, Vec3::X, Vec3::new(0.25, 0.0, 0.0)).unwrap();
+    assert_eq!(d.merge_sectors(hallway, new).unwrap(), hallway);
+    let level = loads(&d);
+    assert_eq!(level.sectors.len(), original.sectors.len());
+    assert_eq!(level.portals.len(), loads(&original).portals.len());
+    for s in 0..original.sectors.len() {
+        assert_eq!(looks(&d, s), looks(&original, s), "sector {s}");
+    }
+    // room_a across the middle, merged the other way round (room_a into its new part,
+    // after the others): its crates go with it, and the sectors after it move down.
+    let mut d = original.clone();
+    let new = d.cleave(0, Vec3::X, Vec3::ZERO).unwrap();
+    assert!(d.entities.iter().any(|e| e.sector == new));
+    let merged = d.merge_sectors(new, 0).unwrap();
+    assert_eq!(merged, original.sectors.len() - 1);
+    assert_eq!(d.sectors[merged].name, "room_a_2");
+    loads(&d);
+    assert_eq!(looks(&d, merged), looks(&original, 0));
+    for (e, was) in d.entities.iter().zip(&original.entities) {
+        assert_eq!(e.sector, if was.sector == 0 { merged } else { was.sector - 1 }, "{}", e.name);
+    }
+}
+
+#[test]
+fn merging_sectors_takes_an_opening_between_them_and_a_convex_union() {
+    let mut d = doc("two_rooms.mmp");
+    let same = d.clone();
+    assert!(d.merge_sectors(0, 2).unwrap_err().contains("don't open onto each other"));
+    // room_a and the hallway meet at a doorway in room_a's wall: the wall would be inside.
+    assert!(d.merge_sectors(0, 1).unwrap_err().contains("convex"));
+    assert!(d.merge_sectors(1, 1).unwrap_err().contains("another sector"));
+    assert_eq!(d, same);
+    // A room built beside room_a, opened onto it through a whole wall: one room.
+    let room = d.add_box(Vec3::new(4.0, 0.0, 0.0), Vec3::new(8.0, 4.0, 8.0), "annex").unwrap();
+    d.adjoin(wall(&d, room, Vec3::X)).unwrap();
+    d.merge_sectors(0, room).unwrap();
+    let level = loads(&d);
+    assert_eq!(level.sectors.len(), same.sectors.len());
+    assert!((level.sectors[0].bounds.max.x - 8.0).abs() < 1e-4);
+}
+
+#[test]
+fn every_merge_of_sectors_a_level_allows_loads() {
+    // Each pair of sectors with an opening between them, in every level: merged, or
+    // refused, never a level the loader refuses.
+    let dir = format!("{}/../../assets/levels", env!("CARGO_MANIFEST_DIR"));
+    let mut merged = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "mmp") {
+            continue;
+        }
+        let file = path.file_name().unwrap().to_str().unwrap();
+        let original = doc(file);
+        let mut pairs: Vec<(usize, usize)> = original
+            .adjoins
+            .iter()
+            .map(|a| (original.surfaces[a.surface].sector, original.surfaces[original.adjoins[a.mirror].surface].sector))
+            .filter(|&(a, b)| a < b)
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        for (a, b) in pairs {
+            let mut d = original.clone();
+            if d.merge_sectors(a, b).is_ok() {
+                let mut assets = assets();
+                if let Err(e) = assets.parse_level("edited.mmp", &d.to_text()) {
+                    panic!("{file}: merging sectors {a} and {b}: {e}");
+                }
+                merged += 1;
+            }
+        }
+    }
+    // (21 across the levels when this was written.)
+    assert!(merged > 0);
+}
+
+#[test]
+fn exclusion_lists_name_lights_and_become_masks() {
+    use moose_assets::{FLASHLIGHT_ID, TemplateDoc};
+    // sunny_rooms: one light (bit 0) and the sun (bit 1), both named.
+    let mut d = doc("sunny_rooms.mmp");
+    d.lights[0].options.push("name=lamp".into());
+    d.directional[0].options.push("name=sun".into());
+    // A surface of room_a keeps off the lamp and the flashlight, the hallway (sector 1)
+    // the sun; a template keeps off the lamp, and an entity placing it says none.
+    let surface = d.sector_surfaces(0).find(|&i| d.surfaces[i].adjoin.is_none()).unwrap();
+    d.surfaces[surface].options.push("exclude_lights=lamp,flashlight".into());
+    d.sectors[1].options.push("exclude_lights=sun".into());
+    d.templates.push(TemplateDoc { name: "boxed".into(), model: "crate.obj".into(), options: vec!["exclude_lights=lamp".into()] });
+    let props: Vec<usize> = (0..d.entities.len()).filter(|&e| d.entities[e].kind == moose_assets::EntityKind::Prop).collect();
+    assert!(props.len() >= 2);
+    d.entities[props[0]].model = Some("boxed".into());
+    d.entities[props[1]].model = Some("boxed".into());
+    d.entities[props[1]].options.push("exclude_lights=none".into());
+    let level = loads(&d);
+    // Per polygon (solid surfaces in order), its own and its sector's.
+    let polygon = (0..surface).filter(|&i| d.surfaces[i].adjoin.is_none()).count();
+    assert_eq!(level.face_excluded_lights[polygon], 1 | 1 << FLASHLIGHT_ID);
+    let hallway = &level.sectors[1];
+    assert_eq!(hallway.excluded_lights, 1 << 1);
+    assert!(hallway.polygons.clone().all(|p| level.face_excluded_lights[p as usize] == 1 << 1));
+    let spawn = |e: usize| level.spawns.iter().find(|s| s.name == d.entities[e].name).unwrap().excluded_lights;
+    assert_eq!((spawn(props[0]), spawn(props[1])), (1, 0));
+    // A light a list names must be there; a light can't take the flashlight's name.
+    let mut bad = d.clone();
+    bad.sectors[1].options = vec!["exclude_lights=lantern".into()];
+    let mut assets = assets();
+    let err = assets.parse_level("edited.mmp", &bad.to_text()).unwrap_err().to_string();
+    assert!(err.contains("no light is named 'lantern'"), "{err}");
+    let mut bad = d.clone();
+    bad.lights[0].options = vec!["name=flashlight".into()];
+    assert!(assets.parse_level("edited.mmp", &bad.to_text()).is_err());
+    // Written back, it loads the same.
+    let again = moose_assets::LevelDoc::parse(std::path::Path::new("x.mmp"), &d.to_text()).unwrap();
+    assert_eq!(loads(&again).face_excluded_lights, level.face_excluded_lights);
+}

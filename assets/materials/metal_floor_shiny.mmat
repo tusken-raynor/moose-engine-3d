@@ -1,0 +1,6 @@
+MOOSEMATERIAL 2
+# Metal floors, shiny ones over their reflection, and water with the Water floors setting.
+shader             textured
+texture0           metal_tile.png
+variant.reflected  metal_fresnel
+variant.water      water_floor

@@ -11,7 +11,7 @@ The editor is a mode of the app, not a separate program: Tab switches between pl
 - picking with the mouse in the 3D view and in 2D views (top, front, side), with hover and selection outlines
 - a properties panel on the right: click a row to toggle or cycle it, scroll over it to change a number
 - entity editing: move, turn, scale, kind, model, animation, static, occluder, duplicate, delete
-- sector tools: extrude, push/pull, cleave, open and wall up, new room, delete sector, vertex moves
+- sector tools: extrude, push/pull, cleave, merge sectors, open and wall up, new room, delete sector, vertex moves
 - placement: lights (with spot cones), props, spawn points; the level's ambient light and sun
 - texture alignment on surfaces (levels with uvs)
 - undo and redo, saving, copy and paste, camera bookmarks, hot reload of models, textures and the level
@@ -58,10 +58,10 @@ The panel shows what the selection can do; most rows are also on keys.
 | Selection | Rows |
 | --- | --- |
 | Nothing | New room (4 × 3 × 4 m where the view is), add a light, a prop or a spawn point, ambient red/green/blue, and for a level with a sun: its size and where it comes from |
-| Surface | Its sector (click to select the sector), and for a solid surface: reflective, sky, extrude by (scroll), extrude, push/pull (scroll, or PgUp/PgDn), open to a matching surface of another sector, texture rows; for an opening: the sector it opens to, wall it up |
-| Sector | Cleave (then click the cut's two ends in a 2D view; Esc stops), delete |
+| Surface | Its sector (click to select the sector), and for a solid surface: material, stitch from a touching face, merge with a touching face, reflective, sky, extrude by (scroll), extrude, push/pull (scroll, or PgUp/PgDn), open to a matching surface of another sector, lights kept off (below), texture rows; for an opening: the sector it opens to, wall it up |
+| Sector | Cleave (then click the cut's two ends in a 2D view, on the grid or with Ctrl/Cmd held on the nearest vertex; Esc stops), merge with a sector (then click a face of it), lights kept off (below), delete |
 | Vertex | X, Y, Z (also the arrows and PgUp/PgDn) |
-| Entity | Kind, model (cycles through assets/models), animation (for a model with them: its animations, or none), position, yaw/pitch/roll, scale, static, occluder (mesh or none), duplicate, delete |
+| Entity | Kind, model (cycles through assets/models), animation (for a model with them: its animations, or none), position, yaw/pitch/roll, scale, static, occluder (mesh or none), lights kept off (drawn entities), duplicate, delete |
 | Light | Position, color, range, source radius, shadows, spot on/off with aim and cone angles, duplicate, delete |
 
 **Sector tools** are `LevelDoc` methods in `moose_assets` (`mmp_edit.rs`), each tested by loading its result:
@@ -69,13 +69,24 @@ The panel shows what the selection can do; most rows are also on keys.
 - **Extrude:** a surface becomes an opening, and a prism behind it becomes a new sector: its far end (selected after, to extrude again) and a side per edge take the surface's attribute values.
 - **Push/pull:** a surface's corners move along its normal; surfaces sharing them stretch.
 - **Cleave:** a sector is split by a plane (through the cut drawn in a 2D view, square to the view) into two sectors joined by an opening. Surfaces crossing the plane are split, with one new vertex per crossed edge and attribute values between the edge's ends. Openings to other sectors that the plane crosses are split on both sides. New vertices on other surfaces' edges are added to them as corners, so there are no T-junctions. Entities and lights behind the plane move to the new sector.
+- **Merge with a sector:** then click any face of the other sector, or an opening of the selected one onto it (Esc stops). The two must open onto each other and be convex together (a room and a hallway through a doorway aren't: the wall around the door would be inside); otherwise it is refused and says which. The openings between them go, and the other's surfaces, entities and lights become the selected sector's, which keeps its name and meta values; the sectors after the other move down one. Where the openings were, two surfaces on one plane that look alike (the same material, flags and options, and the texture running on unchanged) become one, two openings onto the same sector become one on both sides, and corners left in a straight line there go where every surface using them allows. So a cleave merged back is as it was (`LevelDoc::merge_sectors`). One undo takes it back.
+- **Lights kept off:** a solid surface's, a sector's and a drawn entity's panels list the lights they aren't lit by (`exclude_lights=`; an entity's from its template marked so). Clicking the row starts picking: each light clicked is kept off, or lights it again if it was (Esc stops); a light without a name is named for it (`light`, `light_1`, ...). **Lit by the flashlight** and **Lit by the sun** (in a level with one, named `sun` if it has no name) switch those, which can't be clicked. An entity keeps a list of its own only where it differs from its template's. Deleting a light takes it off every list; duplicating one leaves the copy unnamed. The Light panel shows a light's name.
 - **Open to a match:** a surface and another sector's surface with corners in the same places become an opening pair; their corners are welded into the same vertices.
 - **Wall up:** an opening pair becomes solid again, taking attribute values from the sector's other surfaces at the same vertices.
 - **New room:** a box sector on its own, with each attribute's first values. Open it to the level with a matching wall, or build it by extruding instead.
+- **New level** (Esc > Levels, not the editor's panel): a name is typed, and a level of one 10 × 5 × 10 m room starts, not saved yet: every surface the `default` material, textured flat (a tile every 2 m), a spawn point looking down the room, a light under the ceiling and some ambient light. Levels > Save level (or Ctrl+S here) writes it to `assets/levels/NAME.mmp`; until then the editor counts it as unsaved.
 - **Delete sector:** openings into it are walled up; refused while an entity or light is in it.
 - **Vertices** move on the grid; the loader refuses a move that bends a surface or dents a sector.
 
-**Texture alignment** (levels with a `uv` attribute): shift across and down by 1/8 of a tile, scale about the surface's middle, turn a quarter, or map flat from the corners' positions exactly as the test levels are made (along the normal's strongest axis, a tile every 2 m, v growing down on walls). New values go in new rows, so surfaces sharing rows keep theirs.
+**Cut a surface** (a solid surface selected, in a 2D view): press the left button and drag a line across it; letting go cuts it in two along the plane through the line, square to the view (the whole surface, wherever the line crosses it). Ends snap to the grid, or with Ctrl (Cmd) held, to the nearest vertex on screen. Nothing else is split: no new sector or opening. The halves keep the surface's material, flags and options, and their texture coordinates run on from its own, so it looks the same. The new corners go into every surface sharing the cut edges (the floor and ceiling under a cut wall, and both sides of an opening the cut lands on), so there are no T-junctions. A press let go without dragging is a click (it selects); Esc or F6 stops a cut; one undo takes it back. Refused for openings and lines that miss the surface.
+
+**Merge with a touching face** (a solid surface's panel): then click a surface to merge into it (Esc stops). The two must be in the same sector, on one plane facing the same way, and touch along one run of edges, and their union must be convex (corners in a straight line are fine); otherwise it is refused and says which. The selected surface becomes the union: its material, flags and options, and with a `uv` attribute its texture mapping (fitted to its corners) carried across the whole of it, so the texture runs on with no seam. Corners left in a straight line along its edges stay where another surface uses them (the floor and ceiling under a cut wall: no T-junction) and go otherwise. One undo takes it back. The undoing of **Cut a surface**, and the way to tidy a wall built from pieces.
+
+**Stitch from a touching face** (a solid surface's panel): then click a surface that shares an edge with it (Esc stops). The selected surface takes the clicked one's material (`material=` and `filterN=`; its own meta values stay) and, with a `uv` attribute, its texture mapping unfolded about the shared edge: the texture runs on across the fold as if the two were one flat surface, no seam on the edge and no stretching (the mapping is fitted to the clicked surface's corners, so it follows however that one was aligned). A coplanar neighbor simply continues. **Right-click** the surface instead for a mirrored stitch: the texture reflected across the shared edge (folded back onto the clicked surface's side, so a point some way past the edge takes the texture as far back from it), still with no seam on the edge. While a surface is being picked, the right button is this click rather than a look around. Refused for openings and surfaces that don't share an edge; one undo takes it back.
+
+**Texture alignment** (levels with a `uv` attribute): shift across and down by 1/8 of a tile, scale about the surface's middle, size across or down, turn, flip across or down (mirrored about the middle: left to right, or top to bottom), or map flat from the corners' positions exactly as the test levels are made (along the normal's strongest axis, a tile every 2 m, v growing down on walls). New values go in new rows, so surfaces sharing rows keep theirs. Scrolling steps by 1/8 of a repeat, a quarter of the scale and 15°; with Alt (Option) held, by 1/128, a hundredth and 1° (Alt, not Shift: macOS turns Shift+wheel into a sideways scroll).
+
+The panel shows the surface's mapping as numbers, fitted to its corners' coordinates: **across** and **down** (its offset, in repeats), **size across** and **size down** (meters a repeat; negative is flipped) and **turn** (degrees), all relative to the flat mapping (offset 0, 2 m, 0°; a shear, as stitching can leave, is kept but not shown). Clicking one types a number into it: Enter sets it (a unit after it, `m` or `°`, is let be), Esc drops it; while typing, the keys are the text's and the view holds still. Sizes and turns keep the texture at the surface's middle where it was; offsets are set as typed. A surface whose coordinates aren't one flat mapping (all in a line) shows `scroll` and takes no typing.
 
 ## Keys
 
@@ -84,6 +95,7 @@ The panel shows what the selection can do; most rows are also on keys.
 | Tab | Editor on and off |
 | F5, F6 | Wireframe over the 3D view; 3D/top/front/side |
 | Left click | Select (or place a cut's end) |
+| Left drag (2D, a surface selected) | Cut the surface along the line; Ctrl/Cmd snaps its ends to vertices |
 | Right button held | Look (3D) or pan (2D) |
 | Wheel | Change the row under the pointer, or zoom a 2D view |
 | V | Vertex picking |

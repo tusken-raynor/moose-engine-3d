@@ -39,6 +39,9 @@ const ON_PLANE: f32 = 1e-5;
 /// How far past an occluder's polygon a point must be to be in its shadow, in meters, so
 /// the occluder's own faces (and what touches them) aren't shadowed by it.
 const CAP_BIAS: f32 = 1e-3;
+/// How close to a window's plane both ends of a later window's edge are to be along it, in
+/// meters (clipping puts them on it, up to rounding).
+const ON_WINDOW_PLANE: f32 = 1e-3;
 /// Limit on portals followed from a light.
 const MAX_DEPTH: u16 = 16;
 /// Most shadow slots (the bits of a shadow mask).
@@ -390,6 +393,17 @@ struct VolumeEdge {
 /// through it) and its volume.
 type Window = (Range<u32>, u32);
 
+/// A window's edge, for the windows seen through it: its plane through the light (facing
+/// into the window), and its soft edge's wedge (outer and inner planes, facing into the
+/// shadow), or `None` if it is hard. An edge of a window beyond along the same plane is the
+/// same edge: it takes the wedge (or is hard) as this one, turned about the edge that casts
+/// it, not about where clipping put it.
+type WindowEdge = (Half, Option<(Half, Half)>);
+
+/// A window's edge that takes the wedge of the window it is seen through's edge along the
+/// same plane (see [`WindowEdge`]): its ends, and that wedge.
+type InheritedWedge = ((Vec3, Vec3), (Half, Half));
+
 /// A shadow-casting light, for one frame.
 struct Caster {
     bit: u32,
@@ -520,8 +534,11 @@ pub(crate) struct Carver {
     /// Whether each occluder model seen so far is convex.
     convex: HashMap<(MeshId, usize), bool>,
     next_points: Vec<Vec3>,
-    /// Sectors to visit from a light: (sector, window in, portal depth).
-    stack: Vec<(u32, Option<Window>, u16)>,
+    /// Sectors to visit from a light: (sector, window in, portal depth, the window's edges
+    /// in `window_edges`).
+    stack: Vec<(u32, Option<Window>, u16, Range<usize>)>,
+    /// Windows' edges (see [`Carver::window_edges_of`]), for the windows beyond.
+    window_edges: Vec<WindowEdge>,
     /// While building a cache: edges along the polygon's own keep that label.
     keep_polygon_edges: bool,
     /// Cached shadows: per (shadow slot, polygon key), and per slot what they were carved for.
@@ -569,6 +586,7 @@ impl Carver {
             let windows_start = self.windows.len() as u32;
             let mut reached = vec![false; world.sectors.len()];
             self.stack.clear();
+            self.window_edges.clear();
             if !shadows {
                 // Here for its beam only.
             } else if light.directional {
@@ -579,14 +597,15 @@ impl Carver {
                         let open = open_air(geometry, light, sector, outline, Some(p));
                         self.points.clear();
                         self.points.extend(geometry.polygon_points(polygon));
-                        let window = self.add_window(if open { &hard } else { light }, slot);
-                        self.stack.push((s as u32, Some(window), 0));
+                        let window = self.add_window(if open { &hard } else { light }, slot, &[], &[]);
+                        let edges = self.window_edges_of(if open { &hard } else { light }, &[], &[]);
+                        self.stack.push((s as u32, Some(window), 0, edges));
                     }
                 }
             } else {
-                self.stack.push((light.sector, None, 0));
+                self.stack.push((light.sector, None, 0, 0..0));
             }
-            while let Some((sector, window, depth)) = self.stack.pop() {
+            while let Some((sector, window, depth, parent_edges)) = self.stack.pop() {
                 reached[sector as usize] = true;
                 if let Some((_, volume)) = &window {
                     self.windows.push((sector, *volume));
@@ -609,6 +628,10 @@ impl Carver {
                         for k in w.clone() {
                             clip_points(&mut self.points, &mut self.next_points, self.planes[k as usize]);
                         }
+                        // Clipping can leave corners a hair apart: the plane through the
+                        // light and such an edge points any way at all (its direction is
+                        // rounding), and would cut a wedge out of the windows beyond.
+                        drop_near_duplicates(&mut self.points);
                     }
                     if self.points.len() < 3 {
                         continue;
@@ -624,9 +647,38 @@ impl Carver {
                         }
                     }
                     let target = &world.sectors[portal.target as usize];
-                    let open = light.directional && open_air(geometry, light, target, &portal.positions, None);
-                    let window = self.add_window(if open { &hard } else { light }, slot);
-                    self.stack.push((portal.target, Some(window), depth + 1));
+                    // A light whose sphere reaches through the opening's plane is partly in
+                    // the sector beyond already: soft edges, which take each ray from the
+                    // light to cross the opening, don't hold, so the window is hard (from the
+                    // light's center).
+                    let straddles = !light.directional
+                        && (portal.plane.normal.dot(light.position) + portal.plane.d).abs() < light.radius;
+                    let open = straddles
+                        || (light.directional && open_air(geometry, light, target, &portal.positions, None));
+                    // Its edges another opening out of this sector shares (see `joined_edges`):
+                    // no soft edge there. And its edges along an edge's plane of the window
+                    // it is seen through are that edge (see `WindowEdge`): hard where it is
+                    // (the opening the light came in by, where nothing is between the two,
+                    // or a window made hard), and otherwise soft with its wedge, turned
+                    // about the edge that casts it.
+                    let mut joined = joined_edges(world, geometry, &source, sector, p);
+                    let mut inherited = Vec::new();
+                    let n = self.points.len();
+                    for i in 0..n {
+                        let (a, b) = (self.points[i], self.points[(i + 1) % n]);
+                        let on = |e: &&WindowEdge| {
+                            e.0.distance(a).abs() < ON_WINDOW_PLANE && e.0.distance(b).abs() < ON_WINDOW_PLANE
+                        };
+                        match self.window_edges[parent_edges.clone()].iter().find(on).map(|e| e.1) {
+                            Some(None) => joined.push((a, b)),
+                            Some(Some(wedge)) => inherited.push(((a, b), wedge)),
+                            None => {}
+                        }
+                    }
+                    let lit_by = if open { &hard } else { light };
+                    let window = self.add_window(lit_by, slot, &joined, &inherited);
+                    let edges = self.window_edges_of(lit_by, &joined, &inherited);
+                    self.stack.push((portal.target, Some(window), depth + 1, edges));
                 }
             }
             let windows_end = self.windows.len() as u32;
@@ -825,7 +877,57 @@ impl Carver {
     /// Adds the window a light sees through the convex outline in `self.points` (a portal,
     /// or a sky surface for a directional light): its planes through the light, to clip
     /// windows seen through it, then its volume (see [`add_outline`](Self::add_outline)).
-    fn add_window(&mut self, light: &Light, slot: u8) -> Window {
+    /// The edges of the window just added from `self.points` by `light` (see
+    /// [`Carver::add_window`]), kept in `self.window_edges` for the windows seen through it:
+    /// each one's plane and wedge, as the window has them (hard if the window is carved hard).
+    fn window_edges_of(
+        &mut self,
+        light: &Light,
+        joined: &[(Vec3, Vec3)],
+        inherited: &[InheritedWedge],
+    ) -> Range<usize> {
+        let source = Source::of(light);
+        let n = self.points.len();
+        let center = self.points.iter().copied().sum::<Vec3>() / n as f32;
+        let start = self.window_edges.len();
+        let mut soft = source.soft();
+        for i in 0..n {
+            let (a, b) = (self.points[i], self.points[(i + 1) % n]);
+            let Some(h) = source.through(a, b, center) else {
+                soft = false;
+                continue;
+            };
+            let along = |&(u, v): &(Vec3, Vec3)| on_line(a, u, v) && on_line(b, u, v);
+            let wedge = if joined.iter().any(along) {
+                None
+            } else if let Some(&(_, w)) = inherited.iter().find(|(line, _)| along(line)) {
+                Some(w)
+            } else {
+                let w = source.grazing(a, b, h.flip(), &[]);
+                soft &= w.is_some();
+                w
+            };
+            self.window_edges.push((h, wedge));
+        }
+        // Not wholly soft: carved hard all round (see `add_outline`).
+        if !soft {
+            for e in &mut self.window_edges[start..] {
+                e.1 = None;
+            }
+        }
+        start..self.window_edges.len()
+    }
+
+    /// Its edges along the `joined` lines (each a pair of points on it) are hard (see
+    /// [`joined_edges`]), and those along the `inherited` ones take their wedges (see
+    /// `WindowEdge`).
+    fn add_window(
+        &mut self,
+        light: &Light,
+        slot: u8,
+        joined: &[(Vec3, Vec3)],
+        inherited: &[InheritedWedge],
+    ) -> Window {
         let source = Source::of(light);
         let n = self.points.len();
         let center = self.points.iter().copied().sum::<Vec3>() / n as f32;
@@ -840,7 +942,7 @@ impl Carver {
         let outline: Vec<(Vec3, Vec3)> =
             (0..n).map(|i| (self.points[i], self.points[(i + 1) % n])).collect();
         let volume = self.volumes.len() as u32;
-        self.add_outline(light, slot, None, &outline, true, center, &[], true, &[]);
+        self.add_outline(light, slot, None, &outline, true, center, &[], true, &[], joined, inherited);
         (start..end, volume)
     }
 
@@ -915,7 +1017,7 @@ impl Carver {
         // The occluder's points, which its soft edge's outer side keeps (see
         // `Source::grazing`).
         let keep: Vec<Vec3> = self.faces.iter().flat_map(|f| self.points[f.clone()].iter().copied()).collect();
-        self.add_outline(light_ref, slot, owner, &outline, ordered, center, &caps, false, &keep);
+        self.add_outline(light_ref, slot, owner, &outline, ordered, center, &caps, false, &keep, &[], &[]);
     }
 
     /// Adds the volume of a convex outline (its edges, in order around if `ordered`, about
@@ -930,6 +1032,9 @@ impl Carver {
     /// the core, within it, to the plane on the other side. The ring between is carved in
     /// sectors, one per wedge: between planes through the light and its edge's ends that
     /// halve the angle to the neighboring edges.
+    ///
+    /// An edge on one of the `joined` lines is hard: its wedge has no width (both its planes
+    /// the one through the light's center), so it lets all of the light through or none.
     #[allow(clippy::too_many_arguments)]
     fn add_outline(
         &mut self,
@@ -942,6 +1047,8 @@ impl Carver {
         caps: &[Half],
         window: bool,
         keep: &[Vec3],
+        joined: &[(Vec3, Vec3)],
+        inherited: &[InheritedWedge],
     ) {
         let source = Source::of(light);
         let start = self.planes.len() as u32;
@@ -959,7 +1066,15 @@ impl Carver {
             let caster = (a, b);
             // Facing into the shadow: into an occluder's outline, out of a window's.
             let shadow = if window { hard.flip() } else { hard };
-            match source.grazing(a, b, shadow, keep) {
+            let along = |&(u, v): &(Vec3, Vec3)| on_line(a, u, v) && on_line(b, u, v);
+            let wedge = if joined.iter().any(along) {
+                Some((shadow, shadow))
+            } else if let Some(&(_, w)) = inherited.iter().find(|(line, _)| along(line)) {
+                Some(w)
+            } else {
+                source.grazing(a, b, shadow, keep)
+            };
+            match wedge {
                 Some((outer, inner)) => {
                     let plane = if window { inner.flip() } else { outer };
                     self.volume_edges.push(VolumeEdge { plane, caster });
@@ -1328,7 +1443,9 @@ impl Carver {
                     }
                     let volume = &self.volumes[v as usize];
                     let planes = if receiver.hard { volume.hard.clone() } else { volume.planes.clone() };
-                    // What no window has reached yet waits for the next.
+                    // What no window has reached yet waits for the next, and so does what
+                    // one lets only part of the light through (its soft edge): another
+                    // may let the rest through (see `reaching`).
                     let mut next = Vec::new();
                     for piece in std::mem::take(&mut self.work) {
                         self.rest.clear();
@@ -1338,16 +1455,28 @@ impl Carver {
                             if receiver.hard {
                                 self.pieces.push(inside);
                             } else {
+                                let done = self.pieces.len();
                                 self.soft_split(inside, v, bit, lined);
+                                let mut k = done;
+                                while k < self.pieces.len() {
+                                    if self.in_volume(&self.pieces[k], v) {
+                                        next.push(self.pieces.swap_remove(k));
+                                    } else {
+                                        k += 1;
+                                    }
+                                }
                             }
                         }
                     }
                     self.work = next;
                 }
-                for piece in &mut self.work {
-                    piece.shadowed |= bit;
+                // Outside every window: dark. In some window's soft edge: lit that much.
+                for mut piece in std::mem::take(&mut self.work) {
+                    if !self.in_window(&piece, bit) {
+                        piece.shadowed |= bit;
+                    }
+                    self.pieces.push(piece);
                 }
-                self.pieces.append(&mut self.work);
             }
             // Occluders: each lit piece is split by each shadow volume.
             for v in self.casters[c].volumes.clone() {
@@ -1404,7 +1533,10 @@ impl Carver {
         let (core, sectors, window) = (volume.core.clone(), volume.sectors.clone(), volume.window);
         if core.is_empty() {
             let mut piece = piece;
-            if !window {
+            if window {
+                // All of the light comes through: whatever other windows let through.
+                piece = self.without_windows(piece, bit);
+            } else {
                 piece.shadowed |= bit;
             }
             self.pieces.push(piece);
@@ -1453,7 +1585,10 @@ impl Carver {
     ) {
         let saved = std::mem::take(&mut self.rest);
         if let Some(mut inside) = self.split_region(piece, core, lined) {
-            if !window {
+            if window {
+                // All of the light comes through: whatever other windows let through.
+                inside = self.without_windows(inside, bit);
+            } else {
                 inside.shadowed |= bit;
             }
             self.pieces.push(inside);
@@ -1466,6 +1601,41 @@ impl Carver {
     }
 
     /// `piece` with soft shadow volume `v` added to its list.
+    /// Whether `piece` is in volume `v`'s soft edge.
+    fn in_volume(&self, piece: &Piece, v: u32) -> bool {
+        self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize].contains(&v)
+    }
+
+    /// Whether `piece` is in the soft edge of a window of the light with shadow bit `bit`.
+    fn in_window(&self, piece: &Piece, bit: u32) -> bool {
+        self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize]
+            .iter()
+            .any(|&v| {
+                let volume = &self.volumes[v as usize];
+                volume.window && 1 << volume.slot == bit
+            })
+    }
+
+    /// `piece` without the soft edges of the light with shadow bit `bit`'s windows.
+    fn without_windows(&mut self, piece: Piece, bit: u32) -> Piece {
+        if !self.in_window(&piece, bit) {
+            return piece;
+        }
+        let first = self.volume_lists.len() as u32;
+        for k in piece.first_volume..piece.first_volume + piece.volume_count {
+            let v = self.volume_lists[k as usize];
+            let volume = &self.volumes[v as usize];
+            if !(volume.window && 1 << volume.slot == bit) {
+                self.volume_lists.push(v);
+            }
+        }
+        Piece {
+            first_volume: first,
+            volume_count: self.volume_lists.len() as u32 - first,
+            ..piece
+        }
+    }
+
     fn with_volume(&mut self, piece: Piece, v: u32) -> Piece {
         let first = self.volume_lists.len() as u32;
         self.volume_lists.extend_from_within(
@@ -1683,8 +1853,14 @@ enum Tag {
 
 /// How much of a light reaches `p`, a corner of a piece centered on `center`, along the
 /// piece's edge from `p` to `along`, past the soft edges of the windows and occluders it is
-/// in (their wedges, and whether each is a window). What windows let through multiplies;
-/// what occluders cover adds up (capped at all of it); see [`Carver::soft_values`].
+/// in (their wedges, and whether each is a window); see [`Carver::soft_values`].
+///
+/// What the windows let through adds up (capped at all of it): a ray from the light into
+/// a sector comes through one run of openings, so two windows into it (by different ways
+/// round) let different parts of the light through. Where two windows' soft edges meet on
+/// one line (openings sharing an edge, as a room's floor and wall openings at their
+/// corner), each lets part through and together all of it. Within one window, its edges'
+/// shares multiply. What occluders cover adds up (capped at all of it).
 ///
 /// Only a wedge whose line `p` is on is taken along the edge (see [`Wedge::covers`]): the
 /// others have their value at `p`, whichever edge it is on.
@@ -1692,15 +1868,17 @@ fn reaching<'a>(
     soft: impl Iterator<Item = (&'a [Wedge], bool)>,
     (p, along, center): (Vec3, Vec3, Vec3),
 ) -> f32 {
-    let (mut through, mut covered) = (1.0, 0.0);
+    let (mut through, mut windows, mut covered) = (0.0, false, 0.0);
     for (wedges, window) in soft {
         let covers = wedges.iter().map(|w| w.covers(p, along, center));
         if window {
-            through *= covers.map(|c| 1.0 - c).product::<f32>();
+            windows = true;
+            through += covers.map(|c| 1.0 - c).product::<f32>();
         } else {
             covered += covers.product::<f32>();
         }
     }
+    let through: f32 = if windows { through.min(1.0) } else { 1.0 };
     through * (1.0 - covered.min(1.0))
 }
 
@@ -1749,6 +1927,46 @@ fn open_air(geometry: &Mesh, light: &Light, sector: &moose_assets::Sector, outli
     })
 }
 
+/// The edges of portal `p` (out of `sector`) that another portal out of the sector shares
+/// (the same two positions, either way round), where the light can go on out through that
+/// one too. Nothing is there to block any of the light: what passes the edge on one side
+/// goes out through the one portal, on the other side through the other (a room's floor
+/// and wall openings meeting at a curb, say). So the window through `p` has no soft edge
+/// there. Carved soft, it would take away the part of a light with a size on the far side
+/// of the edge, and nothing would give it back where that part can't come round another
+/// way (a light just inside the wall opening's plane, its sphere reaching past it: the
+/// part beyond lights the floor below only back through the room, which isn't followed).
+fn joined_edges(world: &World, geometry: &Mesh, source: &Source, sector: u32, p: u32) -> Vec<(Vec3, Vec3)> {
+    let outline = &world.portals[p as usize].positions;
+    let n = outline.len();
+    let mut joined = Vec::new();
+    for q in world.sectors[sector as usize].portals.clone().filter(|&q| q != p) {
+        let other = &world.portals[q as usize];
+        if !other.flags.render_through() || !source.faces(other.plane.normal, portal_point(geometry, other)) {
+            continue;
+        }
+        let m = other.positions.len();
+        for i in 0..n {
+            let (a, b) = (outline[i], outline[(i + 1) % n]);
+            let shared = (0..m).any(|k| {
+                let (c, d) = (other.positions[k], other.positions[(k + 1) % m]);
+                (c, d) == (b, a) || (c, d) == (a, b)
+            });
+            if shared {
+                joined.push((geometry.positions[a as usize], geometry.positions[b as usize]));
+            }
+        }
+    }
+    joined
+}
+
+/// Whether point `p` is on the line through `u` and `v`.
+fn on_line(p: Vec3, u: Vec3, v: Vec3) -> bool {
+    let d = v - u;
+    let len2 = d.length_squared();
+    len2 > 1e-12 && (p - u).cross(d).length() / len2.sqrt() < 1e-4
+}
+
 fn portal_point(geometry: &Mesh, portal: &moose_assets::Portal) -> Vec3 {
     geometry.positions[portal.positions[0] as usize]
 }
@@ -1792,6 +2010,18 @@ fn occluder_parts(mesh: &Mesh) -> Vec<Vec<usize>> {
 }
 
 /// Clips a convex outline to the half-space of `plane` (keeping points on it).
+/// How close two corners of a window's outline are to count as one, in meters.
+const SAME_POINT: f32 = 1e-4;
+
+/// Drops corners of the closed outline `points` within [`SAME_POINT`] of the one before
+/// them (and the last, of the first).
+fn drop_near_duplicates(points: &mut Vec<Vec3>) {
+    points.dedup_by(|b, a| a.distance(*b) < SAME_POINT);
+    while points.len() > 1 && points[0].distance(points[points.len() - 1]) < SAME_POINT {
+        points.pop();
+    }
+}
+
 fn clip_points(points: &mut Vec<Vec3>, next: &mut Vec<Vec3>, plane: Half) {
     next.clear();
     let n = points.len();
@@ -2504,7 +2734,7 @@ mod tests {
             (0..4).map(|i| (p[i], p[(i + 1) % 4])).collect()
         };
         let mut c = Carver::default();
-        c.add_outline(&light, 0, None, &opening, true, Vec3::new(0.0, 2.0, 0.0), &[], true, &[]);
+        c.add_outline(&light, 0, None, &opening, true, Vec3::new(0.0, 2.0, 0.0), &[], true, &[], &[], &[]);
         c.windows.push((1, 0));
         c.casters.push(Caster {
             bit: 1,
@@ -2562,6 +2792,184 @@ mod tests {
     }
 
     #[test]
+    fn windows_side_by_side_let_all_the_light_through_between_them() {
+        // Two openings meeting along x = 0 (a room's floor and wall openings at their
+        // corner, say: each a way into the sector below), 1 m by 4 m, 1 m below a light of radius 0.2,
+        // 3 m above the floor: across their shared edge's soft edges (|x| < 0.4 on the
+        // floor) what one lets through and the other add up to all of it
+        // (smoothstep(t) + smoothstep(1 - t) = 1), so there is no dark seam.
+        let center = Vec3::new(0.0, 3.0, 0.0);
+        let mut light = Light::point(0, center, Vec3::ONE, 100.0);
+        light.radius = 0.2;
+        let mut c = Carver::default();
+        for (k, x) in [-1.0f32, 0.0].into_iter().enumerate() {
+            let p = [
+                Vec3::new(x, 2.0, -2.0),
+                Vec3::new(x + 1.0, 2.0, -2.0),
+                Vec3::new(x + 1.0, 2.0, 2.0),
+                Vec3::new(x, 2.0, 2.0),
+            ];
+            let opening: Vec<(Vec3, Vec3)> = (0..4).map(|i| (p[i], p[(i + 1) % 4])).collect();
+            c.add_outline(&light, 0, None, &opening, true, Vec3::new(x + 0.5, 2.0, 0.0), &[], true, &[], &[], &[]);
+            c.windows.push((1, k as u32));
+        }
+        c.casters.push(Caster {
+            bit: 1,
+            is_static: false,
+            source: Source::Point { at: center, radius: 0.0 },
+            range: 100.0,
+            light: Light::point(0, center, Vec3::ONE, 100.0),
+            whole: Some(0),
+            windows: 0..2,
+            volumes: 0..0,
+            shadows: true,
+            beam: None,
+        });
+        // A strip of floor across the seam, all of it well within the openings' light
+        // along z (which reaches 6 m out).
+        let floor = [
+            Vec3::new(-3.0, 0.0, -1.0),
+            Vec3::new(-3.0, 0.0, 1.0),
+            Vec3::new(3.0, 0.0, 1.0),
+            Vec3::new(3.0, 0.0, -1.0),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let receiver = Receiver {
+            sectors: &[1],
+            entity: None,
+            normal: Vec3::Y,
+            point: floor[0],
+            parts: Parts::All,
+            beams: true,
+            hard: false,
+        };
+        let n = c.carve(&records(&floor), &edges, stride, 0, &receiver).len();
+        // Every piece over the seam (its middle within the soft edges) gets all of it at
+        // every corner: none is dark between them.
+        let mut seen = 0;
+        for i in 0..n {
+            let p = c.piece(i);
+            let corners: Vec<Vec3> = c.records(&p).chunks(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
+            let middle = corners.iter().sum::<Vec3>() / corners.len() as f32;
+            if middle.x.abs() >= 0.4 {
+                continue;
+            }
+            seen += 1;
+            assert_eq!(p.shadowed, 0, "the piece at {middle} is in shadow");
+            let mut values = Vec::new();
+            if c.soft_values(&p, &mut values) != 0 {
+                for (v, (along_in, along_out)) in corners.iter().zip(values) {
+                    assert!(along_in > 0.999 && along_out > 0.999, "{v} (of the piece at {middle}): {along_in}, {along_out}");
+                }
+            }
+        }
+        assert!(seen > 0);
+    }
+
+    #[test]
+    fn a_windows_corners_a_hair_apart_make_no_plane_of_their_own() {
+        // A window's outline as clipping can leave it (cheese_1, round a sidewalk's corner):
+        // a wall opening's top corner twice, a millionth of a meter apart, off a little in x
+        // and z by rounding. The plane through the light and that edge would point any way
+        // at all and cut a wedge out of the windows beyond.
+        let light = Light::point(0, Vec3::new(2.0, 1.76, 6.78), Vec3::ONE, 100.0);
+        let mut c = Carver {
+            points: vec![
+                Vec3::new(16.26, 13.5, 5.0),
+                Vec3::new(5.0, 13.5, 5.0),
+                Vec3::new(5.0000005, 13.499999, 4.9999995),
+                Vec3::new(5.0, 0.0, 5.0),
+                Vec3::new(16.26, 0.0, 5.0),
+            ],
+            ..Carver::default()
+        };
+        drop_near_duplicates(&mut c.points);
+        assert_eq!(c.points.len(), 4);
+        let (planes, _) = c.add_window(&light, 0, &[], &[]);
+        // Every plane goes through the light and a whole edge of the outline.
+        let edges: Vec<(Vec3, Vec3)> = (0..4).map(|i| (c.points[i], c.points[(i + 1) % 4])).collect();
+        for k in planes {
+            let h = c.planes[k as usize];
+            assert!(h.distance(light.position).abs() < 1e-4);
+            assert!(edges.iter().any(|&(a, b)| h.distance(a).abs() < 1e-4 && h.distance(b).abs() < 1e-4));
+        }
+        // And the outline's ends meeting the start go too.
+        let mut ring = vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(0.00001, 0.0, 0.0)];
+        drop_near_duplicates(&mut ring);
+        assert_eq!(ring.len(), 3);
+    }
+
+    #[test]
+    fn a_windows_edge_joined_to_another_opening_is_hard() {
+        // A light of radius 0.2 just inside a wall opening's plane (z = 0.01 behind it),
+        // 1 m above a floor opening that meets the wall opening along x at z = 0, y = 0.
+        // Soft, the floor opening's edge there would take away the half of the light past
+        // the wall's plane (all along the floor below, near the edge); joined, it is hard:
+        // what is below it gets all of the light.
+        let center = Vec3::new(0.0, 1.0, -0.01);
+        let mut light = Light::point(0, center, Vec3::ONE, 100.0);
+        light.radius = 0.2;
+        let p = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(-2.0, 0.0, 0.0),
+        ];
+        let opening: Vec<(Vec3, Vec3)> = (0..4).map(|i| (p[i], p[(i + 1) % 4])).collect();
+        let lit_near_the_edge = |joined: &[(Vec3, Vec3)]| {
+            let mut c = Carver::default();
+            c.add_outline(&light, 0, None, &opening, true, Vec3::new(0.0, 0.0, -1.0), &[], true, &[], joined, &[]);
+            c.windows.push((1, 0));
+            c.casters.push(Caster {
+                bit: 1,
+                is_static: false,
+                source: Source::Point { at: center, radius: 0.0 },
+                range: 100.0,
+                light: Light::point(0, center, Vec3::ONE, 100.0),
+                whole: Some(0),
+                windows: 0..1,
+                volumes: 0..0,
+                shadows: true,
+                beam: None,
+            });
+            // The floor below (0.25 m down), between x = -0.5 and 0.5, from the edge back.
+            let floor = [
+                Vec3::new(-0.5, -0.25, -0.3),
+                Vec3::new(-0.5, -0.25, 0.0),
+                Vec3::new(0.5, -0.25, 0.0),
+                Vec3::new(0.5, -0.25, -0.3),
+            ];
+            let stride = RECORD_FLOATS + 4;
+            let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+            let receiver = Receiver {
+                sectors: &[1],
+                entity: None,
+                normal: Vec3::Y,
+                point: floor[0],
+                parts: Parts::All,
+                beams: true,
+                hard: false,
+            };
+            let n = c.carve(&records(&floor), &edges, stride, 0, &receiver).len();
+            // The least light at any corner.
+            let mut least: f32 = 1.0;
+            for i in 0..n {
+                let piece = c.piece(i);
+                let mut values = Vec::new();
+                if piece.shadowed != 0 {
+                    least = 0.0;
+                } else if c.soft_values(&piece, &mut values) != 0 {
+                    least = values.iter().fold(least, |m, v| m.min(v.0).min(v.1));
+                }
+            }
+            least
+        };
+        assert!(lit_near_the_edge(&[]) < 0.75, "soft, the far half is taken away");
+        assert!(lit_near_the_edge(&[(p[2], p[3])]) > 0.999);
+    }
+
+    #[test]
     fn the_sun_casts_parallel_shadows_softened_by_its_angle() {
         // Sunlight straight down, 2 degrees across, over a 1 m square 2 m above the floor:
         // its shadow is the square itself, its soft edge 2 m * tan 1 degree = 3.5 cm wide
@@ -2608,7 +3016,7 @@ mod tests {
         ];
         c.points.clear();
         c.points.extend_from_slice(&sky);
-        let (_, v) = c.add_window(&sun, 0);
+        let (_, v) = c.add_window(&sun, 0, &[], &[]);
         c.windows.push((0, v));
         c.casters[0].windows = 0..1;
         let n = c.carve(&records(&floor), &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
@@ -2709,6 +3117,193 @@ mod tests {
         assert!((soft - cached_soft).abs() < 1e-3, "{soft} {cached_soft}");
         // Once cached, it isn't carved again: a changed light drops it.
         assert_eq!(c.cache.len(), 1);
+    }
+
+    #[test]
+    fn a_light_reaching_through_an_openings_plane_lights_what_is_just_past_it() {
+        // two_rooms: a light of radius 0.2 in room_a, 2 cm from its doorway's plane (z = 0;
+        // the doorway is x from -1 to 1, y from 0 to 3), its sphere reaching 18 cm into the
+        // hallway. The hallway's side wall by the doorway (x = -1) is lit straight through it
+        // all along; soft, the doorway's far edges took the strip within the sphere's reach
+        // (rays from the part past the plane don't cross the doorway) as full shadow.
+        let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+        let level = assets.load_level("two_rooms.mmp").unwrap();
+        let world = World::new(level, &assets);
+        let mut light = Light::point(0, Vec3::new(0.0, 1.5, 0.02), Vec3::ONE, 10.0);
+        light.radius = 0.2;
+        light.shadow = Some(0);
+        let mut c = Carver::default();
+        c.prepare(&world, &assets, &[light], (true, 1.0));
+        let wall = [
+            Vec3::new(-1.0, 0.5, 0.0),
+            Vec3::new(-1.0, 0.5, -1.0),
+            Vec3::new(-1.0, 2.5, -1.0),
+            Vec3::new(-1.0, 2.5, 0.0),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let receiver = Receiver {
+            sectors: &[1],
+            entity: None,
+            normal: Vec3::X,
+            point: wall[0],
+            parts: Parts::All,
+            beams: true,
+            hard: false,
+        };
+        let n = c.carve(&records(&wall), &edges, stride, 0, &receiver).len();
+        for i in 0..n {
+            let p = c.piece(i);
+            let corners: Vec<Vec3> = c.records(&p).chunks(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
+            assert_eq!(p.shadowed, 0, "a piece in shadow: {corners:?}");
+            let mut values = Vec::new();
+            c.soft_values(&p, &mut values);
+            assert!(values.iter().all(|v| v.0 > 0.999 && v.1 > 0.999), "{corners:?}: {values:?}");
+        }
+    }
+
+    #[test]
+    fn windows_meeting_where_openings_meet_are_hard_on_both_paths() {
+        // Three rooms (beside two_rooms, far off): A tall on the left, B low and C above it
+        // on the right. A's east wall is open to both (its lower half to B, its upper half
+        // to C) and B's ceiling to C, the three openings meeting along one line (x = 104,
+        // y = 2). A light in A reaches C two ways, straight through A's upper opening and
+        // through B, the two windows meeting at the plane through it and that line, where
+        // nothing blocks any light: C's far wall is all lit. The straight window is hard
+        // there (A's openings meet); the one through B has its edge there shared with the
+        // opening the light came into B by, hard too. Soft, it took a band out of the wall
+        // past the plane, which the straight window, hard, didn't give back.
+        use moose_assets::LevelDoc;
+        let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/levels/two_rooms.mmp");
+        let mut doc = LevelDoc::parse(std::path::Path::new(path), &std::fs::read_to_string(path).unwrap()).unwrap();
+        let room = |doc: &mut LevelDoc, min: Vec3, max: Vec3, name: &str| doc.add_box(min, max, name).unwrap();
+        let a = room(&mut doc, Vec3::new(100.0, 0.0, 0.0), Vec3::new(104.0, 4.0, 4.0), "a");
+        let b = room(&mut doc, Vec3::new(104.0, 0.0, 0.0), Vec3::new(106.0, 2.0, 4.0), "b");
+        let c = room(&mut doc, Vec3::new(104.0, 2.0, 0.0), Vec3::new(106.0, 4.0, 4.0), "c");
+        let wall = |doc: &LevelDoc, sector: usize, normal: Vec3| {
+            doc.sector_surfaces(sector)
+                .find(|&i| doc.surfaces[i].adjoin.is_none() && doc.surface_normal(i).normalize().dot(normal) > 0.99)
+                .unwrap()
+        };
+        // A's east wall in two at y = 2: its upper half stays, its lower half follows it.
+        let east = wall(&doc, a, Vec3::NEG_X);
+        let lower = doc.cut_surface(east, Vec3::Y, Vec3::new(104.0, 2.0, 0.0)).unwrap();
+        doc.adjoin(east).unwrap();
+        doc.adjoin(lower).unwrap();
+        let ceiling = wall(&doc, b, Vec3::NEG_Y);
+        doc.adjoin(ceiling).unwrap();
+        let level = assets.parse_level("four.mmp", &doc.to_text()).unwrap();
+        let world = World::new(level, &assets);
+        let mut light = Light::point(a as u32, Vec3::new(102.0, 1.5, 2.0), Vec3::ONE, 20.0);
+        light.radius = 0.1;
+        light.shadow = Some(0);
+        let mut c_carver = Carver::default();
+        c_carver.prepare(&world, &assets, &[light], (true, 1.0));
+        // C's far wall (x = 106, facing -x).
+        let far = [
+            Vec3::new(106.0, 2.1, 0.5),
+            Vec3::new(106.0, 2.1, 3.5),
+            Vec3::new(106.0, 3.9, 3.5),
+            Vec3::new(106.0, 3.9, 0.5),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let sectors = [c as u32];
+        let receiver = Receiver {
+            sectors: &sectors,
+            entity: None,
+            normal: Vec3::NEG_X,
+            point: far[0],
+            parts: Parts::All,
+            beams: true,
+            hard: false,
+        };
+        let n = c_carver.carve(&records(&far), &edges, stride, 0, &receiver).len();
+        for i in 0..n {
+            let p = c_carver.piece(i);
+            let corners: Vec<Vec3> =
+                c_carver.records(&p).chunks(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
+            assert_eq!(p.shadowed, 0, "a piece in shadow: {corners:?}");
+            let mut values = Vec::new();
+            c_carver.soft_values(&p, &mut values);
+            assert!(values.iter().all(|v| v.0 > 0.999 && v.1 > 0.999), "{corners:?}: {values:?}");
+        }
+    }
+
+    #[test]
+    fn a_soft_edge_seen_through_another_opening_keeps_its_penumbra() {
+        // Three rooms (beside two_rooms, far off): A with the light, its east wall open
+        // (z from 0 to 4) into B, wider (z from -2 to 6); B's floor open into C, 25 cm
+        // deep below it (a road below a sidewalk). The doorway's edge at z = 4 shadows C's
+        // floor softly, its penumbra widening with the distance from that edge: about 21 cm
+        // across (in z) at x = 105.5, 31 cm over a strip 10 cm wide there (the edge crosses
+        // it at 45 degrees). C's window is B's floor opening clipped by the
+        // doorway's window, so its edge there is where the doorway's plane meets B's floor,
+        // 25 cm above C's: turned about that, the penumbra was about 5 cm wide (15 over the
+        // strip), and as wide all along (cheese_1's porch entry, on the road).
+        use moose_assets::LevelDoc;
+        let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/levels/two_rooms.mmp");
+        let mut doc = LevelDoc::parse(std::path::Path::new(path), &std::fs::read_to_string(path).unwrap()).unwrap();
+        let room = |doc: &mut LevelDoc, min: Vec3, max: Vec3, name: &str| doc.add_box(min, max, name).unwrap();
+        let a = room(&mut doc, Vec3::new(100.0, 0.0, 0.0), Vec3::new(104.0, 3.0, 4.0), "a");
+        let b = room(&mut doc, Vec3::new(104.0, 0.0, -2.0), Vec3::new(108.0, 3.0, 6.0), "b");
+        let c = room(&mut doc, Vec3::new(104.0, -0.25, -2.0), Vec3::new(108.0, 0.0, 6.0), "c");
+        let wall = |doc: &LevelDoc, sector: usize, normal: Vec3| {
+            doc.sector_surfaces(sector)
+                .find(|&i| doc.surfaces[i].adjoin.is_none() && doc.surface_normal(i).normalize().dot(normal) > 0.99)
+                .unwrap()
+        };
+        // B's west wall cut to A's east wall (z from 0 to 4), and the two opened; B's
+        // floor opened to C.
+        let west = wall(&doc, b, Vec3::X);
+        doc.cut_surface(west, Vec3::Z, Vec3::new(104.0, 0.0, 0.0)).unwrap();
+        doc.cut_surface(west, Vec3::NEG_Z, Vec3::new(104.0, 0.0, 4.0)).unwrap();
+        let east = wall(&doc, a, Vec3::NEG_X);
+        doc.adjoin(east).unwrap();
+        let floor = wall(&doc, b, Vec3::Y);
+        doc.adjoin(floor).unwrap();
+        let level = assets.parse_level("three.mmp", &doc.to_text()).unwrap();
+        let world = World::new(level, &assets);
+        let mut light = Light::point(a as u32, Vec3::new(102.0, 1.5, 2.0), Vec3::ONE, 20.0);
+        light.radius = 0.1;
+        light.shadow = Some(0);
+        let mut carver = Carver::default();
+        carver.prepare(&world, &assets, &[light], (true, 1.0));
+        // A strip of C's floor across the shadow's edge (at z = 5.5 there).
+        let strip = [
+            Vec3::new(105.45, -0.25, 4.5),
+            Vec3::new(105.45, -0.25, 5.99),
+            Vec3::new(105.55, -0.25, 5.99),
+            Vec3::new(105.55, -0.25, 4.5),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let sectors = [c as u32];
+        let receiver = Receiver {
+            sectors: &sectors,
+            entity: None,
+            normal: Vec3::Y,
+            point: strip[0],
+            parts: Parts::All,
+            beams: true,
+            hard: false,
+        };
+        // The penumbra: the pieces partly lit, from where it starts to where it ends.
+        let n = carver.carve(&records(&strip), &edges, stride, 0, &receiver).len();
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for i in 0..n {
+            let p = carver.piece(i);
+            let mut values = Vec::new();
+            carver.soft_values(&p, &mut values);
+            if p.shadowed == 0 && values.iter().any(|v| v.0 < 0.999) && values.iter().any(|v| v.0 > 0.001) {
+                for r in carver.records(&p).chunks(stride) {
+                    (lo, hi) = (lo.min(r[5]), hi.max(r[5]));
+                }
+            }
+        }
+        assert!(hi - lo > 0.2 && hi - lo < 0.4, "the penumbra spans z from {lo} to {hi}");
     }
 
     #[test]

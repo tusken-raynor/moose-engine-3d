@@ -1,0 +1,8 @@
+MOOSEMATERIAL 2
+# Shift: a texel's size (2 m per repeat over 128 texels).
+shader             water
+texture0           @water:metal_tile.png
+texture1           @water_heights
+reflectance        setting
+fade               setting
+shift              0.015625

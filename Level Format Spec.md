@@ -35,6 +35,8 @@ Models referenced by entities are `.obj` files or `.mmdl` files (see the Model F
 - Each remaining section begins with its keyword and a row count. Rows start with an `id` that must equal the row's position, counting from 0.
 - Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, optionally `templates`, `entities`, then optionally `ambient`, optionally `lights` and optionally `directional`.
 - Some rows take **options** after their fixed columns: words like `static`, or `key=value` pairs like `radius=0.05`. Options are optional and can come in any order.
+- **Meta values** are options written `$KEY=VALUE`: numbers the level puts on itself (after its name on the `name` line), a sector, a surface, a template or an entity (over its template's), for materials to read (see the Material Format Spec's sources) and scripts to change. `KEY` is letters, digits and `_`; `VALUE` is one or more numbers separated by commas (`$wet=200`, `$team=204,51,51`), written as the material inputs that read them are typed (colors and 0-255 values as whole numbers). The engine gives them no meaning, but checks the other options strictly: a word that isn't an option is still an error, and only `$` marks a meta value.
+- **Light exclusion lists:** `exclude_lights=NAME,NAME` on a sector, a solid surface, a template or a drawn entity (prop, actor, terrain) names the lights it isn't lit by: none of their light, bumps, highlights or shadows reach it, though it still casts their shadows. Lights are named with `name=` (lights and directional lights share the names), and `flashlight` is the player's flashlight. A sector's list keeps its lights off all its surfaces, along with each surface's own; entities have their own lists (a sector's doesn't reach them), and an entity's list replaces its template's (`exclude_lights=none` for none over a template's). Only the level's first 63 lights (its lights, then its directional lights) can be excluded.
 
 ```
 MOOSEMAP 1
@@ -99,7 +101,7 @@ The `format` column is the storage format only. The interpolation format (16.16,
 | `name` | Identifier, for debugging and scripting |
 | `first_surface`, `surface_count` | The sector's contiguous range in `surfaces`. Ranges appear in sector order and cover every surface. |
 
-The loader computes each sector's bounds and center; the file does not store them.
+Then its meta values (`$KEY=VALUE`) and its light exclusion list (`exclude_lights=`), if it has them: a sector takes no other options. The loader computes each sector's bounds and center; the file does not store them.
 
 **`surfaces`**
 
@@ -195,7 +197,7 @@ Occluders are the artist's choice. Any shape works; a complex one only costs mor
 | `dx dy dz` | Spot lights only: where it shines (any length) |
 | `inner outer` | Spot lights only: the cone's half-angles in degrees. Full strength within `inner`, fading smoothly to nothing at `outer`. |
 
-Options: `radius=R` is the size of the light's source in meters, 0 or more (default 0). Shadows soften over the part of the source an occluder covers, and 0 casts hard shadows. `shadows=on|off` sets whether it casts shadows (default on). `oscillate=DX:DY:DZ:PERIOD` makes it a moving light: it swings smoothly (a sine) through its position, `DX DY DZ` either way, once every `PERIOD` seconds. Moving lights aren't baked; their shadows are worked out as they go. Both ends of the swing must lie inside the level, but the path between them isn't checked.
+Options: `name=NAME` names it, for materials to read its color or brightness (`light:NAME`) and exclusion lists to name it (`exclude_lights=`); names are unique, and `flashlight` and `none` are taken. `radius=R` is the size of the light's source in meters, 0 or more (default 0). Shadows soften over the part of the source an occluder covers, and 0 casts hard shadows. `shadows=on|off` sets whether it casts shadows (default on). `oscillate=DX:DY:DZ:PERIOD` makes it a moving light: it swings smoothly (a sine) through its position, `DX DY DZ` either way, once every `PERIOD` seconds. Moving lights aren't baked; their shadows are worked out as they go. Both ends of the swing must lie inside the level, but the path between them isn't checked.
 
 A light reaches its own sector, and passes into the next through any open portal (render-through adjoin) within its range and, for a spot light, its cone. It never passes through walls. See the Lighting Spec for how surfaces are lit.
 
@@ -207,7 +209,7 @@ A light reaches its own sector, and passes into the next through any open portal
 | `r g b` | Linear RGB, as for lights |
 | `angle` | The source's angular diameter in degrees, 0 to 45 (the sun is about 0.53): its shadows soften over the part of it an occluder covers. 0 casts hard shadows. |
 
-Options: `shadows=on|off` (default on).
+Options: `shadows=on|off` (default on), and `name=NAME`, as a light's.
 
 ## Terrain
 
@@ -242,7 +244,8 @@ A **`blocker`** entity places a model whose polygons are never drawn, but hide f
 10. Template names are unique, and each template row has a name and a model. Entity names are unique. Spawn points have no model (`-`) and no options; props, actors, terrains and blockers must have one, and it must load. Terrains take no options but `material=` and `filterN=`, and blockers none. A `material=` names a loaded material. A `filterN=` comes with a material and names slot 0 or 1 (its sampler's name is checked by the app, which owns the samplers). Scale is positive. Only props are `static`. `anim=` names an animation of the entity's model, and not on a `static` prop. An occluder is one of the forms above, a facing polygon has 3 to 64 sides and a positive radius, and a proxy model must load.
 11. Ambient light and light colors are not negative. Each light's range is positive, and its position lies inside its sector (as for entities). Each light row has 8 or 13 fields before its options. A spot light's direction is not zero, and its angles satisfy 0 ≤ inner ≤ outer ≤ 180. A light's radius is 0 or more.
 12. Each directional light has 7 fields before its options, a direction that is not zero, a color that is not negative, and an angle from 0 to 45 degrees.
-13. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.
+13. Each name an `exclude_lights=` list holds is a light's (`name=`) or `flashlight`, and one of the level's first 63 lights.
+14. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.
 
 ## Planned extensions
 

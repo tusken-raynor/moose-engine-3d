@@ -23,8 +23,19 @@ pub struct Level {
     /// Light that reaches everything, in linear RGB (1 is a surface's full color).
     pub ambient: Vec3,
     pub lights: Vec<Light>,
+    /// Per light (its `lights`, then its `directional` lights), its name (`name=`), which
+    /// materials read it by (`light:NAME`) and exclusions name it by.
+    pub light_names: Vec<Option<String>>,
     /// Lights from far away (a sun), entering sectors through their sky surfaces.
     pub directional: Vec<DirectionalLight>,
+    /// The keys of every meta value in the level (`$KEY=VALUE`; see [`crate::meta`]), the
+    /// level's own (on its `name` line), and per `geometry` polygon, its surface's. Sectors'
+    /// and entities' are theirs ([`Sector::meta`], [`EntitySpawn::meta`]).
+    pub meta_keys: crate::meta::MetaKeys,
+    pub meta: crate::meta::MetaValues,
+    pub faces: Vec<crate::meta::MetaValues>,
+    /// Per `geometry` polygon, the lights it isn't lit by: its surface's and its sector's.
+    pub face_excluded_lights: Vec<LightMask>,
 }
 
 /// Light from so far away that it arrives along one direction everywhere, like sunlight. It
@@ -41,7 +52,18 @@ pub struct DirectionalLight {
     pub angle: f32,
     /// Whether it casts shadows.
     pub shadows: bool,
+    /// Its bit in a [`LightMask`] (see [`Light::id`]).
+    pub id: u8,
 }
+
+/// Lights a thing isn't lit by (`exclude_lights=` on a surface, sector or entity): bit k
+/// for the level's light k (its `lights`, then its `directional` lights; only the first
+/// [`FLASHLIGHT_ID`] can be), and bit [`FLASHLIGHT_ID`] for the player's flashlight.
+pub type LightMask = u64;
+/// The flashlight's bit in a [`LightMask`].
+pub const FLASHLIGHT_ID: u8 = 63;
+/// The [`Light::id`] of a light no mask can exclude.
+pub const NO_LIGHT_ID: u8 = u8::MAX;
 
 /// A light: it lights surfaces facing it within `range` of it, fading smoothly to nothing
 /// there, and within its cone. A point light's cone is whole: it shines every way. A spot
@@ -89,6 +111,9 @@ pub struct Light {
     /// where it fades (the renderer's penumbra rule): for a soft cone, which they follow
     /// anyway, at no cost over a point light.
     pub coarse: bool,
+    /// Its bit in a [`LightMask`]: its place among the level's lights (the flashlight's,
+    /// [`FLASHLIGHT_ID`]), or [`NO_LIGHT_ID`] for one nothing can exclude.
+    pub id: u8,
 }
 
 /// A light swinging back and forth through its position: `offset` either way, smoothly (a
@@ -113,11 +138,17 @@ impl From<&DirectionalLight> for Light {
         let mut light = Light::directional(d.direction, d.color, d.angle);
         light.shadows = d.shadows;
         light.is_static = true;
+        light.id = d.id;
         light
     }
 }
 
 impl Light {
+    /// Whether `mask` excludes it.
+    pub fn excluded_by(&self, mask: LightMask) -> bool {
+        self.id < 64 && mask >> self.id & 1 != 0
+    }
+
     /// Where a moving light is `time` seconds in (a light that doesn't move stays put).
     pub fn at_time(&self, time: f32) -> Vec3 {
         match self.motion {
@@ -149,6 +180,7 @@ impl Light {
             motion: None,
             beam: false,
             coarse: false,
+            id: NO_LIGHT_ID,
         }
     }
 
@@ -170,6 +202,7 @@ impl Light {
             motion: None,
             beam: false,
             coarse: false,
+            id: NO_LIGHT_ID,
         }
     }
 
@@ -200,6 +233,7 @@ impl Light {
             motion: None,
             beam: false,
             coarse: false,
+            id: NO_LIGHT_ID,
         }
     }
 
@@ -255,6 +289,11 @@ pub struct Sector {
     pub bounds: Aabb,
     /// Mean of the sector's vertices; always inside a convex sector.
     pub center: Vec3,
+    /// Its meta values (`$KEY=VALUE` on its row).
+    pub meta: crate::meta::MetaValues,
+    /// The lights its surfaces aren't lit by (`exclude_lights=`; also in each of its faces'
+    /// [`Level::face_excluded_lights`]).
+    pub excluded_lights: LightMask,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -364,6 +403,10 @@ pub struct EntitySpawn {
     /// What its model is drawn with, if it names a material (`material=`); otherwise its
     /// vertex colors.
     pub binding: Option<crate::material::Binding>,
+    /// Its meta values (`$KEY=VALUE`), over its template's.
+    pub meta: crate::meta::MetaValues,
+    /// The lights its model isn't lit by (`exclude_lights=`; its own, else its template's).
+    pub excluded_lights: LightMask,
 }
 
 /// How an entity's shadows' edges are drawn, from a light with a size.

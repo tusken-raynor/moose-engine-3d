@@ -16,6 +16,8 @@ use crate::text::{Line, tokenize};
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelDoc {
     pub name: String,
+    /// The level's own meta values (`$KEY=VALUE` after its name).
+    pub name_options: Vec<String>,
     pub vertices: Vec<Vec3>,
     pub attributes: Vec<AttributeDoc>,
     pub sectors: Vec<SectorDoc>,
@@ -42,6 +44,8 @@ pub struct SectorDoc {
     pub name: String,
     pub first_surface: usize,
     pub surface_count: usize,
+    /// Its meta values (`$KEY=VALUE`), as written.
+    pub options: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,8 +153,12 @@ impl LevelDoc {
         if args[0] != "1" {
             return Err(c.err(line, format!("unsupported format version '{}'", args[0])));
         }
-        let (_, args) = c.header("name", 1)?;
-        let name = args[0].clone();
+        let Some(name_line) = c.lines.get(c.pos).filter(|l| l.tokens[0] == "name" && l.tokens.len() >= 2) else {
+            let no = c.lines.get(c.pos).map(|l| l.no);
+            return Err(LoadError::new(path, no, "expected 'name' and the level's name"));
+        };
+        let (name, name_options) = (name_line.tokens[1].clone(), name_line.tokens[2..].to_vec());
+        c.pos += 1;
         let vec3 = |c: &Cursor, r: &Line, i: usize| -> Result<Vec3, LoadError> {
             Ok(Vec3::new(c.float(r, i)?, c.float(r, i + 1)?, c.float(r, i + 2)?))
         };
@@ -174,13 +182,17 @@ impl LevelDoc {
             let section = c.section("values", true, Some(attribute.count))?;
             attribute.values = section.rows.into_iter().map(|r| r.tokens).collect();
         }
-        let section = c.section("sectors", false, Some(3))?;
+        let section = c.section("sectors", false, None)?;
         let mut sectors = Vec::new();
         for r in &section.rows {
+            if r.tokens.len() < 3 {
+                return Err(c.err(r.no, "sector row needs a name, its first surface and its surface count"));
+            }
             sectors.push(SectorDoc {
                 name: r.tokens[0].clone(),
                 first_surface: c.parse(r, 1, "surface index")?,
                 surface_count: c.parse(r, 2, "surface count")?,
+                options: r.tokens[3..].to_vec(),
             });
         }
         let section = c.section("surfaces", false, None)?;
@@ -312,6 +324,7 @@ impl LevelDoc {
         }
         Ok(LevelDoc {
             name,
+            name_options,
             vertices,
             attributes,
             sectors,
@@ -333,7 +346,7 @@ impl LevelDoc {
             out.push('\n');
         };
         line("MOOSEMAP 1".into());
-        line(format!("name {}", quoted(&self.name)));
+        line(format!("name {} {}", quoted(&self.name), self.name_options.join(" ")));
         line(String::new());
         line(format!("vertices {}", self.vertices.len()));
         line("#  id   x       y       z".into());
@@ -357,7 +370,7 @@ impl LevelDoc {
         line(format!("sectors {}", self.sectors.len()));
         line("#  id  name  first_surface  surface_count".into());
         for (i, s) in self.sectors.iter().enumerate() {
-            line(format!("   {i:<3} {} {} {}", quoted(&s.name), s.first_surface, s.surface_count));
+            line(format!("   {i:<3} {} {} {}  {}", quoted(&s.name), s.first_surface, s.surface_count, s.options.join(" ")));
         }
         line(String::new());
         line(format!("surfaces {}", self.surfaces.len()));

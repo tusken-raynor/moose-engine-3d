@@ -1,0 +1,5 @@
+MOOSEMATERIAL 2
+# Crates: bumps and a highlight by their specular map; with Translucent crates, see-through.
+shader             textured_translucent
+texture0           new_crate.png
+opacity            128

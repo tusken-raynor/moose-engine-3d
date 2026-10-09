@@ -1,0 +1,14 @@
+MOOSEMATERIAL 2
+shader             reflective_bumpy
+texture0           dirt_gravel_1_muddy_albedo_refl.png
+texture1           dirt_gravel_1_normal.png
+texture2           @water_heights
+short              4
+far                7
+reflectance        100
+fade               1
+shift              0.003
+ripple             0.001
+ripple_size        0.08
+drift              0
+ripple_speed       0.9

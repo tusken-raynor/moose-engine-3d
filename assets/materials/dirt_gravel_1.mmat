@@ -1,0 +1,6 @@
+MOOSEMATERIAL 2
+shader             basic_bumpy
+texture0           dirt_gravel_1_albedo.png
+texture1           dirt_gravel_1_normal.png
+short              4
+far                7

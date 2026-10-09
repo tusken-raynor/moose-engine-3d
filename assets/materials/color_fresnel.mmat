@@ -1,0 +1,4 @@
+MOOSEMATERIAL 2
+# Shiny surfaces of levels without texture coordinates: over their reflection, a Fresnel falloff.
+shader             vertex_color_fresnel
+reflectance        setting

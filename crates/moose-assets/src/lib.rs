@@ -8,17 +8,23 @@
 //! and are never triangulated.
 
 pub mod bump;
+pub mod meta;
 mod error;
 mod geom;
 mod half;
 mod level;
 mod material;
-pub use material::{Binding, MATERIAL_SLOTS, MaterialDef, MaterialLibrary, ParamValue, TextureSource};
+pub use material::{
+    Binding, MATERIAL_SLOTS, MaterialDef, MaterialLibrary, ParamValue, Scope, TextureSource, check_material_name,
+    material_comments,
+};
+pub use meta::{MetaKeys, MetaValues};
 mod mesh;
 mod mmp;
 pub use mmp::{merged_options, option_key};
 mod mmp_doc;
 mod mmp_edit;
+pub use mmp_edit::fit_affine;
 mod mmdl;
 mod mmdl_doc;
 mod obj;
@@ -32,7 +38,7 @@ mod texture;
 pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
-    DirectionalLight, EntityKind, EntitySpawn, Level, Light, NO_SECTOR, Occluder, Oscillation, ShadowKind,
+    DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
     Portal, PortalFlags, Sector, Terrain,
 };
 pub use mmp_doc::{

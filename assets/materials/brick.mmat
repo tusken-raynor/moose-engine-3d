@@ -1,0 +1,10 @@
+MOOSEMATERIAL 2
+# Walls. Brick has bumps (its normal map) and a highlight (dull on the mortar, by its alpha) and,
+# flat, detail noise. Unit values (specular, detail, opacity, strength) are 0-255.
+shader             lit
+texture0           brick_wall.png
+texture1           brick_wall_normal.png
+filter1            bilinear
+specular           64
+shininess          32
+detail             26

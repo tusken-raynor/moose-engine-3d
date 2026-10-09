@@ -9,10 +9,11 @@ use glam::{EulerRot, Quat, Vec3};
 use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
 use crate::level::{
-    DirectionalLight, EntityKind, EntitySpawn, Level, Light, Occluder, ShadowKind, Oscillation, Portal,
-    PortalFlags, Sector, Terrain,
+    DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, Occluder,
+    ShadowKind, Oscillation, Portal, PortalFlags, Sector, Terrain,
 };
 use crate::material::{Binding, binding_of};
+use crate::meta::{MetaKeys, MetaValues, take_meta};
 use crate::terrain::{self, Region};
 use crate::mesh::{AttribData, MeshBuilder, PolyFlags, StorageFormat};
 use crate::store::Assets;
@@ -23,6 +24,9 @@ struct SectorRec {
     name: String,
     first: usize,
     count: usize,
+    meta: MetaValues,
+    /// The lights it names in `exclude_lights=`, resolved once the lights are read.
+    exclude: Vec<String>,
 }
 
 struct SurfaceRec {
@@ -36,6 +40,8 @@ struct SurfaceRec {
     plane: Plane,
     /// What it is drawn with (`material=` after its vertices).
     binding: Option<Binding>,
+    meta: MetaValues,
+    exclude: Vec<String>,
 }
 
 struct AdjoinRec {
@@ -58,7 +64,33 @@ struct EntityRec {
     occluder: OccluderRec,
     shadow: ShadowKind,
     animation: Option<String>,
+    meta: MetaValues,
     binding: Option<Binding>,
+    exclude: Vec<String>,
+}
+
+/// The light names in an `exclude_lights=` option among `options`, if any, and the other
+/// options.
+fn take_exclusions<'a>(
+    options: impl IntoIterator<Item = &'a String>,
+) -> Result<(Vec<String>, Vec<&'a String>), String> {
+    let (mut names, mut rest) = (Vec::new(), Vec::new());
+    for option in options {
+        match option.strip_prefix("exclude_lights=") {
+            // None, over a template's.
+            Some("none") => {}
+            Some(list) => {
+                for name in list.split(',') {
+                    if name.is_empty() {
+                        return Err(format!("'{option}': light names, separated by commas"));
+                    }
+                    names.push(name.to_string());
+                }
+            }
+            None => rest.push(option),
+        }
+    }
+    Ok((names, rest))
 }
 
 /// An option's key: the part before `=`, or the whole word for a flag.
@@ -262,8 +294,19 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     if args[0] != "1" {
         return Err(c.err(line, format!("unsupported format version '{}'", args[0])));
     }
-    let (_, args) = c.header("name", 1)?;
-    let level_name = args[0].clone();
+    // The name, then the level's own meta values.
+    let mut keys = MetaKeys::default();
+    let Some(name_line) = c.lines.get(c.pos).filter(|l| l.tokens[0] == "name" && l.tokens.len() >= 2) else {
+        let no = c.lines.get(c.pos).map(|l| l.no);
+        return Err(LoadError::new(path, no, "expected 'name' and the level's name"));
+    };
+    let level_name = name_line.tokens[1].clone();
+    let (level_meta, rest) =
+        take_meta(&mut keys, &name_line.tokens[2..]).map_err(|m| c.err(name_line.no, format!("name: {m}")))?;
+    if let Some(option) = rest.first() {
+        return Err(c.err(name_line.no, format!("name: unknown option '{option}' (meta values are $KEY=VALUE)")));
+    }
+    c.pos += 1;
 
     // ---- Vertices
     let section = c.section("vertices", false, Some(3))?;
@@ -318,14 +361,25 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     let table_rows = |k: usize| tables[k].len() / decls[k].1 as usize;
 
     // ---- Sectors
-    let sector_section = c.section("sectors", false, Some(3))?;
+    let sector_section = c.section("sectors", false, None)?;
     let mut sectors = Vec::new();
-    for r in &sector_section.rows {
+    for (i, r) in sector_section.rows.iter().enumerate() {
+        if r.tokens.len() < 3 {
+            return Err(c.err(r.no, format!("sector {i} needs a name, its first surface and its surface count")));
+        }
+        // Then its meta values.
+        let (meta, rest) = take_meta(&mut keys, &r.tokens[3..]).map_err(|m| c.err(r.no, format!("sector {i}: {m}")))?;
+        let (exclude, rest) = take_exclusions(rest).map_err(|m| c.err(r.no, format!("sector {i}: {m}")))?;
+        if let Some(option) = rest.first() {
+            return Err(c.err(r.no, format!("sector {i}: unknown option '{option}' (meta values are $KEY=VALUE)")));
+        }
         sectors.push(SectorRec {
             line: r.no,
             name: r.tokens[0].clone(),
             first: c.parse(r, 1, "surface index")?,
             count: c.parse(r, 2, "surface count")?,
+            meta,
+            exclude,
         });
     }
 
@@ -447,6 +501,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
         let (binding, rest) = binding_of(assets.materials(), options)
             .map_err(|m| c.err(r.no, format!("surface {i}: {m}")))?;
+        let (meta, rest) = take_meta(&mut keys, rest).map_err(|m| c.err(r.no, format!("surface {i}: {m}")))?;
+        let (exclude, rest) = take_exclusions(rest).map_err(|m| c.err(r.no, format!("surface {i}: {m}")))?;
         if let Some(option) = rest.first() {
             return Err(c.err(r.no, format!("surface {i}: unknown option '{option}'")));
         }
@@ -459,6 +515,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             attr_rows,
             plane,
             binding,
+            meta,
+            exclude,
         });
     }
 
@@ -551,10 +609,12 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         // Options after the name.
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
         let (mut shadow, mut animation) = (ShadowKind::Soft, None);
+        let mut exclude = Vec::new();
         let options = merged_options(template.map_or(&[][..], |t| &t.2), &r.tokens[11..]);
         // What it's drawn with (props, actors and terrains).
         let (binding, options) = binding_of(assets.materials(), &options)
             .map_err(|m| c.err(r.no, format!("entity '{name}': {m}")))?;
+        let (meta, options) = take_meta(&mut keys, options).map_err(|m| c.err(r.no, format!("entity '{name}': {m}")))?;
         if binding.is_some() && !matches!(kind, EntityKind::Prop | EntityKind::Actor | EntityKind::Terrain) {
             return Err(c.err(r.no, format!("entity '{name}': {} entities take no material", kind.name())));
         }
@@ -584,6 +644,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 Some(("occluder", value)) => occluder = occluder_option(value).map_err(fail)?,
                 // `none` overrides a template's.
                 Some(("anim", value)) if !value.is_empty() => animation = (value != "none").then(|| value.to_string()),
+                // Its own replace its template's.
+                Some(("exclude_lights", _)) => exclude = take_exclusions([option]).map_err(fail)?.0,
                 _ => return Err(fail(format!("unknown option '{option}'"))),
             }
         }
@@ -601,6 +663,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             shadow,
             animation,
             binding,
+            meta,
+            exclude,
         });
     }
 
@@ -618,7 +682,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             return Err(c.err(line, "ambient light cannot be negative".to_string()));
         }
     }
-    let mut lights = Vec::new();
+    let (mut lights, mut light_names) = (Vec::new(), Vec::new());
     if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "lights") {
         let section = c.section("lights", false, None)?;
         for (i, r) in section.rows.iter().enumerate() {
@@ -662,6 +726,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 Light::spot(sector as u32, position, color, range, direction, inner, outer)
             };
             light.is_static = true;
+            light.id = if i < FLASHLIGHT_ID as usize { i as u8 } else { NO_LIGHT_ID };
+            let mut name = None;
             for option in &r.tokens[fields..] {
                 let fail = |m: String| c.err(r.no, format!("light {i}: {m}"));
                 match option.split_once('=') {
@@ -671,6 +737,16 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                             .ok()
                             .filter(|r| r.is_finite() && *r >= 0.0)
                             .ok_or_else(|| fail(format!("radius '{v}' must be 0 or more")))?;
+                    }
+                    // What materials read it by (`light:NAME`).
+                    Some(("name", v)) if !v.is_empty() => {
+                        if light_names.iter().any(|n: &Option<String>| n.as_deref() == Some(v)) {
+                            return Err(fail(format!("another light is named '{v}'")));
+                        }
+                        if v == "flashlight" || v == "none" {
+                            return Err(fail(format!("a light can't be named '{v}' ('flashlight' is the player's, 'none' no light)")));
+                        }
+                        name = Some(v.to_string());
                     }
                     Some(("shadows", "on")) => light.shadows = true,
                     Some(("shadows", "off")) => light.shadows = false,
@@ -695,6 +771,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 }
             }
             lights.push((r.no, light));
+            light_names.push(name);
         }
     }
 
@@ -726,10 +803,22 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 ));
             }
             let mut shadows = true;
+            let mut name = None;
             for option in &r.tokens[fields..] {
                 match option.as_str() {
                     "shadows=on" => shadows = true,
                     "shadows=off" => shadows = false,
+                    // Named like the level's other lights, in the same names.
+                    o if o.starts_with("name=") && o.len() > 5 => {
+                        let v = &o[5..];
+                        if light_names.iter().any(|n: &Option<String>| n.as_deref() == Some(v)) {
+                            return Err(c.err(r.no, format!("directional light {i}: another light is named '{v}'")));
+                        }
+                        if v == "flashlight" || v == "none" {
+                            return Err(c.err(r.no, format!("directional light {i}: a light can't be named '{v}'")));
+                        }
+                        name = Some(v.to_string());
+                    }
                     _ => {
                         return Err(c.err(
                             r.no,
@@ -738,12 +827,15 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     }
                 }
             }
+            let k = lights.len() + i;
             directional.push(DirectionalLight {
                 direction: direction.normalize(),
                 color,
                 angle,
                 shadows,
+                id: if k < FLASHLIGHT_ID as usize { k as u8 } else { NO_LIGHT_ID },
             });
+            light_names.push(name);
         }
     }
 
@@ -753,6 +845,30 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             format!("unexpected '{}' after the last section", extra.tokens[0]),
         ));
     }
+
+    // Exclusions, now the lights' names are known: each a mask of their bits.
+    let excluded = |names: &[String], line: usize, what: &str| -> Result<LightMask, LoadError> {
+        let mut mask: LightMask = 0;
+        for name in names {
+            let bit = match light_names.iter().position(|n| n.as_deref() == Some(name.as_str())) {
+                _ if name == "flashlight" => FLASHLIGHT_ID as usize,
+                Some(k) if k < FLASHLIGHT_ID as usize => k,
+                Some(_) => {
+                    return Err(c.err(line, format!("{what}: only the level's first {FLASHLIGHT_ID} lights can be excluded ('{name}')")));
+                }
+                None => {
+                    return Err(c.err(line, format!("{what}: exclude_lights: no light is named '{name}' (lights take name=)")));
+                }
+            };
+            mask |= 1 << bit;
+        }
+        Ok(mask)
+    };
+    let sector_excluded = sectors
+        .iter()
+        .enumerate()
+        .map(|(i, s)| excluded(&s.exclude, s.line, &format!("sector {i}")))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // ---- Validation: sector ranges
     let mut expect = 0;
@@ -961,6 +1077,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     // The vertex table becomes the mesh's positions in order; unused entries are dropped at finish.
     let mut builder = MeshBuilder::new(&level_name, vertices, decls.iter().cloned());
     let mut bindings: Vec<Binding> = Vec::new();
+    // Per geometry polygon, its surface's meta values.
+    let mut faces: Vec<MetaValues> = Vec::new();
+    let mut face_excluded_lights: Vec<LightMask> = Vec::new();
     let mut sectors_out = Vec::with_capacity(sectors.len());
     let mut portals = Vec::with_capacity(adjoins.len());
     for (si, s) in sectors.iter().enumerate() {
@@ -972,6 +1091,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     builder
                         .push_polygon(&indices, PolyFlags(surf.flags))
                         .map_err(|m| c.err(surf.line, m))?;
+                    faces.push(surf.meta.clone());
+                    let own = excluded(&surf.exclude, surf.line, "surface")?;
+                    face_excluded_lights.push(own | sector_excluded[si]);
                     if let Some(binding) = &surf.binding {
                         // Surfaces with the same binding share it.
                         let index = match bindings.iter().position(|b| b == binding) {
@@ -1011,6 +1133,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             portals: first_portal..portals.len() as u32,
             bounds: bounds[si],
             center: centers[si],
+            meta: s.meta.clone(),
+            excluded_lights: sector_excluded[si],
         });
     }
 
@@ -1050,6 +1174,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     .map_err(|err| c.err(e.line, format!("entity '{}': occluder: {err}", e.name)))?,
             ),
         };
+        let excluded_lights = excluded(&e.exclude, e.line, &format!("entity '{}'", e.name))?;
         spawns.push(EntitySpawn {
             name: e.name,
             kind: e.kind,
@@ -1063,6 +1188,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             shadow: e.shadow,
             animation: e.animation,
             binding: e.binding,
+            meta: e.meta,
+            excluded_lights,
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
@@ -1119,6 +1246,11 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         bindings,
         ambient,
         lights: lights.into_iter().map(|(_, l)| l).collect(),
+        light_names,
         directional,
+        meta_keys: keys,
+        meta: level_meta,
+        faces,
+        face_excluded_lights,
     })
 }

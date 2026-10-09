@@ -1,0 +1,4 @@
+MOOSEMATERIAL 2
+# Mirror balls: a cube map of their surroundings, baked at load.
+shader             cube_reflection
+texture0           @cube

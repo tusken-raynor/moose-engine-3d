@@ -1,0 +1,9 @@
+MOOSEMATERIAL 2
+shader             random_sections
+texture0           plain_sidewalk_atlas_albedo.png
+filter0            bilinear_mipmap_linear
+texture1           plain_sidewalk_atlas_normal.png
+filter1            bilinear_mipmap_linear
+short              4
+far                7
+seed               12

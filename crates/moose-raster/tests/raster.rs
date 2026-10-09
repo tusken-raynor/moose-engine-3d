@@ -4,7 +4,7 @@ use glam::Vec3;
 use moose_assets::Assets;
 use moose_raster::shaders::VertexColor;
 use moose_raster::{
-    LayoutError, MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target,
+    MaterialId, Params, RasterConfig, RasterPath, Renderer, Surface, Target,
 };
 use moose_scene::{Camera, PORTAL_CLEARANCE, Viewport, World};
 use moose_view::{EdgeLine, PolygonKind, ViewGeometry, pixel_edge};
@@ -379,6 +379,8 @@ fn render_ids(
             } else {
                 path
             },
+            back_light: 0.0,
+            excluded_lights: 0,
         }
     })
     .unwrap();
@@ -578,21 +580,26 @@ fn splitscreen_viewports_draw_only_their_own_pixels() {
 }
 
 #[test]
-fn layout_errors_name_the_missing_attribute() {
+fn a_missing_attribute_reads_zero() {
+    // A material reading `uv` (and passing it to its pixels) on the level, which has none:
+    // drawn, with uv 0 everywhere (green), not refused.
     mod uv_shader {
         use moose_raster::shader::{Material, PixelContext, SampleContext, U32s, VertexContext};
-        moose_raster::material_io! { vertex { uv: 2 } sampled {} fixed32 {} fixed16 {} float {} }
+        moose_raster::material_io! { vertex { uv: 2 } sampled { uv: 2 } fixed32 {} fixed16 {} float { uv: 2 } }
         pub struct NeedsUv;
         impl Material for NeedsUv {
             moose_raster::material_types!();
-            fn shade_vertex(_: &Vertex, _: &VertexContext) -> Sampled {
-                Sampled {}
+            fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+                Sampled { uv: v.uv }
             }
-            fn shade_sample(_: &SampledLanes, _: &SampleContext) -> Interp {
-                Interp {}
+            fn shade_sample(s: &SampledLanes, _: &SampleContext) -> Interp {
+                Interp { uv: s.uv }
             }
-            fn shade_pixel(_: &Fixed32, _: &Fixed16, _: &Floats, _: &PixelContext) -> U32s {
-                U32s::splat(0)
+            fn shade_pixel(_: &Fixed32, _: &Fixed16, c: &Floats, _: &PixelContext) -> U32s {
+                let none = wide::f32x8::splat(0.0);
+                let zero = c.uv[0].simd_eq(none) & c.uv[1].simd_eq(none);
+                let zero: U32s = wide::bytemuck::cast(zero);
+                (zero & U32s::splat(0x00FF00)) | (!zero & U32s::splat(0xFF0000))
             }
         }
     }
@@ -612,16 +619,12 @@ fn layout_errors_name_the_missing_attribute() {
         width: VP.width,
         height: VP.height,
     };
-    let err = r
-        .render(&mut target, VP, &out, &assets, |_| Surface::new(uv))
-        .unwrap_err();
-    assert_eq!(
-        err,
-        LayoutError::MissingAttribute {
-            mesh: "Two Rooms".into(),
-            name: "uv"
-        }
-    );
+    // The level's polygons only (the crates' model has texture coordinates).
+    let level = filtered(&out, |p| matches!(p.source, moose_view::PolygonSource::World { .. }));
+    r.render(&mut target, VP, &level, &assets, |_| Surface::new(uv)).unwrap();
+    let green = pixels.iter().filter(|&&p| p & 0xFF_FFFF == 0x00FF00).count();
+    assert!(green > pixels.len() / 2, "{green} of {} pixels", pixels.len());
+    assert!(pixels.iter().all(|&p| matches!(p & 0xFF_FFFF, 0 | 0x00FF00)), "a pixel read a uv");
 }
 
 /// A copy of `geometry` keeping only the polygons `keep` accepts.
@@ -1083,7 +1086,7 @@ fn textured_floors_show_the_texel_under_each_pixel() {
         r.render(&mut target, VP, &out, &assets, |p| {
             if floor(p) {
                 Surface {
-                    textures: [Some(texture), None],
+                    textures: std::array::from_fn(|k| (k == 0).then_some(texture)),
                     filters: [moose_raster::shaders::filter::NEAREST_MIPMAP_NONE; moose_raster::MAX_TEXTURES],
                     ..Surface::new(textured)
                 }

@@ -161,11 +161,11 @@ fn main() {
                     let water_textures = water_textures.filter(|_| n.y > 0.9);
                     let mut s = match water_textures {
                         Some([water_texture, heights]) => Surface {
-                            textures: [Some(water_texture), Some(heights)],
+                            textures: std::array::from_fn(|k| [Some(water_texture), Some(heights)].get(k).copied().flatten()),
                             ..Surface::new(water)
                         },
                         None => Surface {
-                            textures: [texture, None],
+                            textures: std::array::from_fn(|k| if k == 0 { texture } else { None }),
                             ..Surface::new(if texture.is_some() {
                                 textured_fresnel
                             } else {

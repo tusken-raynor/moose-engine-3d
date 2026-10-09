@@ -1,0 +1,3 @@
+MOOSEMATERIAL 2
+# Vertex colors, lit: anything that names no material is drawn this way too.
+shader             vertex_color

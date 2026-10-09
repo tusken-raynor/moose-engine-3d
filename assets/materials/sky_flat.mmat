@@ -1,0 +1,3 @@
+MOOSEMATERIAL 2
+# Sky surfaces: the sky box with the level's sun; its vertex colors with the Sky setting flat.
+shader             sky

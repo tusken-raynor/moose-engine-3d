@@ -235,11 +235,22 @@ const HIGHLIGHT: u32 = 0x3A_4E_6E;
 
 /// Draws a menu page over the frame: the frame darkened, and a panel in the middle with
 /// its title, its rows (the selected one highlighted, values on the right), notes below
-/// them, and a line of key hints.
+/// them, and a line of key hints. Rows that don't fit scroll, keeping the selected one in
+/// view, with `...` where more are above or below.
 pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize, notes: &[&str], hint: &str) {
     let scale = if canvas.height >= 600 { 2 } else { 1 };
     let line = Canvas::line_height(scale);
     canvas.shade(0, 0, canvas.width, canvas.height, 90);
+    let spacer = if notes.is_empty() { 0 } else { 1 };
+    let room = (canvas.height.saturating_sub(16 * scale) / line).saturating_sub(notes.len() + spacer + 4).max(3);
+    let (rows, selected, more) = if rows.len() > room {
+        // Two rows go to the marks above and below.
+        let shown = room - 2;
+        let first = selected.saturating_sub(shown / 2).min(rows.len() - shown);
+        (&rows[first..first + shown], selected - first, Some((first > 0, first + shown < rows.len())))
+    } else {
+        (rows, selected, None)
+    };
     let label_w = rows.iter().map(|r| Canvas::text_width(&r.label, scale)).max().unwrap_or(0);
     let value_w = rows
         .iter()
@@ -250,8 +261,8 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
     let notes_w = notes.iter().chain([&hint]).map(|n| Canvas::text_width(n, scale)).max().unwrap_or(0);
     let pad = 8 * scale;
     let width = (label_w + 12 * scale + value_w).max(notes_w).max(Canvas::text_width(title, scale)) + 2 * pad;
-    let spacer = if notes.is_empty() { 0 } else { 1 };
-    let height = line * (rows.len() + notes.len() + spacer + 4) + 2 * pad;
+    let marks = if more.is_some() { 2 } else { 0 };
+    let height = line * (rows.len() + marks + notes.len() + spacer + 4) + 2 * pad;
     let (x0, y0) = (
         canvas.width.saturating_sub(width) / 2,
         canvas.height.saturating_sub(height) / 2,
@@ -259,6 +270,15 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
     canvas.fill(x0, y0, width, height, 0x14_16_1C);
     canvas.text(x0 + pad, y0 + pad, title, TITLE, scale);
     let mut y = y0 + pad + line * 2;
+    let mark = |canvas: &mut Canvas, y: usize, on: bool| {
+        if on {
+            canvas.text(x0 + pad, y, "...", DIM, scale);
+        }
+    };
+    if let Some((above, _)) = more {
+        mark(canvas, y, above);
+        y += line;
+    }
     for (i, row) in rows.iter().enumerate() {
         let on = i == selected;
         if on {
@@ -270,6 +290,10 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
             let vx = x0 + width - pad - Canvas::text_width(value, scale);
             canvas.text(vx, y, value, color, scale);
         }
+        y += line;
+    }
+    if let Some((_, below)) = more {
+        mark(canvas, y, below);
         y += line;
     }
     y += line;

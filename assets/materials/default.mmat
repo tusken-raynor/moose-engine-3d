@@ -1,0 +1,5 @@
+MOOSEMATERIAL 2
+# The default: Moose v1's default texture, plain diffuse. New levels are drawn with it.
+shader             textured
+texture0           default.png
+filter0            nearest_mipmap_linear

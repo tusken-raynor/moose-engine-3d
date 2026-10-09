@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use glam::{Affine3A, Quat, Vec3};
-use moose_assets::{
+use moose_assets::{LightMask, MetaKeys, MetaValues,
     Aabb, Assets, Binding, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
     Sector,
 };
@@ -42,6 +42,17 @@ pub struct World {
     pub ambient: Vec3,
     /// Lights from far away, entering through sky surfaces.
     pub directional: Vec<DirectionalLight>,
+    /// The level's meta keys and values (see `moose_assets::meta`): its own, and per
+    /// `geometry` polygon, its surface's (sectors' and entities' are theirs). Materials
+    /// read them each frame; scripts will change them.
+    pub meta_keys: MetaKeys,
+    pub meta: MetaValues,
+    pub faces: Vec<MetaValues>,
+    /// Per level polygon, the lights it isn't lit by (its surface's and sector's
+    /// `exclude_lights=`).
+    pub face_excluded_lights: Vec<LightMask>,
+    /// Per level light (in the level's order), its name, if it has one.
+    pub light_names: Vec<Option<String>>,
     /// The level's lights. Set them with [`World::set_lights`], which finds where each
     /// reaches.
     lights: Vec<Light>,
@@ -87,6 +98,11 @@ pub struct Entity {
     /// What its model (or, for a terrain, its pieces) is drawn with, if it names a
     /// material; otherwise its vertex colors.
     pub binding: Option<Binding>,
+    /// Its meta values (`$KEY=VALUE`, over its template's): what materials read with
+    /// `entity:KEY`, and scripts will change.
+    pub meta: MetaValues,
+    /// The lights its model isn't lit by (`exclude_lights=`).
+    pub excluded_lights: LightMask,
 }
 
 
@@ -211,6 +227,8 @@ impl World {
                     shadow: spawn.shadow,
                     animation: spawn.animation,
                     binding: spawn.binding,
+                    meta: spawn.meta,
+                    excluded_lights: spawn.excluded_lights,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }
@@ -236,6 +254,11 @@ impl World {
             spawn_points,
             ambient: level.ambient,
             directional: level.directional,
+            meta_keys: level.meta_keys,
+            meta: level.meta,
+            faces: level.faces,
+            face_excluded_lights: level.face_excluded_lights,
+            light_names: level.light_names,
             lights: Vec::new(),
             sector_lights: Vec::new(),
             boundaries,

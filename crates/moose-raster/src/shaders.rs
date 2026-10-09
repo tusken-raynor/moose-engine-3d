@@ -881,14 +881,15 @@ pub use textured::Textured;
 
 
 /// How a bumpy surface's light differs from a flat one's at [`LANES`](crate::shader::LANES)
-/// sample points, from a group of the lights that reach it, each weighted by its
+/// sample points, for one channel of the lights that reach it, each weighted by its
 /// brightness (the luminance of its color times its falloff and cone, as [`diffuse`] has
 /// them): in tangent space (`tangent`, `bitangent`, `normal`: x along the texture's u, y
-/// along its v, z out), over the group's brightness on a flat surface (ambient included),
-/// so that a flat texel's factor is exactly 1.
+/// along its v, z out), over the channel's brightness on a flat surface, so that a flat
+/// texel's factor is exactly 1.
 #[derive(Clone, Copy)]
 struct Bumps {
-    /// The ambient light's share of the flat brightness.
+    /// The ambient light's share of the flat brightness (the lights that always reach
+    /// only: the split lights' channels have none).
     ambient: F32s,
     /// The sum of the lights' directions (toward them, unit length) times their share of
     /// the flat brightness: lights in front of the surface only.
@@ -896,23 +897,76 @@ struct Bumps {
     /// The lights' color (linear) where they reach, before any surface's cosine: lights in
     /// front of the surface only. A highlight's.
     color: [F32s; 3],
+    /// The sum of the directions of the lights behind the surface (within its back light
+    /// angle, `SampleContext::back`) times their share of the flat brightness, each eased
+    /// from all of it at the surface's plane to none at the angle. None of them lights the
+    /// flat surface; a texel's normal tilted toward them catches them (see [`bump_factor`]).
+    /// The lights that always reach's channel only.
+    behind: [F32s; 3],
 }
 
-/// [`Bumps`] of the lights that always reach the polygon's pixels (`rest`: all but its
-/// split lights, which shadows or a beam's cone cut pixel by pixel; see
-/// `SampleContext::light_split`), and of all of them (`all`). Pixels bump the two lights
-/// apart, then blend them as much as the split lights reach (see
-/// `PixelContext::light_scaled`): a light that doesn't reach a pixel doesn't bump it, and
-/// the others still do.
+/// The bump channels (see [`bumps`]): the lights that always reach, the shadowed lamps,
+/// the flashlight.
+pub(crate) const BUMP_CHANNELS: usize = 3;
+
+/// Bump values to interpolate (`bump` outputs): the lights that always reach's ambient
+/// share and summed direction, the shadowed lamps' summed direction, the flashlight's
+/// direction, and the lights behind's summed direction (a share of the first channel's
+/// brightness).
+pub(crate) const BUMP_LANES: usize = 13;
+
 #[inline(always)]
-fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> (Bumps, Bumps) {
+fn bump_lanes([rest, lamps, flash]: &[Bumps; BUMP_CHANNELS]) -> [F32s; BUMP_LANES] {
+    [
+        rest.ambient, rest.toward[0], rest.toward[1], rest.toward[2],
+        lamps.toward[0], lamps.toward[1], lamps.toward[2],
+        flash.toward[0], flash.toward[1], flash.toward[2],
+        rest.behind[0], rest.behind[1], rest.behind[2],
+    ]
+}
+
+/// Whether there is any light from one way in `bump` for the lights that always reach
+/// (not the ambient light only), in front of the surface or behind it.
+#[inline(always)]
+fn bump_has_rest(bump: &[F32s; BUMP_LANES]) -> bool {
+    let len2 = |k: usize| bump[k] * bump[k] + bump[k + 1] * bump[k + 1] + bump[k + 2] * bump[k + 2];
+    (len2(1) + len2(10)).simd_ge(F32s::fill(1e-4)).any()
+}
+
+/// A texel's bumps' factor on channel `g`: 0, the lights that always reach (its ambient
+/// share, its normal's cosine with their summed direction, and with the lights behind the
+/// surface's, which only a normal tilted toward them catches); 1, the shadowed lamps (its
+/// normal's cosine with theirs); 2, the flashlight (with its).
+#[inline(always)]
+fn bump_factor(normal: &[F32s; 3], bump: &[F32s; BUMP_LANES], g: usize) -> F32s {
+    let zero = F32s::fill(0.0);
+    let cos = |k: usize| (normal[0] * bump[k] + normal[1] * bump[k + 1] + normal[2] * bump[k + 2]).max(zero);
+    match g {
+        0 => bump[0] + cos(1) + cos(10),
+        1 => cos(4),
+        _ => cos(7),
+    }
+}
+
+/// [`Bumps`] per channel of the lights reaching a polygon: those that always reach its
+/// pixels (the ambient light and all but its split lights); its split lights but the
+/// flashlight, the shadowed lamps (pooled, as the first are); and the player's flashlight,
+/// when it is split (its shadow or its beam's cone cuts it pixel by pixel; see
+/// `SampleContext::light_split`). Pixels bump each channel apart and add them, each split
+/// light as much as it reaches (see `PixelContext::light_scaled`): a light that doesn't
+/// reach a pixel doesn't bump it, and the others still do. The flashlight, the light most
+/// unlike the others (low, close, often grazing), never steers their bumps, nor they its.
+#[inline(always)]
+fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> [Bumps; BUMP_CHANNELS] {
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     let luma = |c: glam::Vec3| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
     let ambient = F32s::fill(luma(ctx.ambient));
-    // Per group (rest, all): the flat brightness, the summed directions, the color.
-    let mut flat = [ambient; 2];
-    let mut toward = [[zero; 3]; 2];
-    let mut color = [[zero; 3]; 2];
+    // Per channel: the flat brightness, the summed directions, the color.
+    let mut flat = [ambient, zero, zero];
+    let mut toward = [[zero; 3]; BUMP_CHANNELS];
+    let mut color = [[zero; 3]; BUMP_CHANNELS];
+    let mut behind = [zero; 3];
+    let back = F32s::fill(ctx.back.max(1e-6));
     let dot = |a: &[F32s; 3], b: &[F32s; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
@@ -931,29 +985,54 @@ fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> (
         // Toward the light, in tangent space.
         let to = frame.map(|axis| dot(axis, &d) * inv_len);
         let front = to[2].max(zero);
-        let lit = k * front.simd_gt(zero).select(one, zero);
-        // A split light (as `diffuse` tells them) is in all only.
+        let lit = front.simd_gt(zero).select(one, zero);
+        // Its channel: a split light (as `diffuse` tells them) is a lamp's or the
+        // flashlight's.
         let split = ctx.light_split.get(i).is_some_and(|&j| (j as usize) < ctx.split.len());
-        for g in if split { 1..2 } else { 0..2 } {
-            flat[g] += k * front;
-            for (sum, v) in toward[g].iter_mut().zip(to) {
-                *sum += lit * v;
-            }
-            let shines = reach * front.simd_gt(zero).select(one, zero);
-            for (sum, l) in color[g].iter_mut().zip([l.color.x, l.color.y, l.color.z]) {
-                *sum += shines * F32s::fill(l);
+        let g = match split {
+            false => 0,
+            true if l.id == moose_assets::FLASHLIGHT_ID => 2,
+            true => 1,
+        };
+        flat[g] += k * front;
+        for (sum, v) in toward[g].iter_mut().zip(to) {
+            *sum += k * lit * v;
+        }
+        for (sum, c) in color[g].iter_mut().zip([l.color.x, l.color.y, l.color.z]) {
+            *sum += reach * lit * F32s::fill(c);
+        }
+        // Behind the surface, within its back light angle: eased out to none at it.
+        if g == 0 && ctx.back > 0.0 {
+            let w = ((to[2] + back) / back).max(zero).min(one);
+            let w = lit.simd_gt(zero).select(zero, w * w * (F32s::fill(3.0) - w - w));
+            for (sum, v) in behind.iter_mut().zip(to) {
+                *sum += k * w * v;
             }
         }
     }
-    let group = |g: usize| {
+    std::array::from_fn(|g| {
         let over = flat[g].max(F32s::fill(1e-6)).recip();
         Bumps {
-            ambient: ambient * over,
+            ambient: if g == 0 { ambient * over } else { zero },
             toward: toward[g].map(|v| v * over),
             color: color[g],
+            behind: if g == 0 { behind.map(|v| v * over) } else { [zero; 3] },
         }
-    };
-    (group(0), group(1))
+    })
+}
+
+/// A normal map texel's normal (`normal`, tangent space), bent toward flat by how much of
+/// the bumps there are (`f`, 0 to 1), at unit length: always, as the bump factors take it
+/// so (a flat texel's factor exactly 1). A normal map's normals are only nearly unit, and
+/// filtered ones shorter (about 0.9 past the first mip level of cheese_1's gravel): once
+/// only where the bumps were fading, so they were dimmer where they weren't, and the fade's
+/// start showed as a hard edge, in steps a block of pixels wide.
+#[inline(always)]
+fn unit_normal(normal: [F32s; 3], f: F32s) -> [F32s; 3] {
+    let one = F32s::fill(1.0);
+    let bent = [normal[0] * f, normal[1] * f, one + (normal[2] - one) * f];
+    let inv = (bent[0] * bent[0] + bent[1] * bent[1] + bent[2] * bent[2]).max(F32s::fill(1e-12)).recip_sqrt();
+    bent.map(|c| c * inv)
 }
 
 /// A texel's byte `shift` bits up as a float, 0 to 255.
@@ -989,21 +1068,25 @@ pub mod textured_lit {
     pub const FLAT: u8 = 0;
     pub const NORMAL_MAP: u8 = 1;
 
+    // Seen in a mirror, no bumps or highlights: their values aren't carried.
     crate::material_io! {
         vertex { uv: 2, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
-        sampled { uv: 2, lod: 1, normal: 3, tangent: 3, bitangent: 3, position: 3 }
+        sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
-        fixed16 { lod: 1, fade: 1 }
-        float { bump: 8, spec: 12 }
+        fixed16 { lod: 1, fade: 1 if !MIRRORED }
+        float { bump: 13 if !MIRRORED, spec: 6 if !MIRRORED }
     }
 
-    /// Textured, bumpy and shiny as `BUMP` and `SPECULAR` say (see the module).
-    pub struct TexturedLit<const BUMP: u8, const SPECULAR: bool>;
+    /// Textured, bumpy and shiny as `BUMP` and `SPECULAR` say (see the module); seen in a
+    /// mirror (`MIRRORED`), neither: textured and lit.
+    pub struct TexturedLit<const BUMP: u8, const SPECULAR: bool, const MIRRORED: bool = false>;
 
     /// The configurations the app uses.
     pub type TexturedNormal = TexturedLit<NORMAL_MAP, false>;
     pub type TexturedSpecular = TexturedLit<FLAT, true>;
     pub type TexturedNormalSpecular = TexturedLit<NORMAL_MAP, true>;
+    /// Seen in a mirror (the same whatever the bumps and highlight).
+    pub type TexturedLitMirrored = TexturedLit<FLAT, false, true>;
 
     /// Bumps are whole out to `BUMPS_WHOLE` meters from the eye, and fade (smoothly) to
     /// flat by `BUMPS_GONE`, past which the normal map isn't read.
@@ -1023,7 +1106,8 @@ pub mod textured_lit {
         h.map(|v| v * inv)
     }
 
-    impl<const BUMP: u8, const SPECULAR: bool> Material for TexturedLit<BUMP, SPECULAR> {
+    impl<const BUMP: u8, const SPECULAR: bool, const MIRRORED: bool> Material for TexturedLit<BUMP, SPECULAR, MIRRORED> {
+        const MIRRORED: bool = MIRRORED;
         crate::material_types!();
 
         #[inline(always)]
@@ -1039,15 +1123,22 @@ pub mod textured_lit {
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            if MIRRORED {
+                return Interp {
+                    uv: s.uv,
+                    lod: s.lod,
+                    light: super::light_output(super::diffuse(ctx, &s.position, &s.normal)),
+                    ..Default::default()
+                };
+            }
             let frame = [&s.tangent, &s.bitangent, &s.normal];
-            let (rest, all) = super::bumps(ctx, &s.position, frame);
+            let channels = super::bumps(ctx, &s.position, frame);
             let zero = F32s::fill(0.0);
-            let bump = match BUMP {
-                NORMAL_MAP => [
-                    rest.ambient, rest.toward[0], rest.toward[1], rest.toward[2],
-                    all.ambient, all.toward[0], all.toward[1], all.toward[2],
-                ],
-                _ => [zero; 8],
+            // The channels' directions: the bumps', and the highlights' (their half vectors
+            // are made at the pixels).
+            let bump = match (BUMP, SPECULAR) {
+                (NORMAL_MAP, _) | (_, true) => super::bump_lanes(&channels),
+                _ => [zero; super::BUMP_LANES],
             };
             let spec = if SPECULAR {
                 // The way to the eye, in tangent space.
@@ -1060,10 +1151,12 @@ pub mod textured_lit {
                     .max(F32s::fill(1e-12))
                     .recip_sqrt();
                 let eye = frame.map(|axis| (axis[0] * to_eye[0] + axis[1] * to_eye[1] + axis[2] * to_eye[2]) * inv);
-                let (hr, ha) = (half(&rest.toward, &eye), half(&all.toward, &eye));
-                [hr[0], hr[1], hr[2], rest.color[0], rest.color[1], rest.color[2], ha[0], ha[1], ha[2], all.color[0], all.color[1], all.color[2]]
+                // The way to the eye, and the color of the lights that always reach (the
+                // split lights' are the pixels': see `Split`).
+                let rest = &channels[0].color;
+                [eye[0], eye[1], eye[2], rest[0], rest[1], rest[2]]
             } else {
-                [zero; 12]
+                [zero; 6]
             };
             // How much of the bumps there are, by distance: 1 within `BUMPS_WHOLE`, 0 past
             // `BUMPS_GONE`.
@@ -1090,6 +1183,9 @@ pub mod textured_lit {
         #[inline(always)]
         fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
             let texel = ctx.texel(0, &a.uv, b.lod[0]);
+            if MIRRORED {
+                return super::lit_texel(texel, &ctx.light(&a.light)) & U32s::fill(0xFF_FFFF);
+            }
             let one = F32s::fill(1.0);
             // How much of the bumps there are (8.8): none at all, far away, reads nothing.
             let fade = I32s::from_i16x8(b.fade[0]);
@@ -1097,40 +1193,31 @@ pub mod textured_lit {
             // Which lights bump it: those that always reach, if any has a direction (not
             // the ambient light only), and the split ones, if any reaches.
             let rest = match BUMP {
-                NORMAL_MAP => (c.bump[1] * c.bump[1] + c.bump[2] * c.bump[2] + c.bump[3] * c.bump[3])
-                    .simd_ge(F32s::fill(1e-4))
-                    .any(),
+                NORMAL_MAP => super::bump_has_rest(&c.bump),
                 _ => false,
             };
-            let all = ctx.split.count > 0 && (0..ctx.split.count).any(|j| ctx.split.reaches[j].simd_gt(F32s::fill(0.0)).any());
-            let bumpy = BUMP != FLAT && !far && (rest || all || SPECULAR);
-            // The texel's normal (tangent space; z out), and its bumps' factors on the
-            // lights that always reach and on all of them.
-            let (mut normal, mut factors) = ([F32s::fill(0.0), F32s::fill(0.0), one], (one, one));
+            let (lamps, flash) = (ctx.split_reaches(false), ctx.split_reaches(true));
+            let bumpy = BUMP != FLAT && !far && (rest || lamps || flash || SPECULAR);
+            // The texel's normal (tangent space; z out), and its bumps' factors on each
+            // channel: the lights that always reach, the shadowed lamps, the flashlight.
+            let (mut normal, mut factors) = ([F32s::fill(0.0), F32s::fill(0.0), one], [one; 3]);
             if bumpy {
                 let lod = b.lod[0];
                 let n = ctx.texel(1, &a.uv, lod);
                 let k = F32s::fill(1.0 / 127.5);
                 normal = [16, 8, 0].map(|shift| (super::channel(n, shift) - F32s::fill(127.5)) * k);
-                // Toward flat as the bumps fade with distance.
+                // Toward flat as the bumps fade with distance, then unit length.
                 let f = (fade.round_float() * F32s::fill(1.0 / 256.0)).min(one);
-                if f.simd_lt(one).any() {
-                    let bent = [normal[0] * f, normal[1] * f, one + (normal[2] - one) * f];
-                    let inv = (bent[0] * bent[0] + bent[1] * bent[1] + bent[2] * bent[2])
-                        .max(F32s::fill(1e-12))
-                        .recip_sqrt();
-                    normal = bent.map(|c| c * inv);
+                normal = super::unit_normal(normal, f);
+                for (g, on) in [rest, lamps, flash].into_iter().enumerate() {
+                    if on {
+                        factors[g] = super::bump_factor(&normal, &c.bump, g);
+                    }
                 }
-                let factor = |g: usize| {
-                    let cos = normal[0] * c.bump[g + 1] + normal[1] * c.bump[g + 2] + normal[2] * c.bump[g + 3];
-                    c.bump[g] + cos.max(F32s::fill(0.0))
-                };
-                let rested = if rest { factor(0) } else { one };
-                factors = (rested, if all { factor(4) } else { rested });
             }
             let light = if bumpy {
                 let encode = |f: F32s| f.max(F32s::fill(0.0)).sqrt();
-                ctx.light_scaled(&a.light, encode(factors.0), encode(factors.1))
+                ctx.light_scaled(&a.light, encode(factors[0]), encode(factors[1]), encode(factors[2]))
             } else {
                 ctx.light(&a.light)
             };
@@ -1151,22 +1238,37 @@ pub mod textured_lit {
             let n_len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2])
                 .max(F32s::fill(1e-12))
                 .recip_sqrt();
-            let shine = |g: usize| {
-                let h = &c.spec[g..g + 3];
-                let h_len = (h[0] * h[0] + h[1] * h[1] + h[2] * h[2]).max(F32s::fill(1e-12)).recip_sqrt();
-                let mut p = ((normal[0] * h[0] + normal[1] * h[1] + normal[2] * h[2]) * n_len * h_len).max(F32s::fill(0.0));
+            // Channel `g`'s: its half vector, between its lights' direction (the bumps') and the
+            // eye's, both normalized.
+            let eye = {
+                let e = [c.spec[0], c.spec[1], c.spec[2]];
+                let inv = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).max(F32s::fill(1e-12)).recip_sqrt();
+                e.map(|v| v * inv)
+            };
+            let power = |g: usize| {
+                let h = half(&[c.bump[1 + 3 * g], c.bump[2 + 3 * g], c.bump[3 + 3 * g]], &eye);
+                let mut p = ((normal[0] * h[0] + normal[1] * h[1] + normal[2] * h[2]) * n_len).max(F32s::fill(0.0));
                 for _ in 0..squarings {
                     p = p * p;
                 }
-                [c.spec[g + 3] * p, c.spec[g + 4] * p, c.spec[g + 5] * p]
+                p
             };
-            let rest_shine = shine(0);
-            let shine = if ctx.split.count > 0 {
-                let (all_shine, f) = (shine(6), ctx.split_reach());
-                std::array::from_fn(|k| rest_shine[k] + (all_shine[k] - rest_shine[k]) * f)
-            } else {
-                rest_shine
-            };
+            // The lights that always reach's, then each split channel's: its lights' light
+            // as much as each reaches the pixel.
+            let p = power(0);
+            let mut shine = [c.spec[3] * p, c.spec[4] * p, c.spec[5] * p];
+            for (g, flashlight, on) in [(1, false, lamps), (2, true, flash)] {
+                if on {
+                    let p = power(g);
+                    for (j, (light, reach)) in ctx.split.light.iter().zip(ctx.split.reaches).enumerate().take(ctx.split.count) {
+                        if (ctx.split.flashlight == Some(j)) == flashlight {
+                            for k in 0..3 {
+                                shine[k] += light[k] * reach * p;
+                            }
+                        }
+                    }
+                }
+            }
             // Added to the gamma-encoded color as it is (a cheat: light adds in linear
             // terms), each channel at most 255.
             let scale = super::channel(texel, 24) * F32s::fill(strength);
@@ -1181,7 +1283,224 @@ pub mod textured_lit {
     }
 }
 
-pub use textured_lit::{TexturedLit, TexturedNormal, TexturedNormalSpecular, TexturedSpecular};
+pub use textured_lit::{TexturedLit, TexturedLitMirrored, TexturedNormal, TexturedNormalSpecular, TexturedSpecular};
+
+/// A road's shader: [`Textured`], lit, with bumps from a normal map (texture 1's color,
+/// `(n + 1) / 2`, read with texture 1's sampler) and nothing else: no highlight, no detail.
+/// The bumps are a factor on the light, as [`TexturedLit`]'s are (the texel's normal's
+/// cosine with the lights' directions summed into one), whole out to `short` meters from
+/// the eye (`values[0]`) and fading smoothly to flat by `far` (`values[1]`), past which the
+/// normal map isn't read.
+///
+/// `MIRRORED` is its copy for polygons seen in a mirror, which draws no bumps and carries
+/// none of their values; the app draws with it where bumps are off too.
+pub mod basic_bumpy {
+    use crate::shader::{F32s, Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext};
+
+    crate::material_io! {
+        vertex { uv: 2, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
+        sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { lod: 1, fade: 1 if !MIRRORED }
+        float { bump: 13 if !MIRRORED }
+    }
+
+    pub struct BasicBumpy<const MIRRORED: bool = false>;
+
+    /// Seen in a mirror (or with bumps off): textured and lit.
+    pub type BasicBumpyMirrored = BasicBumpy<true>;
+
+    impl<const MIRRORED: bool> Material for BasicBumpy<MIRRORED> {
+        const MIRRORED: bool = MIRRORED;
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled {
+                uv: v.uv,
+                normal: v.face_normal,
+                tangent: v.face_tangent,
+                bitangent: v.face_bitangent,
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            if MIRRORED {
+                return Interp { uv: s.uv, lod: s.lod, light, ..Default::default() };
+            }
+            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            Interp {
+                uv: s.uv,
+                lod: s.lod,
+                light,
+                // How much of the bumps there are, by distance: 1 within `short`, 0 past `far`.
+                fade: [bump_fade(ctx, &s.position, ctx.params.values[0], ctx.params.values[1])],
+                bump: super::bump_lanes(&channels),
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
+            let texel = ctx.texel(0, &a.uv, b.lod[0]);
+            let light = if MIRRORED {
+                ctx.light(&a.light)
+            } else {
+                bumped_light(ctx, &a.light, b.fade[0], &c.bump, || ctx.texel(1, &a.uv, b.lod[0]))
+            };
+            super::lit_texel(texel, &light) & U32s::fill(0xFF_FFFF)
+        }
+    }
+
+    /// The light at the pixels (an encoded `light` output) with the bumps of a normal map
+    /// on it: `fade` how much of the bumps there are (8.8; none reads nothing), `bump` the
+    /// lights' directions in tangent space (as `super::bumps` gives them: the ones that
+    /// always reach, then all), and `normal_map` the normal map's texel, read only if it is
+    /// needed. Shared by the programs bumped like [`BasicBumpy`].
+    #[inline(always)]
+    pub(super) fn bumped_light(
+        ctx: &PixelContext,
+        light: &[I32s; 3],
+        fade: crate::shader::I16s,
+        bump: &[F32s; super::BUMP_LANES],
+        normal_map: impl FnOnce() -> U32s,
+    ) -> [I32s; 3] {
+        // None at all (far away, or no light from any one way): flat, the normal map
+        // unread.
+        let one = F32s::fill(1.0);
+        let fade = I32s::from_i16x8(fade);
+        let rest = super::bump_has_rest(bump);
+        let (lamps, flash) = (ctx.split_reaches(false), ctx.split_reaches(true));
+        if fade.simd_le(I32s::fill(0)).all() || !(rest || lamps || flash) {
+            return ctx.light(light);
+        }
+        // The texel's normal (tangent space; z out), toward flat as the bumps fade.
+        let n = normal_map();
+        let k = F32s::fill(1.0 / 127.5);
+        let normal = [16, 8, 0].map(|shift| (super::channel(n, shift) - F32s::fill(127.5)) * k);
+        let f = (fade.round_float() * F32s::fill(1.0 / 256.0)).min(one);
+        let normal = super::unit_normal(normal, f);
+        // Its factor on each channel that has light here.
+        let factor = |g: usize, on: bool| if on { super::bump_factor(&normal, bump, g) } else { one };
+        let factors = (factor(0, rest), factor(1, lamps), factor(2, flash));
+        let encode = |f: F32s| f.max(F32s::fill(0.0)).sqrt();
+        ctx.light_scaled(light, encode(factors.0), encode(factors.1), encode(factors.2))
+    }
+
+    /// How much of the bumps there are at sample points `position` (smoothly 1 within
+    /// `short` meters of the eye to 0 by `far`).
+    #[inline(always)]
+    pub(super) fn bump_fade(ctx: &SampleContext, position: &[F32s; 3], short: f32, far: f32) -> F32s {
+        let zero = F32s::fill(0.0);
+        let distance = (0..3)
+            .map(|k| {
+                let d = F32s::fill(ctx.eye[k]) - position[k];
+                d * d
+            })
+            .fold(zero, |a, b| a + b)
+            .sqrt();
+        let t = ((F32s::fill(far) - distance) * F32s::fill(1.0 / (far - short).max(1e-3))).max(zero).min(F32s::fill(1.0));
+        t * t * (F32s::fill(3.0) - t - t)
+    }
+}
+
+pub use basic_bumpy::{BasicBumpy, BasicBumpyMirrored};
+
+/// [`BasicBumpy`] for a texture of four sections side by side that tile with each other in
+/// any order (a sidewalk's slabs, say), which surfaces map one section to a whole repeat
+/// of their `uv` (1:1). Each repeat (cell: the whole parts of `uv`) gets one of the four,
+/// picked by a hash of the cell and `seed` (`values[2]`, a whole number), so they don't
+/// show the same four in a row: the texture is read at u = (section + u's fraction) / 4,
+/// in 16.16, `(section << 16 | fraction) >> 2`. The normal map is laid out the same way.
+///
+/// The texture's level of detail is measured from u / 4 (the texture is four repeats
+/// wide), so it is as sharp as the plain one would be. Inputs: `short`, `far` (as
+/// [`BasicBumpy`]'s) and `seed`. `MIRRORED` is its copy seen in a mirror (or with bumps
+/// off): the same sections, no bumps.
+pub mod random_sections {
+    use super::basic_bumpy::{bump_fade, bumped_light};
+    use crate::shader::{Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext};
+
+    // `uv` is u / 4 (what the level of detail is measured from); `cell` the surface's own.
+    crate::material_io! {
+        vertex { uv: 2, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
+        sampled { uv: 2, lod: 1, cell: 2, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
+        fixed32 { cell: 2, light: 3 }
+        fixed16 { lod: 1, fade: 1 if !MIRRORED }
+        float { bump: 13 if !MIRRORED }
+    }
+
+    pub struct RandomSections<const MIRRORED: bool = false>;
+
+    /// Seen in a mirror (or with bumps off): the same sections, textured and lit.
+    pub type RandomSectionsMirrored = RandomSections<true>;
+
+    /// One of four (0 to 3) for each cell `(x, y)` and `seed`: an integer hash's top bits.
+    #[inline(always)]
+    pub fn section(x: I32s, y: I32s, seed: i32) -> I32s {
+        let u = |v: I32s| -> U32s { wide::bytemuck::cast(v) };
+        let mut h = (u(x) * U32s::fill(0x8DA6_B343)) ^ (u(y) * U32s::fill(0xD816_3841)) ^ U32s::fill((seed as u32).wrapping_mul(0xCB1A_B31F));
+        h ^= h >> 15;
+        h *= U32s::fill(0x2C1B_3C6D);
+        h ^= h >> 12;
+        h *= U32s::fill(0x297A_2D39);
+        h ^= h >> 15;
+        wide::bytemuck::cast(h >> 30)
+    }
+
+    impl<const MIRRORED: bool> Material for RandomSections<MIRRORED> {
+        const MIRRORED: bool = MIRRORED;
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled {
+                uv: [v.uv[0] / 4.0, v.uv[1]],
+                cell: v.uv,
+                normal: v.face_normal,
+                tangent: v.face_tangent,
+                bitangent: v.face_bitangent,
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            if MIRRORED {
+                return Interp { cell: s.cell, lod: s.lod, light, ..Default::default() };
+            }
+            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            Interp {
+                cell: s.cell,
+                lod: s.lod,
+                light,
+                fade: [bump_fade(ctx, &s.position, ctx.params.values[0], ctx.params.values[1])],
+                bump: super::bump_lanes(&channels),
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
+            // The cell (whole parts: the shift floors, negatives too), its section, and where
+            // in that section the pixel is.
+            let [cu, cv] = a.cell;
+            let k = section(cu >> 16, cv >> 16, ctx.params.values[2] as i32);
+            let uv = [((k << 16) | (cu & I32s::fill(0xFFFF))) >> 2, cv];
+            let texel = ctx.texel(0, &uv, b.lod[0]);
+            let light = if MIRRORED {
+                ctx.light(&a.light)
+            } else {
+                bumped_light(ctx, &a.light, b.fade[0], &c.bump, || ctx.texel(1, &uv, b.lod[0]))
+            };
+            super::lit_texel(texel, &light) & U32s::fill(0xFF_FFFF)
+        }
+    }
+}
+
+pub use random_sections::{RandomSections, RandomSectionsMirrored};
 
 /// [`Textured`], translucent: the texture's color at a uniform opacity, blended over what
 /// is behind.
@@ -1332,6 +1651,22 @@ pub mod textured_fresnel {
         w: F32s,
         behind_w: F32s,
     ) -> U32s {
+        over_with(texel, b.facing[0], c.distance[0], params.values[0], params.values[1], w, behind_w)
+    }
+
+    /// [`over`] from its values: the surface's `facing` and `distance` (as
+    /// `super::facing_and_distance` gives them), its `reflectance` (F0, 0 to 1) and fade
+    /// `range` (meters; 0, none).
+    #[inline(always)]
+    pub fn over_with(
+        texel: U32s,
+        facing: I16s,
+        distance: F32s,
+        reflectance: f32,
+        range: f32,
+        w: F32s,
+        behind_w: F32s,
+    ) -> U32s {
         // Smoothness (1 - roughness) as a Q15 fraction: (255 - alpha) / 127, at most 1
         // (32767 / 127 is 258.0).
         let rough: U32s = texel >> 24_u32;
@@ -1339,15 +1674,14 @@ pub mod textured_fresnel {
         let smooth = smooth.min(U32s::fill(ONE as u32));
         let smooth = I16s::from_i32x8_truncate(wide::bytemuck::cast::<U32s, I32s>(smooth));
         // F = F0 + (1 - F0)(1 - cos)^5 = 1 - (1 - F0) * keep, then less by roughness.
-        let scale = ((1.0 - params.values[0].clamp(0.0, 1.0)) * ONE as f32).round() as i16;
-        let fresnel = I16s::fill(ONE) - keep(b.facing[0]).mul_scale_round(I16s::fill(scale));
+        let scale = ((1.0 - reflectance.clamp(0.0, 1.0)) * ONE as f32).round() as i16;
+        let fresnel = I16s::fill(ONE) - keep(facing).mul_scale_round(I16s::fill(scale));
         let mut reflected = fresnel.mul_scale_round(smooth);
-        let range = params.values[1];
         if range > 0.0 {
             // What is left `bounce` meters past the surface: (1 - t)^2, t = bounce / range
             // (as a Q15 fraction). No fade where nothing is behind (lanes past the run).
             let one = F32s::fill(1.0);
-            let bounce = c.distance[0] * (w / behind_w - one);
+            let bounce = distance * (w / behind_w - one);
             let t = one
                 - (bounce * F32s::fill(1.0 / range))
                     .max(F32s::fill(0.0))
@@ -1474,6 +1808,210 @@ pub mod water {
 }
 
 pub use water::Water;
+
+/// [`BasicBumpy`] with puddles: texture 0's alpha says where it is wet (255 water, 0 dry,
+/// between them the shore), and there it reflects what is above it by Fresnel, as
+/// [`TexturedFresnel`] does, drawn over the reflection the engine draws under a reflective
+/// surface. Where it is wet, as much as it is:
+///
+/// - The ground under the water wobbles: texture 0 is read again with its `uv` moved by
+///   two crossing waves of `uv` and time (smoothed triangle waves: no texture of its own),
+///   the move scaled by the wetness read where the pixel really is, so the shore stays
+///   still.
+/// - The bumps fade out: water over the ground is flat.
+/// - The reflection is shifted along the row by texture 2, the turbulence (its blue byte
+///   from 128, as [`Water`]'s heights; a grey noise or `@water_heights`), slid across the
+///   surface with time.
+///
+/// It reads texture 0 where the pixel is, again where it's wet, the normal map (texture 1)
+/// where the bumps are, and the turbulence where it's wet and over a reflection.
+///
+/// Params (`values`): `short` and `far`, the bumps' fade with distance (as
+/// [`BasicBumpy`]'s; both 0, no bumps); the reflectance (F0) and fade (meters; 0, none) of
+/// [`TexturedFresnel`]; `shift`, the reflection's shift per turbulence step at a meter (as
+/// [`Water`]'s); `ripple`, how far the ground moves (in repeats of its texture);
+/// `ripple_size`, a wave's length (repeats); `ripple_speed`, waves a second; and `drift`,
+/// repeats a second the turbulence slides.
+///
+/// Its copies: `REFLECTED`, translucent over its reflection; not, opaque (no reflection
+/// under it: reflections off, or a surface not marked reflective), with its puddles but
+/// no reflection; `MIRRORED`, seen in a mirror, textured and lit only.
+pub mod reflective_bumpy {
+    use super::basic_bumpy::{bump_fade, bumped_light};
+    use crate::shader::{
+        F32s, Fill, I16s, I32s, Material, Over, PixelContext, RowBehind, SampleContext, U32s, VertexContext,
+        blend_lanes,
+    };
+
+    crate::material_io! {
+        vertex { uv: 2, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
+        sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { lod: 1, facing: 1, fade: 1 if !MIRRORED }
+        float { distance: 1, bump: 13 if !MIRRORED }
+    }
+
+    const SHORT: usize = 0;
+    const FAR: usize = 1;
+    const REFLECTANCE: usize = 2;
+    const FADE: usize = 3;
+    const SHIFT: usize = 4;
+    const RIPPLE: usize = 5;
+    const RIPPLE_SIZE: usize = 6;
+    const RIPPLE_SPEED: usize = 7;
+    const DRIFT: usize = 8;
+    /// Largest shift of the reflection, in pixels.
+    const MAX_SHIFT: i32 = 32;
+
+    pub struct ReflectiveBumpy<const REFLECTED: bool = false, const MIRRORED: bool = false>;
+
+    /// Over its reflection.
+    pub type ReflectiveBumpyReflected = ReflectiveBumpy<true, false>;
+    /// Seen in a mirror: textured and lit.
+    pub type ReflectiveBumpyMirrored = ReflectiveBumpy<false, true>;
+
+    /// A smooth wave of period 1 in `x`, from -1 to 1: a triangle wave, smoothstepped.
+    #[inline(always)]
+    pub(crate) fn wave(x: F32s) -> F32s {
+        let f = x - x.floor();
+        let g = (f + f - F32s::fill(1.0)).abs();
+        let s = g * g * (F32s::fill(3.0) - g - g);
+        s + s - F32s::fill(1.0)
+    }
+
+    /// `rate` a second at `time`, wrapped to one turn: a phase of period 1 that keeps its
+    /// fraction as time grows.
+    #[inline(always)]
+    pub(crate) fn turns(time: f32, rate: f32) -> f32 {
+        (time as f64 * rate as f64).rem_euclid(1.0) as f32
+    }
+
+    impl<const REFLECTED: bool, const MIRRORED: bool> Material for ReflectiveBumpy<REFLECTED, MIRRORED> {
+        const MIRRORED: bool = MIRRORED;
+        const TRANSLUCENT: bool = REFLECTED;
+        const READS_BEHIND: bool = REFLECTED;
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled {
+                uv: v.uv,
+                normal: v.face_normal,
+                tangent: v.face_tangent,
+                bitangent: v.face_bitangent,
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            let (facing, distance) = super::facing_and_distance(ctx.eye, &s.position, &s.normal);
+            if MIRRORED {
+                return Interp { uv: s.uv, lod: s.lod, light, facing: [facing], distance: [distance], ..Default::default() };
+            }
+            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            let p = &ctx.params.values;
+            Interp {
+                uv: s.uv,
+                lod: s.lod,
+                light,
+                facing: [facing],
+                distance: [distance],
+                fade: [bump_fade(ctx, &s.position, p[SHORT], p[FAR])],
+                bump: super::bump_lanes(&channels),
+            }
+        }
+
+        /// Without what is behind: no reflection.
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
+            let zero = F32s::fill(0.0);
+            let over = Over { w: zero, behind_w: zero, row: RowBehind::NONE };
+            Self::shade_over(a, b, c, ctx, &over)
+        }
+
+        #[inline(always)]
+        fn shade_over(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext, over: &Over) -> U32s {
+            let opaque = U32s::fill(0xFF00_0000);
+            let rgb = U32s::fill(0xFF_FFFF);
+            let lod = b.lod[0];
+            let ground = ctx.texel(0, &a.uv, lod);
+            if MIRRORED {
+                return super::lit_texel(ground, &ctx.light(&a.light)) & rgb;
+            }
+            let p = &ctx.params.values;
+            // How wet, where the pixel really is: 0 to 255, and 0 to 1.
+            let wet: I32s = wide::bytemuck::cast(ground >> 24_u32);
+            let any_wet = wet.simd_gt(I32s::fill(0)).any();
+            let wetness = wet.round_float() * F32s::fill(1.0 / 255.0);
+            // The ground under the water, moved by two crossing waves as much as it's wet.
+            let color = if any_wet && p[RIPPLE] != 0.0 {
+                let k = F32s::fill(1.0 / p[RIPPLE_SIZE].max(1e-3));
+                let repeat = F32s::fill(1.0 / 65536.0);
+                let (u, v) = (a.uv[0].round_float() * repeat, a.uv[1].round_float() * repeat);
+                let (one, two) = (turns(ctx.time, p[RIPPLE_SPEED]), turns(ctx.time, p[RIPPLE_SPEED] * 0.77));
+                let reach = wetness * F32s::fill(p[RIPPLE] * 65536.0);
+                let du = wave(v * k + F32s::fill(one)) * reach;
+                let dv = wave(u * k * F32s::fill(0.83) - F32s::fill(two) + F32s::fill(0.25)) * reach;
+                let moved = [a.uv[0] + du.round_int(), a.uv[1] + dv.round_int()];
+                ctx.texel(0, &moved, lod)
+            } else {
+                ground
+            };
+            // The bumps, less as it's wetter (8.8 times 0 to 256, over 256).
+            let dry = I32s::fill(255) - wet;
+            let fade = (I32s::from_i16x8(b.fade[0]) * (dry + (dry >> 7_i32))) >> 8_i32;
+            let fade = I16s::from_i32x8_truncate(fade);
+            let light = bumped_light(ctx, &a.light, fade, &c.bump, || ctx.texel(1, &a.uv, lod));
+            let lit = super::lit_texel(color, &light) & rgb;
+            if !REFLECTED {
+                return lit;
+            }
+            if !any_wet {
+                return lit | opaque;
+            }
+            // The reflection, shifted along the row by the turbulence (as much as it's wet,
+            // and by depth: w is 1 / depth), let through by Fresnel where it's wet.
+            let (w, behind_w) = (over.w, over.behind_w);
+            let ripple = p[SHIFT] * ctx.focal;
+            let x = ctx.at.x_lanes();
+            let (under, under_w) = if ripple != 0.0 {
+                let slide = |turn: f32| I32s::fill((turn * 65536.0) as i32);
+                let at = [
+                    a.uv[0] + slide(turns(ctx.time, p[DRIFT])),
+                    a.uv[1] + slide(turns(ctx.time, p[DRIFT] * 0.61)),
+                ];
+                let h: I32s = wide::bytemuck::cast(ctx.texel(2, &at, lod) & U32s::fill(0xFF));
+                let shift = ((h - I32s::fill(128)).round_float() * w * wetness * F32s::fill(ripple * 0.25))
+                    .round_int()
+                    .max(I32s::fill(-MAX_SHIFT))
+                    .min(I32s::fill(MAX_SHIFT));
+                over.row.at(x + shift)
+            } else {
+                over.row.at(x)
+            };
+            // Lanes past the run keep nothing behind.
+            let under_w = behind_w.simd_gt(F32s::fill(0.0)).select(under_w, behind_w);
+            // Its alpha as `over` reads it, how rough: 255 less how wet.
+            let rough: U32s = wide::bytemuck::cast(I32s::fill(255) - wet);
+            let surface = super::textured_fresnel::over_with(
+                lit | (rough << 24_u32),
+                b.facing[0],
+                c.distance[0],
+                p[REFLECTANCE],
+                p[FADE],
+                w,
+                under_w,
+            );
+            // Blended here, so the renderer's own blend (alpha 255) keeps it as it is.
+            blend_lanes(surface, under) | opaque
+        }
+    }
+}
+
+pub use reflective_bumpy::{ReflectiveBumpy, ReflectiveBumpyMirrored, ReflectiveBumpyReflected};
+
 
 /// A mirror finish from a cube map (texture `[0]`, made with
 /// [`Texture::cube`](moose_assets::Texture::cube)), opaque: the color the cube map holds in
@@ -1667,6 +2205,175 @@ mod tests {
         SampleContext, TextureSet, blend,
     };
 
+    #[test]
+    fn a_light_just_behind_bumps_only_texels_tilted_toward_it_within_the_back_light_angle() {
+        use crate::shader::Fill;
+        use moose_assets::Light;
+        let params = Params::default();
+        let f = |v: f32| F32s::fill(v);
+        // A surface at the origin facing +z, its texture's u along x and v along y.
+        let (position, frame) = ([f(0.0); 3], [[f(1.0), f(0.0), f(0.0)], [f(0.0), f(1.0), f(0.0)], [f(0.0), f(0.0), f(1.0)]]);
+        let flat = [f(0.0), f(0.0), f(1.0)];
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let tilted = [f(0.0), f(s), f(s)];
+        let factors = |light_z: f32, back_deg: f32| {
+            let lights = [Light::point(0, Vec3::new(0.0, 1.0, light_z), Vec3::ONE, 10.0)];
+            let ctx = SampleContext {
+                eye: Vec3::new(0.0, 0.0, 5.0),
+                focal: 360.0,
+                object: &Object::IDENTITY,
+                params: &params,
+                lights: &lights,
+                ambient: Vec3::splat(0.1),
+                light_split: &[],
+                split: &[],
+                back: back_deg.to_radians().sin(),
+            };
+            let channels = super::bumps(&ctx, &position, [&frame[0], &frame[1], &frame[2]]);
+            let lanes = super::bump_lanes(&channels);
+            let at = |n: &[F32s; 3], g| super::bump_factor(n, &lanes, g).to_array()[0];
+            (at(&flat, 0), at(&tilted, 0), at(&tilted, 1), super::bump_has_rest(&lanes))
+        };
+        // Just behind (about 6 degrees), with no back light angle: no bumps, only ambient.
+        let (flat0, tilted0, _, rest0) = factors(-0.1, 0.0);
+        assert!(!rest0 && (flat0 - 1.0).abs() < 1e-5 && (tilted0 - 1.0).abs() < 1e-5);
+        // With 20 degrees: a flat texel is as before (the light gives a flat face nothing),
+        // one tilted toward the light catches it; the shadowed lamps' channel has nothing (it
+        // isn't split).
+        let (flat20, tilted20, split20, rest20) = factors(-0.1, 20.0);
+        assert!(rest20 && (flat20 - 1.0).abs() < 1e-5);
+        assert!(tilted20 > 2.0, "{tilted20}");
+        assert_eq!(split20, 0.0);
+        // It eases out toward the angle, and past it is gone.
+        let (_, tilted_near_edge, _, _) = factors(-0.3, 20.0);
+        assert!(1.0 < tilted_near_edge && tilted_near_edge < tilted20, "{tilted_near_edge}");
+        let (_, past, _, rest_past) = factors(-0.5, 20.0);
+        assert!(!rest_past && (past - 1.0).abs() < 1e-5);
+        // A light in front is bumped the same with or without the angle.
+        assert_eq!(factors(0.2, 0.0), factors(0.2, 20.0));
+    }
+
+    #[test]
+    fn the_flashlight_and_the_shadowed_lamps_bump_apart() {
+        use crate::shader::{Fill, Split};
+        use moose_assets::{FLASHLIGHT_ID, Light};
+        use std::cell::Cell;
+        // A surface at the origin facing +z. A lamp above it and the flashlight off to the
+        // side, low and bright, aimed away: both split (a shadow, a beam). Each channel's
+        // direction is its own (to it over its cosine): the lamp's (0, 1, 1), the
+        // flashlight's low along -x; the lights that always reach have the ambient only.
+        let params = Params::default();
+        let f = |v: f32| F32s::fill(v);
+        let (position, frame) = ([f(0.0); 3], [[f(1.0), f(0.0), f(0.0)], [f(0.0), f(1.0), f(0.0)], [f(0.0), f(0.0), f(1.0)]]);
+        let split: [Cell<F32s>; 2] = Default::default();
+        let lamp = Light::point(0, Vec3::new(0.0, 1.0, 1.0), Vec3::splat(0.5), 10.0);
+        let mut flashlight = Light::spot(0, Vec3::new(-5.0, 0.0, 0.3), Vec3::splat(3.4), 16.0, Vec3::NEG_X, 6.0, 20.0);
+        (flashlight.beam, flashlight.id) = (true, FLASHLIGHT_ID);
+        let lights = [lamp, flashlight];
+        let ctx = SampleContext {
+            eye: Vec3::new(0.0, 0.0, 5.0),
+            focal: 360.0,
+            object: &Object::IDENTITY,
+            params: &params,
+            lights: &lights,
+            ambient: Vec3::splat(0.05),
+            light_split: &[0, 1],
+            split: &split,
+            back: 0.0,
+        };
+        let [rest, lamps, flash] = super::bumps(&ctx, &position, [&frame[0], &frame[1], &frame[2]]);
+        let first = |b: &super::Bumps| b.toward.map(|v| v.to_array()[0]);
+        assert_eq!(first(&rest), [0.0; 3]);
+        let (l, fl) = (first(&lamps), first(&flash));
+        assert!(l[0].abs() < 1e-4 && (l[1] - 1.0).abs() < 1e-4 && (l[2] - 1.0).abs() < 1e-4, "{l:?}");
+        assert!(fl[0] < -10.0 && (fl[2] - 1.0).abs() < 1e-4, "{fl:?}");
+        // At pixels the lamp reaches and the flashlight doesn't, the light is the ambient
+        // light by its factor and the lamp's by its own: the flashlight's factor, however
+        // big, changes nothing.
+        let texture = Texture::solid("t", 0);
+        let textures = slots(&[&texture]);
+        let mut px = pixel_ctx(&textures, &params, 0, 360.0);
+        px.split = Split {
+            count: 2,
+            light: [[f(0.4); 3], [f(2.0); 3], [f(0.0); 3], [f(0.0); 3]],
+            reaches: [f(1.0), f(0.0), f(0.0), f(0.0)],
+            flashlight: Some(1),
+        };
+        let light = [I32s::fill(((0.05f32 + 0.4 + 2.0).sqrt() * 65536.0).round() as i32); 3];
+        let shade = |flash: f32| px.light_scaled(&light, f(1.0), f(1.5f32.sqrt()), f(flash.sqrt()))[1].to_array()[0];
+        let want = ((0.05f32 + 0.4 * 1.5).sqrt() * 65536.0) as i32;
+        assert!((shade(1.0) - want).abs() < 64 && shade(9.0) == shade(1.0), "{} {}", shade(1.0), want);
+    }
+
+    #[test]
+    fn a_short_normal_bumps_the_same_whether_the_bumps_are_fading_or_not() {
+        use crate::shader::Fill;
+        // A filtered normal map texel's normal is short (0.9 here). Its factor must not
+        // jump between where the bumps are whole and just past where they start fading.
+        let f = |v: f32| F32s::fill(v);
+        let short = [f(0.3 * 0.9), f(0.1 * 0.9), f((1.0f32 - 0.09 - 0.01).sqrt() * 0.9)];
+        let whole = super::unit_normal(short, f(1.0));
+        let fading = super::unit_normal(short, f(0.999));
+        let len = |n: &[F32s; 3]| (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().to_array()[0];
+        assert!((len(&whole) - 1.0).abs() < 1e-5 && (len(&fading) - 1.0).abs() < 1e-5);
+        for k in 0..3 {
+            assert!((whole[k] - fading[k]).abs().to_array()[0] < 1e-3, "{k}");
+        }
+        // Faded out, flat.
+        let flat = super::unit_normal(short, f(0.0));
+        assert_eq!(flat.map(|c| c.to_array()[0]), [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn sections_are_picked_evenly_and_the_same_every_time() {
+        use super::random_sections::section;
+        use crate::shader::{Fill, I32s};
+        let pick = |x: i32, y: i32, seed: i32| section(I32s::fill(x), I32s::fill(y), seed).to_array()[0];
+        let mut counts = [0usize; 4];
+        let (mut same_as_neighbor, mut moved_by_seed) = (0, 0);
+        for y in -32..32 {
+            for x in -32..32 {
+                let k = pick(x, y, 0);
+                assert!((0..4).contains(&k));
+                assert_eq!(k, pick(x, y, 0));
+                counts[k as usize] += 1;
+                same_as_neighbor += (k == pick(x + 1, y, 0)) as usize;
+                moved_by_seed += (k != pick(x, y, 7)) as usize;
+            }
+        }
+        // 4096 cells: about 1024 each, a quarter alike side by side, three quarters moved.
+        assert!(counts.iter().all(|&n| (900..1150).contains(&n)), "{counts:?}");
+        assert!((850..1200).contains(&same_as_neighbor), "{same_as_neighbor}");
+        assert!((2900..3250).contains(&moved_by_seed), "{moved_by_seed}");
+        // Lanes are cells of their own.
+        let lanes = section(I32s::from([0, 1, 2, 3, 4, 5, 6, 7]), I32s::fill(3), 0).to_array();
+        assert_eq!(lanes, std::array::from_fn(|i| pick(i as i32, 3, 0)));
+    }
+
+    #[test]
+    fn a_mirrored_copy_carries_only_its_own_values() {
+        use super::{TexturedLitMirrored, TexturedNormalSpecular};
+        use crate::shader::{Fill, LaneValues, layout_len};
+        let (full, mirrored) = (TexturedNormalSpecular::IO, TexturedLitMirrored::IO);
+        // uv, lod, light; no tangent frame, bump fade, bumps or highlight.
+        assert_eq!(layout_len(mirrored.interp), 2 + 3 + 1);
+        assert_eq!(layout_len(full.interp), 2 + 3 + 1 + 1 + 13 + 6);
+        assert_eq!(layout_len(mirrored.sampled), layout_len(full.sampled) - 6);
+        assert_eq!(<TexturedLitMirrored as Material>::Interp::len(true), 6);
+        // Its values round-trip through the engine's shorter layout.
+        let values: Vec<F32s> = (0..6).map(|k| F32s::fill(k as f32)).collect();
+        let interp = <TexturedLitMirrored as Material>::Interp::from_lanes(&values, true);
+        let mut back = vec![F32s::fill(-1.0); 6];
+        interp.write_lanes(&mut back, true);
+        assert_eq!(back, values);
+        assert_eq!(interp.bump, [F32s::fill(0.0); 13]);
+    }
+
+    /// A texture set with `given` in its first slots, the first again in the rest.
+    fn slots<'a>(given: &[&'a Texture]) -> TextureSet<'a> {
+        std::array::from_fn(|k| given.get(k).copied().unwrap_or(given[0]))
+    }
+
     fn pixel_ctx<'a>(
         textures: &'a TextureSet<'a>,
         params: &'a Params,
@@ -1679,6 +2386,7 @@ mod tests {
             filters: [super::filter::BILINEAR_MIPMAP_LINEAR; crate::shader::MAX_TEXTURES],
             params,
             focal,
+            time: 0.0,
             split: Default::default(),
         }
     }
@@ -1686,6 +2394,44 @@ mod tests {
     /// A 16.16 `light` output of exactly 1: surfaces lit as they are.
     fn full_light() -> [I32s; 3] {
         [I32s::from([65536; LANES]); 3]
+    }
+
+    #[test]
+    fn a_bumped_pixel_gets_the_color_of_the_split_light_that_reaches_it() {
+        use crate::shader::{Fill, Split};
+        // A dim ambient, a red light whose shadow covers part of the polygon, and a bright
+        // white one (a beam) also split: at these pixels the red one reaches and the white
+        // one doesn't. Unbumped (factors 1), the light is the ambient and the red one's,
+        // as an unbumped pixel's is, not the two split lights' summed color let through.
+        let (ambient, red, white) = ([0.01f32; 3], [0.5f32, 0.05, 0.02], [1.0f32, 1.05, 1.2]);
+        let f = |v: f32| F32s::fill(v);
+        let texture = Texture::solid("t", 0);
+        let (textures, params) = (slots(&[&texture]), Params::default());
+        let mut ctx = pixel_ctx(&textures, &params, 0, 360.0);
+        ctx.split = Split {
+            count: 2,
+            light: [red.map(f), white.map(f), [f(0.0); 3], [f(0.0); 3]],
+            reaches: [f(1.0), f(0.0), f(0.0), f(0.0)],
+            flashlight: None,
+        };
+        let light: [I32s; 3] = std::array::from_fn(|c| {
+            I32s::fill(((ambient[c] + red[c] + white[c]).sqrt() * 65536.0).round() as i32)
+        });
+        let flat = ctx.light(&light);
+        let bumped = ctx.light_scaled(&light, f(1.0), f(1.0), f(1.0));
+        for c in 0..3 {
+            let want = (ambient[c] + red[c]).sqrt() * 65536.0;
+            let (a, b) = (flat[c].to_array()[0] as f32, bumped[c].to_array()[0] as f32);
+            assert!((a - want).abs() < 64.0 && (b - want).abs() < 64.0, "channel {c}: {a}, {b}, want {want}");
+        }
+        // Bumped (factors on the encoded light): the ambient light by its own, the red one by
+        // the shadowed lamps' (the white one, which doesn't reach, by nothing).
+        let bumped = ctx.light_scaled(&light, f(0.5f32.sqrt()), f(2.0f32.sqrt()), f(1.0));
+        for c in 0..3 {
+            let want = (ambient[c] * 0.5 + red[c] * 2.0).sqrt() * 65536.0;
+            let b = bumped[c].to_array()[0] as f32;
+            assert!((b - want).abs() < 64.0, "channel {c}: {b}, want {want}");
+        }
     }
 
     #[test]
@@ -1728,7 +2474,7 @@ mod tests {
         let floats = textured_fresnel::Floats {
             distance: [F32s::from([2.0; LANES])],
         };
-        let textures = [&tex, &map];
+        let textures = slots(&[&tex, &map]);
         let out = <Water>::shade_over(
             &textured_fresnel::Fixed32 {
                 uv: [u, I32s::from([0; LANES])],
@@ -1760,6 +2506,62 @@ mod tests {
     }
 
     #[test]
+    fn a_puddle_reflects_and_moves_only_where_it_is_wet() {
+        use super::filter::NEAREST_MIPMAP_NONE;
+        use super::reflective_bumpy::{self as rb, ReflectiveBumpy, ReflectiveBumpyReflected};
+        use crate::shader::Fill;
+        // Eight texels, one a lane: the first four dry (alpha 0), the last four wet (255),
+        // each its own color. A flat turbulence 12 steps up shifts the reflection 3 pixels
+        // here (as `Water`'s: at w 1/2, focal 1, `shift` 2). A full mirror (F0 1, no fade).
+        let colors: Vec<u32> = (0..8u32).map(|i| (if i < 4 { 0 } else { 255 << 24 }) | (0x10_20_30 + i * 0x08_08_08)).collect();
+        let tex = Texture::new("t", 8, 1, colors.clone()).unwrap();
+        let flat = Texture::solid("n", 0xFF80_80FF);
+        let turbulence = Texture::solid("h", 140 * 0x01_01_01);
+        let textures = slots(&[&tex, &flat, &turbulence]);
+        let behind: Vec<u32> = (0..64).map(|i| 0x01_02_03 * i).collect();
+        let depths = vec![0.25f32; 64];
+        let u = I32s::from(std::array::from_fn(|i| ((2 * i as i32 + 1) << 16) / 16));
+        let a = rb::Fixed32 { uv: [u, I32s::from([0; LANES])], light: full_light() };
+        let (b, c) = (rb::Fixed16::default(), rb::Floats::default());
+        let shade = |time: f32, ripple: f32, reflected: bool| {
+            let params = Params::new(&[0.0, 0.0, 1.0, 0.0, 2.0, ripple, 1.0, 1.0, 0.0]);
+            let ctx = PixelContext {
+                filters: [NEAREST_MIPMAP_NONE; crate::shader::MAX_TEXTURES],
+                time,
+                ..pixel_ctx(&textures, &params, 1020, 1.0)
+            };
+            let over = Over { w: F32s::fill(0.5), behind_w: F32s::fill(0.25), row: RowBehind::new(&behind, &depths, 1000) };
+            match reflected {
+                true => <ReflectiveBumpyReflected>::shade_over(&a, &b, &c, &ctx, &over),
+                false => <ReflectiveBumpy>::shade_pixel(&a, &b, &c, &ctx),
+            }
+            .to_array()
+        };
+        let (opaque, over) = (shade(0.0, 0.0, false), shade(0.0, 0.0, true));
+        for i in 0..LANES {
+            if i < 4 {
+                // Dry: the ground, lit, the same in both copies (opaque over the reflection).
+                assert_eq!(opaque[i], colors[i] & 0xFF_FFFF, "lane {i}");
+                assert_eq!(over[i], 0xFF00_0000 | opaque[i], "lane {i}");
+            } else {
+                // Wet: the reflection, from 3 pixels along.
+                assert_eq!(over[i], 0xFF00_0000 | behind[20 + i + 3], "lane {i}");
+            }
+        }
+        // Rippling, only the wet ground moves: a quarter repeat at most, two texels here.
+        let (then, later) = (shade(0.0, 0.25, false), shade(0.37, 0.25, false));
+        assert_eq!(then[..4], opaque[..4]);
+        assert_eq!(later[..4], opaque[..4]);
+        assert!((4..LANES).any(|i| then[i] != later[i]), "{then:x?} {later:x?}");
+        // The waves are smooth, from -1 to 1, a turn long.
+        let x = F32s::from(std::array::from_fn(|i| i as f32 / 8.0));
+        let (w0, w1) = (rb::wave(x).to_array(), rb::wave(x + F32s::fill(1.0)).to_array());
+        assert_eq!(w0, w1);
+        assert!(w0.iter().all(|v| (-1.0..=1.0).contains(v)) && w0[0] == 1.0 && w0[4] == -1.0, "{w0:?}");
+        assert!((rb::turns(15502.7, 0.5) - 0.35).abs() < 1e-3);
+    }
+
+    #[test]
     fn filtered_heights_shift_by_fractions_rounded() {
         use super::filter::BILINEAR_MIPMAP_NONE;
         use super::water::Water;
@@ -1774,7 +2576,7 @@ mod tests {
         let params = Params::new(&[1.0, 0.0, 2.0]);
         // u from the first cell's center (1/4) to the second's (3/4).
         let u = I32s::from(std::array::from_fn(|i| (1 << 14) + ((i as i32) << 15) / 7));
-        let textures = [&tex, &map];
+        let textures = slots(&[&tex, &map]);
         let ctx = PixelContext {
             filters: [BILINEAR_MIPMAP_NONE; crate::shader::MAX_TEXTURES],
             ..pixel_ctx(&textures, &params, 20, 1.0)
@@ -1823,6 +2625,7 @@ mod tests {
             ambient: Vec3::ONE,
             light_split: &[],
             split: &[],
+            back: 0.0,
         };
         let (d, n) = ([1.0f32, -2.0, 0.5], [0.3f32, 0.9, -0.1]);
         let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
@@ -1855,7 +2658,7 @@ mod tests {
         let alphas = [128u32, 191, 255, 50];
         let texels: Vec<u32> = (0..4).map(|i| alphas[i] << 24 | colors[i]).collect();
         let tex = Texture::new("t", 4, 1, texels).unwrap();
-        let textures = [&tex, &tex];
+        let textures = slots(&[&tex]);
         for f0 in [0.04f32, 0.15, 1.0] {
             let params = Params::new(&[f0, 0.0]);
             for cos in [0.0f32, 0.3, 0.7, 1.0] {
@@ -1901,7 +2704,7 @@ mod tests {
         // A smooth texel (alpha 128), seen at cos 0.5 from 2 m away (w = 1/2), with the
         // reflected points behind it 0 to 7 m past the surface; fade range 5 m.
         let tex = Texture::new("t", 1, 1, vec![128 << 24 | 0x40_40_40]).unwrap();
-        let textures = [&tex, &tex];
+        let textures = slots(&[&tex]);
         let (f0, cos, range, distance) = (0.15f32, 0.5f32, 5.0f32, 2.0f32);
         let params = Params::new(&[f0, range]);
         let bounces = [0.0f32, 0.5, 1.0, 2.5, 4.0, 5.0, 7.0, 0.0];
@@ -1974,7 +2777,7 @@ mod tests {
     fn split_lights_come_out_of_the_sum_as_their_shadow_covers_them() {
         use crate::shader::{Fill, Split};
         let blank = Texture::solid("t", 0);
-        let (textures, params) = ([&blank; 2], Params::new(&[]));
+        let (textures, params) = (slots(&[&blank]), Params::new(&[]));
         let mut ctx = pixel_ctx(&textures, &params, 0, 1.0);
         // No split lights: the light as it is.
         assert_eq!(ctx.light(&full_light()), full_light());

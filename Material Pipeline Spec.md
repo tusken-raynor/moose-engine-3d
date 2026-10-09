@@ -101,6 +101,8 @@ pub trait Material: 'static {
 }
 ```
 
+**Mirrored copies** (Oct 6). A program can be compiled in a copy for polygons seen in a mirror (`const MIRRORED: bool` in its `Material` impl, `true` for that copy). A `sampled`, `fixed32`, `fixed16` or `float` value written `name: N if !MIRRORED` is dropped from that copy's layout (`IO_MIRRORED`, where it counts 0): the engine never stores or interpolates it, its struct field stays (0), and the stages' `if MIRRORED` branches compile out of the other copy. `TexturedLit` drops its tangent frame, bump fade, bumps and highlight that way.
+
 **Built-ins.** These names are filled by the engine, not by the previous stage. A material declares only the ones it uses.
 
 | Where | Name | Count | Value |
@@ -108,7 +110,7 @@ pub trait Material: 'static {
 | `vertex` | `position` | 3 | World position of the source vertex |
 | `vertex` | `face_normal` | 3 | World normal of the source polygon's plane |
 | `sampled` | `position` | 3 | World position of the point: the real surface point, even in a mirror |
-| `sampled` | `lod` | 1 | Texture level of detail (log2 texels per pixel), from the `sampled` value `uv` and texture slot 0 |
+| `sampled` | `lod` | 1 | Texture level of detail (log2 texels per pixel, the larger of the x and y footprints), from the `sampled` value `uv` and texture slot 0: worked out exactly at each sample point (Oct 6) from the polygon's screen gradients of `u w`, `v w` and `w` (constant across a flat polygon) and the point's `uv` and `w`, not blended from the corners. A blend runs far too sharp across a big polygon seen at a grazing angle (10 m along a floor from 1 to 20 m away, 3 levels and more), which aliased normal maps into grain. |
 
 **Contexts.** Values the engine owns reach materials through contexts, not through uniforms the app fills per polygon.
 
@@ -130,6 +132,7 @@ pub struct PixelContext<'a> {
     pub textures: &'a TextureSet<'a>,
     pub params: &'a Params,
     pub focal: f32,
+    pub time: f32,            // the frame's time in seconds (Renderer::time, set by the app)
 }
 pub struct Over<'a> {         // what shade_over sees, as today
     pub w: F32s,
@@ -146,7 +149,7 @@ pub struct Over<'a> {         // what shade_over sees, as today
 - `shade_sample` sees exact, perspective-correct inputs at its points. Its outputs are interpolated linearly in screen space, so anything nonlinear belongs inside it, not after it.
 - `shade_pixel` is today's `shade`. `shade_over` is today's `shade_over`, with its extra arguments gathered in `Over`.
 
-**Registration and binding.** `register_material::<M>()` returns a `MaterialId` (today's `ShaderId`). The app's per-polygon callback stays. It returns a `Surface` with a material, params, textures and a raster path override. It still runs at render time, so the choice can depend on whether a polygon's reflection was drawn. Each (mesh, material) pair is validated once: every `vertex` name must exist in the mesh or be a built-in.
+**Registration and binding.** `register_material::<M>()` returns a `MaterialId` (today's `ShaderId`). The app's per-polygon callback stays. It returns a `Surface` with a material, params, textures and a raster path override. It still runs at render time, so the choice can depend on whether a polygon's reflection was drawn. Each (mesh, material) pair is mapped once: every `vertex` name is a built-in or a mesh attribute; one the mesh doesn't have reads 0, and one with fewer components reads 0 past them (Oct 6; it used to be an error, which stopped the frame).
 
 ## The vertex stage runs before clipping
 
@@ -283,6 +286,7 @@ The gain is mostly from `min_step` 1. The per-row design could not afford it eve
 | `Textured<F>` | uv | pass through (plus lod) | texel |
 | `TexturedFresnel<F>` | uv, face normal | facing, distance (plus lod) | over: roughness, Fresnel, fade |
 | `Water<F>` | uv, face normal | facing, distance (plus lod) | over: ripple shift, focal from context |
+| `ReflectiveBumpy` | uv, face normal, tangent frame | bumps, bump fade, facing, distance (plus lod) | wet by texture 0's alpha: ground wobbled by waves of uv and time, bumps flattened; over: turbulence shift, Fresnel, fade |
 | `CubeReflection<F>` | normal rotated to world (rotated entities now reflect correctly) | reflection vector from eye; lod from params radius, object center and focal | cube lookup |
 
 - The pixel math of every shader stays the same. Only where its inputs come from changes.

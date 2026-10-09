@@ -126,6 +126,15 @@ pub struct Surface {
     /// Each texture slot's sampler (one of [`filter::ALL`](crate::shader::filter::ALL)),
     /// which the material reads it with: picked at run time, per polygon.
     pub filters: [u8; MAX_TEXTURES],
+    /// How far behind its plane a light may be and still reach it, as the sine of the angle
+    /// (0, the default: none). Such a light lights none of the flat surface, but bump-mapped
+    /// programs' normals tilted toward it catch it, fading from all of it at the plane to
+    /// none at the angle (a rounded edge's normals, past where the face turns away).
+    pub back_light: f32,
+    /// The lights it isn't lit by (see [`Light::excluded_by`]): left out of its lights,
+    /// so none of their light, bumps, highlights or shadows reach it (0, the default:
+    /// none). It still casts their shadows.
+    pub excluded_lights: moose_assets::LightMask,
 }
 
 impl Surface {
@@ -136,6 +145,8 @@ impl Surface {
             path_override: None,
             textures: [None; MAX_TEXTURES],
             filters: [crate::shader::filter::BILINEAR_MIPMAP_LINEAR; MAX_TEXTURES],
+            back_light: 0.0,
+            excluded_lights: 0,
         }
     }
 }
@@ -240,6 +251,8 @@ struct PolygonSetup {
     /// reaches each pixel.
     splits: u8,
     split_colors: [Vec3; MAX_SPLIT],
+    /// Which split light is the player's flashlight, if one is.
+    split_flashlight: Option<u8>,
     /// Each split light's shadow slot.
     split_slots: [u8; MAX_SPLIT],
     first_shadow: u32,
@@ -271,6 +284,12 @@ struct PolygonSetup {
     light_count: u16,
     /// Where its `sampled` world position is among its sampled values, if it has one.
     position: Option<u16>,
+    /// Where its `sampled` `uv` and level of detail are, and texture 0's size in texels,
+    /// if it has a level of detail: its sample points work theirs out exactly (see
+    /// [`point_lods`]).
+    lod: Option<(u16, u16, f32, f32)>,
+    /// Its surface's back light (see [`Surface::back_light`]).
+    back: f32,
 }
 
 #[derive(Default)]
@@ -440,6 +459,9 @@ pub struct RenderStats {
 /// The span buffer renderer. Keeps its arenas and scratchpads between frames.
 pub struct Renderer {
     pub config: RasterConfig,
+    /// The frame's time in seconds, for pixels that move with it (see
+    /// `PixelContext::time`); the app sets it each frame.
+    pub time: f32,
     materials: Vec<MaterialEntry>,
     /// Per (mesh, material): where each vertex stage input comes from, and the `sampled`
     /// built-ins. Validated once, then reused.
@@ -459,6 +481,7 @@ struct Textures<'a> {
     assets: &'a Assets,
     blank: &'a Texture,
     focal: f32,
+    time: f32,
     ambient: Vec3,
     blur: Option<&'a BlurGrid>,
 }
@@ -477,6 +500,7 @@ impl Renderer {
     pub fn new(config: RasterConfig) -> Self {
         Self {
             config,
+            time: 0.0,
             materials: Vec::new(),
             remaps: HashMap::new(),
             surfaces: Vec::new(),
@@ -530,6 +554,7 @@ impl Renderer {
             assets,
             blank: &self.blank,
             focal: geometry.focal,
+            time: self.time,
             ambient: geometry.ambient,
             blur: None,
         };
@@ -630,20 +655,28 @@ impl Renderer {
 }
 
 /// A polygon's tangent and bitangent, in model space: the directions its `uv` attribute's
-/// u and v grow along it, each unit length (from its first three vertices; zero without
-/// `uv`, or for a polygon whose texture is degenerate on it).
+/// u and v grow along it, each unit length (zero without `uv`, or for a polygon whose
+/// texture is degenerate on it). From the triangle of its fan (its first vertex and two
+/// neighbors) whose texture is least degenerate: its first three vertices can lie in a
+/// line (a corner added on an edge), which tells nothing across it.
 fn face_tangents(mesh: &moose_assets::Mesh, polygon: &moose_assets::Polygon) -> (Vec3, Vec3) {
     let Some(uv) = mesh.attribs.iter().find(|a| a.name == UV && a.count == 2) else {
         return (Vec3::ZERO, Vec3::ZERO);
     };
-    let vs: Vec<usize> = polygon.vertices().take(3).collect();
+    let vs: Vec<usize> = polygon.vertices().collect();
     if vs.len() < 3 {
         return (Vec3::ZERO, Vec3::ZERO);
     }
     let p = |v: usize| mesh.positions[mesh.vertex_positions[v] as usize];
     let t = |v: usize| (uv.data.get_f32(v * 2), uv.data.get_f32(v * 2 + 1));
-    let (e1, e2) = (p(vs[1]) - p(vs[0]), p(vs[2]) - p(vs[0]));
-    let ((u0, v0), (u1, v1), (u2, v2)) = (t(vs[0]), t(vs[1]), t(vs[2]));
+    // Per fan triangle (0, k, k + 1): its texture's determinant; the largest.
+    let det = |k: usize| {
+        let ((u0, v0), (u1, v1), (u2, v2)) = (t(vs[0]), t(vs[k]), t(vs[k + 1]));
+        (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0)
+    };
+    let k = (1..vs.len() - 1).max_by(|&a, &b| det(a).abs().total_cmp(&det(b).abs())).unwrap();
+    let (e1, e2) = (p(vs[k]) - p(vs[0]), p(vs[k + 1]) - p(vs[0]));
+    let ((u0, v0), (u1, v1), (u2, v2)) = (t(vs[0]), t(vs[k]), t(vs[k + 1]));
     let (du1, dv1, du2, dv2) = (u1 - u0, v1 - v0, u2 - u0, v2 - v0);
     let det = du1 * dv2 - du2 * dv1;
     if det.abs() < 1e-12 {
@@ -657,8 +690,12 @@ fn face_tangents(mesh: &moose_assets::Mesh, polygon: &moose_assets::Polygon) -> 
 /// Where a vertex stage input comes from.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum VertexSource {
-    /// A mesh attribute: its index in the mesh's attributes, and its count.
-    Attrib(usize, usize),
+    /// A mesh attribute: its index in the mesh's attributes, its count in the mesh, and
+    /// the count the material reads (components past the mesh's read 0).
+    Attrib(usize, usize, usize),
+    /// An attribute the mesh doesn't have: this many zeros (black, for a color), so a
+    /// material on a mesh without what it reads still draws.
+    Zero(usize),
     /// The source vertex's world position.
     Position,
     /// The source polygon's plane normal, in world space.
@@ -716,17 +753,12 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
             vertex.push(source);
             continue;
         }
-        let Some(index) = m.attribs.iter().position(|a| a.name == want.name) else {
-            return Err(LayoutError::MissingAttribute {
-                mesh: m.name.clone(),
-                name: want.name,
-            });
-        };
-        let found = m.attribs[index].count;
-        if found != want.count {
-            return Err(mismatch(want.name, want.count, found));
-        }
-        vertex.push(VertexSource::Attrib(index, found as usize));
+        // An attribute the mesh doesn't have reads 0; one with fewer components reads 0
+        // past them (and with more, only those the material reads).
+        vertex.push(match m.attribs.iter().position(|a| a.name == want.name) {
+            Some(index) => VertexSource::Attrib(index, m.attribs[index].count as usize, want.count as usize),
+            None => VertexSource::Zero(want.count as usize),
+        });
     }
     let mut remap = Remap {
         vertex,
@@ -767,6 +799,32 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
         });
     }
     Ok(remap)
+}
+
+/// Which of a polygon's partly shadowing lights keep their shadows on it when it has room
+/// for fewer (see `MAX_SPLIT`): the player's flashlight first, then by how much light each
+/// brings to the polygon's `center` (facing `normal`): its brightness there, as the sample
+/// points light it (falloff, angle, cone), a little at least while it reaches.
+fn split_priority(light: &Light, center: Vec3, normal: Vec3) -> f32 {
+    if light.id == moose_assets::FLASHLIGHT_ID {
+        return f32::INFINITY;
+    }
+    let to = light.position - center;
+    let d = to.length().max(1e-4);
+    let t = (1.0 - (d * d) / (light.range * light.range)).max(0.0);
+    let cos = (normal.dot(to) / d).max(0.05);
+    let (scale, offset) = light.cone();
+    let c = (offset - to.dot(light.direction) / d * scale).clamp(0.0, 1.0);
+    let luma = 0.2126 * light.color.x + 0.7152 * light.color.y + 0.0722 * light.color.z;
+    luma * t * t * cos * c * c * (3.0 - c - c)
+}
+
+/// Whether a light `height` in front of a polygon's plane (below 0, behind it) lights it:
+/// in front, or behind by up to the polygon's back light angle (`back`, its sine; see
+/// `Surface::back_light`) as seen from `far` away (as far as the polygon's farthest point
+/// may be from the light, where the angle is smallest).
+fn lights_face(height: f32, far: f32, back: f32) -> bool {
+    height > 0.0 || (back > 0.0 && height > -back * far)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,11 +893,15 @@ fn setup_polygon(
         let mut i = 0;
         for &from in &remap.vertex {
             match from {
-                VertexSource::Attrib(a, count) => {
+                VertexSource::Attrib(a, stride, count) => {
                     let data = &mesh.attribs[a].data;
                     for c in 0..count {
-                        input[i + c] = data.get_f32(v * count + c);
+                        input[i + c] = if c < stride { data.get_f32(v * stride + c) } else { 0.0 };
                     }
+                    i += count;
+                }
+                VertexSource::Zero(count) => {
+                    input[i..i + count].fill(0.0);
                     i += count;
                 }
                 VertexSource::Position => {
@@ -885,9 +947,11 @@ fn setup_polygon(
         }
     }
     bins.vertex_out = outs;
+    let mut lod_at = None;
     if let (Some(uv), Some(lod)) = (remap.uv, remap.lod) {
         let texture = textures.get(s.textures[0]);
         let size = (texture.width() as f32, texture.height() as f32);
+        lod_at = Some((uv as u16, lod as u16, size.0, size.1));
         let values = &bins.values;
         let uv_at = |v: usize| (values[v * n_vals + uv], values[v * n_vals + uv + 1]);
         vertex_lods(verts, uv_at, size, &mut bins.lods);
@@ -904,6 +968,7 @@ fn setup_polygon(
     let first_light = bins.lights.len() as u32;
     let (mut splits, mut split_slots) = (0usize, [0u8; MAX_SPLIT]);
     let mut split_colors = [Vec3::ZERO; MAX_SPLIT];
+    let mut split_flashlight = None;
     let positions = &geometry.world_positions[p.vertices()];
     let normal = Vec3::from_array(face_normal);
     let (lo, hi) = positions
@@ -912,26 +977,51 @@ fn setup_polygon(
             (lo.min(q), hi.max(q))
         });
     let (center, radius) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
-    for &li in geometry.polygon_lights(p) {
-        let light = geometry.lights[li as usize];
+    // Lights up to the surface's back light angle behind its plane reach it too (its bumps).
+    let back = s.back_light.clamp(0.0, 1.0);
+    let lights_it = |light: &Light| {
         let height = normal.dot(light.position - positions[0]);
+        let far = light.position.distance(center) + radius;
         let near = light.position.clamp(lo, hi).distance(light.position);
         let in_shadow = light.shadow.is_some_and(|k| p.shadowed >> k & 1 != 0);
-        if !in_shadow
-            && height > 0.0
-            && height < light.range
+        !in_shadow
+            && !light.excluded_by(s.excluded_lights)
+            && lights_face(height, far, back)
+            && height.abs() < light.range
             && near < light.range
             && light.cone_reaches(center, radius)
-        {
-            // A light whose shadow covers part of it is split off (see `SampleContext`).
+    };
+    // Its split lights: those whose shadow covers part of it (see `SampleContext`), as
+    // many as it has room for, by priority (see `split_priority`). The rest are lit whole
+    // here: their shadows on it are lost, the least of them first.
+    let room = (0..=MAX_SPLIT)
+        .rev()
+        .find(|&n| layout_len(entry.io.interp) + split_outputs(n) <= MAX_VARYINGS)
+        .unwrap_or(0);
+    let mut chosen: [(f32, u32); MAX_SPLIT] = [(f32::NEG_INFINITY, u32::MAX); MAX_SPLIT];
+    for &li in geometry.polygon_lights(p) {
+        let light = geometry.lights[li as usize];
+        let Some(k) = light.shadow else { continue };
+        if p.split >> k & 1 == 0 || room == 0 || !lights_it(&light) {
+            continue;
+        }
+        // Into the best `room`, kept in order (highest first).
+        let priority = split_priority(&light, center, normal);
+        if let Some(at) = chosen[..room].iter().position(|&(q, _)| priority > q) {
+            chosen.copy_within(at..room - 1, at + 1);
+            chosen[at] = (priority, li);
+        }
+    }
+    for &li in geometry.polygon_lights(p) {
+        let light = geometry.lights[li as usize];
+        if lights_it(&light) {
             let split = match light.shadow {
-                Some(k)
-                    if p.split >> k & 1 != 0
-                        && splits < MAX_SPLIT
-                        && layout_len(entry.io.interp) + split_outputs(splits + 1) <= MAX_VARYINGS =>
-                {
+                Some(k) if chosen[..room].iter().any(|&(_, c)| c == li) => {
                     split_slots[splits] = k;
                     split_colors[splits] = light.color;
+                    if light.id == moose_assets::FLASHLIGHT_ID {
+                        split_flashlight = Some(splits as u8);
+                    }
                     splits += 1;
                     (splits - 1) as u8
                 }
@@ -991,6 +1081,7 @@ fn setup_polygon(
         n_vals: n_vals as u16,
         splits: splits as u8,
         split_colors,
+        split_flashlight,
         split_slots,
         first_shadow,
         shadows: (bins.shadows.len() as u32 - first_shadow) as u16,
@@ -1012,6 +1103,8 @@ fn setup_polygon(
         first_light,
         light_count: (bins.lights.len() as u32 - first_light) as u16,
         position: remap.position.map(|p| p as u16),
+        lod: lod_at,
+        back,
     });
     // Bin a reference into every band the polygon's rows touch.
     let id = surface_id(thread, local);
@@ -1511,6 +1604,7 @@ fn sample_context<'a>(
         split,
         ambient: textures.ambient,
         focal: textures.focal,
+        back: p.back,
     }
 }
 
@@ -1845,6 +1939,33 @@ fn build_tiles(
                 }
             }
             *input = q * inv;
+        }
+        // The level of detail, worked out at each point rather than interpolated from the
+        // corners (which, across a big polygon seen at a grazing angle, comes out far too
+        // sharp in the middle: the true one grows with the log of the distance).
+        if let Some((uv, lod, width, height)) = p.lod {
+            let (uv, lod) = (uv as usize, lod as usize);
+            // The gradients of u w and v w (the fan triangle's planes), and w's.
+            let gradient = |k: usize| {
+                let c = |t: usize| &planes.fans[(t * n_in + k) * 3..(t * n_in + k) * 3 + 3];
+                let (mut gx, mut gy) = (F32s::fill(c(0)[1]), F32s::fill(c(0)[2]));
+                for t in 1..planes.n_fans {
+                    let here = fan.simd_eq(F32s::fill(t as f32));
+                    if here.to_bitmask() != 0 {
+                        gx = here.select(F32s::fill(c(t)[1]), gx);
+                        gy = here.select(F32s::fill(c(t)[2]), gy);
+                    }
+                }
+                (gx, gy)
+            };
+            inputs[lod] = point_lods(
+                gradient(uv),
+                gradient(uv + 1),
+                (F32s::fill(planes.wx), F32s::fill(planes.wy)),
+                [inputs[uv], inputs[uv + 1]],
+                inv,
+                (width, height),
+            );
         }
         let ctx = sample_context(p, b, textures, &split[..splits]);
         (entry.sample)(&inputs[..n_in], &ctx, &mut outputs[..n_material]);
@@ -2252,6 +2373,7 @@ fn shade_points(
         x0,
         splits: p.splits as usize,
         split_colors: p.split_colors,
+        split_flashlight: p.split_flashlight,
         reaches: &s.reaches,
         row: s.row,
         half_rate: p.half_rate,
@@ -2263,6 +2385,7 @@ fn shade_points(
         filters: p.filters,
         eye: p.eye,
         focal: textures.focal,
+        time: textures.time,
         object: &p.object,
     };
     let span = draw_fn(&shaders[p.material.0 as usize], p.half_rate);
@@ -2407,6 +2530,30 @@ fn vertex_lods(
         let long = x_len.max(y_len);
         out.push(if long > 0.0 { long.log2() } else { -16.0 });
     }
+}
+
+/// The level of detail at [`LANES`] points of a polygon, as [`vertex_lods`] works it out at
+/// its corners: from the screen-space gradients of `u w` (`du`), `v w` (`dv`) and `w` (`dw`),
+/// constant across a flat polygon, and each point's `uv` and `1 / w` (`inv`), in texels of
+/// a `size.0` by `size.1` texture: log2 of texels per screen pixel, the larger of the x and y
+/// footprints.
+#[inline(always)]
+fn point_lods(
+    du: (F32s, F32s),
+    dv: (F32s, F32s),
+    dw: (F32s, F32s),
+    uv: [F32s; 2],
+    inv: F32s,
+    size: (f32, f32),
+) -> F32s {
+    let d = |g: (F32s, F32s), c: F32s| ((g.0 - c * dw.0) * inv, (g.1 - c * dw.1) * inv);
+    let ((dudx, dudy), (dvdx, dvdy)) = (d(du, uv[0]), d(dv, uv[1]));
+    let (w, h) = (F32s::fill(size.0), F32s::fill(size.1));
+    let len2 = |a: F32s, b: F32s| (a * w) * (a * w) + (b * h) * (b * h);
+    let long2 = len2(dudx, dvdx).max(len2(dudy, dvdy));
+    // log2 of the length: half log2 of its square. None measured: the sharpest.
+    let lod = long2.max(F32s::fill(1e-30)).ln() * F32s::fill(0.5 / std::f32::consts::LN_2);
+    long2.simd_gt(F32s::fill(0.0)).select(lod, F32s::fill(-16.0))
 }
 
 /// The shader drawing a row state's polygon.
@@ -3027,6 +3174,56 @@ mod tests {
     }
 
     #[test]
+    fn the_flashlight_keeps_its_shadow_first_then_the_brightest_lights() {
+        // A floor at the origin facing up.
+        let (center, up) = (Vec3::ZERO, Vec3::Y);
+        let lamp = |at: Vec3, bright: f32| Light::point(0, at, Vec3::splat(bright), 10.0);
+        let near = split_priority(&lamp(Vec3::new(0.0, 2.0, 0.0), 1.0), center, up);
+        let far = split_priority(&lamp(Vec3::new(0.0, 6.0, 0.0), 1.0), center, up);
+        let dim = split_priority(&lamp(Vec3::new(0.0, 2.0, 0.0), 0.2), center, up);
+        let low = split_priority(&lamp(Vec3::new(5.0, 0.3, 0.0), 1.0), center, up);
+        assert!(near > far && near > dim && near > low, "{near} {far} {dim} {low}");
+        // A spot aimed away brings next to nothing; the flashlight, however dim or aimed
+        // away, comes first.
+        let away = Light::spot(0, Vec3::new(0.0, 2.0, 0.0), Vec3::ONE, 10.0, Vec3::Y, 10.0, 20.0);
+        assert_eq!(split_priority(&away, center, up), 0.0);
+        let flashlight = Light { id: moose_assets::FLASHLIGHT_ID, ..away };
+        assert_eq!(split_priority(&flashlight, center, up), f32::INFINITY);
+    }
+
+    #[test]
+    fn a_light_behind_a_face_lights_it_only_within_its_back_light_angle() {
+        let back = 20f32.to_radians().sin();
+        // In front, whatever the angle.
+        assert!(lights_face(0.01, 1.0, 0.0) && lights_face(0.01, 1.0, back));
+        // Just behind: not without a back light angle; with one, up to it.
+        assert!(!lights_face(-0.01, 1.0, 0.0));
+        assert!(lights_face(-0.01, 1.0, back));
+        assert!(lights_face(-0.33, 1.0, back) && !lights_face(-0.35, 1.0, back));
+        // On the plane, a face doesn't face it.
+        assert!(!lights_face(0.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn a_face_whose_first_corners_are_in_a_line_still_has_tangents() {
+        // A 1 x 4 m floor quad with a corner added on its long edge, first: its first
+        // three corners lie in a line. Its texture runs u along x and v along z, as the
+        // same quad without the extra corner has it.
+        let obj = |first: &str| {
+            format!(
+                "v 0 0 0\nv 0 0 2\nv 0 0 4\nv 1 0 4\nv 1 0 0\n\
+                 vt 0 0\nvt 0 2\nvt 0 4\nvt 1 4\nvt 1 0\n{first}\n"
+            )
+        };
+        let path = std::path::Path::new("t.obj");
+        let lined = moose_assets::parse_obj(path, "lined", &obj("f 1/1 2/2 3/3 4/4 5/5")).unwrap();
+        let plain = moose_assets::parse_obj(path, "plain", &obj("f 1/1 3/3 4/4 5/5")).unwrap();
+        let (t, b) = face_tangents(&lined, &lined.polygons[0]);
+        assert!(t.distance(Vec3::X) < 1e-5 && b.distance(Vec3::Z) < 1e-5, "{t} {b}");
+        assert_eq!((t, b), face_tangents(&plain, &plain.polygons[0]));
+    }
+
+    #[test]
     fn a_crates_faces_have_tangents_along_their_texture() {
         // Each face's tangent and bitangent are unit length, in its plane, and point the
         // way its u and v grow across it.
@@ -3053,6 +3250,42 @@ mod tests {
                 assert_eq!(along.dot(b) > 0.0, dv > 0.0, "v grows along the bitangent");
             }
         }
+    }
+
+    #[test]
+    fn a_points_level_of_detail_is_its_own_not_a_blend_of_its_corners() {
+        // A floor 1 m below the eye, 1 to 20 m away, 1 m a repeat (seen at a grazing angle):
+        // a point (x, z) on it is at screen (f x / z, f / z), w = 1 / z, uv (x, z).
+        let (f, size) = (500.0, (64.0, 64.0));
+        let at = |x: f32, z: f32| ((f * x / z, f / z, 1.0 / z), (x, z));
+        let corners = [at(-1.0, 1.0), at(1.0, 1.0), at(1.0, 20.0), at(-1.0, 20.0)];
+        let middle = at(0.0, 10.0);
+        // The corners' own (exact), and the middle's, exact as a corner of a polygon there.
+        let quad = lods(&corners.map(|c| c.0), &corners.map(|c| c.1), size);
+        let exact = lods(&[middle.0, corners[0].0, corners[1].0], &[middle.1, corners[0].1, corners[1].1], size)[0];
+        // The quad's gradients of u w, v w and w (any three corners: it is flat).
+        let [(a, ua), (b, ub), (c, uc)] = [corners[0], corners[1], corners[2]];
+        let det = (b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1);
+        let gradient = |fa: f32, fb: f32, fc: f32| {
+            (
+                F32s::fill(((fb - fa) * (c.1 - a.1) - (fc - fa) * (b.1 - a.1)) / det),
+                F32s::fill(((fc - fa) * (b.0 - a.0) - (fb - fa) * (c.0 - a.0)) / det),
+            )
+        };
+        let du = gradient(ua.0 * a.2, ub.0 * b.2, uc.0 * c.2);
+        let dv = gradient(ua.1 * a.2, ub.1 * b.2, uc.1 * c.2);
+        let dw = gradient(a.2, b.2, c.2);
+        let point = |(_, uv): ((f32, f32, f32), (f32, f32)), z: f32| {
+            point_lods(du, dv, dw, [F32s::fill(uv.0), F32s::fill(uv.1)], F32s::fill(z), size).to_array()[0]
+        };
+        // At the corners, what the corners have; in the middle, its own.
+        assert!((point(corners[0], 1.0) - quad[0]).abs() < 1e-3);
+        assert!((point(corners[2], 20.0) - quad[2]).abs() < 1e-3);
+        assert!((point(middle, 10.0) - exact).abs() < 1e-3, "{} vs {exact}", point(middle, 10.0));
+        // The corners' blend there (as varyings are, along the floor) is far sharper.
+        let t = (10.0 - 1.0) / (20.0 - 1.0);
+        let blend = quad[1] + (quad[2] - quad[1]) * t;
+        assert!(exact - blend > 2.0, "exact {exact}, blended {blend}");
     }
 
     #[test]

@@ -1,0 +1,4 @@
+MOOSEMATERIAL 2
+# Terrain: vertex colors times a detail texture, smoothly lit.
+shader             terrain_detail
+texture0           terrain_detail.png
