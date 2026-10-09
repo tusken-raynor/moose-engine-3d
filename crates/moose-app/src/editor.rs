@@ -1796,7 +1796,7 @@ impl Editor {
                     }
                 }
             }
-            (None, Field::AmbientRed | Field::AmbientGreen | Field::AmbientBlue) => {
+            (_, Field::AmbientRed | Field::AmbientGreen | Field::AmbientBlue) => {
                 let a = self.doc.ambient.get_or_insert(Vec3::ONE);
                 let c = match field {
                     Field::AmbientRed => &mut a.x,
@@ -1806,7 +1806,7 @@ impl Editor {
                 *c = (*c + 0.01 * dir).max(0.0);
                 Ok(format!("ambient {}, {}, {}", n(a.x), n(a.y), n(a.z)))
             }
-            (None, Field::SunAngle | Field::SunYaw | Field::SunPitch) => {
+            (_, Field::SunAngle | Field::SunYaw | Field::SunPitch) => {
                 let Some(sun) = self.doc.directional.first_mut() else {
                     return Err("the level has no sun".into());
                 };
