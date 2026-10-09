@@ -87,7 +87,7 @@ The editor works on the level's own tables, `moose_assets::LevelDoc`: the `.mmp`
 | Selection | Rows |
 | --- | --- |
 | Nothing | The mode's "No sector selected" (the icons hold the rest) |
-| Surface | Its sector (click: that sector, in sector mode), and for a solid surface: material (the browser: a search, its textures previewed in slot order under the list, Apply at the top gives the selected faces the one clicked), stitch from a touching face, merge with touching faces (several selected: the ones that merge), cut (C), reflective and sky, extrude (E; its depth typed or scrolled), push/pull (typed or scrolled, or PgUp/PgDn), open to a match (M; with two faces selected, those two), split into triangles, lights kept off (below), meta values, texture rows; for an opening: the sector it's in, wall it up (both sides), meta values |
+| Surface | Its sector (click: that sector, in sector mode), and for a solid surface: material (the browser: a search, its textures previewed in slot order under the list, Apply at the top gives the selected faces the one clicked), stitch from a touching face, merge with touching faces (M; several selected: the ones that merge), cut (C), reflective and sky, extrude (E; its depth typed or scrolled), push/pull (typed or scrolled, or PgUp/PgDn), open to a match (J; with two faces selected, those two), split into triangles, lights kept off (below), meta values, texture rows; for an opening: the sector it's in, wall it up (both sides), meta values |
 | Sector | Cleave (C, then the cut), merge (M: with one selected, then click a face of the other; with several, the ones that merge), its middle X, Y, Z (typed or scrolled: moves it) and turn (scroll, or `[` `]`), lights kept off (below), meta values, delete (X) |
 | Vertex | X, Y, Z (typed or scrolled; also the arrows and PgUp/PgDn); several selected move together |
 | Entity | Kind, model (cycles through assets/models), animation (for a model with them: its animations, or none), position, yaw/pitch/roll, scale, static, occluder (mesh or none), lights kept off (drawn entities), duplicate, delete |
@@ -135,7 +135,7 @@ The editor's keys are its own (`editor_keys.rs`): the game's hotkeys don't work 
 | F5, G, O | Wireframe over 3D; grid step (1/16, 1/8, 1/4, 1/2, 1 m); pick openings in 3D |
 | / | Find by number |
 | C, M, X (sector) | Cleave; merge; delete |
-| C, E, M (face) | Cut; extrude; open to a match |
+| C, E, M, J (face) | Cut; extrude; merge faces (several selected: the ones that merge; one: then click the other); open to a match |
 | M, X (entity) | Mesh editor; delete |
 | X (light) | Delete |
 | P, X, M (mesh editor) | Pick proxies; delete the polygon; leave |

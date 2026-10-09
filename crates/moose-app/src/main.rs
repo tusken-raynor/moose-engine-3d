@@ -3378,6 +3378,11 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             if pressed(Action::Extrude) {
                 app.edit(Field::Extrude, 1.0);
             }
+            if pressed(Action::MergeFaces) {
+                // Several selected: the ones that merge; one: then click the other.
+                let multi = app.editor.selected_faces().len() > 1;
+                app.edit(if multi { Field::MergeSelectedFaces } else { Field::Merge }, 1.0);
+            }
             if pressed(Action::OpenToMatch) {
                 app.edit(Field::Adjoin, 1.0);
             }

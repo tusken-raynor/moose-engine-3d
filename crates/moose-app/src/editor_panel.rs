@@ -655,7 +655,12 @@ impl Editor {
         c.row("Its sector", d.sectors[s.sector].name.clone(), Some(Act::Edit(Field::SelectSector)), None);
         c.row("Material", format!("{material} >"), Some(Act::Open(Menu::Materials)), None);
         c.row("Stitch from a touching face", pick(Pick::Stitch, String::new()), Some(Act::Edit(Field::Stitch)), None);
-        let (merge_field, merge) = if selected > 1 { (Field::MergeSelectedFaces, "the selected".to_string()) } else { (Field::Merge, pick(Pick::Merge, String::new())) };
+        let merge_key = keys.key(Action::MergeFaces).name();
+        let (merge_field, merge) = if selected > 1 {
+            (Field::MergeSelectedFaces, format!("the selected ({merge_key})"))
+        } else {
+            (Field::Merge, pick(Pick::Merge, format!("({merge_key})")))
+        };
         c.row("Merge with touching faces", merge, Some(Act::Edit(merge_field)), None);
         let cut = if self.cutting.is_some() { "drag or click in 2D".into() } else { format!("{}, then the cut", keys.key(Action::CutFace).name()) };
         c.row("Cut", cut, Some(Act::Edit(Field::Cleave)), None);

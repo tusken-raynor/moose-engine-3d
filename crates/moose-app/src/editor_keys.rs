@@ -77,6 +77,7 @@ pub enum Action {
     // With a face selected.
     CutFace,
     Extrude,
+    MergeFaces,
     OpenToMatch,
     // With an entity or light selected.
     MeshEditor,
@@ -90,12 +91,12 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the gear menu lists them.
-    pub const ALL: [Action; 36] = {
+    pub const ALL: [Action; 37] = {
         use Action::*;
         [
             Forward, Backward, StrafeLeft, StrafeRight, Ascend, Descend, SectorMode, FaceMode, VertexMode, ViewTop,
             ViewBottom, ViewFront, ViewBack, ViewLeft, ViewRight, View3d, TurnLeft, TurnRight, TurnUp, TurnDown, Wire,
-            Grid, Openings, Find, Cleave, MergeSectors, DeleteSector, CutFace, Extrude, OpenToMatch, MeshEditor,
+            Grid, Openings, Find, Cleave, MergeSectors, DeleteSector, CutFace, Extrude, MergeFaces, OpenToMatch, MeshEditor,
             DeleteEntity, DeleteLight, PickProxies, DeletePolygon, LeaveMesh,
         ]
     };
@@ -104,7 +105,7 @@ impl Action {
         use Action::*;
         match self {
             Cleave | MergeSectors | DeleteSector => Context::Sector,
-            CutFace | Extrude | OpenToMatch => Context::Face,
+            CutFace | Extrude | MergeFaces | OpenToMatch => Context::Face,
             MeshEditor | DeleteEntity => Context::Entity,
             DeleteLight => Context::Light,
             PickProxies | DeletePolygon | LeaveMesh => Context::Mesh,
@@ -144,6 +145,7 @@ impl Action {
             DeleteSector => "Delete sector",
             CutFace => "Cut (then the cut)",
             Extrude => "Extrude",
+            MergeFaces => "Merge faces",
             OpenToMatch => "Open to a match",
             MeshEditor => "Mesh editor",
             DeleteEntity => "Delete",
@@ -186,7 +188,8 @@ impl Action {
             DeleteSector => Key::X,
             CutFace => Key::C,
             Extrude => Key::E,
-            OpenToMatch => Key::M,
+            MergeFaces => Key::M,
+            OpenToMatch => Key::J,
             MeshEditor => Key::M,
             DeleteEntity => Key::X,
             DeleteLight => Key::X,
@@ -334,9 +337,10 @@ mod tests {
         assert_eq!(keys.key(Action::Cleave), Key::C);
         // C in a face's context and a sector's is fine: one is selected at a time.
         assert_eq!(keys.key(Action::CutFace), Key::C);
-        // Binding Extrude to M takes Open to a match's key: it gets E.
-        keys.bind(Action::Extrude, Key::M);
-        assert_eq!((keys.key(Action::Extrude), keys.key(Action::OpenToMatch)), (Key::M, Key::E));
+        // Binding Extrude to J takes Open to a match's key: it gets E.
+        assert_eq!((keys.key(Action::MergeFaces), keys.key(Action::OpenToMatch)), (Key::M, Key::J));
+        keys.bind(Action::Extrude, Key::J);
+        assert_eq!((keys.key(Action::Extrude), keys.key(Action::OpenToMatch)), (Key::J, Key::E));
         // An editor-wide key clashes with every context's.
         keys.bind(Action::Grid, Key::X);
         assert_eq!(keys.key(Action::DeleteSector), Key::G);
