@@ -564,11 +564,15 @@ impl Editor {
         self.doc != self.saved || !self.path.exists()
     }
 
-    /// Shows `message` on the status line, and prints it to the console (to copy).
     pub fn say(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), Instant::now()));
+    }
+
+    /// Shows what went wrong on the status line, and prints it to the console (to copy).
+    pub fn warn(&mut self, message: impl Into<String>) {
         let message = message.into();
         if !cfg!(test) {
-            println!("editor: {message}");
+            eprintln!("editor warning: {message}");
         }
         self.status = Some((message, Instant::now()));
     }

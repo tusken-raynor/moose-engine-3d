@@ -951,7 +951,7 @@ impl App {
     /// it won't load, as a move: see `settle`; the drag is one undo, when it's let go).
     fn drag_to(&mut self, delta: Vec3) {
         if let Err(e) = self.editor.move_selection(delta, &self.world) {
-            self.editor.say(e);
+            self.editor.warn(e);
             return;
         }
         match self.rebuild() {
@@ -1069,7 +1069,7 @@ impl App {
             Typing::Search => self.editor.search = text.to_string(),
             Typing::Find => match self.editor.find(text) {
                 Ok(s) => self.go_to(s),
-                Err(e) => self.editor.say(e),
+                Err(e) => self.editor.warn(e),
             },
             Typing::MetaKey(k) | Typing::MetaValue(k) => {
                 let owner = meta_owner(&self.editor);
@@ -1140,13 +1140,15 @@ impl App {
             return;
         }
         let Some(value) = number.parse::<f32>().ok().filter(|v| v.is_finite()) else {
-            self.editor.say(format!("'{number}' is not a number"));
+            self.editor.warn(format!("'{number}' is not a number"));
             return;
         };
         // Not an edit: how far the next extrude goes.
         if field == editor::Field::ExtrudeBy {
-            let said = self.editor.set_typed(field, value, &self.world);
-            self.editor.say(said.unwrap_or_else(|e| e));
+            match self.editor.set_typed(field, value, &self.world) {
+                Ok(said) => self.editor.say(said),
+                Err(e) => self.editor.warn(e),
+            }
             return;
         }
         let before = self.editor.begin();
@@ -1174,7 +1176,7 @@ impl App {
                     .and_then(|_| self.rebuild());
                 match result {
                     Ok(()) => self.editor.say(format!("dropped the changes to {file}")),
-                    Err(e) => self.editor.say(e),
+                    Err(e) => self.editor.warn(e),
                 }
             }
             return;
@@ -1200,7 +1202,7 @@ impl App {
                 self.editor.model = Some(mesh_edit::ModelEdit::new(file.clone(), path, doc, entity));
                 self.editor.say(format!("editing {file}"));
             }
-            Err(e) => self.editor.say(e),
+            Err(e) => self.editor.warn(e),
         }
     }
 
@@ -1238,7 +1240,7 @@ impl App {
                     let _ = self.assets.set_model_text(&file, &old);
                     let _ = self.rebuild();
                 }
-                self.editor.say(why);
+                self.editor.warn(why);
             }
         }
     }
@@ -1257,7 +1259,7 @@ impl App {
                 model.mark_saved();
                 self.editor.say(format!("saved {}", path.display()));
             }
-            Err(e) => self.editor.say(format!("cannot save {}: {e}", path.display())),
+            Err(e) => self.editor.warn(format!("cannot save {}: {e}", path.display())),
         }
     }
 
@@ -1276,7 +1278,7 @@ impl App {
                 .and_then(|()| self.rebuild());
             match result {
                 Ok(()) => self.editor.say(if redo { "redone" } else { "undone" }),
-                Err(e) => self.editor.say(e),
+                Err(e) => self.editor.warn(e),
             }
             return;
         }
@@ -1323,7 +1325,7 @@ impl App {
         if materials_changed {
             match self.reload_materials() {
                 Ok(()) => self.editor.say("reloaded the materials"),
-                Err(e) => self.editor.say(e),
+                Err(e) => self.editor.warn(e),
             }
         }
         let (models, textures) = self.assets.loaded_files();
@@ -1363,18 +1365,18 @@ impl App {
                         Ok(())
                     }
                     Err(e) => {
-                        self.editor.say(e);
+                        self.editor.warn(e);
                         continue;
                     }
                 },
             };
             match result {
                 Ok(()) => self.editor.say(format!("reloaded {}", path.display())),
-                Err(e) => self.editor.say(e.to_string()),
+                Err(e) => self.editor.warn(e.to_string()),
             }
         }
         if rebuild && let Err(e) = self.rebuild() {
-            self.editor.say(e);
+            self.editor.warn(e);
         }
     }
 
@@ -2273,6 +2275,17 @@ impl App {
 
 /// The level files (`.mmp`) in the assets' levels folder, sorted.
 /// The model files in assets/models (sorted).
+/// What a material change says: what it did, or what went wrong (printed to the console
+/// too, to copy).
+fn material_status(said: Result<String, String>) -> String {
+    said.unwrap_or_else(|e| {
+        if !cfg!(test) {
+            eprintln!("material warning: {e}");
+        }
+        e
+    })
+}
+
 /// The level loader's message `why` about the level at `path` (its text `src`), with what
 /// it's about named by number where its line is a table row (`face 40 of sector 3`), for
 /// finding it in the editor (World > Find by number).
@@ -2991,7 +3004,7 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
             app.editor.rebinding = None;
             match app.editor.keys.save() {
                 Ok(()) => app.editor.say(said),
-                Err(e) => app.editor.say(format!("{said} (not saved: {e})")),
+                Err(e) => app.editor.warn(format!("{said} (not saved: {e})")),
             }
         }
         return true;
@@ -3494,7 +3507,7 @@ fn material_input(app: &mut App, display: &Display) {
                 let names = app.materials.names().to_vec();
                 if let Some(draft) = &mut app.material {
                     let said = draft.typed(row, &text, &names);
-                    draft.status = Some(said.unwrap_or_else(|e| e)).filter(|s| !s.is_empty());
+                    draft.status = Some(material_status(said)).filter(|s| !s.is_empty());
                 }
             }
         }
@@ -3582,12 +3595,12 @@ fn run_mact(app: &mut App, act: material_screen::MAct, dir: i32, textures: &[Str
                         draft.typed(Row::Texture(k), if pick == "none" { "" } else { &pick }, &names).map(|_| format!("texture {k}: {pick}"))
                     }
                 };
-                draft.status = Some(said.unwrap_or_else(|e| e));
+                draft.status = Some(material_status(said));
             }
         }
         MAct::Step(row) => {
             if let Some(draft) = &mut app.material {
-                draft.status = draft.step(row, dir, textures).err();
+                draft.status = draft.step(row, dir, textures).err().map(|e| material_status(Err(e)));
             }
         }
         MAct::Row(row) => {
@@ -3604,11 +3617,11 @@ fn run_mact(app: &mut App, act: material_screen::MAct, dir: i32, textures: &[Str
                     (screen.picker, screen.pick) = (Some(Picker::Texture(k)), Some(now));
                     (screen.picker_search, screen.picker_list) = (String::new(), Default::default());
                 }
-                Row::Sampler(_) | Row::Source(_) => draft.status = draft.step(row, dir, textures).err(),
+                Row::Sampler(_) | Row::Source(_) => draft.status = draft.step(row, dir, textures).err().map(|e| material_status(Err(e))),
                 Row::Save => {
                     let said = app.save_material();
                     if let Some(draft) = &mut app.material {
-                        draft.status = Some(said.unwrap_or_else(|e| e));
+                        draft.status = Some(material_status(said));
                     }
                 }
                 _ => {
@@ -4076,7 +4089,7 @@ fn run() -> Result<(), String> {
                 let drag = app.editor.dragging.take().unwrap();
                 app.editor.revert(drag.before, "drag stopped");
                 if let Err(e) = app.rebuild() {
-                    app.editor.say(e);
+                    app.editor.warn(e);
                 }
             } else if app.editor.on && !menu.open && app.editor.boxing.is_some() {
                 app.editor.boxing = None;
@@ -4145,7 +4158,7 @@ fn run() -> Result<(), String> {
                         let names = app.materials.names().to_vec();
                         if let Some(draft) = &mut app.material {
                             let said = draft.typed(row, &text, &names);
-                            draft.status = Some(said.unwrap_or_else(|e| e)).filter(|s| !s.is_empty());
+                            draft.status = Some(material_status(said)).filter(|s| !s.is_empty());
                         }
                     }
                     _ => {}
@@ -4200,7 +4213,7 @@ fn run() -> Result<(), String> {
             if let (Item::MaterialRow(row), true) = (item, dir != 0) {
                 let textures = material_edit::texture_choices(&app.assets.root().join("textures"));
                 if let Some(draft) = &mut app.material {
-                    draft.status = draft.step(row, dir, &textures).err();
+                    draft.status = draft.step(row, dir, &textures).err().map(|e| material_status(Err(e)));
                 }
             }
             // B binds a key to the setting (as Enter on it), Delete unbinds it.
@@ -4260,7 +4273,7 @@ fn run() -> Result<(), String> {
                     Item::MaterialRow(material_edit::Row::Save) => {
                         let said = app.save_material();
                         if let Some(draft) = &mut app.material {
-                            draft.status = Some(said.unwrap_or_else(|e| e));
+                            draft.status = Some(material_status(said));
                         }
                     }
                     Item::MaterialRow(row) => {
@@ -4268,7 +4281,7 @@ fn run() -> Result<(), String> {
                         if let Some(draft) = &mut app.material {
                             match draft.typing(row) {
                                 Some(text) => menu.typing = Some((item, text)),
-                                None => draft.status = draft.step(row, 1, &textures).err(),
+                                None => draft.status = draft.step(row, 1, &textures).err().map(|e| material_status(Err(e))),
                             }
                         }
                     }
