@@ -564,8 +564,13 @@ impl Editor {
         self.doc != self.saved || !self.path.exists()
     }
 
+    /// Shows `message` on the status line, and prints it to the console (to copy).
     pub fn say(&mut self, message: impl Into<String>) {
-        self.status = Some((message.into(), Instant::now()));
+        let message = message.into();
+        if !cfg!(test) {
+            println!("editor: {message}");
+        }
+        self.status = Some((message, Instant::now()));
     }
 
     pub fn step(&self) -> f32 {
@@ -605,7 +610,11 @@ impl Editor {
     pub fn revert(&mut self, before: Snapshot, why: &str) {
         (self.doc, self.selection, self.multi) = before;
         self.tidy();
-        self.say(why);
+        // Refused: on the console as an error, with the whole of the loader's message.
+        if !cfg!(test) {
+            eprintln!("editor error: {why}");
+        }
+        self.status = Some((why.to_string(), Instant::now()));
     }
 
     /// Whether `selection` is in the tables as they are.

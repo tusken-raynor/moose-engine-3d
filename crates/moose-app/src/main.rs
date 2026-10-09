@@ -902,6 +902,7 @@ impl App {
             Err(why) => {
                 self.editor.find_problem(&why);
                 if keep || self.editor.broken.is_some() {
+                    eprintln!("editor error (kept, the level won't load): {why}");
                     self.editor.broken = Some(self.named_problem(&why));
                     self.editor.commit(before, &format!("{what} (the level won't load until it's fixed)"));
                 } else {
