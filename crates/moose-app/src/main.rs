@@ -59,8 +59,8 @@
 //!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
 //!                         degree edge (default 8; 0 is a hard edge)
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
-//!   --level-lights        start with the level's own lights on (off by default, leaving the
-//!                         flashlight and the ambient light)
+//!   --no-level-lights     start with the level's own lights off, leaving the flashlight and
+//!                         the ambient light (on by default; --level-lights is accepted too)
 //!   --time T              seconds into the water's animation, for --screenshot
 //!   --bench N             for --screenshot: render the frame N more times and print the
 //!                         average view and raster times (for measuring)
@@ -316,7 +316,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         blur_scale: None,
         blur_half_rate: false,
         flashlight_fade: FLASHLIGHT_FADES[3],
-        level_lights: false,
+        level_lights: true,
         time: 0.0,
         bench: 0,
         views: None,
@@ -431,6 +431,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                 o.flashlight_fade = value()?.parse().map_err(|_| "bad --flashlight-fade")?
             }
             "--level-lights" => o.level_lights = true,
+            "--no-level-lights" => o.level_lights = false,
             "--show-samples" => o.show_samples = true,
             "--show-shadow-mesh" => o.show_shadow_mesh = true,
             "--dither-beam" => o.dither_beam = true,
@@ -511,6 +512,8 @@ struct Settings {
     /// The frame rate is capped, at `cap` frames a second.
     capped: bool,
     cap: u32,
+    /// The cap it started with (`--fps`), among the menu's choices (see `fps_choices`).
+    start_cap: u32,
     /// The debug HUD is showing; F3 toggles.
     hud: bool,
     /// The shadow pieces' outlines are drawn over the frame; F4 toggles.
@@ -748,7 +751,8 @@ impl App {
                 smoothing: 2,
                 capped: options.fps != 0,
                 cap: if options.fps == 0 { MAX_FPS } else { options.fps },
-                hud: options.hud || options.screenshot.is_none(),
+                start_cap: if options.fps == 0 { MAX_FPS } else { options.fps },
+                hud: options.hud,
                 shadow_mesh: options.show_shadow_mesh,
             },
             time: 0.0,
@@ -1572,7 +1576,16 @@ impl App {
             Setting::Fade => s.fade_range = cycle(&FADE_RANGE, s.fade_range, dir),
             Setting::TranslucentCrates => s.translucent_crates = !s.translucent_crates,
             Setting::PerPixelCrates => s.per_pixel_crates = !s.per_pixel_crates,
-            Setting::FrameCap => s.capped = !s.capped,
+            Setting::FrameCap => {
+                // Off, then each choice up.
+                let choices: Vec<u32> = std::iter::once(0).chain(fps_choices(s.start_cap)).collect();
+                let now = if s.capped { choices.iter().position(|&c| c == s.cap).unwrap_or(0) } else { 0 };
+                let next = choices[wrap(now, choices.len())];
+                s.capped = next != 0;
+                if next != 0 {
+                    s.cap = next;
+                }
+            }
             Setting::Resolution => {
                 let sizes = self.resolutions();
                 let i = sizes.iter().position(|&wh| wh == (self.width, self.height)).unwrap_or(0);
@@ -1705,7 +1718,7 @@ impl App {
         for (on, flag) in [
             (s.water, "--water"),
             (!s.flashlight, "--no-flashlight"),
-            (s.level_lights, "--level-lights"),
+            (!s.level_lights, "--no-level-lights"),
             (!s.shadows, "--no-shadows"),
             (!self.geometry.config.dynamic_shadows, "--no-dynamic-shadows"),
             (!s.sun, "--no-sun"),
@@ -2043,6 +2056,15 @@ fn cycle(list: &[f32], now: f32, dir: i32) -> f32 {
     list[i.rem_euclid(n) as usize]
 }
 
+/// The frame caps the menu offers: multiples of 30 up to 120, and the one it started with
+/// (`--fps`) where it falls among them.
+fn fps_choices(start: u32) -> Vec<u32> {
+    let mut choices = vec![30, 60, 90, 120, start];
+    choices.sort_unstable();
+    choices.dedup();
+    choices
+}
+
 /// A page of the options menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
@@ -2170,7 +2192,6 @@ impl Page {
             Page::Main => &[
                 Resume,
                 Open(Page::Levels),
-                Open(Page::Materials),
                 Open(Page::Lighting),
                 Open(Page::Flashlight),
                 Open(Page::Rendering),
@@ -2415,6 +2436,10 @@ struct Menu {
     binding: Option<Setting>,
     /// A row being typed on (Enter on it), and the text so far.
     typing: Option<(Item, String)>,
+    /// Where the page was last drawn, for the mouse, and where the pointer was then (a row
+    /// the pointer moves onto is selected; one it rests on doesn't take over the keys).
+    layout: Option<ui::MenuLayout>,
+    cursor: Option<(f32, f32)>,
 }
 
 /// Draws the menu page or the HUD over the app's frame, as the settings say.
@@ -2424,7 +2449,8 @@ fn draw_ui(
     binding: Option<Setting>,
     typing: Option<&str>,
     hud: Option<Vec<String>>,
-) {
+    back: bool,
+) -> Option<ui::MenuLayout> {
     let mut rows = menu.map(|(page, _)| app.rows(page));
     // The row being typed on shows the text so far.
     if let (Some(rows), Some((_, selected)), Some(text)) = (&mut rows, menu, typing)
@@ -2447,23 +2473,25 @@ fn draw_ui(
     if let Some(lines) = hud {
         ui::draw_hud(&mut canvas, &lines);
     }
+    let mut layout = None;
     if let (Some((page, selected)), Some(rows)) = (menu, rows) {
         let hint = match (page, binding) {
             _ if typing.is_some() => "Type   Enter done   Esc cancel".into(),
             (_, Some(setting)) => format!("Press a key for {}   Esc cancels", Item::Set(setting).label()),
-            (Page::Main, _) => "Up/Down choose   Enter pick   Esc close".into(),
+            (Page::Main, _) => "Up/Down choose   Enter or click pick   Esc close".into(),
             (Page::Levels, _) => "Up/Down choose   Enter load   Backspace back".into(),
             (Page::Materials, _) => "Up/Down choose   Enter open   Backspace back".into(),
             (Page::Material, _) => "Up/Down choose   Left/Right change   Enter type   Backspace back".into(),
-            _ => "Up/Down choose   Left/Right change   B bind a key   Backspace back".into(),
+            _ => "Click, wheel or Left/Right: change   B bind a key   Backspace back".into(),
         };
-        ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), &hint);
+        layout = Some(ui::draw_menu(&mut canvas, page.title(), &rows, selected, page.notes(), &hint, back));
     }
     if let Some((text, at)) = &app.toast
         && at.elapsed() < Duration::from_secs(2)
     {
         ui::draw_toast(&mut canvas, text);
     }
+    layout
 }
 
 /// Draws the last frame's shadow pieces (see `ViewGeometry::shadow_pieces`) over it, for
@@ -2988,7 +3016,7 @@ fn run() -> Result<(), String> {
                 app.materials.names(),
             ));
         }
-        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, None, hud);
+        draw_ui(&mut app, options.menu.map(|page| (page, 0)), None, None, hud, options.menu.is_some_and(|p| p != Page::Main));
         app.save_png(Path::new(path))?;
         println!(
             "wrote {path} ({}x{}): view {view_ms:.3} ms, raster {raster_ms:.3} ms",
@@ -3015,6 +3043,8 @@ fn run() -> Result<(), String> {
         back: Vec::new(),
         binding: None,
         typing: None,
+        layout: None,
+        cursor: None,
     };
     // Frame rate and times, averaged over half a second for the HUD.
     let (mut stats_at, mut frames, mut view_sum, mut raster_sum) = (Instant::now(), 0u32, 0.0, 0.0);
@@ -3133,6 +3163,21 @@ fn run() -> Result<(), String> {
             }
             // Rows come and go on the material page (its shaders read different things).
             menu.selected = menu.selected.min(items.len() - 1);
+            // The mouse: a row the pointer moves onto is selected; a click is Enter on it,
+            // a right click or the wheel steps it back or on; Back goes up a page.
+            let cursor = display.cursor_position();
+            let layout = menu.layout.as_ref();
+            let hovered = cursor.and_then(|c| layout?.row_at(c)).filter(|&i| i < items.len());
+            let (clicked, right) = (display.mouse_clicked(MouseButton::Left), display.mouse_clicked(MouseButton::Right));
+            let scroll = display.scroll();
+            let back_clicked = clicked && cursor.is_some_and(|c| layout.and_then(|l| l.back).is_some_and(|b| b.contains(c)));
+            if cursor != menu.cursor || clicked || right || scroll != 0.0 {
+                if let Some(i) = hovered {
+                    menu.selected = i;
+                }
+                menu.cursor = cursor;
+            }
+            let row_clicked = clicked && hovered.is_some();
             if display.key_repeated(Key::Up) {
                 menu.selected = (menu.selected + items.len() - 1) % items.len();
             }
@@ -3140,10 +3185,12 @@ fn run() -> Result<(), String> {
                 menu.selected = (menu.selected + 1) % items.len();
             }
             let item = items[menu.selected];
-            let dir = if display.key_repeated(Key::Left) {
+            let dir = if display.key_repeated(Key::Left) || (right && hovered.is_some()) {
                 -1
             } else if display.key_repeated(Key::Right) {
                 1
+            } else if hovered.is_some() && scroll != 0.0 {
+                scroll.signum() as i32
             } else {
                 0
             };
@@ -3165,7 +3212,7 @@ fn run() -> Result<(), String> {
                     app.unbind(setting);
                 }
             }
-            if display.key_pressed(Key::Enter) && !alt {
+            if (display.key_pressed(Key::Enter) && !alt) || row_clicked {
                 match item {
                     Item::Resume => menu.open = false,
                     Item::Respawn => {
@@ -3227,7 +3274,7 @@ fn run() -> Result<(), String> {
                     }
                 }
             }
-            if display.key_pressed(Key::Backspace) {
+            if display.key_pressed(Key::Backspace) || back_clicked {
                 match menu.back.pop() {
                     Some((page, selected)) => (menu.page, menu.selected) = (page, selected),
                     None => menu.open = false,
@@ -3354,8 +3401,9 @@ fn run() -> Result<(), String> {
         if !menu.open && display.key_pressed(Key::U) {
             app.change(Setting::FlashlightMount, 1);
         }
-        // Hotkeys: as Enter on their settings in the menu.
-        if !menu.open {
+        // Hotkeys: as Enter on their settings in the menu. The game's, while playing: the
+        // editor has its own keys (see `editor::Keys`).
+        if !menu.open && !app.editor.on {
             for (key, setting) in app.bindings.clone() {
                 if display.key_pressed(key) {
                     app.change(setting, 1);
@@ -3404,7 +3452,7 @@ fn run() -> Result<(), String> {
         }
         let hud = app.settings.hud.then(|| app.hud(stats.0, stats.1, stats.2, stats.3));
         let typing = menu.typing.as_ref().map(|(_, text)| text.as_str());
-        draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud);
+        menu.layout = draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud, !menu.back.is_empty());
         display.set_size(app.width, app.height);
         display.present(&app.pixels)?;
         let t = display.present_times();
@@ -3675,17 +3723,17 @@ mod tests {
         app.travel(false);
         assert_eq!(app.editor.doc.surfaces.len(), surfaces);
         assert_eq!(app.editor.hover, None);
-        draw_ui(&mut app, None, None, None, None);
+        draw_ui(&mut app, None, None, None, None, false);
         app.editor.panel();
         // Redone, the room is back, but what pointed into it isn't kept.
         app.travel(true);
         assert_eq!(app.editor.doc.surfaces.len(), surfaces + 6);
-        draw_ui(&mut app, None, None, None, None);
+        draw_ui(&mut app, None, None, None, None, false);
         // A stale one set by hand isn't drawn or listed either.
         app.travel(false);
         app.editor.hover = Some(Selection::Surface(last));
         app.editor.selection = Some(Selection::Vertex(10_000));
-        draw_ui(&mut app, None, None, None, None);
+        draw_ui(&mut app, None, None, None, None, false);
         app.editor.panel();
     }
 
@@ -3703,7 +3751,7 @@ mod tests {
             app.editor.selection = Some(Selection::Vertex(d.vertices.len() - 1));
         };
         let draw = |app: &mut App| {
-            draw_ui(app, None, None, None, None);
+            draw_ui(app, None, None, None, None, false);
             app.editor.panel();
         };
         // The edits the level accepted.
@@ -4416,8 +4464,8 @@ mod tests {
             // The level list, the materials and the material creator are made by the app.
             let made = matches!(page, Page::Levels | Page::Materials | Page::Material);
             assert!(made || !page.items().is_empty());
-            // The material creator opens from the materials.
-            if !matches!(page, Page::Main | Page::Material) {
+            // The materials (and the material creator) open from the editor.
+            if !matches!(page, Page::Main | Page::Materials | Page::Material) {
                 assert!(Page::Main.items().contains(&Item::Open(page)), "{page:?}");
             }
         }

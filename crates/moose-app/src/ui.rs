@@ -233,24 +233,71 @@ const DIM: u32 = 0x8C_8C_8C;
 const SELECTED: u32 = 0xFF_FF_FF;
 const HIGHLIGHT: u32 = 0x3A_4E_6E;
 
+/// A rectangle on screen, in pixels: left, top, width, height.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+impl Rect {
+    pub fn new(x: usize, y: usize, w: usize, h: usize) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    /// Whether framebuffer point `(x, y)` is in it.
+    pub fn contains(&self, (x, y): (f32, f32)) -> bool {
+        x >= self.x as f32 && y >= self.y as f32 && x < (self.x + self.w) as f32 && y < (self.y + self.h) as f32
+    }
+}
+
+/// Where a menu page was drawn, for the mouse: each row shown (its index among the page's
+/// rows, and where it is) and the Back button.
+#[derive(Clone, Debug, Default)]
+pub struct MenuLayout {
+    pub rows: Vec<(usize, Rect)>,
+    pub back: Option<Rect>,
+}
+
+impl MenuLayout {
+    /// The row under framebuffer point `at`, if any.
+    pub fn row_at(&self, at: (f32, f32)) -> Option<usize> {
+        self.rows.iter().find(|(_, r)| r.contains(at)).map(|&(i, _)| i)
+    }
+}
+
 /// Draws a menu page over the frame: the frame darkened, and a panel in the middle with
-/// its title, its rows (the selected one highlighted, values on the right), notes below
-/// them, and a line of key hints. Rows that don't fit scroll, keeping the selected one in
-/// view, with `...` where more are above or below.
-pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize, notes: &[&str], hint: &str) {
+/// its title (after a Back button, with `back`), its rows (the selected one highlighted,
+/// values on the right), notes below them, and a line of key hints. Rows that don't fit
+/// scroll, keeping the selected one in view, with `...` where more are above or below.
+/// Returns where everything went, for the mouse.
+pub fn draw_menu(
+    canvas: &mut Canvas,
+    title: &str,
+    rows: &[Row],
+    selected: usize,
+    notes: &[&str],
+    hint: &str,
+    back: bool,
+) -> MenuLayout {
+    let all = rows.len();
     let scale = if canvas.height >= 600 { 2 } else { 1 };
     let line = Canvas::line_height(scale);
     canvas.shade(0, 0, canvas.width, canvas.height, 90);
     let spacer = if notes.is_empty() { 0 } else { 1 };
     let room = (canvas.height.saturating_sub(16 * scale) / line).saturating_sub(notes.len() + spacer + 4).max(3);
-    let (rows, selected, more) = if rows.len() > room {
+    let (rows, selected, more, first) = if rows.len() > room {
         // Two rows go to the marks above and below.
         let shown = room - 2;
         let first = selected.saturating_sub(shown / 2).min(rows.len() - shown);
-        (&rows[first..first + shown], selected - first, Some((first > 0, first + shown < rows.len())))
+        (&rows[first..first + shown], selected - first, Some((first > 0, first + shown < rows.len())), first)
     } else {
-        (rows, selected, None)
+        (rows, selected, None, 0)
     };
+    let back_label = "< Back";
+    let title_x = if back { Canvas::text_width(back_label, scale) + Canvas::text_width("  ", scale) } else { 0 };
     let label_w = rows.iter().map(|r| Canvas::text_width(&r.label, scale)).max().unwrap_or(0);
     let value_w = rows
         .iter()
@@ -260,7 +307,7 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
         .unwrap_or(0);
     let notes_w = notes.iter().chain([&hint]).map(|n| Canvas::text_width(n, scale)).max().unwrap_or(0);
     let pad = 8 * scale;
-    let width = (label_w + 12 * scale + value_w).max(notes_w).max(Canvas::text_width(title, scale)) + 2 * pad;
+    let width = (label_w + 12 * scale + value_w).max(notes_w).max(title_x + Canvas::text_width(title, scale)) + 2 * pad;
     let marks = if more.is_some() { 2 } else { 0 };
     let height = line * (rows.len() + marks + notes.len() + spacer + 4) + 2 * pad;
     let (x0, y0) = (
@@ -268,7 +315,13 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
         canvas.height.saturating_sub(height) / 2,
     );
     canvas.fill(x0, y0, width, height, 0x14_16_1C);
-    canvas.text(x0 + pad, y0 + pad, title, TITLE, scale);
+    let mut layout = MenuLayout { rows: Vec::with_capacity(rows.len()), back: None };
+    if back {
+        canvas.text(x0 + pad, y0 + pad, back_label, TEXT, scale);
+        let w = Canvas::text_width(back_label, scale);
+        layout.back = Some(Rect::new(x0 + pad / 2, y0 + pad / 2, w + pad, line));
+    }
+    canvas.text(x0 + pad + title_x, y0 + pad, title, TITLE, scale);
     let mut y = y0 + pad + line * 2;
     let mark = |canvas: &mut Canvas, y: usize, on: bool| {
         if on {
@@ -290,8 +343,10 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
             let vx = x0 + width - pad - Canvas::text_width(value, scale);
             canvas.text(vx, y, value, color, scale);
         }
+        layout.rows.push((first + i, Rect::new(x0 + pad / 2, y - scale * 2, width - pad, line)));
         y += line;
     }
+    debug_assert!(layout.rows.iter().all(|&(i, _)| i < all));
     if let Some((_, below)) = more {
         mark(canvas, y, below);
         y += line;
@@ -302,6 +357,7 @@ pub fn draw_menu(canvas: &mut Canvas, title: &str, rows: &[Row], selected: usize
         y += line;
     }
     canvas.text(x0 + pad, y0 + height - pad - line + 2 * scale, hint, DIM, scale);
+    layout
 }
 
 /// Draws the debug HUD's lines in the top left corner, on a dark band.
