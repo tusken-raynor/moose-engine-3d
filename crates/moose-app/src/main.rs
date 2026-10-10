@@ -4900,12 +4900,12 @@ mod tests {
         assert_eq!(settings.sun.values[10], 0.0, "not night");
         assert_eq!(settings.sun.values[16], 1.0, "clouds");
         app.frame().unwrap();
-        // An hour of the day on (25 s), the sun has moved.
-        app.set_time(25.0);
+        // An hour of the day on (5 s), the sun has moved.
+        app.set_time(5.0);
         app.apply_lights(false);
         assert!(sun(&app).unwrap().direction.distance(morning.direction) > 0.05);
         // Midnight: no sunlight and no sun shadows, the sky at night, a dimmer ambient light.
-        let midnight = (1.0 - 0.35) * 600.0;
+        let midnight = (1.0 - 0.35) * 120.0;
         app.set_time(midnight);
         app.apply_lights(false);
         assert!(sun(&app).is_none());
@@ -4927,7 +4927,7 @@ mod tests {
         let options = parse_options(["--level", "canyon_day.mmp"].map(String::from)).unwrap();
         let line = app.command_line(&options, midnight + 30.0);
         let start: f32 = line.split("--time-of-day ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
-        let again = (start + (midnight + 30.0) / 600.0).rem_euclid(1.0);
+        let again = (start + (midnight + 30.0) / 120.0).rem_euclid(1.0);
         assert!((again - held).abs() < 1e-3 || (again - held).abs() > 1.0 - 1e-3, "{line}");
         assert!(line.contains("--weather "));
     }

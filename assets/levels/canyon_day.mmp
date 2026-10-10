@@ -328,4 +328,4 @@ ambient 0.15 0.16 0.20
 
 directional 1
 #  id  dx     dy     dz     r      g      b      angle
-   0   0.30   -0.85  0.42   1.78   1.69   1.51   0.53  cycle=600 time=0.35 clouds=7 weather=0.45 wind=12 wind_from=60
+   0   0.30   -0.85  0.42   1.78   1.69   1.51   0.53  cycle=120 time=0.35 clouds=7 weather=0.45 wind=12 wind_from=60
