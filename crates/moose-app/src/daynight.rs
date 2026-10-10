@@ -25,8 +25,13 @@ const EASE: f32 = 40.0;
 /// How far the cover wanders about the weather on its own, and how slowly (seconds).
 const WANDER: f32 = 0.12;
 const WANDER_TIME: f32 = 90.0;
-/// How much softer a fully cloudy sun's shadows are: degrees added to its size.
+/// How much softer a fully cloudy sun's shadows are: degrees added to its size; and a sun
+/// behind a thick cloud's.
 const OVERCAST_SPREAD: f32 = 6.0;
+const BEHIND_SPREAD: f32 = 4.0;
+/// Seconds the sun's light takes to follow a cloud coming in front of it or going (most of
+/// the way), so it dims and brightens, and its shadows soften, smoothly.
+const BEHIND_EASE: f32 = 1.5;
 
 /// What the cycle and the clouds come to at one moment.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,6 +83,8 @@ pub struct DayNight {
     /// Seconds the cycle has been held (paused), which don't count toward the time of day.
     held: f32,
     last: Option<f32>,
+    /// How much cloud is in front of the sun, eased (see [`BEHIND_EASE`]).
+    behind: Option<f32>,
 }
 
 impl DayNight {
@@ -93,7 +100,7 @@ impl DayNight {
         let east = Vec3::Y.cross(north).normalize();
         let pole = noon.cross(east).normalize();
         let clouds = sky.clouds.map(|seed| Clouds::new(seed, time as f64, noon));
-        DayNight { sky, noon, color, angle, east, pole, ambient, cover: sky.weather, clouds, held: 0.0, last: None }
+        DayNight { sky, noon, color, angle, east, pole, ambient, cover: sky.weather, clouds, held: 0.0, last: None, behind: None }
     }
 
     /// Whether the sun moves (the level has a cycle).
@@ -120,9 +127,25 @@ impl DayNight {
         let target = weather.unwrap_or(self.sky.weather);
         self.cover += (target - self.cover) * (1.0 - (-dt / EASE).exp());
         let toward = self.toward(time);
-        match &mut self.clouds {
+        let changed = match &mut self.clouds {
             Some(clouds) => clouds.advance_to(time as f64, toward),
             None => false,
+        };
+        // The cloud in front of the sun, eased: a cloud's edge sliding over it dims it over a
+        // second or two, not at once.
+        let now = self.behind_now(time, toward);
+        self.behind = Some(match self.behind {
+            Some(b) => b + (now - b) * (1.0 - (-dt / BEHIND_EASE).exp()),
+            None => now,
+        });
+        changed
+    }
+
+    /// How much cloud is in front of the sun (toward it: `toward`) at `time`, as it is.
+    fn behind_now(&self, time: f32, toward: Vec3) -> f32 {
+        match &self.clouds {
+            Some(c) if toward.y > 0.0 => c.density_at(Self::on_layer(toward) + self.slide(time), time as f64, self.cover(time)),
+            _ => 0.0,
         }
     }
 
@@ -166,14 +189,11 @@ impl DayNight {
         // Low, the sun is warmer and dimmer.
         let low = 1.0 - smooth(0.0, 0.35, up);
         let warm = Vec3::ONE.lerp(Vec3::new(1.0, 0.62, 0.38), low);
-        // Behind a cloud, dimmer still.
-        let behind = match &self.clouds {
-            Some(c) if up > 0.0 => c.density_at(Self::on_layer(toward) + self.slide(time), time as f64, cover),
-            _ => 0.0,
-        };
+        // Behind a cloud (eased: see `advance`), dimmer still, and its shadows softer.
+        let behind = self.behind.unwrap_or_else(|| self.behind_now(time, toward));
         let lit = smooth(-0.02, 0.12, up) * (1.0 - 0.85 * behind) * (1.0 - 0.25 * cover);
         let sun = self.color * warm * lit;
-        let angle = (self.angle + OVERCAST_SPREAD * cover).min(45.0);
+        let angle = (self.angle + OVERCAST_SPREAD * cover + BEHIND_SPREAD * behind).min(45.0);
         let night_ambient = self.ambient * 0.25 * Vec3::new(0.55, 0.65, 1.0);
         let ambient = night_ambient.lerp(self.ambient * (1.0 + 0.6 * cover), day);
         let brightness = 0.35 + 0.65 * smooth(-0.05, 0.4, up);
@@ -201,7 +221,7 @@ impl DayNight {
 
     /// Goes on from `old` (the level rebuilt): its held time, cover and clock.
     pub fn carry_on(&mut self, old: &DayNight) {
-        (self.held, self.cover, self.last) = (old.held, old.cover, old.last);
+        (self.held, self.cover, self.last, self.behind) = (old.held, old.cover, old.last, old.behind);
     }
 
     /// How many fields of the layer a unit of the view's slope spans (`sky_box`'s `[20]`).
@@ -286,5 +306,23 @@ mod tests {
         assert!(now.clouds.unwrap().cut < 0.0);
         // Cloudy days' shadows are softer.
         assert!(now.angle > 0.53 + 3.0);
+    }
+
+    #[test]
+    fn a_cloud_in_front_of_the_sun_dims_it_over_a_second_or_two() {
+        let mut d = cycle(0.5);
+        d.advance(0.0, true, None);
+        // The sun's view of the clouds as it is, against the eased one, a step at a time:
+        // the eased one never jumps more than a share of the gap.
+        let mut last = d.behind.unwrap();
+        for k in 1..400 {
+            let t = k as f32 * 0.05;
+            d.advance(t, true, Some(0.7));
+            let eased = d.behind.unwrap();
+            let raw = d.behind_now(t, d.toward(t));
+            let share = 1.0 - (-0.05f32 / BEHIND_EASE).exp();
+            assert!((eased - last).abs() <= (raw - last).abs() * share + 1e-5, "{t}: {last} -> {eased} (raw {raw})");
+            last = eased;
+        }
     }
 }

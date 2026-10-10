@@ -122,9 +122,19 @@ impl Clouds {
     /// `cover` (see [`density`]): for dimming the sun behind a cloud.
     pub fn density_at(&self, at: Vec2, time: f64, cover: f32) -> f32 {
         let t = self.blend(time);
+        // Bilinear, as the shader reads it (texel centers at halves), wrapping.
         let read = |g: &Generation| {
-            let (x, y) = ((at.x.rem_euclid(1.0) * CLOUD_SIZE as f32) as usize, (at.y.rem_euclid(1.0) * CLOUD_SIZE as f32) as usize);
-            g.field[y.min(CLOUD_SIZE - 1) * CLOUD_SIZE + x.min(CLOUD_SIZE - 1)]
+            let n = CLOUD_SIZE as isize;
+            let (x, y) = (at.x.rem_euclid(1.0) * CLOUD_SIZE as f32 - 0.5, at.y.rem_euclid(1.0) * CLOUD_SIZE as f32 - 0.5);
+            let (x0, y0) = (x.floor(), y.floor());
+            let (fx, fy) = (x - x0, y - y0);
+            let texel = |dx: isize, dy: isize| {
+                let (sx, sy) = ((x0 as isize + dx).rem_euclid(n), (y0 as isize + dy).rem_euclid(n));
+                g.field[(sy * n + sx) as usize]
+            };
+            let top = texel(0, 0) + (texel(1, 0) - texel(0, 0)) * fx;
+            let bottom = texel(0, 1) + (texel(1, 1) - texel(0, 1)) * fx;
+            top + (bottom - top) * fy
         };
         density(read(&self.older) + (read(&self.newer) - read(&self.older)) * t, cover)
     }
