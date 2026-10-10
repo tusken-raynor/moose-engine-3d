@@ -223,7 +223,7 @@ pub const SHADERS: [ShaderInfo; 16] = [
     ShaderInfo { name: "cube_reflection", about: "A mirror finish from a cube map of what's around it (a mirror ball); the engine fills in its inputs.", kind: Kind::CubeReflection, slots: &["cube"], inputs: &[], engine: &[], attribs: &["normal"] },
     ShaderInfo { name: "terrain_detail", about: "Vertex colors times a detail texture (128 keeps the color), smoothly lit by the mesh's normals: terrain.", kind: Kind::TerrainDetail, slots: &["detail"], inputs: &[], engine: &[], attribs: &["color", "uv", "normal"] },
     ShaderInfo { name: "terrain_noise", about: "terrain_detail with its grain from 3D noise in the world instead of a texture: no seams, no stretching on slopes.", kind: Kind::TerrainNoise, slots: &[], inputs: &[input("strength", Unit, "How far the grain takes colors either way (0: none).")], engine: &[], attribs: &["color", "normal"] },
-    ShaderInfo { name: "sky_box", about: "A sky from a cube map, with the level's sun in it (a disk and its glare); the engine fills in its inputs.", kind: Kind::SkyBox, slots: &["cube"], inputs: &[], engine: &[], attribs: &[] },
+    ShaderInfo { name: "sky_box", about: "A sky from a cube map, with the level's sun in it (a disk and its glare). With a day and night (the sun's cycle=), it fades to the night's cube map, whose stars turn; with clouds (@clouds), a layer of them over it. The engine fills in its inputs.", kind: Kind::SkyBox, slots: &["day cube", "night cube", "clouds"], inputs: &[], engine: &[], attribs: &[] },
 ];
 
 /// The registered program named `name`.
@@ -371,6 +371,8 @@ pub struct Materials {
     /// heights (`@water_heights`).
     pub waters: Vec<(TextureId, TextureId)>,
     pub heights: Option<TextureId>,
+    /// The clouds' field (`@clouds`), drawn by the app from the level's (see `daynight`).
+    pub clouds: Option<TextureId>,
 }
 
 impl Materials {
@@ -382,6 +384,7 @@ impl Materials {
         let mut compiled = Vec::with_capacity(library.len());
         let mut waters: Vec<(TextureId, TextureId)> = Vec::new();
         let mut heights = None;
+        let mut clouds = None;
         let mut cubes: HashMap<String, TextureId> = HashMap::new();
         for def in &library.materials {
             let at = |m: String| format!("{}:{}: material '{}': {m}", def.file.display(), def.line, def.name);
@@ -421,7 +424,12 @@ impl Materials {
                             Tex::Id(*heights.get_or_insert_with(|| assets.add_texture(ripples.heights("water heights"))))
                         }
                         ("cube", None) => Tex::EntityCube,
-                        _ => return Err(at(format!("no run-time texture '@{name}' (known: @water:FILE, @water_heights, @cube)"))),
+                        ("clouds", None) => Tex::Id(*clouds.get_or_insert_with(|| {
+                            // Clear until the level's clouds are drawn in it.
+                            let size = moose_assets::CLOUD_SIZE as u32;
+                            assets.add_texture(Texture::new("clouds", size, size, vec![0; (size * size) as usize]).unwrap())
+                        })),
+                        _ => return Err(at(format!("no run-time texture '@{name}' (known: @water:FILE, @water_heights, @cube, @clouds)"))),
                     },
                 };
             }
@@ -474,6 +482,7 @@ impl Materials {
             compiled,
             waters,
             heights,
+            clouds,
         })
     }
 
@@ -783,7 +792,17 @@ impl Table {
             Kind::CubeReflection => (ids.cube_reflection, Params::default()),
             Kind::TerrainDetail => (ids.terrain_detail, Params::default()),
             Kind::TerrainNoise => (ids.terrain_noise, Params::new(values)),
-            Kind::SkyBox => (ids.sky_box, self.sun),
+            Kind::SkyBox => {
+                // Without a night's cube map, no night; without clouds, none.
+                let mut sun = self.sun;
+                if b.textures[1] == Tex::None {
+                    sun.values[10] = 0.0;
+                }
+                if b.textures[2] == Tex::None {
+                    sun.values[16] = 0.0;
+                }
+                (ids.sky_box, sun)
+            }
         };
         // Each engine input is one number.
         let mut back_light = 0.0;

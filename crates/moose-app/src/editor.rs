@@ -156,6 +156,18 @@ pub enum Field {
     SunAngle,
     SunYaw,
     SunPitch,
+    /// The sun's day and night and clouds (its `cycle=`, `time=` typed in hours, `clouds=`,
+    /// `weather=`, `wind=`, `wind_from=`).
+    DayLength,
+    DayStart,
+    CloudSeed,
+    Weather,
+    Wind,
+    WindFrom,
+    /// Adds a sun to a level without one.
+    AddSun,
+    /// Gives the level's sky faces the day and night sky (`sky_cycle`).
+    SkyCycleFaces,
     /// A surface's texture: shifted across, shifted down, scaled, sized across or down
     /// (meters a repeat), turned, flipped across (mirrored left to right) or down (top to
     /// bottom), or mapped flat from its corners' positions. Across, down, the sizes and the
@@ -259,6 +271,12 @@ impl Field {
                 | Field::SunAngle
                 | Field::SunYaw
                 | Field::SunPitch
+                | Field::DayLength
+                | Field::DayStart
+                | Field::CloudSeed
+                | Field::Weather
+                | Field::Wind
+                | Field::WindFrom
         )
     }
 
@@ -1819,6 +1837,41 @@ impl Editor {
                 *c = (*c + 0.01 * dir).max(0.0);
                 Ok(format!("ambient {}, {}, {}", n(a.x), n(a.y), n(a.z)))
             }
+            (_, Field::AddSun) => {
+                if !self.doc.directional.is_empty() {
+                    return Err("the level has a sun".into());
+                }
+                self.doc.directional.push(moose_assets::DirectionalDoc {
+                    direction: Vec3::new(0.3, -0.85, 0.42),
+                    color: Vec3::new(1.8, 1.7, 1.5),
+                    angle: 0.53,
+                    options: Vec::new(),
+                });
+                Ok("added a sun: it comes in through sky faces (flag sky)".into())
+            }
+            (_, Field::SkyCycleFaces) => {
+                let mut k = 0;
+                for s in self.doc.surfaces.iter_mut().filter(|s| s.flags & 0x2 != 0) {
+                    s.options.retain(|o| !o.starts_with("material="));
+                    s.options.push("material=sky_cycle".into());
+                    k += 1;
+                }
+                Ok(format!("{} drawn with the day and night sky", count(k, "sky face")))
+            }
+            (_, Field::DayLength | Field::DayStart | Field::CloudSeed | Field::Weather | Field::Wind | Field::WindFrom) => {
+                // Stepped: a minute a day, a quarter hour, a seed, a twentieth, a meter a
+                // second, 15°.
+                let now = |key: &str, default: f32| self.sun_option(key).and_then(|v| v.parse::<f32>().ok()).unwrap_or(default);
+                let value = match field {
+                    Field::DayLength => (now("cycle", 0.0) + 60.0 * dir).max(0.0),
+                    Field::DayStart => (now("time", 0.5) + dir / 96.0).rem_euclid(1.0) * 24.0,
+                    Field::CloudSeed => self.sun_option("clouds").map_or(1.0, |s| s.parse::<f32>().unwrap_or(0.0) + dir),
+                    Field::Weather => now("weather", 0.3) + 0.05 * dir,
+                    Field::Wind => now("wind", 8.0) + dir,
+                    _ => now("wind_from", 0.0) + TURN * dir,
+                };
+                self.set_sky(field, value)
+            }
             (_, Field::SunAngle | Field::SunYaw | Field::SunPitch) => {
                 let Some(sun) = self.doc.directional.first_mut() else {
                     return Err("the level has no sun".into());
@@ -2040,6 +2093,41 @@ impl Editor {
             }
             _ => Err("that doesn't apply here".into()),
         }
+    }
+
+    /// The sun's option `key` (`key=value`), if it has a sun with one.
+    pub fn sun_option(&self, key: &str) -> Option<&str> {
+        let sun = self.doc.directional.first()?;
+        sun.options.iter().find_map(|o| o.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// Sets the sun's day, night or clouds `field` to `value` (a start time in hours; a
+    /// cloud seed below 0 for no clouds; a day of 0 for none).
+    fn set_sky(&mut self, field: Field, value: f32) -> Result<String, String> {
+        // Short, to a hundredth: `600`, `0.8`.
+        let n = |v: f32| format!("{}", (v * 100.0).round() / 100.0);
+        let sun = self.doc.directional.first_mut().ok_or("the level has no sun (World: Add a sun)")?;
+        let (key, set, said) = match field {
+            Field::DayLength if value <= 0.0 => ("cycle", None, "no day and night: the sun stays".to_string()),
+            Field::DayLength => ("cycle", Some(n(value.round())), format!("a day lasts {} s", value.round())),
+            Field::DayStart => {
+                let hours = value.rem_euclid(24.0);
+                ("time", Some(format!("{:.4}", hours / 24.0)), format!("the day starts at {}", crate::daynight::clock(hours / 24.0)))
+            }
+            Field::CloudSeed if value < 0.0 => ("clouds", None, "no clouds".to_string()),
+            Field::CloudSeed => ("clouds", Some(format!("{}", value.round() as u32)), format!("clouds, seed {}", value.round() as u32)),
+            Field::Weather => {
+                let w = value.clamp(0.0, 1.0);
+                ("weather", Some(n((w * 100.0).round() / 100.0)), format!("weather {}", n((w * 100.0).round() / 100.0)))
+            }
+            Field::Wind => ("wind", Some(n(value.clamp(0.0, 200.0))), format!("wind {} m/s", n(value.clamp(0.0, 200.0)))),
+            _ => ("wind_from", Some(n(value.rem_euclid(360.0))), format!("wind from {}°", n(value.rem_euclid(360.0)))),
+        };
+        sun.options.retain(|o| moose_assets::option_key(o) != key);
+        if let Some(v) = set {
+            sun.options.push(format!("{key}={v}"));
+        }
+        Ok(said)
     }
 
     /// Adds a prop of `model` where the view is (on the grid), in the sector `world` has
@@ -2383,6 +2471,9 @@ impl Editor {
                     sun.direction = -aim(yaw, pitch);
                 }
                 return Ok("sun set".into());
+            }
+            (_, Field::DayLength | Field::DayStart | Field::CloudSeed | Field::Weather | Field::Wind | Field::WindFrom) => {
+                return self.set_sky(field, value);
             }
             (Some(_), Field::X | Field::Y | Field::Z) => {
                 let axis = axis_of(field);

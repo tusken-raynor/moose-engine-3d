@@ -2093,12 +2093,24 @@ pub use cube_reflection::CubeReflection;
 /// A sky: a cube map seen from where the eye is (texture 0, RGBM: see [`SKY_RANGE`]), so it
 /// shows the same whichever surfaces it is drawn on, with a sun in it: a disk and its glare
 /// toward the level's sun, past white (an HDR material: how far is in the top byte, for a
-/// post pass to make glow; see `Material::HDR`).
+/// post pass to make glow; see `Material::HDR`). With a day and night cycle, it fades to a
+/// second cube map, the night's (texture 1), whose stars turn about the sky's pole as the
+/// sun does; with clouds, a layer of them over it (texture 2, `moose_assets::Clouds`), read
+/// where the view meets the layer, as much of it cloud as the cover says.
 ///
-/// Params: the way toward the sun (`values[0..3]`, unit length), its tint (`values[3..6]`),
-/// its angular radius (`values[6]`, radians), how bright its disk and glare are
-/// (`values[7]`, 0 for no sun), whether to write how far past white (`values[8]`, 1 or 0),
-/// and the cube map's face size (`values[9]`, texels).
+/// Params:
+/// - the sun: the way toward it (`values[0..3]`, unit length), its tint (`[3..6]`), its
+///   angular radius (`[6]`, radians), how bright its disk and glare are (`[7]`, 0 for no
+///   sun), whether to write how far past white (`[8]`, 1 or 0);
+/// - the cube maps' face size (`[9]`, texels);
+/// - night: how far to the night's cube map (`[10]`, 0 day to 1 night), the pole the stars
+///   turn about (`[11..14]`, unit) and the cosine and sine of their turn (`[14]`, `[15]`);
+/// - clouds (`[16]` 1 for some): the field's level they start at (`[17]`, see
+///   `moose_assets::cloud_cut`), where the layer is read from (`[18..20]`: the wind's slide,
+///   in fields) and how many fields a unit of the view's slope spans (`[20]`), how far from
+///   the field's older generation to its newer (`[21]`), their sunlit color (`[22..25]`) and
+///   their shaded one (`[25..28]`, display-encoded, either past 1);
+/// - the day's cube map's tint (`[28..31]`: dimmer and warmer as the sun goes down).
 pub mod sky_box {
     use crate::shader::{
         F32s, Fill, HDR_RANGE, I32s, Material, PixelContext, SampleContext, U32s, VertexContext, sample_cube_by,
@@ -2148,9 +2160,33 @@ pub mod sky_box {
         #[inline(always)]
         fn shade_pixel(_: &Fixed32, _: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
             let v = &ctx.params.values;
-            let texel = sample_cube_by(ctx.textures[0], c.dir, c.lod[0].to_array()[0], ctx.at, ctx.filters[0]);
-            let m = super::channel(texel, 24) * F32s::fill(SKY_RANGE / (255.0 * 255.0));
-            let mut color = [16, 8, 0].map(|shift| super::channel(texel, shift) * m);
+            let lod = c.lod[0].to_array()[0];
+            let decode = |texel: U32s| {
+                let m = super::channel(texel, 24) * F32s::fill(SKY_RANGE / (255.0 * 255.0));
+                [16, 8, 0].map(|shift| super::channel(texel, shift) * m)
+            };
+            let night = v[10];
+            let mut color = [F32s::fill(0.0); 3];
+            if night < 1.0 {
+                let day = decode(sample_cube_by(ctx.textures[0], c.dir, lod, ctx.at, ctx.filters[0]));
+                for k in 0..3 {
+                    color[k] = day[k] * F32s::fill(v[28 + k] * (1.0 - night));
+                }
+            }
+            if night > 0.0 {
+                // The stars turned about the pole: the view turned back (Rodrigues).
+                let d = &c.dir;
+                let k = [F32s::fill(v[11]), F32s::fill(v[12]), F32s::fill(v[13])];
+                let (cos, sin) = (F32s::fill(v[14]), F32s::fill(v[15]));
+                let kd = k[0] * d[0] + k[1] * d[1] + k[2] * d[2];
+                let cross = [k[1] * d[2] - k[2] * d[1], k[2] * d[0] - k[0] * d[2], k[0] * d[1] - k[1] * d[0]];
+                let turned: [F32s; 3] =
+                    std::array::from_fn(|i| d[i] * cos + cross[i] * sin + k[i] * kd * (F32s::fill(1.0) - cos));
+                let stars = decode(sample_cube_by(ctx.textures[1], turned, lod, ctx.at, ctx.filters[1]));
+                for k in 0..3 {
+                    color[k] += stars[k] * F32s::fill(night);
+                }
+            }
             if v[7] > 0.0 {
                 // The sun: a disk (its edge over a pixel) and glare around it, by the angle
                 // from it (from 1 - cos, which is half its square near the sun).
@@ -2169,6 +2205,36 @@ pub mod sky_box {
                 let sun = (disk * F32s::fill(12.0) + glare(1.5, 0.02) + glare(0.25, 0.25)) * F32s::fill(v[7]);
                 for (k, ch) in color.iter_mut().enumerate() {
                     *ch += sun * F32s::fill(v[3 + k]);
+                }
+            }
+            if v[16] > 0.0 {
+                // Where the view meets the layer (a unit above the eye: the view's slope),
+                // slid by the wind; none below the horizon, fading in just above it.
+                let d = &c.dir;
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).max(F32s::fill(1e-12)).sqrt();
+                let up = d[1] / len;
+                let over = d[1].max(F32s::fill(1e-4)).recip();
+                let scale = F32s::fill(v[20] * 65536.0);
+                let u = (d[0] * over * scale + F32s::fill(v[18] * 65536.0)).round_int();
+                let w = (d[2] * over * scale + F32s::fill(v[19] * 65536.0)).round_int();
+                let texel = ctx.texel(2, &[u, w], crate::shader::I16s::fill(0));
+                let byte = |shift: u32| super::channel(texel, shift) * F32s::fill(1.0 / 255.0);
+                let t = F32s::fill(v[21]);
+                let field = byte(16) + (byte(0) - byte(16)) * t;
+                let lit = byte(8) + (byte(24) - byte(8)) * t;
+                let smooth = |x: F32s| x * x * (F32s::fill(3.0) - x - x);
+                let cut = F32s::fill(v[17]);
+                let soft = moose_assets::CLOUD_SOFTNESS;
+                let cover = smooth(((field - cut) * F32s::fill(1.0 / soft)).max(F32s::fill(0.0)).min(F32s::fill(1.0)));
+                let horizon = smooth(((up - F32s::fill(0.02)) * F32s::fill(1.0 / 0.13)).max(F32s::fill(0.0)).min(F32s::fill(1.0)));
+                let alpha = cover * horizon;
+                // Thick cloud is darker underneath.
+                let thick = smooth(((field - cut - F32s::fill(soft)) * F32s::fill(1.0 / 0.3)).max(F32s::fill(0.0)).min(F32s::fill(1.0)));
+                let dim = F32s::fill(1.0) - thick * F32s::fill(0.35);
+                for (k, ch) in color.iter_mut().enumerate() {
+                    let (shade, sun) = (F32s::fill(v[25 + k]), F32s::fill(v[22 + k]));
+                    let cloud = (shade + (sun - shade) * lit) * dim;
+                    *ch = *ch + (cloud - *ch) * alpha;
                 }
             }
             // White at most in the color, and how far past white in the top byte.

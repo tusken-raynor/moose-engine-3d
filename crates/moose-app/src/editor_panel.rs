@@ -485,10 +485,30 @@ impl Editor {
             let (yaw, pitch) = crate::editor::aim_of(-sun.direction);
             let (v, a, w) = typed(Field::SunAngle, format!("{}°", n(sun.angle)));
             c.row("Sun size", v, a, w);
-            let (v, a, w) = typed(Field::SunYaw, format!("{}°", n(yaw)));
-            c.row("Sun from (yaw)", v, a, w);
-            let (v, a, w) = typed(Field::SunPitch, format!("{}°", n(pitch)));
-            c.row("Sun height", v, a, w);
+            // With a day and night, where it is at noon.
+            let noon = if self.sun_option("cycle").is_some() { " at noon" } else { "" };
+            let (v, a, w) = typed(Field::SunYaw, format!("{}°", n(yaw.round())));
+            c.row(&format!("Sun from (yaw){noon}"), v, a, w);
+            let (v, a, w) = typed(Field::SunPitch, format!("{}°", n(pitch.round())));
+            c.row(&format!("Sun height{noon}"), v, a, w);
+            // Its day and night, and clouds.
+            let option = |key: &str| self.sun_option(key).map(str::to_string);
+            let length = option("cycle").unwrap_or("none".into());
+            let (v, a, w) = typed(Field::DayLength, if length == "none" { length } else { format!("{length} s") });
+            c.row("Day lasts", v, a, w);
+            let start = option("time").and_then(|t| t.parse::<f32>().ok()).unwrap_or(0.5);
+            let (v, a, w) = typed(Field::DayStart, crate::daynight::clock(start));
+            c.row("Day starts at (hours)", v, a, w);
+            let (v, a, w) = typed(Field::CloudSeed, option("clouds").unwrap_or("none (-1)".into()));
+            c.row("Clouds (seed)", v, a, w);
+            let (v1, a1, w1) = typed(Field::Weather, option("weather").unwrap_or("0.3".into()));
+            let (v2, a2, w2) = typed(Field::Wind, format!("{} m/s", option("wind").unwrap_or("8".into())));
+            c.pair(("Weather", v1, a1, w1), ("Wind", v2, a2, w2));
+            let (v, a, w) = typed(Field::WindFrom, format!("{}°", option("wind_from").unwrap_or("0".into())));
+            c.row("Wind from", v, a, w);
+            c.row("Sky faces: day and night sky", String::new(), Some(Act::Edit(Field::SkyCycleFaces)), None);
+        } else {
+            c.row("Add a sun", "+".into(), Some(Act::Edit(Field::AddSun)), None);
         }
         c.row("Meta values", format!("{} >", self.meta_values(Owner::Level).len()), Some(Act::Open(Menu::Meta(Owner::Level))), None);
         c.gap();

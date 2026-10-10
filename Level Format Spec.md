@@ -209,7 +209,17 @@ A light reaches its own sector, and passes into the next through any open portal
 | `r g b` | Linear RGB, as for lights |
 | `angle` | The source's angular diameter in degrees, 0 to 45 (the sun is about 0.53): its shadows soften over the part of it an occluder covers. 0 casts hard shadows. |
 
-Options: `shadows=on|off` (default on), and `name=NAME`, as a light's.
+Options: `shadows=on|off` (default on), and `name=NAME`, as a light's. The first directional light (the sun) can also have a day and night and clouds (see the Lighting Spec's Day and night):
+
+| Option | Meaning |
+| --- | --- |
+| `cycle=SECONDS` | How long a day lasts; the sun goes round on an arc through its direction, which is where it is at noon. 0 or none: it stays. |
+| `time=F` | The time of day it starts at, 0 to 1: 0 midnight, 0.25 sunrise, 0.5 noon (the default), 0.75 sunset. |
+| `clouds=SEED` | A layer of clouds over the sky, picked by the seed (a whole number); none without. |
+| `weather=F` | How cloudy the sky tends to be, 0 clear to 1 overcast (default 0.3). |
+| `wind=SPEED`, `wind_from=DEG` | The wind the clouds drift on, meters a second (default 8), and the way it comes from (degrees, turning left from -Z as a yaw does; default 0). |
+
+The sky's faces show the night and the clouds when drawn with a sky that has them (`sky_cycle`).
 
 ## Terrain
 

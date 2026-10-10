@@ -74,7 +74,7 @@ The editor works on the level's own tables, `moose_assets::LevelDoc`: the `.mmp`
 **The icons** (right edge, top down):
 
 - **+ Add:** a new room (4 × 3 × 4 m where the view is), a light, a prop (then its model, from a searchable list), a spawn point.
-- **World:** the level's stats, its ambient light and sun (typed or scrolled), its meta values, and **Find by number** (also `/`): `sector 3`, `face 12` (or `f12`), `vertex 7`, `light 2`, or an entity's name selects it (in its mode) and brings the view to it: a 2D view centered on it, the 3D view backed off from it along where it looks (or, outside the level, turned to it). While the tables won't load, **Go to the problem** does the same for what the loader refused.
+- **World:** the level's stats, its ambient light and sun (typed or scrolled; with a day and night, where it is at noon), the sun's day and night and clouds (how long a day lasts, when it starts, in hours, the clouds' seed, the weather, the wind and where it comes from; see the Lighting Spec), Sky faces: day and night sky (gives the sky faces `sky_cycle`), Add a sun for a level without one, its meta values, and **Find by number** (also `/`): `sector 3`, `face 12` (or `f12`), `vertex 7`, `light 2`, or an entity's name selects it (in its mode) and brings the view to it: a 2D view centered on it, the 3D view backed off from it along where it looks (or, outside the level, turned to it). While the tables won't load, **Go to the problem** does the same for what the loader refused.
 - **Gear:** the editor's controls (see Keys), and the 2D views' turn step.
 - **Materials** (a square of dithered gradient): the material editor, over the whole window (see below).
 

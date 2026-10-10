@@ -1,0 +1,12 @@
+MOOSEMATERIAL 2
+# Sky surfaces of a level with a day and night (its sun's cycle=) and clouds (clouds=): the
+# day's sky fading to the night's, whose stars turn, with the clouds over them; its vertex
+# colors with the Sky setting flat.
+shader             sky_box
+texture0           cube:sky_day
+filter0            bilinear_mipmap_none
+texture1           cube:sky_night
+filter1            bilinear_mipmap_none
+texture2           @clouds
+filter2            bilinear_mipmap_none
+variant.simple_sky sky_flat

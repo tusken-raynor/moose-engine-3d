@@ -28,6 +28,7 @@ pub use mmp_edit::fit_affine;
 mod mmdl;
 mod mmdl_doc;
 mod obj;
+mod clouds;
 mod ripples;
 mod skin;
 mod store;
@@ -39,7 +40,7 @@ pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
     DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
-    Portal, PortalFlags, Sector, Terrain,
+    Portal, PortalFlags, Sector, Sky, Terrain,
 };
 pub use mmp_doc::{
     AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,
@@ -49,6 +50,7 @@ pub use mmp_doc::{
 pub use mmdl_doc::{AnimationDoc, BoneDoc, ModelDoc, ModelPolygonDoc};
 pub use mesh::{Attrib, AttribData, Mesh, NO_MATERIAL, PolyFlags, Polygon, StorageFormat};
 pub use obj::parse_obj;
+pub use clouds::{CLOUD_SIZE, Clouds, PERIOD as CLOUD_PERIOD, SOFTNESS as CLOUD_SOFTNESS, cut as cloud_cut, density as cloud_density};
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};
 pub use skin::{Animation, Bone, Pose, Skin};
 pub use store::{Assets, MeshId, TextureId};

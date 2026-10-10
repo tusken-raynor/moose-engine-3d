@@ -65,7 +65,11 @@
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
 //!   --no-level-lights     start with the level's own lights off, leaving the flashlight and
 //!                         the ambient light (on by default; --level-lights is accepted too)
-//!   --time T              seconds into the water's animation, for --screenshot
+//!   --time T              seconds into the water's animation (and the day), for --screenshot
+//!   --time-of-day F       for a level with a day and night: the time of day at the start
+//!                         (0 midnight, 0.25 sunrise, 0.5 noon, 0.75 sunset)
+//!   --weather W           the clouds' weather, 0 clear to 1 overcast (the level's otherwise)
+//!   --cycle MODE          the day and night: running (the default), held or off
 //!   --bench N             for --screenshot: render the frame N more times and print the
 //!                         average view and raster times (for measuring)
 //!   --views FILE          for --screenshot: first render a frame from each camera in FILE
@@ -94,6 +98,7 @@
 //! what Enter does there; kept in ~/.config/moose/keys.txt), and Delete unbinds it. While playing, the cursor is locked (hidden) for mouse look; in the menu
 //! it is free.
 
+mod daynight;
 mod editor;
 mod editor_keys;
 mod editor_panel;
@@ -247,6 +252,11 @@ struct Options {
     blur_half_rate: bool,
     flashlight_fade: f32,
     time: f32,
+    /// The day's start and the weather (`--time-of-day`, `--weather`), and how the day goes
+    /// (`--cycle`).
+    time_of_day: Option<f32>,
+    weather: Option<f32>,
+    cycle: CycleMode,
     /// For --screenshot: render the frame this many times more, and report the average.
     bench: u32,
     /// For --screenshot: cameras to render a frame from first, one a line.
@@ -331,6 +341,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         flashlight_fade: FLASHLIGHT_FADES[3],
         level_lights: true,
         time: 0.0,
+        time_of_day: None,
+        weather: None,
+        cycle: CycleMode::Running,
         bench: 0,
         views: None,
         show_samples: false,
@@ -478,6 +491,18 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                 o.step_threshold = Some(value()?.parse().map_err(|_| "bad --step-threshold")?)
             }
             "--time" => o.time = value()?.parse().map_err(|_| "bad --time")?,
+            "--time-of-day" => {
+                o.time_of_day = Some(value()?.parse::<f32>().map_err(|_| "bad --time-of-day")?.rem_euclid(1.0))
+            }
+            "--weather" => o.weather = Some(value()?.parse::<f32>().map_err(|_| "bad --weather")?.clamp(0.0, 1.0)),
+            "--cycle" => {
+                o.cycle = match value()?.as_str() {
+                    "running" => CycleMode::Running,
+                    "held" => CycleMode::Held,
+                    "off" => CycleMode::Off,
+                    _ => return Err("--cycle is running, held or off".into()),
+                }
+            }
             "--bench" => o.bench = value()?.parse().map_err(|_| "bad --bench")?,
             "--views" => o.views = Some(value()?),
             other => return Err(format!("unknown option {other}")),
@@ -516,6 +541,10 @@ struct Settings {
     shadows: bool,
     /// The level's directional lights (the sun) are on.
     sun: bool,
+    /// How the level's day and night goes, and the weather asked for (an index into
+    /// `WEATHERS`: the level's, or a cover).
+    cycle: CycleMode,
+    weather: usize,
     /// Every light's source size, as a multiple of its own (one of `SOFTNESS`).
     softness: f32,
     /// The same for shadows carved every frame (dynamic lights' and moving occluders'), at
@@ -657,6 +686,10 @@ struct App {
     material: Option<material_edit::Draft>,
     /// The material editor (the editor's material icon), while it's open.
     material_screen: Option<material_screen::MaterialScreen>,
+    /// The level's day and night and its clouds, if its sun has them; and a weather asked for
+    /// on the command line that isn't one of the menu's.
+    day: Option<daynight::DayNight>,
+    asked_weather: Option<f32>,
     /// Seconds since the start: for the water's ripples and moving lights.
     time: f32,
     pixels: Vec<u32>,
@@ -776,6 +809,11 @@ impl App {
                 cone: options.cone,
                 flashlight_lock: None,
                 smoothing: 2,
+                cycle: options.cycle,
+                weather: options.weather.map_or(0, |w| {
+                    // The nearest of the menu's, or the one asked for (made the menu's last).
+                    WEATHERS.iter().position(|c| c.is_some_and(|c| (c - w).abs() < 1e-3)).unwrap_or(WEATHERS.len())
+                }),
                 capped: options.fps != 0,
                 cap: if options.fps == 0 { MAX_FPS } else { options.fps },
                 start_cap: if options.fps == 0 { MAX_FPS } else { options.fps },
@@ -787,6 +825,8 @@ impl App {
             level: options.level.clone(),
             material: None,
             material_screen: None,
+            day: None,
+            asked_weather: options.weather,
             pixels: vec![0; (options.width * options.height) as usize],
             width: options.width,
             height: options.height,
@@ -806,6 +846,8 @@ impl App {
         );
         app.bake_cube_maps()?;
         app.settings.level_lights = options.level_lights;
+        app.day = app.day_of(options.time_of_day);
+        app.show_clouds();
         Ok(app)
     }
 
@@ -845,6 +887,13 @@ impl App {
             .unwrap_or(0);
         self.world = world;
         self.lights = (self.world.lights().to_vec(), self.world.ambient);
+        // The day goes on from where it was, with the sun's options as they are now.
+        let mut day = self.day_of(None);
+        if let (Some(day), Some(old)) = (&mut day, &self.day) {
+            day.carry_on(old);
+        }
+        self.day = day;
+        self.show_clouds();
         (self.level_filters, self.entity_filters) = binding_filters_of(&self.world)?;
         self.spare_cubes
             .extend(self.cube_maps.drain(..).flatten().map(|c| c.texture));
@@ -1496,6 +1545,44 @@ impl App {
                 *self.assets.texture_mut(heights) = self.ripples.heights("water heights");
             }
         }
+        // The day and the clouds.
+        let (running, weather) = (self.settings.cycle == CycleMode::Running, self.weather_now());
+        if let Some(day) = &mut self.day
+            && day.advance(time, running, weather)
+        {
+            self.show_clouds();
+        }
+    }
+
+    /// The level's day and night and clouds, if its sun has them (`time_of_day`: when the
+    /// day starts, over the level's).
+    fn day_of(&self, time_of_day: Option<f32>) -> Option<daynight::DayNight> {
+        let d = self.world.directional.first().filter(|d| d.sky.cycle > 0.0 || d.sky.clouds.is_some())?;
+        let mut sky = d.sky;
+        if let Some(t) = time_of_day {
+            sky.time = t;
+        }
+        Some(daynight::DayNight::new(d.direction, d.color, d.angle, sky, self.lights.1, self.time))
+    }
+
+    /// Puts the clouds' field into their texture (`@clouds`), if there are both.
+    fn show_clouds(&mut self) {
+        if let (Some(id), Some(clouds)) = (self.materials.clouds, self.day.as_ref().and_then(|d| d.clouds.as_ref())) {
+            *self.assets.texture_mut(id) = clouds.texture("clouds");
+        }
+    }
+
+    /// The weather asked for: the menu's, the command line's, or none (the level's).
+    fn weather_now(&self) -> Option<f32> {
+        match WEATHERS.get(self.settings.weather) {
+            Some(w) => *w,
+            None => self.asked_weather,
+        }
+    }
+
+    /// What the day and clouds come to now, if the level has them.
+    fn day_now(&self) -> Option<daynight::Now> {
+        self.day.as_ref().map(|d| d.now(self.time, self.settings.cycle == CycleMode::Off))
     }
 
     /// Bakes a cube map for each mirror ball: the level rendered six times from the ball's
@@ -1569,6 +1656,9 @@ impl App {
         // view scales the lights' sizes below by this).
         self.geometry.config.dynamic_softness =
             if s.softness > 0.0 { s.dynamic_softness.min(s.softness) / s.softness } else { 0.0 };
+        // The day: where the sun is, how it lights, the ambient light.
+        let day = self.day_now();
+        let moving = self.day.as_ref().is_some_and(|d| (d.cycles() && s.cycle == CycleMode::Running) || d.clouds.is_some());
         let mut lights: Vec<Light> = Vec::new();
         for (i, &l) in self.lights.0.iter().enumerate() {
             let mut l = scaled(l);
@@ -1580,6 +1670,19 @@ impl App {
             if l.directional {
                 if !s.sun {
                     continue;
+                }
+                if let Some(now) = &day {
+                    // Down: no sunlight, no shadows.
+                    if now.sun.max_element() < 1e-3 {
+                        continue;
+                    }
+                    let sun = Light::directional(-now.toward, now.sun, now.angle);
+                    (l.direction, l.position, l.color, l.radius) = (sun.direction, sun.position, sun.color, sun.radius);
+                    // Carved every frame while it moves (or its size does, with the clouds),
+                    // rather than cached and thrown away each frame.
+                    if moving {
+                        l.is_static = false;
+                    }
                 }
                 // Its radius is the sine of its angular radius: the angle is scaled, up to
                 // 22.5 degrees (45 across).
@@ -1605,7 +1708,7 @@ impl App {
             light.id = moose_assets::FLASHLIGHT_ID;
             lights.push(light);
         }
-        self.world.set_lights(lights, self.lights.1);
+        self.world.set_lights(lights, day.map_or(self.lights.1, |now| now.ambient));
     }
 
     /// The player's flashlight: where it was locked, or on their shoulder.
@@ -1753,6 +1856,29 @@ impl App {
                 true => on(s.sun),
                 false => "none here".into(),
             },
+            Setting::DayNight => match &self.day {
+                Some(day) if day.cycles() => {
+                    let mode = match s.cycle {
+                        CycleMode::Running => "running",
+                        CycleMode::Held => "held",
+                        CycleMode::Off => "off",
+                    };
+                    format!("{mode} ({})", daynight::clock(day.time_of_day(self.time)))
+                }
+                _ => "none here".into(),
+            },
+            Setting::Weather => match (&self.day, self.weather_now()) {
+                (Some(day), _) if day.clouds.is_none() => "no clouds here".into(),
+                (None, _) => "no clouds here".into(),
+                (Some(_), None) => "the level's".into(),
+                (Some(_), Some(w)) => match w {
+                    w if w <= 0.01 => "clear".into(),
+                    w if (w - 0.35).abs() < 0.01 => "fair".into(),
+                    w if (w - 0.65).abs() < 0.01 => "cloudy".into(),
+                    w if w >= 0.99 => "overcast".into(),
+                    w => format!("{w:.2}"),
+                },
+            },
             Setting::Softness => softness(s.softness),
             Setting::DynamicSoftness => softness(s.dynamic_softness),
             Setting::SpotPenumbra => format!("x{:.2}", s.penumbra),
@@ -1806,6 +1932,19 @@ impl App {
             Setting::Lit => s.lit = !s.lit,
             Setting::LevelLights => s.level_lights = !s.level_lights,
             Setting::Sun => s.sun = !s.sun,
+            Setting::DayNight => {
+                s.cycle = match (s.cycle, dir > 0) {
+                    (CycleMode::Running, true) | (CycleMode::Off, false) => CycleMode::Held,
+                    (CycleMode::Held, true) | (CycleMode::Running, false) => CycleMode::Off,
+                    _ => CycleMode::Running,
+                }
+            }
+            Setting::Weather => {
+                // The level's, then clear to overcast (and one asked for on the command line,
+                // while it's chosen).
+                let n = WEATHERS.len();
+                s.weather = wrap(s.weather.min(n - 1), n);
+            }
             Setting::Softness => s.softness = cycle(&SOFTNESS, s.softness, dir),
             Setting::DynamicSoftness => s.dynamic_softness = cycle(&SOFTNESS, s.dynamic_softness, dir),
             Setting::SpotPenumbra => {
@@ -1999,6 +2138,17 @@ impl App {
         ));
         add(format!("--cone {}", self.cone_name()));
         add(format!("--time {time}"));
+        if let Some(day) = &self.day {
+            // The day's start that makes it this time of day at `time`, and the cover now
+            // (as the weather, which a screenshot starts at).
+            if day.cycles() {
+                let start = (day.time_of_day(time) - time / day.sky.cycle).rem_euclid(1.0);
+                add(format!("--time-of-day {start:.5}"));
+            }
+            if day.clouds.is_some() {
+                add(format!("--weather {:.3}", day.cover(time)));
+            }
+        }
         for (on, flag) in [
             (s.water, "--water"),
             (!s.flashlight, "--no-flashlight"),
@@ -2097,17 +2247,56 @@ impl App {
     /// What the player's settings say this frame, for resolving materials.
     fn frame_settings(&self) -> FrameSettings {
         let s = &self.settings;
-        // The sky box's params: toward the sun, its tint and size, whether there is one,
-        // whether to write how far past white for the bloom.
+        // The sky box's params (see `moose_raster::shaders::sky_box`): the sun (toward it, its
+        // tint and size, how much shows, whether to write how far past white for the
+        // bloom), and with a day and night, the night and the stars' turn, and the clouds.
+        let day = self.day_now();
         let sun = self.world.directional.first().filter(|_| s.sun);
-        let (toward, tint, radius) = match sun {
-            Some(d) => (
+        let (toward, tint, radius, disk) = match (sun, &day) {
+            // The disk as big as the level has it (a cloudy day softens shadows, not it).
+            (Some(d), Some(now)) => (
+                now.toward,
+                now.sun / now.sun.max_element().max(1e-6),
+                (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
+                now.disk,
+            ),
+            (Some(d), None) => (
                 -d.direction.normalize(),
                 d.color / d.color.max_element().max(1e-6),
                 (d.angle * 0.5).to_radians() * SUN_DISK_SCALE,
+                1.0,
             ),
-            None => (Vec3::Y, Vec3::ONE, 0.0),
+            (None, _) => (Vec3::Y, Vec3::ONE, 0.0, 0.0),
         };
+        let mut sky = [0.0f32; 31];
+        sky[..9].copy_from_slice(&[
+            toward.x,
+            toward.y,
+            toward.z,
+            tint.x,
+            tint.y,
+            tint.z,
+            radius,
+            disk,
+            if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
+        ]);
+        sky[28..31].copy_from_slice(&[1.0; 3]);
+        if let Some(now) = &day {
+            sky[10] = now.night;
+            sky[11..14].copy_from_slice(&now.pole.to_array());
+            // The view turned back by the stars' turn.
+            (sky[14], sky[15]) = (now.turn.cos(), -now.turn.sin());
+            if let Some(c) = &now.clouds {
+                sky[16] = 1.0;
+                sky[17] = c.cut;
+                (sky[18], sky[19]) = (c.slide.x, c.slide.y);
+                sky[20] = daynight::DayNight::layer_scale();
+                sky[21] = c.blend;
+                sky[22..25].copy_from_slice(&c.sunlit.to_array());
+                sky[25..28].copy_from_slice(&c.shaded.to_array());
+            }
+            sky[28..31].copy_from_slice(&now.day_tint.to_array());
+        }
         FrameSettings {
             water: s.water,
             translucent: s.translucent_crates,
@@ -2116,17 +2305,7 @@ impl App {
             specular: s.specular,
             reflectance: s.reflectance,
             fade: s.fade_range,
-            sun: Params::new(&[
-                toward.x,
-                toward.y,
-                toward.z,
-                tint.x,
-                tint.y,
-                tint.z,
-                radius,
-                if sun.is_some() { 1.0 } else { 0.0 },
-                if s.bloom != BloomMode::Off { 1.0 } else { 0.0 },
-            ]),
+            sun: Params::new(&sky),
             // The level's lights as they are now: black while they're off (the sun with
             // its own setting).
             lights: self
@@ -2454,6 +2633,19 @@ fn fps_choices(start: u32) -> Vec<u32> {
     choices
 }
 
+/// How a level's day and night goes (the Lighting page's Day and night).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleMode {
+    Running,
+    /// The time of day stands still.
+    Held,
+    /// The sun stays as the level has it, and the sky as at its noon.
+    Off,
+}
+
+/// The weathers the menu steps through: the level's, then clear to overcast.
+const WEATHERS: [Option<f32>; 5] = [None, Some(0.0), Some(0.35), Some(0.65), Some(1.0)];
+
 /// A page of the options menu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
@@ -2496,6 +2688,8 @@ enum Setting {
     Lit,
     LevelLights,
     Sun,
+    DayNight,
+    Weather,
     Softness,
     DynamicSoftness,
     SpotPenumbra,
@@ -2597,6 +2791,8 @@ impl Page {
                 Set(DynamicSoftness),
                 Set(LevelLights),
                 Set(Sun),
+                Set(DayNight),
+                Set(Weather),
                 Set(SpotPenumbra),
             ],
             Page::Flashlight => &[
@@ -2695,6 +2891,8 @@ impl Item {
                 Setting::Lit => "All lighting",
                 Setting::LevelLights => "Level lights",
                 Setting::Sun => "Sun",
+                Setting::DayNight => "Day and night",
+                Setting::Weather => "Weather",
                 Setting::Softness => "Shadow softness",
                 Setting::DynamicSoftness => "Dynamic softness",
                 Setting::SpotPenumbra => "Spot cone edge",
@@ -4686,6 +4884,84 @@ mod tests {
         assert_eq!(app.material_screen.as_ref().unwrap().shaders(), ["basic_bumpy", "reflective_bumpy"]);
         run_mact(&mut app, MAct::Close, 1, &textures);
         assert!(app.material_screen.is_none());
+    }
+
+    #[test]
+    fn a_day_turns_to_night_the_sun_goes_down_and_the_sky_follows() {
+        let mut app = test_app("canyon_day.mmp");
+        assert!(app.day.as_ref().is_some_and(|d| d.cycles() && d.clouds.is_some()));
+        let sun = |app: &App| app.world.lights().iter().find(|l| l.directional).copied();
+        // The morning (08:24): the sun up, carved every frame as it moves.
+        app.set_time(0.0);
+        app.apply_lights(false);
+        let morning = sun(&app).expect("the sun is up");
+        assert!(morning.direction.y < 0.0 && !morning.is_static);
+        let (day_ambient, settings) = (app.world.ambient, app.frame_settings());
+        assert_eq!(settings.sun.values[10], 0.0, "not night");
+        assert_eq!(settings.sun.values[16], 1.0, "clouds");
+        app.frame().unwrap();
+        // An hour of the day on (25 s), the sun has moved.
+        app.set_time(25.0);
+        app.apply_lights(false);
+        assert!(sun(&app).unwrap().direction.distance(morning.direction) > 0.05);
+        // Midnight: no sunlight and no sun shadows, the sky at night, a dimmer ambient light.
+        let midnight = (1.0 - 0.35) * 600.0;
+        app.set_time(midnight);
+        app.apply_lights(false);
+        assert!(sun(&app).is_none());
+        assert_eq!(app.frame_settings().sun.values[10], 1.0);
+        assert!(app.world.ambient.length() < day_ambient.length());
+        app.frame().unwrap();
+        // Held, the time of day stands still.
+        app.settings.cycle = CycleMode::Held;
+        app.set_time(midnight + 30.0);
+        let held = app.day.as_ref().unwrap().time_of_day(midnight + 30.0);
+        assert!(!(1e-3..=1.0 - 1e-3).contains(&held), "{held}");
+        // Off: the sun where the level has it, up.
+        app.settings.cycle = CycleMode::Off;
+        app.apply_lights(false);
+        let authored = app.world.directional[0].direction;
+        assert!(sun(&app).unwrap().direction.distance(authored) < 1e-4);
+        // F1's command line takes the time of day back to where it was.
+        app.settings.cycle = CycleMode::Running;
+        let options = parse_options(["--level", "canyon_day.mmp"].map(String::from)).unwrap();
+        let line = app.command_line(&options, midnight + 30.0);
+        let start: f32 = line.split("--time-of-day ").nth(1).unwrap().split(' ').next().unwrap().parse().unwrap();
+        let again = (start + (midnight + 30.0) / 600.0).rem_euclid(1.0);
+        assert!((again - held).abs() < 1e-3 || (again - held).abs() > 1.0 - 1e-3, "{line}");
+        assert!(line.contains("--weather "));
+    }
+
+    #[test]
+    fn the_editor_gives_a_level_a_sun_a_day_and_clouds() {
+        use editor::Field;
+        let mut app = test_app("two_rooms.mmp");
+        assert!(app.day.is_none());
+        app.edit(Field::AddSun, 1.0);
+        assert_eq!(app.world.directional.len(), 1);
+        app.type_value(Field::DayLength, "600");
+        app.type_value(Field::DayStart, "18");
+        app.type_value(Field::CloudSeed, "4");
+        app.type_value(Field::Weather, "0.8");
+        let options = app.editor.doc.directional[0].options.clone();
+        for o in ["cycle=600", "time=0.7500", "clouds=4", "weather=0.8"] {
+            assert!(options.iter().any(|x| x == o), "{o} in {options:?}");
+        }
+        assert!(app.day.as_ref().is_some_and(|d| d.cycles() && d.clouds.is_some()));
+        assert!((app.day.as_ref().unwrap().time_of_day(0.0) - 0.75).abs() < 1e-4);
+        app.edit(Field::SkyCycleFaces, 1.0);
+        let doc = &app.editor.doc;
+        assert!(doc.surfaces.iter().filter(|s| s.flags & 0x2 != 0).all(|s| s.options.iter().any(|o| o == "material=sky_cycle")));
+        // No clouds, no day: none of it.
+        app.type_value(Field::CloudSeed, "-1");
+        app.type_value(Field::DayLength, "0");
+        assert!(app.day.is_none());
+        // The loader checks the options.
+        let text = std::fs::read_to_string(app.assets.root().join("levels/canyon_day.mmp")).unwrap();
+        let bad = text.replace("weather=0.45", "weather=2");
+        let why = app.assets.parse_level("bad.mmp", &bad).unwrap_err().to_string();
+        assert!(why.contains("weather is a number from 0 to 1"), "{why}");
+        assert!(app.assets.parse_level("bad.mmp", &text.replace("clouds=7", "clouds=x")).is_err());
     }
 
     #[test]

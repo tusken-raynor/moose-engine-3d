@@ -736,7 +736,8 @@ pub type TextureSet<'a> = [&'a Texture; MAX_TEXTURES];
 /// reaches materials through their stage contexts instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Params {
-    pub values: [f32; 16],
+    /// 32: the sky box takes the most (the sun, day and night, the stars' turn, clouds).
+    pub values: [f32; 32],
 }
 
 impl Params {

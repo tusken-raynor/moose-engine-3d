@@ -54,6 +54,36 @@ pub struct DirectionalLight {
     pub shadows: bool,
     /// Its bit in a [`LightMask`] (see [`Light::id`]).
     pub id: u8,
+    /// Its day and night, and the clouds (see [`Sky`]).
+    pub sky: Sky,
+}
+
+/// A sun's day and night cycle and its sky's clouds (directional light options). With a
+/// cycle, the sun goes round once a `cycle` seconds on an arc through its direction (where
+/// it is at noon), the sky fades to night and back, and the stars turn; with clouds, the sky
+/// has a layer of them, seeded, changing with time and drifting with the wind, as much of it
+/// cloud as the weather says (eased toward it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sky {
+    /// Seconds a day lasts (`cycle=`); 0, no cycle: the sun stays where it is.
+    pub cycle: f32,
+    /// The time of day it starts at (`time=`): 0 midnight, 0.25 sunrise, 0.5 noon, 0.75
+    /// sunset.
+    pub time: f32,
+    /// The clouds' seed (`clouds=`); none, no clouds.
+    pub clouds: Option<u32>,
+    /// How much of the sky the clouds tend toward (`weather=`), 0 clear to 1 overcast.
+    pub weather: f32,
+    /// The wind (`wind=`, meters a second, and `wind_from=`, degrees the way it comes from,
+    /// turning left from -Z as a yaw does).
+    pub wind: f32,
+    pub wind_from: f32,
+}
+
+impl Default for Sky {
+    fn default() -> Sky {
+        Sky { cycle: 0.0, time: 0.5, clouds: None, weather: 0.3, wind: 8.0, wind_from: 0.0 }
+    }
 }
 
 /// Lights a thing isn't lit by (`exclude_lights=` on a surface, sector or entity): bit k

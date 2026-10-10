@@ -10,7 +10,7 @@ use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
 use crate::level::{
     DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, Occluder,
-    ShadowKind, Oscillation, Portal, PortalFlags, Sector, Terrain,
+    ShadowKind, Oscillation, Portal, PortalFlags, Sector, Sky, Terrain,
 };
 use crate::material::{Binding, binding_of};
 use crate::meta::{MetaKeys, MetaValues, take_meta};
@@ -804,7 +804,47 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             }
             let mut shadows = true;
             let mut name = None;
+            let mut sky = Sky::default();
             for option in &r.tokens[fields..] {
+                // A sky option's number, checked to be within `range`.
+                let number = |key: &str, range: std::ops::RangeInclusive<f32>| -> Result<Option<f32>, LoadError> {
+                    let Some(v) = option.strip_prefix(key).and_then(|o| o.strip_prefix('=')) else {
+                        return Ok(None);
+                    };
+                    match v.parse::<f32>() {
+                        Ok(x) if range.contains(&x) => Ok(Some(x)),
+                        _ => Err(c.err(
+                            r.no,
+                            format!("directional light {i}: {key} is a number from {} to {}", range.start(), range.end()),
+                        )),
+                    }
+                };
+                if let Some(v) = number("cycle", 0.0..=1e6)? {
+                    sky.cycle = v;
+                    continue;
+                }
+                if let Some(v) = number("time", 0.0..=1.0)? {
+                    sky.time = v;
+                    continue;
+                }
+                if let Some(v) = number("weather", 0.0..=1.0)? {
+                    sky.weather = v;
+                    continue;
+                }
+                if let Some(v) = number("wind_from", -360.0..=360.0)? {
+                    sky.wind_from = v;
+                    continue;
+                }
+                if let Some(v) = number("wind", 0.0..=200.0)? {
+                    sky.wind = v;
+                    continue;
+                }
+                if let Some(seed) = option.strip_prefix("clouds=") {
+                    sky.clouds = Some(seed.parse().map_err(|_| {
+                        c.err(r.no, format!("directional light {i}: clouds is a seed, a whole number from 0"))
+                    })?);
+                    continue;
+                }
                 match option.as_str() {
                     "shadows=on" => shadows = true,
                     "shadows=off" => shadows = false,
@@ -834,6 +874,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 angle,
                 shadows,
                 id: if k < FLASHLIGHT_ID as usize { k as u8 } else { NO_LIGHT_ID },
+                sky,
             });
             light_names.push(name);
         }
