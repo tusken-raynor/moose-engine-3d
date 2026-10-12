@@ -80,7 +80,7 @@ lights 5
 
 ## Sections
 
-**`vertices`**: the global position table. Adjacent sectors share vertices wherever they meet.
+**`vertices`**: the global position table. Adjacent sectors share vertices wherever they meet. After its `x y z`, a vertex can have meta values (`$KEY=VALUE`), for a material input read per vertex (`vertex:KEY`, see the Material Format Spec): blended across each face whose material reads it, and costing nothing where none does. Nothing else follows a position.
 
 **`attributes`**: declares the per-vertex attributes (varyings) that every drawn surface vertex carries. The format assigns them no meaning. `color` is only a name that a shader asks for; the rasterizer sees three u8 values to interpolate.
 

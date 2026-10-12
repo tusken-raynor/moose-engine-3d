@@ -14,7 +14,7 @@ use moose_assets::{
     TextureSource,
 };
 use moose_raster::shaders::{
-    BasicBumpy, BasicBumpyMirrored, CubeReflection, RandomSections, RandomSectionsMirrored, ReflectiveBumpy,
+    BasicBumpy, BasicBumpyMirrored, ColoredBumpy, ColoredBumpyMirrored, CubeReflection, RandomSections, RandomSectionsMirrored, ReflectiveBumpy,
     ReflectiveBumpyMirrored, ReflectiveBumpyReflected, SkyBox, Textured, TexturedFresnel, TexturedLitMirrored, TexturedNormal, TexturedNormalSpecular,
     TexturedSpecular, TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel,
     VertexColorNoise, VertexColorTranslucent, Water, filter,
@@ -39,6 +39,8 @@ pub enum Kind {
     /// `BasicBumpy`: diffuse, bumped where the material gives a normal map and the player's
     /// setting allows; flat in a mirror.
     BasicBumpy,
+    /// `ColoredBumpy`: `BasicBumpy` with its corners' colors multiplied into the texture's.
+    ColoredBumpy,
     /// `RandomSections`: `BasicBumpy` with each repeat one of four sections, picked at random.
     RandomSections,
     /// `ReflectiveBumpy`: `BasicBumpy` with puddles where its color's alpha says, reflecting
@@ -107,15 +109,24 @@ impl InputType {
     }
 }
 
-/// An input a program reads, by name, and what it does (for the material editor).
+/// An input a program reads, by name, and what it does (for the material editor); with
+/// `vertex`, read per vertex: a mesh attribute of its name, blended across the polygon,
+/// which the engine fills from the material's source (a `vertex:` meta value, or one for the
+/// whole polygon) where a material reads it (see [`Materials::fill_vertex_inputs`]).
 pub struct Input {
     pub name: &'static str,
     pub ty: InputType,
     pub about: &'static str,
+    pub vertex: bool,
 }
 
 const fn input(name: &'static str, ty: InputType, about: &'static str) -> Input {
-    Input { name, ty, about }
+    Input { name, ty, about, vertex: false }
+}
+
+/// An input read per vertex (see [`Input`]).
+const fn per_vertex(name: &'static str, ty: InputType, about: &'static str) -> Input {
+    Input { name, ty, about, vertex: true }
 }
 
 /// A program materials can name: its texture slots, its inputs (in the order it reads
@@ -189,7 +200,7 @@ impl ShaderInfo {
 }
 
 use EngineInput::BackLight;
-use InputType::{Number, Unit};
+use InputType::{Color, Number, Unit};
 
 /// The registry (see the Material Format Spec).
 // Inputs several programs share.
@@ -200,7 +211,7 @@ const FADE: Input = input("fade", Number, "Meters past the surface over which it
 const OPACITY: Input = input("opacity", Unit, "How solid it is, 0 (unseen) to 255.");
 const DETAIL: Input = input("detail", Unit, "Fine noise added close up, where the texture is magnified (0: none); the color's alpha masks it.");
 
-pub const SHADERS: [ShaderInfo; 16] = [
+pub const SHADERS: [ShaderInfo; 17] = [
     ShaderInfo { name: "vertex_color", about: "The mesh's vertex colors, lit.", kind: Kind::VertexColor, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
     ShaderInfo { name: "sky", about: "The mesh's vertex colors, unlit: shown as they are, whatever the lights.", kind: Kind::Sky, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
     ShaderInfo { name: "vertex_color_translucent", about: "Vertex colors, lit, seen through at one opacity.", kind: Kind::VertexColorTranslucent, slots: &[], inputs: &[OPACITY], engine: &[], attribs: &["color"] },
@@ -213,6 +224,8 @@ pub const SHADERS: [ShaderInfo; 16] = [
     ShaderInfo { name: "lit", about: "A texture with bumps from a normal map and a highlight (the color's alpha dulls it, for mortar and such), and detail noise.", kind: Kind::Lit, slots: &["color", "normal map"], inputs: &[input("specular", Unit, "How bright the highlight is (0: none)."), input("shininess", Number, "How tight the highlight is, as the log2 of its power (5 is a power of 32)."), DETAIL], engine: &[BackLight], attribs: &["uv"] },
     // A road: diffuse with bumps, whole out to `short` meters and gone by `far`.
     ShaderInfo { name: "basic_bumpy", about: "A texture with bumps from a normal map and nothing else (a road): bumps whole up close, fading out with distance.", kind: Kind::BasicBumpy, slots: &["color", "normal map"], inputs: &[SHORT, FAR], engine: &[BackLight], attribs: &["uv"] },
+    // `basic_bumpy` with the corners' colors (the `color` attribute, 255 none) multiplied in.
+    ShaderInfo { name: "colored_bumpy", about: "basic_bumpy with a tint, read per vertex and blended across the face, multiplied into the texture (255,255,255 leaves it as it is): for variety painted on vertices (vertex:KEY meta values).", kind: Kind::ColoredBumpy, slots: &["color", "normal map"], inputs: &[SHORT, FAR, per_vertex("tint", Color, "Multiplied into the texture's color, per vertex and blended across the face (255,255,255: no change). Usually vertex:KEY|255,255,255, from the vertices' meta values.")], engine: &[BackLight], attribs: &["uv"] },
     // A sidewalk: `basic_bumpy` with each repeat (1:1) one of the 4:1 texture's four
     // sections, picked by a hash of the repeat and `seed` (a whole number).
     ShaderInfo { name: "random_sections", about: "basic_bumpy for a texture of four sections side by side (a sidewalk's slabs): each repeat shows one, picked at random.", kind: Kind::RandomSections, slots: &["color", "normal map"], inputs: &[SHORT, FAR, input("seed", Number, "A whole number: another picks the sections differently.")], engine: &[BackLight], attribs: &["uv"] },
@@ -259,6 +272,8 @@ pub struct ShaderIds {
     lit_mirrored: MaterialId,
     /// `BasicBumpy`, and its copy seen in a mirror (or with bumps off).
     basic_bumpy: [MaterialId; 2],
+    /// `ColoredBumpy`, and its copy seen in a mirror (or with bumps off).
+    colored_bumpy: [MaterialId; 2],
     /// `RandomSections`, and its copy seen in a mirror (or with bumps off).
     random_sections: [MaterialId; 2],
     /// `ReflectiveBumpy`: opaque, over its reflection, and seen in a mirror.
@@ -287,6 +302,7 @@ impl ShaderIds {
             ],
             lit_mirrored: r.register_material::<TexturedLitMirrored>(),
             basic_bumpy: [r.register_material::<BasicBumpy>(), r.register_material::<BasicBumpyMirrored>()],
+            colored_bumpy: [r.register_material::<ColoredBumpy>(), r.register_material::<ColoredBumpyMirrored>()],
             random_sections: [r.register_material::<RandomSections>(), r.register_material::<RandomSectionsMirrored>()],
             reflective_bumpy: [
                 r.register_material::<ReflectiveBumpy>(),
@@ -454,6 +470,16 @@ impl Materials {
                     }
                 })?;
                 let source = check_source(info.input(k).0.ty, name, value).map_err(|m| at(format!("{name}: {m}")))?;
+                // `vertex:` is for inputs read per vertex, and those take numbers and meta values.
+                match (&source, info.input(k).0.vertex) {
+                    (Source::Read { from: Scope::Vertex, .. }, false) => {
+                        return Err(at(format!("{name}: only an input read per vertex takes vertex: (colored_bumpy's tint)")));
+                    }
+                    (Source::Setting(_) | Source::Read { from: Scope::Light | Scope::Entity, .. }, true) => {
+                        return Err(at(format!("{name}: read per vertex, it takes numbers or a meta value (vertex:, face:, sector:, level:)")));
+                    }
+                    _ => {}
+                }
                 if let (true, Source::Fixed(v)) = (name == BACK_LIGHT.name, &source)
                     && !(0.0..=90.0).contains(&v[0])
                 {
@@ -489,6 +515,85 @@ impl Materials {
     /// The materials' names, by id.
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// Fills the level geometry's attributes for the inputs its materials' programs read per
+    /// vertex (see [`Input::vertex`]): each such input an attribute of its name on `world`'s
+    /// geometry mesh, every corner of a polygon whose material reads it taking the value of
+    /// its source there (a `vertex:` meta value of the corner's vertex, or one for the whole
+    /// polygon: a number, its face's, sector's or the level's), or its fallback where that
+    /// has none (or the wrong count); other polygons' corners 0 (their programs don't read
+    /// it). Only inputs some material reads are made, so vertex meta nothing reads costs
+    /// nothing. Call when the level is loaded or rebuilt.
+    pub fn fill_vertex_inputs(&self, assets: &mut Assets, world: &World) {
+        use moose_assets::{Attrib, AttribData};
+        // The inputs read per vertex, by name, with their type.
+        let mut wanted: Vec<(&'static str, InputType)> = Vec::new();
+        for c in &self.compiled {
+            for (k, input) in c.info.all_inputs().enumerate() {
+                if input.vertex && c.inputs.get(k).is_some_and(|s| s.is_some()) && !wanted.iter().any(|w| w.0 == input.name) {
+                    wanted.push((input.name, input.ty));
+                }
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+        let mesh = assets.mesh(world.geometry);
+        // Per polygon, its sector (the polygons are its sectors' in order).
+        let mut sector_of = vec![0usize; mesh.polygons.len()];
+        for (s, sector) in world.sectors.iter().enumerate() {
+            for p in sector.polygons.clone() {
+                if let Some(slot) = sector_of.get_mut(p as usize) {
+                    *slot = s;
+                }
+            }
+        }
+        let mut attribs = Vec::new();
+        for (name, ty) in wanted {
+            let n = ty.len();
+            let mut data: Vec<f32> = vec![0.0; mesh.vertex_positions.len() * n];
+            for (p, polygon) in mesh.polygons.iter().enumerate() {
+                let Some(binding) = world.bindings.get(polygon.material as usize) else { continue };
+                let c = &self.compiled[binding.material as usize];
+                let Some(k) = c.info.all_inputs().position(|i| i.name == name && i.vertex) else { continue };
+                let Some(source) = &c.inputs[k] else { continue };
+                let read = |meta: Option<&moose_assets::meta::MetaValues>, key: &str, fallback: &[f32]| -> Vec<f32> {
+                    let found = world.meta_keys.id(key).and_then(|id| meta.and_then(|m| m.get(id)));
+                    found.filter(|v| ty.check(v).is_ok()).unwrap_or(fallback).to_vec()
+                };
+                for pv in polygon.vertices() {
+                    // As written (0-255 for a color), before the shader's units.
+                    let written: Vec<f32> = match source {
+                        Source::Fixed(v) => v.iter().map(|x| if ty == InputType::Number { *x } else { x * 255.0 }).collect(),
+                        Source::Read { from: Scope::Vertex, key, fallback } => {
+                            read(world.vertex_meta.get(mesh.vertex_positions[pv] as usize), key, fallback)
+                        }
+                        Source::Read { from: Scope::Face, key, fallback } => read(world.faces.get(p), key, fallback),
+                        Source::Read { from: Scope::Sector, key, fallback } => {
+                            read(world.sectors.get(sector_of[p]).map(|s| &s.meta), key, fallback)
+                        }
+                        Source::Read { from: Scope::Level, key, fallback } => read(Some(&world.meta), key, fallback),
+                        _ => Vec::new(),
+                    };
+                    let out = &mut data[pv * n..pv * n + n];
+                    for (k, o) in out.iter_mut().enumerate() {
+                        // One number for a color is gray.
+                        *o = if written.len() == 1 { written[0] } else { written.get(k).copied().unwrap_or(0.0) };
+                    }
+                }
+            }
+            let data = match ty {
+                InputType::Number => AttribData::F32(data),
+                _ => AttribData::U8(data.iter().map(|&x| x.round().clamp(0.0, 255.0) as u8).collect()),
+            };
+            attribs.push(Attrib { name: name.to_string(), count: n as u8, data });
+        }
+        let mesh = assets.mesh_mut(world.geometry);
+        for a in attribs {
+            mesh.attribs.retain(|b| b.name != a.name);
+            mesh.attribs.push(a);
+        }
     }
 
     /// Whether material `id` draws with the entity's own cube map (so it needs one baked).
@@ -725,7 +830,8 @@ impl Table {
                 Scope::Face => place.face.and_then(|f| world.faces.get(f as usize)),
                 Scope::Sector => place.sector.and_then(|s| world.sectors.get(s as usize)).map(|s| &s.meta),
                 Scope::Entity => place.entity.and_then(|e| world.entities.get(e as usize)).map(|e| &e.meta),
-                Scope::Level | Scope::Light => None,
+                // (A vertex's is the mesh's, filled at load: see `fill_vertex_inputs`.)
+                Scope::Level | Scope::Light | Scope::Vertex => None,
             };
             let found = read.key.and_then(|key| meta?.get(key));
             read.ty.convert(found.unwrap_or(&read.fallback), &mut values[read.offset..read.offset + read.ty.len()]);
@@ -772,10 +878,14 @@ impl Table {
                     (true, true) => lit(2),
                 }
             }
-            Kind::BasicBumpy | Kind::RandomSections => {
+            Kind::BasicBumpy | Kind::ColoredBumpy | Kind::RandomSections => {
                 // Its flat copy in a mirror, without a normal map, or with bumps off.
                 let bumpy = !b.mirrored && b.textures[1] != Tex::None && self.bump;
-                let copies = if b.kind == Kind::BasicBumpy { ids.basic_bumpy } else { ids.random_sections };
+                let copies = match b.kind {
+                    Kind::BasicBumpy => ids.basic_bumpy,
+                    Kind::ColoredBumpy => ids.colored_bumpy,
+                    _ => ids.random_sections,
+                };
                 (copies[if bumpy { 0 } else { 1 }], Params::new(values))
             }
             Kind::ReflectiveBumpy => {

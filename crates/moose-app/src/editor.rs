@@ -229,6 +229,9 @@ pub enum Field {
     ToggleLight(LightRef),
     /// Splits the selected faces into triangles (flat and convex, whatever they were).
     Triangulate,
+    /// Paints slight color variety on the selected faces' vertices, as `$tint` (see
+    /// `LevelDoc::vary_vertex_meta`), for `colored_bumpy`.
+    VaryTint,
 }
 
 /// What Ctrl+C copied.
@@ -1575,6 +1578,17 @@ impl Editor {
                     made += self.doc.triangulate_surface(f)?;
                 }
                 Ok(format!("split into {}", count(made, "triangle")))
+            }
+            (Some(_), Field::VaryTint) => {
+                let faces: Vec<usize> =
+                    self.selected_faces().into_iter().filter(|&f| self.doc.surfaces[f].adjoin.is_none()).collect();
+                if faces.is_empty() {
+                    return Err("select the faces to vary".into());
+                }
+                // Another seed each time, for another look.
+                let seed = self.doc.vertex_options.iter().flatten().count() as u32 ^ 0x5EED;
+                let painted = self.doc.vary_vertex_meta(&faces, "tint", seed, 1.0);
+                Ok(format!("{} tinted ($tint; the vertices shared with other faces white)", count(painted, "vertex")))
             }
             (Some(_), Field::MergeSelected) => self.merge_selected_sectors(),
             (Some(_), Field::MergeSelectedFaces) => self.merge_selected_faces(),
@@ -2923,6 +2937,7 @@ pub fn new_level_doc(title: &str) -> Result<LevelDoc, String> {
         name: title.to_string(),
         name_options: Vec::new(),
         vertices: Vec::new(),
+        vertex_options: Vec::new(),
         attributes: vec![moose_assets::AttributeDoc {
             name: "uv".into(),
             format: "f32".into(),

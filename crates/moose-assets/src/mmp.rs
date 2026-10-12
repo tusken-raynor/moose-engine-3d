@@ -309,12 +309,21 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
     c.pos += 1;
 
     // ---- Vertices
-    let section = c.section("vertices", false, Some(3))?;
+    let section = c.section("vertices", false, None)?;
     let vertices = section
         .rows
         .iter()
         .map(|r| Ok(Vec3::new(c.float(r, 0)?, c.float(r, 1)?, c.float(r, 2)?)))
         .collect::<Result<Vec<_>, LoadError>>()?;
+    // After its position, a vertex's meta values (for materials that read them per vertex).
+    let mut vertex_meta = Vec::with_capacity(vertices.len());
+    for (i, r) in section.rows.iter().enumerate() {
+        let (meta, rest) = take_meta(&mut keys, &r.tokens[3..]).map_err(|m| c.err(r.no, format!("vertex {i}: {m}")))?;
+        if let Some(option) = rest.first() {
+            return Err(c.err(r.no, format!("vertex {i}: unknown option '{option}' (meta values are $KEY=VALUE)")));
+        }
+        vertex_meta.push(meta);
+    }
 
     // ---- Attribute declarations, then one values table per attribute
     let section = c.section("attributes", false, Some(3))?;
@@ -1234,7 +1243,16 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
-    let geometry = assets.add_mesh(builder.finish(&mut outlines));
+    let (mesh, remap) = builder.finish_remapped(&mut outlines);
+    let geometry = assets.add_mesh(mesh);
+    // Vertex meta by the mesh's positions (unused vertices are dropped from it).
+    let mut by_position = vec![MetaValues::default(); remap.iter().filter(|&&r| r != u32::MAX).count()];
+    for (row, meta) in vertex_meta.into_iter().enumerate() {
+        if let Some(&r) = remap.get(row).filter(|&&r| r != u32::MAX) {
+            by_position[r as usize] = meta;
+        }
+    }
+    let vertex_meta = by_position;
 
     // ---- Terrains, carved by the sectors. A portal's two sides cut with the same plane
     // (the lower surface's, reversed on the other side), so the pieces on both sides share
@@ -1289,6 +1307,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         lights: lights.into_iter().map(|(_, l)| l).collect(),
         light_names,
         directional,
+        vertex_meta,
         meta_keys: keys,
         meta: level_meta,
         faces,

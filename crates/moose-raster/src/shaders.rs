@@ -1408,6 +1408,83 @@ pub mod basic_bumpy {
 
 pub use basic_bumpy::{BasicBumpy, BasicBumpyMirrored};
 
+/// [`BasicBumpy`] with each corner's color (the mesh attribute `color`, three 0-255 values)
+/// multiplied into the texture's: 255 leaves it as it is, less darkens and tints it, smoothly
+/// across the polygon. For variety painted on corners (dirt redder here, greyer there). The
+/// color is interpolated in 8.8 like [`VertexColor`]'s; `MIRRORED` is its copy seen in a
+/// mirror (or with bumps off), colored but not bumped.
+pub mod colored_bumpy {
+    use super::basic_bumpy::{bump_fade, bumped_light};
+    use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext, high_byte};
+
+    crate::material_io! {
+        vertex { uv: 2, tint: 3, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
+        sampled { uv: 2, lod: 1, tint: 3, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
+        fixed32 { uv: 2, light: 3 }
+        fixed16 { lod: 1, tint: 3, fade: 1 if !MIRRORED }
+        float { bump: 13 if !MIRRORED }
+    }
+
+    pub struct ColoredBumpy<const MIRRORED: bool = false>;
+
+    /// Seen in a mirror (or with bumps off): colored, textured and lit.
+    pub type ColoredBumpyMirrored = ColoredBumpy<true>;
+
+    impl<const MIRRORED: bool> Material for ColoredBumpy<MIRRORED> {
+        const MIRRORED: bool = MIRRORED;
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled {
+                uv: v.uv,
+                tint: v.tint,
+                normal: v.face_normal,
+                tangent: v.face_tangent,
+                bitangent: v.face_bitangent,
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            if MIRRORED {
+                return Interp { uv: s.uv, lod: s.lod, tint: s.tint, light, ..Default::default() };
+            }
+            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            Interp {
+                uv: s.uv,
+                lod: s.lod,
+                tint: s.tint,
+                light,
+                fade: [bump_fade(ctx, &s.position, ctx.params.values[0], ctx.params.values[1])],
+                bump: super::bump_lanes(&channels),
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
+            let texel = ctx.texel(0, &a.uv, b.lod[0]);
+            // The tint times the texel's color, per channel: (tint + 1) / 256, so 255
+            // leaves it exactly.
+            let byte = U32s::fill(255);
+            let tint = |shift: u32, k: usize| {
+                ((((texel >> shift) & byte) * (high_byte(b.tint[k]) + U32s::fill(1))) >> 8_u32) << shift
+            };
+            let tinted = (texel & U32s::fill(0xFF00_0000)) | tint(16, 0) | tint(8, 1) | tint(0, 2);
+            let light = if MIRRORED {
+                ctx.light(&a.light)
+            } else {
+                bumped_light(ctx, &a.light, b.fade[0], &c.bump, || ctx.texel(1, &a.uv, b.lod[0]))
+            };
+            super::lit_texel(tinted, &light) & U32s::fill(0xFF_FFFF)
+        }
+    }
+}
+
+pub use colored_bumpy::{ColoredBumpy, ColoredBumpyMirrored};
+
 /// [`BasicBumpy`] for a texture of four sections side by side that tile with each other in
 /// any order (a sidewalk's slabs, say), which surfaces map one section to a whole repeat
 /// of their `uv` (1:1). Each repeat (cell: the whole parts of `uv`) gets one of the four,

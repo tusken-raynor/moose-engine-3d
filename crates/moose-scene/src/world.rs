@@ -48,6 +48,9 @@ pub struct World {
     pub meta_keys: MetaKeys,
     pub meta: MetaValues,
     pub faces: Vec<MetaValues>,
+    /// Per position of the geometry mesh, its vertex's meta values (see
+    /// `Level::vertex_meta`).
+    pub vertex_meta: Vec<MetaValues>,
     /// Per level polygon, the lights it isn't lit by (its surface's and sector's
     /// `exclude_lights=`).
     pub face_excluded_lights: Vec<LightMask>,
@@ -257,6 +260,7 @@ impl World {
             meta_keys: level.meta_keys,
             meta: level.meta,
             faces: level.faces,
+            vertex_meta: level.vertex_meta,
             face_excluded_lights: level.face_excluded_lights,
             light_names: level.light_names,
             lights: Vec::new(),

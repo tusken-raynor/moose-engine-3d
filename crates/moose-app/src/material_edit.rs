@@ -159,8 +159,11 @@ impl Draft {
             Row::Sampler(k) => format!("  sampler {k}"),
             Row::Source(i) => {
                 let (name, ty) = self.input(i);
-                if self.shader().unwrap().input(i as usize).1 {
+                let (input, engine) = self.shader().unwrap().input(i as usize);
+                if engine {
                     format!("Engine: {name} ({}, degrees)", ty.name())
+                } else if input.vertex {
+                    format!("Input: {name} ({}, per vertex)", ty.name())
                 } else {
                     format!("Input: {name} ({})", ty.name())
                 }
@@ -264,11 +267,19 @@ impl Draft {
                     Some(ParamValue::Read { key, .. }) => key.clone(),
                     _ => name.to_string(),
                 };
+                let vertex = self.shader().unwrap().input(i as usize).0.vertex;
                 let mut sources: Vec<Option<ParamValue>> = vec![None, Some(ParamValue::Fixed(number.clone()))];
-                if PARAM_SETTINGS.contains(&name) && ty != InputType::Color {
+                if PARAM_SETTINGS.contains(&name) && ty != InputType::Color && !vertex {
                     sources.push(Some(ParamValue::Setting(None)));
                 }
-                for from in Scope::ALL {
+                // Read per vertex: a vertex's meta value first, or the polygon's; otherwise
+                // anything but a vertex's.
+                let scopes: &[Scope] = if vertex {
+                    &[Scope::Vertex, Scope::Face, Scope::Sector, Scope::Level]
+                } else {
+                    &[Scope::Face, Scope::Sector, Scope::Entity, Scope::Level, Scope::Light]
+                };
+                for &from in scopes {
                     sources.push(Some(ParamValue::Read { from, key: key.clone(), fallback: Some(number.clone()) }));
                 }
                 let kind = |v: &Option<ParamValue>| match v {

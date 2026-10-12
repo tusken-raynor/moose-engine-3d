@@ -67,6 +67,9 @@ An input's **source**, and the rate it is read at (no value is read more often t
 | The level's meta value | `level:KEY` | once a frame |
 | A named light | `light:NAME`: its color now for a color input, how bright that is (its brightest channel) otherwise; black or 0 while it's off | once a frame |
 | A face's, sector's or entity's meta value | `face:KEY`, `sector:KEY`, `entity:KEY` (the entity's own, else its template's) | per polygon drawn |
+| A vertex's meta value | `vertex:KEY`, for an input its program reads per vertex (`colored_bumpy`'s `tint`) | per corner, when the level is loaded (or rebuilt), blended across the polygon |
+
+**Inputs read per vertex** (`Input::vertex`; the editor's label says "per vertex") are mesh attributes of their name, carried by the program as varyings, not params. When the level loads or is rebuilt, `Materials::fill_vertex_inputs` makes each such input that some material reads an attribute on the level's geometry: each corner of a polygon whose material reads it takes its source's value there (a `vertex:` meta value of its vertex, or one for the whole polygon: a number, `face:`, `sector:`, `level:`), the fallback where that has none or the wrong count of numbers; other polygons' corners 0 (their programs don't read it). Only what's read is made: vertex meta nothing reads costs nothing, and an input interpolates across a face only if its program reads it. `vertex:` on an input read per polygon is an error, and so are a setting, a light or an entity's value on one read per vertex. Models don't fill them yet (a model's own attribute of the name would be read).
 
 A read can end in `|VALUE`, written in the input's type: what to use where there is no such value (on a polygon without a face, say, or with a key nothing sets). Without one, 0. Meta values are `$KEY=VALUE` options in the level (see the Level Format Spec); scripts will change them, and materials see the change the next frame. Keys are interned when the level loads, so a polygon's read is an index, not a string.
 
@@ -139,6 +142,7 @@ Each program is registered under a name with what it reads, so materials are che
 | `water` | `Water` | color, heights | `reflectance` (unit), `fade` (number, m), `shift` (number) |
 | `lit` | `TexturedLit` | color, normal map | `specular` (unit), `shininess` (number), `detail` (unit) |
 | `basic_bumpy` | `BasicBumpy` | color, normal map | `short`, `far` (numbers, m: bumps whole out to `short`, flat by `far`) |
+| `colored_bumpy` | `ColoredBumpy` | color, normal map | `short`, `far` (as `basic_bumpy`'s), `tint` (color, per vertex: multiplied into the texture's, 255,255,255 none; usually `vertex:tint\|255,255,255`) |
 | `random_sections` | `RandomSections` | color, normal map (each four sections side by side, 4:1) | `short`, `far` (as `basic_bumpy`'s), `seed` (a whole number) |
 | `reflective_bumpy` | `ReflectiveBumpy` | color (alpha: where it's wet, 255 water), normal map, turbulence (grey; `@water_heights` animates) | `short`, `far` (as `basic_bumpy`'s), `reflectance` (unit), `fade` (number, m), `shift` (number), `ripple`, `ripple_size` (numbers, repeats), `ripple_speed` (number, waves a second), `drift` (number, repeats a second) |
 | `cube_reflection` | `CubeReflection` | cube (`@cube`) | (the engine's: `radius`, `size`) |

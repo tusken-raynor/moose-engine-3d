@@ -19,6 +19,10 @@ pub struct LevelDoc {
     /// The level's own meta values (`$KEY=VALUE` after its name).
     pub name_options: Vec<String>,
     pub vertices: Vec<Vec3>,
+    /// Per vertex, its meta values (`$KEY=VALUE` after its position), as written. May be
+    /// shorter than `vertices` (the rest have none): edits that add vertices needn't add to
+    /// it.
+    pub vertex_options: Vec<Vec<String>>,
     pub attributes: Vec<AttributeDoc>,
     pub sectors: Vec<SectorDoc>,
     pub surfaces: Vec<SurfaceDoc>,
@@ -162,12 +166,16 @@ impl LevelDoc {
         let vec3 = |c: &Cursor, r: &Line, i: usize| -> Result<Vec3, LoadError> {
             Ok(Vec3::new(c.float(r, i)?, c.float(r, i + 1)?, c.float(r, i + 2)?))
         };
-        let section = c.section("vertices", false, Some(3))?;
+        let section = c.section("vertices", false, None)?;
         let vertices = section
             .rows
             .iter()
             .map(|r| vec3(&c, r, 0))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut vertex_options: Vec<Vec<String>> = section.rows.iter().map(|r| r.tokens[3.min(r.tokens.len())..].to_vec()).collect();
+        while vertex_options.last().is_some_and(|o| o.is_empty()) {
+            vertex_options.pop();
+        }
         let section = c.section("attributes", false, Some(3))?;
         let mut attributes = Vec::new();
         for r in &section.rows {
@@ -326,6 +334,7 @@ impl LevelDoc {
             name,
             name_options,
             vertices,
+            vertex_options,
             attributes,
             sectors,
             surfaces,
@@ -351,7 +360,8 @@ impl LevelDoc {
         line(format!("vertices {}", self.vertices.len()));
         line("#  id   x       y       z".into());
         for (i, v) in self.vertices.iter().enumerate() {
-            line(format!("   {i:<4} {:<7} {:<7} {}", number(v.x), number(v.y), number(v.z)));
+            let options = self.vertex_options.get(i).map_or(String::new(), |o| o.iter().map(|o| format!("  {o}")).collect());
+            line(format!("   {i:<4} {:<7} {:<7} {}{options}", number(v.x), number(v.y), number(v.z)));
         }
         line(String::new());
         line(format!("attributes {}", self.attributes.len()));

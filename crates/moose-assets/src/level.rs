@@ -34,6 +34,10 @@ pub struct Level {
     pub meta_keys: crate::meta::MetaKeys,
     pub meta: crate::meta::MetaValues,
     pub faces: Vec<crate::meta::MetaValues>,
+    /// Per position of the geometry mesh (the `vertices` table's rows that surfaces use),
+    /// its meta values: what a material reads with a `vertex:` source, into a program's
+    /// inputs read per vertex.
+    pub vertex_meta: Vec<crate::meta::MetaValues>,
     /// Per `geometry` polygon, the lights it isn't lit by: its surface's and its sector's.
     pub face_excluded_lights: Vec<LightMask>,
 }

@@ -749,6 +749,8 @@ impl App {
         let shaders = ShaderIds::register(&mut renderer);
         let ripples = Ripples::new(1);
         let materials = Materials::compile(&mut assets, &ripples)?;
+        // The inputs its materials read per vertex, from its vertices' meta values.
+        materials.fill_vertex_inputs(&mut assets, &world);
         let materials_names = materials.names().to_vec();
         let textures = material_textures(&assets, &materials_names);
         let (level_filters, entity_filters) = binding_filters_of(&world)?;
@@ -879,6 +881,8 @@ impl App {
             .parse_level(&self.level, &text)
             .map_err(|e| e.to_string())?;
         let mut world = World::new(level, &self.assets);
+        // The inputs its materials read per vertex, from its vertices' meta values.
+        self.materials.fill_vertex_inputs(&mut self.assets, &world);
         self.world.hand_over_copies(&mut world);
         world.animate(&mut self.assets, self.time);
         self.camera.sector = world
@@ -4886,7 +4890,7 @@ mod tests {
         assert_eq!(app.material.as_ref().unwrap().def.textures[1], None);
         // A search narrows the shaders.
         app.material_screen.as_mut().unwrap().picker_search = "bumpy".into();
-        assert_eq!(app.material_screen.as_ref().unwrap().shaders(), ["basic_bumpy", "reflective_bumpy"]);
+        assert_eq!(app.material_screen.as_ref().unwrap().shaders(), ["basic_bumpy", "colored_bumpy", "reflective_bumpy"]);
         run_mact(&mut app, MAct::Close, 1, &textures);
         assert!(app.material_screen.is_none());
     }
@@ -4967,6 +4971,49 @@ mod tests {
         let why = app.assets.parse_level("bad.mmp", &bad).unwrap_err().to_string();
         assert!(why.contains("weather is a number from 0 to 1"), "{why}");
         assert!(app.assets.parse_level("bad.mmp", &text.replace("clouds=7", "clouds=x")).is_err());
+    }
+
+    #[test]
+    fn a_material_reads_a_tint_per_vertex_from_vertex_meta() {
+        use editor::{Field, Selection};
+        let mut app = test_app("two_rooms.mmp");
+        // A material tinting per vertex, on room_a's floor, and its corners' $tint: two
+        // painted, two with none (the fallback, white).
+        let mut library = app.assets.materials().clone();
+        with_material(&mut library, "tinted", "shader colored_bumpy\ntexture0 default.png\ntint vertex:tint|255,255,255\n");
+        app.apply_materials(library).unwrap();
+        let floor = app.editor.doc.sector_surfaces(0).find(|&f| app.editor.doc.surface_normal(f).y > 0.9).unwrap();
+        let corners: Vec<usize> = app.editor.doc.surfaces[floor].corners.iter().map(|c| c.0).collect();
+        app.edit_with(move |e, _| {
+            let s = &mut e.doc.surfaces[floor];
+            s.options.retain(|o| !o.starts_with("material="));
+            s.options.push("material=tinted".into());
+            *e.doc.vertex_options_mut(corners[0]) = vec!["$tint=200,100,50".into()];
+            *e.doc.vertex_options_mut(corners[1]) = vec!["$tint=100".into()];
+            Ok("tinted".into())
+        });
+        assert!(app.editor.broken.is_none());
+        // The mesh's `tint`, per corner: the meta value, one number as gray, or white.
+        let mesh = app.assets.mesh(app.world.geometry);
+        let tint = mesh.attribs.iter().find(|a| a.name == "tint").expect("filled");
+        let moose_assets::AttribData::U8(data) = &tint.data else { panic!("u8") };
+        // (The level's drawn polygons are its solid surfaces in order.)
+        let polygon = app.editor.doc.surfaces[..floor].iter().filter(|s| s.adjoin.is_none()).count();
+        let p = &mesh.polygons[polygon];
+        let at = |k: usize| &data[(p.first_vertex as usize + k) * 3..][..3];
+        let find = |rgb: [u8; 3]| (0..p.vertex_count as usize).any(|k| at(k) == rgb);
+        assert!(find([200, 100, 50]) && find([100, 100, 100]) && find([255, 255, 255]));
+        app.frame().unwrap();
+        // The face's panel says which corners lack it.
+        app.editor.selection = Some(Selection::Surface(floor));
+        assert!(app.editor.vertex_meta_warnings(floor).iter().any(|w| w.contains("$tint on 2 of")));
+        // Vary tint paints it, white where other faces meet the floor (here all of it).
+        app.edit(Field::VaryTint, 1.0);
+        assert!(app.editor.vertex_meta_warnings(floor).is_empty());
+        // `vertex:` only on an input read per vertex.
+        let mut library = app.assets.materials().clone();
+        with_material(&mut library, "wrong", "shader basic_bumpy\ntexture0 default.png\nshort vertex:tint|4\n");
+        assert!(app.apply_materials(library).unwrap_err().contains("only an input read per vertex"));
     }
 
     #[test]
@@ -5468,7 +5515,7 @@ mod tests {
         let mut flat = library.clone();
         with_material(&mut flat, "flat", "shader textured\ntexture0 default.png\nback_light 10");
         let error = app.apply_materials(flat).unwrap_err();
-        assert!(error.contains("doesn't take 'back_light' (only lit, basic_bumpy, random_sections, reflective_bumpy)"), "{error}");
+        assert!(error.contains("doesn't take 'back_light' (only lit, basic_bumpy, colored_bumpy, random_sections, reflective_bumpy)"), "{error}");
         with_material(&mut library, "bent", &format!("shader basic_bumpy\n{bumpy}\nback_light 95"));
         assert!(app.apply_materials(library).unwrap_err().contains("0 to 90 degrees"));
     }

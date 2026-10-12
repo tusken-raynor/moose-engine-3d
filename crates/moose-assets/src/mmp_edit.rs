@@ -98,7 +98,13 @@ impl LevelDoc {
             .iter()
             .map(|&(v, _)| {
                 self.vertices.push(self.vertices[v] - n * distance);
-                self.vertices.len() - 1
+                // Its meta values go with it.
+                let new = self.vertices.len() - 1;
+                let options = self.vertex_options.get(v).cloned().unwrap_or_default();
+                if !options.is_empty() {
+                    *self.vertex_options_mut(new) = options;
+                }
+                new
             })
             .collect();
         let new_sector = self.sectors.len();
@@ -204,7 +210,9 @@ impl LevelDoc {
                     let key = (a.0.min(b.0), a.0.max(b.0));
                     let v = *made.entry(key).or_insert_with(|| {
                         doc.vertices.push(doc.vertices[a.0].lerp(doc.vertices[b.0], t));
-                        doc.vertices.len() - 1
+                        let new = doc.vertices.len() - 1;
+                        doc.lerp_vertex_meta(new, a.0, b.0, t);
+                        new
                     });
                     let rows = doc.lerp_rows(&a.1, &b.1, t);
                     front.push((v, rows.clone()));
@@ -501,7 +509,9 @@ impl LevelDoc {
                     Some(v) => v,
                     None => {
                         self.vertices.push(p);
-                        self.vertices.len() - 1
+                        let new = self.vertices.len() - 1;
+                        self.lerp_vertex_meta(new, a.0, b.0, t);
+                        new
                     }
                 };
                 let rows = self.lerp_rows(&a.1, &b.1, t);
@@ -517,6 +527,97 @@ impl LevelDoc {
         self.set_sector_lists(lists);
         self.add_to_edges(&on_cut);
         Ok(surface + 1)
+    }
+
+    /// Paints slight color variety on surfaces `faces`' vertices, as meta value `$KEY=R,G,B`
+    /// (0-255 each) on each vertex, for a material that reads `vertex:KEY` into a program's
+    /// tint (`colored_bumpy`): each a little darker or lighter, warmer or cooler, picked by a
+    /// hash of the vertex and `seed`, `strength` how much (1: up to 24% darker, ±6% warmth).
+    /// A vertex also a corner of a solid surface not among `faces` gets white (255,255,255:
+    /// no change), so the painted faces meet the others with no seam. Returns how many vertices were painted.
+    pub fn vary_vertex_meta(&mut self, faces: &[usize], key: &str, seed: u32, strength: f32) -> usize {
+        let mut vertices: Vec<usize> = faces.iter().flat_map(|&f| self.surfaces[f].corners.iter().map(|c| c.0)).collect();
+        vertices.sort_unstable();
+        vertices.dedup();
+        let shared: Vec<bool> = vertices
+            .iter()
+            .map(|&v| {
+                self.surfaces
+                    .iter()
+                    .enumerate()
+                    .any(|(i, s)| s.adjoin.is_none() && !faces.contains(&i) && s.corners.iter().any(|c| c.0 == v))
+            })
+            .collect();
+        let hash = |v: usize, k: u32| {
+            let mut h = seed ^ (v as u32).wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B);
+            h = (h ^ (h >> 15)).wrapping_mul(0x2C1B_3C6D);
+            h ^= h >> 12;
+            (h & 0xFFFF) as f32 / 0xFFFF as f32
+        };
+        let mut painted = 0;
+        for (&v, &shared) in vertices.iter().zip(&shared) {
+            let options = self.vertex_options_mut(v);
+            options.retain(|o| o.strip_prefix('$').and_then(|b| b.split_once('=')).is_none_or(|(k, _)| k != key));
+            // Shared with another face: white, no change (and a value for a cut to blend
+            // toward).
+            if shared {
+                options.push(format!("${key}=255,255,255"));
+                continue;
+            }
+            // Never past white: darker by up to a quarter, warmer or cooler about that.
+            let light = 1.0 - 0.24 * strength * hash(v, 1);
+            let warm = (hash(v, 2) - 0.5) * 0.12 * strength;
+            let c = [light * (1.0 + warm), light, light * (1.0 - warm)].map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u32);
+            options.push(format!("${key}={},{},{}", c[0], c[1], c[2]));
+            painted += 1;
+        }
+        painted
+    }
+
+    /// Gives new vertex `v`, `t` of the way along the edge from vertex `a` to `b`, each meta
+    /// value both ends have (with as many numbers), blended between theirs (each number whole
+    /// where both ends' are), as the face showed it there: a cut leaves what a material reads
+    /// across the face as it was. One only one end has, it doesn't get.
+    pub fn lerp_vertex_meta(&mut self, v: usize, a: usize, b: usize, t: f32) {
+        let meta = |doc: &LevelDoc, k: usize| -> Vec<(String, Vec<f32>)> {
+            doc.vertex_options
+                .get(k)
+                .into_iter()
+                .flatten()
+                .filter_map(|o| {
+                    let (key, value) = o.strip_prefix('$')?.split_once('=')?;
+                    Some((key.to_string(), crate::meta::parse_numbers(value).ok()?))
+                })
+                .collect()
+        };
+        let (from, to) = (meta(self, a), meta(self, b));
+        let mut blended = Vec::new();
+        for (key, x) in &from {
+            let Some((_, y)) = to.iter().find(|(k, y)| k == key && y.len() == x.len()) else {
+                continue;
+            };
+            // Each number whole where both ends' are (a color stays a color).
+            let values: Vec<f32> = x
+                .iter()
+                .zip(y)
+                .map(|(&p, &q)| {
+                    let n = p + (q - p) * t;
+                    if p.fract() == 0.0 && q.fract() == 0.0 { n.round() } else { n }
+                })
+                .collect();
+            blended.push(format!("${key}={}", crate::meta::numbers_text(&values)));
+        }
+        if !blended.is_empty() {
+            *self.vertex_options_mut(v) = blended;
+        }
+    }
+
+    /// Vertex `v`'s options (its meta values), made room for if the table is shorter.
+    pub fn vertex_options_mut(&mut self, v: usize) -> &mut Vec<String> {
+        if self.vertex_options.len() <= v {
+            self.vertex_options.resize(v + 1, Vec::new());
+        }
+        &mut self.vertex_options[v]
     }
 
     /// Splits solid surface `surface` into triangles, which are flat and convex whatever it

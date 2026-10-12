@@ -9,6 +9,9 @@ use glam::Vec3;
 use crate::editor::{Editor, Excluder, Field, LightRef, Mode, Pick, Selection, ViewMode};
 use crate::editor_keys::{Action, Context, FIXED};
 use crate::gui::{DIM, Icon, Look, STAT, TEXT, TITLE, Widget};
+
+/// A warning's color: something amiss, not an option.
+const WARNING: u32 = 0xFF_A0_40;
 use crate::ui::{Canvas, Rect};
 
 /// A menu on the panel.
@@ -36,6 +39,8 @@ pub enum Owner {
     Level,
     Sector(usize),
     Surface(usize),
+    /// A vertex: values a material reads per vertex (`vertex:KEY`), blended across faces.
+    Vertex(usize),
 }
 
 /// What something on the panel does.
@@ -389,6 +394,7 @@ impl Editor {
                     Owner::Level => "Level meta values".to_string(),
                     Owner::Sector(s) => format!("Sector {s} meta values"),
                     Owner::Surface(f) => format!("Face {f} meta values"),
+                    Owner::Vertex(v) => format!("Vertex {v} meta values"),
                 };
                 c.header(&title, back, None);
                 c.stats(&["$KEY=VALUE: numbers for materials to read".into(), "Click a key or value to type it".into()]);
@@ -613,6 +619,14 @@ impl Editor {
                     let (v, a, w) = typed(f, n(value));
                     c.row(label, v, a, w);
                 }
+                // What materials read per vertex (vertex:KEY), blended across its faces.
+                let metas = self.meta_values(Owner::Vertex(v));
+                let shown = match metas.len() {
+                    0 => "none >".to_string(),
+                    1 => format!("${}={} >", metas[0].0, metas[0].1),
+                    k => format!("{k} >"),
+                };
+                c.row("Meta values", shown, Some(Act::Open(Menu::Meta(Owner::Vertex(v)))), None);
             }
             Some(Selection::Entity(_) | Selection::Light(_)) => {
                 let rows = self.panel();
@@ -670,6 +684,16 @@ impl Editor {
         stats.push(format!("material {material}"));
         c.header(&format!("Face {i}"), false, None);
         c.stats(&stats);
+        // Vertex meta some corners have and some don't: those use the material's fallback.
+        let warnings = self.vertex_meta_warnings(i);
+        if !warnings.is_empty() {
+            let s = if c.scale > 1 { c.scale - 1 } else { 1 };
+            for w in warnings {
+                c.push(Widget::new(Rect::new(c.x + c.pad, c.y, c.w, Canvas::line_height(s)), Look::Label { text: w, color: WARNING, scale: s }));
+                c.y += Canvas::line_height(s);
+            }
+            c.gap();
+        }
         let on = |bit: u32| if s.flags & bit != 0 { "on" } else { "off" }.to_string();
         let pick = |kind: Pick, idle: String| if self.picking == Some((i, kind)) { "click a face".into() } else { idle };
         c.row("Its sector", d.sectors[s.sector].name.clone(), Some(Act::Edit(Field::SelectSector)), None);
@@ -692,6 +716,7 @@ impl Editor {
         let open = if selected == 2 { "the two selected" } else { "" };
         c.row("Open to a match", format!("{open} ({})", keys.key(Action::OpenToMatch).name()), Some(Act::Edit(Field::Adjoin)), None);
         c.row("Split into triangles", String::new(), Some(Act::Edit(Field::Triangulate)), None);
+        c.row("Vary tint ($tint on its vertices)", String::new(), Some(Act::Edit(Field::VaryTint)), None);
         self.exclusion_row(c, Excluder::Surface, i);
         c.row("Meta values", format!("{} >", self.meta_values(Owner::Surface(i)).len()), Some(Act::Open(Menu::Meta(Owner::Surface(i)))), None);
         if d.attributes.iter().any(|a| a.name == "uv") {
@@ -774,12 +799,39 @@ impl Editor {
         list
     }
 
+    /// What's amiss with face `f`'s vertices' meta values: a key some of its corners have
+    /// and others don't (they use the material's fallback there), or one with different
+    /// counts of numbers on different corners.
+    pub fn vertex_meta_warnings(&self, f: usize) -> Vec<String> {
+        let corners: Vec<usize> = self.doc.surfaces[f].corners.iter().map(|c| c.0).collect();
+        let metas: Vec<Vec<(String, String)>> = corners.iter().map(|&v| self.meta_values(Owner::Vertex(v))).collect();
+        let mut keys: Vec<String> = metas.iter().flatten().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        let mut out = Vec::new();
+        for key in keys {
+            let values: Vec<&String> = metas.iter().filter_map(|m| m.iter().find(|(k, _)| *k == key).map(|(_, v)| v)).collect();
+            if values.len() < corners.len() {
+                out.push(format!("! ${key} on {} of {} corners (the rest: the material's fallback)", values.len(), corners.len()));
+            }
+            let counts: Vec<usize> = values.iter().map(|v| v.split(',').count()).collect();
+            if counts.iter().any(|&c| c != counts[0]) {
+                out.push(format!("! ${key}'s corners have different counts of numbers"));
+            }
+        }
+        out
+    }
+
     /// The meta values (`$KEY=VALUE`) of `owner`, as key and value.
     pub fn meta_values(&self, owner: Owner) -> Vec<(String, String)> {
         let options = match owner {
             Owner::Level => &self.doc.name_options,
             Owner::Sector(s) if s < self.doc.sectors.len() => &self.doc.sectors[s].options,
             Owner::Surface(f) if f < self.doc.surfaces.len() => &self.doc.surfaces[f].options,
+            Owner::Vertex(v) => match self.doc.vertex_options.get(v) {
+                Some(options) => options,
+                None => return Vec::new(),
+            },
             _ => return Vec::new(),
         };
         options
@@ -795,6 +847,8 @@ impl Editor {
             Owner::Level => Some(&mut self.doc.name_options),
             Owner::Sector(s) => self.doc.sectors.get_mut(s).map(|s| &mut s.options),
             Owner::Surface(f) => self.doc.surfaces.get_mut(f).map(|s| &mut s.options),
+            Owner::Vertex(v) if v < self.doc.vertices.len() => Some(self.doc.vertex_options_mut(v)),
+            Owner::Vertex(_) => None,
         }
     }
 

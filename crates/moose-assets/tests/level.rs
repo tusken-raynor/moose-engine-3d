@@ -1152,3 +1152,47 @@ fn exclusion_lists_name_lights_and_become_masks() {
     let again = moose_assets::LevelDoc::parse(std::path::Path::new("x.mmp"), &d.to_text()).unwrap();
     assert_eq!(loads(&again).face_excluded_lights, level.face_excluded_lights);
 }
+
+#[test]
+fn vertices_carry_meta_values_that_cuts_blend_and_variety_paints() {
+    use moose_assets::LevelDoc;
+    use std::path::Path;
+    // Read and written back by the tables, and loaded per mesh position.
+    let src = LEVEL.replacen("   0       -4.00     0.00     8.00", "   0       -4.00     0.00     8.00  $tint=200,220,240", 1);
+    let doc = LevelDoc::parse(Path::new("two_rooms.mmp"), &src).unwrap();
+    assert_eq!(doc.vertex_options[0], ["$tint=200,220,240"]);
+    let again = LevelDoc::parse(Path::new("two_rooms.mmp"), &doc.to_text()).unwrap();
+    assert_eq!(again.vertex_options, doc.vertex_options);
+    let mut assets = assets();
+    let level = assets.parse_level("two_rooms.mmp", &src).unwrap();
+    let key = level.meta_keys.id("tint").unwrap();
+    let mesh = assets.mesh(level.geometry);
+    let at = mesh.positions.iter().position(|p| *p == Vec3::new(-4.0, 0.0, 8.0)).unwrap();
+    assert_eq!(level.vertex_meta[at].get(key), Some(&[200.0, 220.0, 240.0][..]));
+    // Only meta values follow a vertex's position.
+    assert_rejects("   0       -4.00     0.00     8.00", "   0       -4.00     0.00     8.00  shiny", "vertex 0: unknown option 'shiny'");
+    // A face cut between two tinted vertices: the new one between them.
+    let mut doc = LevelDoc::parse(Path::new("two_rooms.mmp"), LEVEL).unwrap();
+    let floor = (0..doc.surfaces.len()).find(|&f| doc.surface_normal(f).y > 0.9 && doc.surfaces[f].sector == 0).unwrap();
+    let corners: Vec<usize> = doc.surfaces[floor].corners.iter().map(|c| c.0).collect();
+    for &v in &corners {
+        let x = doc.vertices[v].x;
+        *doc.vertex_options_mut(v) = vec![format!("$tint={},100,{}", if x < 0.0 { 100 } else { 200 }, if x < 0.0 { 0.5 } else { 1.5 })];
+    }
+    let before = doc.vertices.len();
+    doc.cut_surface(floor, Vec3::X, Vec3::new(1.0, 0.0, 0.0)).unwrap();
+    // The cut at x = 1 across a floor from -4 to 4: 5/8 of the way.
+    let made: Vec<usize> = (before..doc.vertices.len()).collect();
+    assert!(!made.is_empty());
+    for v in made {
+        assert_eq!(doc.vertex_options[v], ["$tint=163,100,1.125"], "{:?}", doc.vertices[v]);
+    }
+    // Variety on the floor's pieces: white where another face (a wall) meets them.
+    let mut doc = LevelDoc::parse(Path::new("two_rooms.mmp"), LEVEL).unwrap();
+    let floor = (0..doc.surfaces.len()).find(|&f| doc.surface_normal(f).y > 0.9 && doc.surfaces[f].sector == 0).unwrap();
+    doc.vary_vertex_meta(&[floor], "tint", 1, 1.0);
+    for c in &doc.surfaces[floor].corners {
+        assert_eq!(doc.vertex_options[c.0], ["$tint=255,255,255"], "a floor corner is a wall's too");
+    }
+    assert!(assets.parse_level("two_rooms.mmp", &doc.to_text()).is_ok());
+}

@@ -92,10 +92,13 @@ pub enum Scope {
     Level,
     /// A light, by name.
     Light,
+    /// Each corner's vertex (level geometry), for an input its program reads per vertex:
+    /// blended across the polygon.
+    Vertex,
 }
 
 impl Scope {
-    pub const ALL: [Scope; 5] = [Scope::Face, Scope::Sector, Scope::Entity, Scope::Level, Scope::Light];
+    pub const ALL: [Scope; 6] = [Scope::Face, Scope::Sector, Scope::Entity, Scope::Level, Scope::Light, Scope::Vertex];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -104,6 +107,7 @@ impl Scope {
             Scope::Entity => "entity",
             Scope::Level => "level",
             Scope::Light => "light",
+            Scope::Vertex => "vertex",
         }
     }
 }
@@ -134,7 +138,7 @@ impl ParamValue {
         }
         crate::meta::parse_numbers(text)
             .map(Self::Fixed)
-            .map_err(|_| format!("'{text}' is not numbers, a setting or a source (face:, sector:, entity:, level:, light:)"))
+            .map_err(|_| format!("'{text}' is not numbers, a setting or a source (face:, sector:, entity:, level:, light:, vertex:)"))
     }
 
     /// As a material file writes it.
