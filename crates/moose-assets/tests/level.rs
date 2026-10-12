@@ -1200,3 +1200,30 @@ fn vertices_carry_meta_values_that_cuts_blend_and_variety_paints() {
     }
     assert!(assets.parse_level("two_rooms.mmp", &doc.to_text()).is_ok());
 }
+
+#[test]
+fn vertices_a_cut_missed_by_a_little_weld_into_one_and_the_sliver_goes() {
+    use moose_assets::LevelDoc;
+    use std::path::Path;
+    let mut doc = LevelDoc::parse(Path::new("two_rooms.mmp"), LEVEL).unwrap();
+    let floor = (0..doc.surfaces.len()).find(|&f| doc.surface_normal(f).y > 0.9 && doc.surfaces[f].sector == 0).unwrap();
+    // Two cuts across the floor 3 cm apart: a strip between them.
+    let (a, b) = (Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.03, 0.0, 0.0));
+    // (A cut keeps the part in front of its plane, x past 1, as the surface it was.)
+    doc.cut_surface(floor, Vec3::X, a).unwrap();
+    // The first cut's line: the floor's corners at x = 1 (one may be a doorway's corner it met).
+    let firsts: Vec<usize> =
+        doc.surfaces[floor].corners.iter().map(|c| c.0).filter(|&v| (doc.vertices[v].x - 1.0).abs() < 1e-4).collect();
+    doc.cut_surface(floor, Vec3::X, b).unwrap();
+    let faces = doc.surfaces.len();
+    // Each of the first cut's vertices welds the second's beside it in: the strip goes.
+    assert_eq!(firsts.len(), 2);
+    let mut gone = 0;
+    for v in firsts {
+        let near = doc.vertices_near(v, 0.0625);
+        assert_eq!(near.len(), 2, "{near:?}");
+        gone += doc.weld_vertices(&near, doc.vertices[v]).unwrap();
+    }
+    assert_eq!((gone, doc.surfaces.len()), (1, faces - 1));
+    assert!(assets().parse_level("two_rooms.mmp", &doc.to_text()).is_ok());
+}

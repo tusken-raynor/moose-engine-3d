@@ -627,6 +627,17 @@ impl Editor {
                     k => format!("{k} >"),
                 };
                 c.row("Meta values", shown, Some(Act::Open(Menu::Meta(Owner::Vertex(v)))), None);
+                c.gap();
+                if selected > 1 {
+                    c.row("Weld the selected into this one", String::new(), Some(Act::Edit(Field::Weld)), None);
+                }
+                let near = self.doc.vertices_near(v, self.step() + 1e-3).len() - 1;
+                c.row(
+                    &format!("Weld nearby ({} m)", moose_assets::number(self.step())),
+                    if near > 0 { format!("{near} near") } else { "none near".into() },
+                    Some(Act::Edit(Field::WeldNear)),
+                    None,
+                );
             }
             Some(Selection::Entity(_) | Selection::Light(_)) => {
                 let rows = self.panel();

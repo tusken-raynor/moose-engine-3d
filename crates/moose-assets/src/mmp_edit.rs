@@ -620,6 +620,57 @@ impl LevelDoc {
         }
     }
 
+    /// Welds vertices `vs` into the first of them, moved to `to`: every surface's corner at
+    /// any of them is at it now. Corners that come together in a surface become one, and a
+    /// surface left without area (a sliver between the vertices welded) goes; an opening
+    /// that would is refused. The first keeps its meta values. Returns how many surfaces
+    /// went. For tidying a cut that missed a corner by a little.
+    pub fn weld_vertices(&mut self, vs: &[usize], to: Vec3) -> Result<usize, String> {
+        let Some(&into) = vs.first() else {
+            return Err("no vertices to weld".into());
+        };
+        let mut doc = self.clone();
+        doc.vertices[into] = to;
+        let mut gone = Vec::new();
+        for (i, s) in doc.surfaces.iter_mut().enumerate() {
+            if !s.corners.iter().any(|c| vs.contains(&c.0)) {
+                continue;
+            }
+            for c in &mut s.corners {
+                if vs.contains(&c.0) {
+                    c.0 = into;
+                }
+            }
+            // Corners together (round the loop too) are one.
+            s.corners.dedup_by(|b, a| a.0 == b.0);
+            while s.corners.len() > 1 && s.corners.first().map(|c| c.0) == s.corners.last().map(|c| c.0) {
+                s.corners.pop();
+            }
+            let p: Vec<Vec3> = s.corners.iter().map(|c| doc.vertices[c.0]).collect();
+            let area = (1..p.len().saturating_sub(1)).map(|k| (p[k] - p[0]).cross(p[k + 1] - p[0])).sum::<Vec3>().length();
+            if p.len() < 3 || area < 1e-6 {
+                if s.adjoin.is_some() {
+                    return Err(format!("welding them would close the opening, face {i}"));
+                }
+                gone.push(i);
+            }
+        }
+        doc.remove_surfaces(&gone);
+        *self = doc;
+        Ok(gone.len())
+    }
+
+    /// The vertices surfaces use within `radius` of vertex `v` (it first).
+    pub fn vertices_near(&self, v: usize, radius: f32) -> Vec<usize> {
+        let mut used: Vec<usize> = self.surfaces.iter().flat_map(|s| s.corners.iter().map(|c| c.0)).collect();
+        used.sort_unstable();
+        used.dedup();
+        let at = self.vertices[v];
+        std::iter::once(v)
+            .chain(used.into_iter().filter(|&u| u != v && self.vertices[u].distance(at) <= radius))
+            .collect()
+    }
+
     /// Vertex `v`'s options (its meta values), made room for if the table is shorter.
     pub fn vertex_options_mut(&mut self, v: usize) -> &mut Vec<String> {
         if self.vertex_options.len() <= v {

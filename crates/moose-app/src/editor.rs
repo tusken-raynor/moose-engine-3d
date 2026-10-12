@@ -229,6 +229,10 @@ pub enum Field {
     ToggleLight(LightRef),
     /// Splits the selected faces into triangles (flat and convex, whatever they were).
     Triangulate,
+    /// Welds the selected vertices into the active one (see `LevelDoc::weld_vertices`).
+    Weld,
+    /// Welds the vertices within a grid step of the active one into it.
+    WeldNear,
     /// Paints slight color variety on the selected faces' vertices, as `$tint` (see
     /// `LevelDoc::vary_vertex_meta`), for `colored_bumpy`.
     VaryTint,
@@ -685,6 +689,11 @@ impl Editor {
     /// The selected faces (the active one last).
     pub fn selected_faces(&self) -> Vec<usize> {
         self.selected().into_iter().filter_map(|s| if let Selection::Surface(i) = s { Some(i) } else { None }).collect()
+    }
+
+    /// The selected vertices (the active one last).
+    pub fn selected_vertices(&self) -> Vec<usize> {
+        self.selected().into_iter().filter_map(|s| if let Selection::Vertex(i) = s { Some(i) } else { None }).collect()
     }
 
     /// A click on `s` (none: on nothing): with `add` (Shift), it joins the selection as the
@@ -1600,6 +1609,27 @@ impl Editor {
                     made += self.doc.triangulate_surface(f)?;
                 }
                 Ok(format!("split into {}", count(made, "triangle")))
+            }
+            (Some(Selection::Vertex(v)), Field::Weld | Field::WeldNear) => {
+                let vs: Vec<usize> = if field == Field::Weld {
+                    let mut vs = vec![v];
+                    vs.extend(self.selected_vertices().into_iter().filter(|&u| u != v));
+                    vs
+                } else {
+                    // A grid step, and a hair (a cut a step off is one).
+                    self.doc.vertices_near(v, self.step() + 1e-3)
+                };
+                if vs.len() < 2 {
+                    return Err(if field == Field::Weld {
+                        "select the vertices to weld (Shift), the one to keep last".into()
+                    } else {
+                        format!("no other vertex within {} m", moose_assets::number(self.step()))
+                    });
+                }
+                let gone = self.doc.weld_vertices(&vs, self.doc.vertices[v])?;
+                (self.selection, self.multi) = (Some(Selection::Vertex(v)), Vec::new());
+                let slivers = if gone > 0 { format!(", {} gone", count(gone, "sliver face")) } else { String::new() };
+                Ok(format!("welded {} into vertex {v}{slivers}", count(vs.len() - 1, "vertex")))
             }
             (Some(_), Field::VaryTint) => {
                 let faces: Vec<usize> =
