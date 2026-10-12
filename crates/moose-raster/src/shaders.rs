@@ -1411,18 +1411,19 @@ pub use basic_bumpy::{BasicBumpy, BasicBumpyMirrored};
 /// [`BasicBumpy`] with each corner's color (the mesh attribute `color`, three 0-255 values)
 /// multiplied into the texture's: 255 leaves it as it is, less darkens and tints it, smoothly
 /// across the polygon. For variety painted on corners (dirt redder here, greyer there). The
-/// color is interpolated in 8.8 like [`VertexColor`]'s; `MIRRORED` is its copy seen in a
-/// mirror (or with bumps off), colored but not bumped.
+/// color is interpolated in floats and clamped at each pixel: a small polygon's sample points
+/// fall outside it, so its blend runs past 0-255, which 8.8 would wrap into another color.
+/// `MIRRORED` is its copy seen in a mirror (or with bumps off), colored but not bumped.
 pub mod colored_bumpy {
     use super::basic_bumpy::{bump_fade, bumped_light};
-    use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext, high_byte};
+    use crate::shader::{F32s, Fill, I32s, Material, PixelContext, SampleContext, U32s, VertexContext};
 
     crate::material_io! {
         vertex { uv: 2, tint: 3, face_normal: 3, face_tangent: 3, face_bitangent: 3 }
         sampled { uv: 2, lod: 1, tint: 3, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
-        fixed16 { lod: 1, tint: 3, fade: 1 if !MIRRORED }
-        float { bump: 13 if !MIRRORED }
+        fixed16 { lod: 1, fade: 1 if !MIRRORED }
+        float { tint: 3, bump: 13 if !MIRRORED }
     }
 
     pub struct ColoredBumpy<const MIRRORED: bool = false>;
@@ -1467,10 +1468,12 @@ pub mod colored_bumpy {
         fn shade_pixel(a: &Fixed32, b: &Fixed16, c: &Floats, ctx: &PixelContext) -> U32s {
             let texel = ctx.texel(0, &a.uv, b.lod[0]);
             // The tint times the texel's color, per channel: (tint + 1) / 256, so 255
-            // leaves it exactly.
+            // leaves it exactly. Clamped first (the blend runs past 0-255 outside a polygon).
             let byte = U32s::fill(255);
             let tint = |shift: u32, k: usize| {
-                ((((texel >> shift) & byte) * (high_byte(b.tint[k]) + U32s::fill(1))) >> 8_u32) << shift
+                let t: I32s = c.tint[k].max(F32s::fill(0.0)).min(F32s::fill(255.0)).round_int();
+                let t: U32s = wide::bytemuck::cast(t);
+                ((((texel >> shift) & byte) * (t + U32s::fill(1))) >> 8_u32) << shift
             };
             let tinted = (texel & U32s::fill(0xFF00_0000)) | tint(16, 0) | tint(8, 1) | tint(0, 2);
             let light = if MIRRORED {
