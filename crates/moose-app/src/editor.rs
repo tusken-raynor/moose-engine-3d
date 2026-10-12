@@ -701,8 +701,30 @@ impl Editor {
     /// values) close; the material browser stays, for giving the next faces it too.
     fn selection_changed(&mut self, before: Option<Selection>) {
         if self.selection != before {
-            use crate::editor_panel::{Menu, Owner};
-            self.menus.retain(|m| !matches!(m, Menu::Lights(..) | Menu::Meta(Owner::Sector(_) | Owner::Surface(_))));
+            self.close_others_menus();
+        }
+    }
+
+    /// Closes the menus that are another thing's than the active selection (the lights a
+    /// sector, face or entity is kept from, a sector's, face's or vertex's meta values), and
+    /// what was opened over them: whatever changed the selection (a click, a mode, Find, an
+    /// edit). Called every frame; the level's menus and the material browser stay.
+    pub fn close_others_menus(&mut self) {
+        use crate::editor_panel::{Menu, Owner};
+        let active = self.current(self.selection);
+        let mine = |m: &Menu| match *m {
+            Menu::Lights(thing, i) => active.and_then(|s| self.excluder(s)) == Some((thing, i)),
+            Menu::Meta(Owner::Sector(s)) => active == Some(Selection::Sector(s)),
+            Menu::Meta(Owner::Surface(f)) => active == Some(Selection::Surface(f)),
+            Menu::Meta(Owner::Vertex(v)) => active == Some(Selection::Vertex(v)),
+            _ => true,
+        };
+        if let Some(k) = self.menus.iter().position(|m| !mine(m)) {
+            self.menus.truncate(k);
+            self.list = Default::default();
+            if matches!(self.typing, Some((crate::editor_panel::Typing::MetaKey(_) | crate::editor_panel::Typing::MetaValue(_), _))) {
+                self.typing = None;
+            }
         }
     }
 

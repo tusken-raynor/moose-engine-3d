@@ -3187,6 +3187,8 @@ fn draw_shadow_mesh(canvas: &mut ui::Canvas, geometry: &ViewGeometry) {
 /// than turning the view.
 fn edit_input(app: &mut App, display: &Display) -> bool {
     use editor::{Field, Mode, Selection, ViewMode};
+    // A menu of something no longer selected (its meta values, its lights) closes.
+    app.editor.close_others_menus();
     use editor_keys::Action;
     use editor_panel::{Act, Typing};
     let (w, h) = (app.width as usize, app.height as usize);
@@ -5014,6 +5016,39 @@ mod tests {
         let mut library = app.assets.materials().clone();
         with_material(&mut library, "wrong", "shader basic_bumpy\ntexture0 default.png\nshort vertex:tint|4\n");
         assert!(app.apply_materials(library).unwrap_err().contains("only an input read per vertex"));
+    }
+
+    #[test]
+    fn a_menu_of_what_is_no_longer_selected_closes() {
+        use editor::{Mode, Selection};
+        use editor_panel::{Act, Menu, Owner};
+        let mut app = test_app("two_rooms.mmp");
+        let e = &mut app.editor;
+        e.set_mode(Mode::Vertex);
+        e.vertex_faces = vec![0];
+        let (a, b) = (e.doc.surfaces[0].corners[0].0, e.doc.surfaces[0].corners[1].0);
+        e.click(Some(Selection::Vertex(a)), false);
+        run_act(&mut app, Act::Open(Menu::Meta(Owner::Vertex(a))), 1.0);
+        // Another vertex: its meta menu closes.
+        app.editor.click(Some(Selection::Vertex(b)), false);
+        app.editor.close_others_menus();
+        assert!(app.editor.menus.is_empty());
+        // Another mode (the face's sector selected): closes too; the level's stays.
+        run_act(&mut app, Act::Open(Menu::Meta(Owner::Vertex(b))), 1.0);
+        app.editor.set_mode(Mode::Face);
+        app.editor.close_others_menus();
+        assert!(app.editor.menus.is_empty());
+        run_act(&mut app, Act::Icon(Menu::World), 1.0);
+        run_act(&mut app, Act::Open(Menu::Meta(Owner::Level)), 1.0);
+        app.editor.click(Some(Selection::Surface(3)), false);
+        app.editor.close_others_menus();
+        assert_eq!(app.editor.menus, [Menu::World, Menu::Meta(Owner::Level)]);
+        // A face's lights, then another face: back to the face panel.
+        app.editor.menus.clear();
+        run_act(&mut app, Act::Open(Menu::Lights(editor::Excluder::Surface, 3)), 1.0);
+        app.editor.selection = Some(Selection::Surface(4));
+        app.editor.close_others_menus();
+        assert!(app.editor.menus.is_empty());
     }
 
     #[test]
