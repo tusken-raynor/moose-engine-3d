@@ -1,0 +1,10 @@
+[package]
+name = "moose-physics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+moose-scene = { path = "../moose-scene" }
+glam.workspace = true
+rapier3d = "0.36"

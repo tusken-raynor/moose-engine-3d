@@ -1,6 +1,7 @@
 MOOSEMATERIAL 2
-shader             basic_bumpy
+shader             colored_bumpy
 texture0           dirt_gravel_1_albedo.png
 texture1           dirt_gravel_1_normal.png
 short              4
 far                7
+tint               vertex:tint|255,255,255

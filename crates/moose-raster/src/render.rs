@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use moose_assets::{Assets, MeshId, Light, Texture, TextureId};
 use moose_scene::Viewport;
 use moose_view::{
@@ -87,7 +87,11 @@ pub struct RasterConfig {
     /// Blur grid cells twice as wide as they are tall (half the columns), like the
     /// half-rate shading of reflections.
     pub blur_half_rate: bool,
-
+    /// Edges between surfaces smoothed: each pixel an edge passes through takes some of its
+    /// neighbor across the edge, as much as the edge leaves on that side (see
+    /// [`find_edges`]). Only where the surfaces differ (not between pieces of one surface),
+    /// and not in reflections, per-pixel actors or translucent surfaces.
+    pub smooth_edges: bool,
 }
 
 impl Default for RasterConfig {
@@ -108,7 +112,7 @@ impl Default for RasterConfig {
             beam_dither: false,
             blur_scale: 8,
             blur_half_rate: false,
-
+            smooth_edges: false,
         }
     }
 }
@@ -282,6 +286,9 @@ struct PolygonSetup {
     /// The lights that reach it, in `ThreadBins::lights`.
     first_light: u32,
     light_count: u16,
+    /// The shadow slots of the lights it is in the full shadow of (see
+    /// `ViewPolygon::shadowed`).
+    shadowed: u32,
     /// Where its `sampled` world position is among its sampled values, if it has one.
     position: Option<u16>,
     /// Where its `sampled` `uv` and level of detail are, and texture 0's size in texels,
@@ -352,6 +359,9 @@ struct ShadowSetup {
     /// Its soft edges (`ThreadBins::shadow_softs`), if it is in any: how much of the light
     /// reaches each pixel is worked out there.
     softs: (u32, u32),
+    /// In full shadow (all dark, in no soft edge, not blurred): its edges are hard, and
+    /// smoothed (see [`smooth_shadow_edges`]).
+    dark: bool,
 }
 
 /// A piece of a polygon's row: pixels `x0..x1`, and w as a linear function of x.
@@ -387,6 +397,58 @@ struct RowState {
     x_right: f32,
     w_left: f32,
     w_right: f32,
+    /// The edges crossed (for smoothing them; see [`find_edges`]).
+    left_edge: EdgeSlope,
+    right_edge: EdgeSlope,
+}
+
+/// A polygon edge crossing a row: x per row along it, and the rows it spans (y, top to
+/// bottom).
+#[derive(Clone, Copy, Debug, Default)]
+struct EdgeSlope {
+    dxdy: f32,
+    top: f32,
+    bottom: f32,
+}
+
+/// A full shadow piece's edge crossing a row (see [`smooth_shadow_edges`]): its split
+/// light, its x at the row's center, its slope and rows, and which way is out of the
+/// shadow (1 right, -1 left).
+#[derive(Clone, Copy, Debug)]
+struct ShadowEdge {
+    split: u8,
+    x: f32,
+    slope: EdgeSlope,
+    side: f32,
+}
+
+/// Which neighbor a pixel an edge passes through takes some of: the one across the edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Across {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// A pixel of a row that an edge passes through (from the viewport's left), and how much
+/// of its neighbor across the edge it takes, in 256ths.
+#[derive(Clone, Copy, Debug)]
+struct EdgeBlend {
+    px: u32,
+    across: Across,
+    k: u32,
+}
+
+/// A band's edge pixels that take some of a row in the next band or the one before, done
+/// once every band is drawn: its first and last rows as shaded (before smoothing, for the
+/// bands next to it), and the pixels of those rows that take from above and below them.
+#[derive(Default)]
+struct Seam {
+    first: Vec<u32>,
+    last: Vec<u32>,
+    up: Vec<(u32, u32)>,
+    down: Vec<(u32, u32)>,
 }
 
 /// One thread's phase 2 scratchpad, sized from the viewport width.
@@ -397,6 +459,9 @@ struct RowScratch {
     reaches: Vec<f32>,
     /// A soft shadow piece's light across its stretch of the row (see `shadow_run`).
     soft_row: Vec<f32>,
+    /// The edges of full shadow pieces crossing the run being shaded, to be smoothed (see
+    /// [`smooth_shadow_edges`]).
+    shadow_edges: Vec<ShadowEdge>,
     /// The framebuffer row being drawn.
     row: i32,
     color: Vec<u32>,
@@ -446,6 +511,13 @@ struct RowScratch {
     occluded: Vec<f32>,
     /// The blur grid's columns of cells under a run (see `BlurGrid::soften`).
     blur_cells: Vec<(f32, f32, f32)>,
+    /// Edge smoothing (see `RasterConfig::smooth_edges`): the row above and this row as
+    /// shaded, before smoothing; this row's edge pixels; and the row above's that take from
+    /// this one, waiting for it.
+    edge_above: Vec<u32>,
+    edge_here: Vec<u32>,
+    edge_blends: Vec<EdgeBlend>,
+    edge_down: Vec<(u32, u32)>,
 }
 
 /// Counts and timings from the last frame.
@@ -482,6 +554,8 @@ pub struct Renderer {
     /// What untextured polygons sample: 1x1 opaque white.
     blank: Texture,
     blur: BlurGrid,
+    /// Per band, its edge pixels waiting for the bands next to it.
+    seams: Vec<Seam>,
 }
 
 /// The textures polygons sample, and the frame's focal length and ambient light; and the
@@ -518,6 +592,7 @@ impl Renderer {
             scratch: Vec::new(),
             blank: Texture::solid("blank", 0xFFFF_FFFF),
             blur: BlurGrid::default(),
+            seams: Vec::new(),
         }
     }
 
@@ -641,17 +716,24 @@ impl Renderer {
         let rows = &mut target.pixels
             [viewport.y as usize * width..(viewport.y + viewport.height) as usize * width];
         let (bins, scratch, shaders) = (&self.bins, &self.scratch, &self.materials);
+        self.seams.resize_with(bands as usize, Seam::default);
+        let seams = &mut self.seams[..bands as usize];
         rows.par_chunks_mut(band_rows as usize * width)
+            .zip(seams.par_iter_mut())
             .enumerate()
-            .for_each(|(b, chunk)| {
+            .for_each(|(b, (chunk, seam))| {
                 let band_started = Instant::now();
                 let t = rayon::current_thread_index().unwrap_or(0) % scratch.len();
                 let mut s = scratch[t].lock().unwrap();
                 render_band(
                     &mut s, bins, shaders, config, &textures, viewport, b, band_rows, chunk, width,
+                    seam,
                 );
                 busy.fetch_add(band_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             });
+        if config.smooth_edges {
+            join_seams(seams, rows, width, viewport, band_rows as usize);
+        }
         let done = Instant::now();
 
         Ok(RenderStats {
@@ -1077,6 +1159,7 @@ fn setup_polygon(
             row_end: pixel_edge(bottom),
             occluded: piece.occluded,
             softs: (first_soft, bins.shadow_softs.len() as u32),
+            dark: piece.soft_count == 0 && !piece.occluded && vertices.iter().all(|v| v.light <= 0.0),
         });
         for v in vertices {
             bins.shadow_vertices.push(SetupVertex { x: v.x, y: v.y, w: v.w });
@@ -1123,6 +1206,7 @@ fn setup_polygon(
         half_rate: p.mirror.is_some(),
         first_light,
         light_count: (bins.lights.len() as u32 - first_light) as u16,
+        shadowed: p.shadowed,
         position: remap.position.map(|p| p as u16),
         lod: lod_at,
         back,
@@ -1154,9 +1238,13 @@ fn render_band(
     band_rows: i32,
     chunk: &mut [u32],
     width: usize,
+    seam: &mut Seam,
 ) {
     let vw = viewport.width as usize;
     let vx = viewport.x as i32;
+    s.edge_down.clear();
+    seam.up.clear();
+    seam.down.clear();
     // Lattices are built per block of rows, whatever the band size, so no band size or
     // thread count changes a pixel.
     let band_top = band as i32 * band_rows;
@@ -1358,9 +1446,301 @@ fn render_band(
             }
         }
 
+        if config.smooth_edges {
+            let per_pixel = !s.pixel_spans.is_empty();
+            smooth_row(s, bins, viewport, r, chunk, width, seam, per_pixel);
+        }
         let out = &mut chunk[r * width + viewport.x as usize..r * width + viewport.x as usize + vw];
         out.copy_from_slice(&s.color);
     }
+}
+
+/// Smooths the edges the row's pixels are on (see [`find_edges`]), from the row as
+/// shaded and the rows above and below. Rows of the band below this one are taken from
+/// once it is shaded; its first and last rows' pixels that take from another band wait in
+/// `seam` (see [`join_seams`]).
+#[allow(clippy::too_many_arguments)]
+fn smooth_row(
+    s: &mut RowScratch,
+    bins: &[ThreadBins],
+    viewport: Viewport,
+    r: usize,
+    chunk: &mut [u32],
+    width: usize,
+    seam: &mut Seam,
+    per_pixel: bool,
+) {
+    let rows = chunk.len() / width;
+    let at = |r: usize| r * width + viewport.x as usize;
+    // This row as shaded, and the row above's pixels waiting for it.
+    std::mem::swap(&mut s.edge_above, &mut s.edge_here);
+    s.edge_here.clear();
+    s.edge_here.extend_from_slice(&s.color);
+    for &(px, k) in &s.edge_down {
+        let i = at(r - 1) + px as usize;
+        chunk[i] = mix(chunk[i], s.edge_here[px as usize], k);
+    }
+    s.edge_down.clear();
+
+    find_edges(s, bins, viewport, per_pixel);
+    let (top, bottom) = (s.row == viewport.y as i32, s.row + 1 == (viewport.y + viewport.height) as i32);
+    for e in &s.edge_blends {
+        let (px, k) = (e.px as usize, e.k);
+        let c = &mut s.color[px];
+        match e.across {
+            // Nothing to blend with past the screen's left and right edges (as above and
+            // below them).
+            Across::Left if px == 0 => {}
+            Across::Right if px + 1 >= s.edge_here.len() => {}
+            Across::Left => *c = mix(*c, s.edge_here[px - 1], k),
+            Across::Right => *c = mix(*c, s.edge_here[px + 1], k),
+            Across::Up if top => {}
+            Across::Up if r == 0 => seam.up.push((e.px, k)),
+            Across::Up => *c = mix(*c, s.edge_above[px], k),
+            Across::Down if bottom => {}
+            Across::Down if r + 1 == rows => seam.down.push((e.px, k)),
+            Across::Down => s.edge_down.push((e.px, k)),
+        }
+    }
+    if r == 0 {
+        seam.first.clear();
+        seam.first.extend_from_slice(&s.edge_here);
+    }
+    if r + 1 == rows {
+        seam.last.clear();
+        seam.last.extend_from_slice(&s.edge_here);
+    }
+}
+
+/// The edge pixels on bands' first and last rows that take from the band before or after
+/// them, once every band is drawn (from those rows as shaded).
+fn join_seams(seams: &[Seam], rows: &mut [u32], width: usize, viewport: Viewport, band_rows: usize) {
+    let height = viewport.height as usize;
+    for (b, seam) in seams.iter().enumerate() {
+        let (first, last) = (b * band_rows, ((b + 1) * band_rows).min(height) - 1);
+        let at = |row: usize, px: u32| row * width + viewport.x as usize + px as usize;
+        if b > 0 {
+            for &(px, k) in &seam.up {
+                let i = at(first, px);
+                rows[i] = mix(rows[i], seams[b - 1].last[px as usize], k);
+            }
+        }
+        if let Some(below) = seams.get(b + 1) {
+            for &(px, k) in &seam.down {
+                let i = at(last, px);
+                rows[i] = mix(rows[i], below.first[px as usize], k);
+            }
+        }
+    }
+}
+
+/// `a` with `k` 256ths of `b` (at most 256), in each byte (the top one, an HDR material's
+/// past-white amount, too).
+#[inline]
+fn mix(a: u32, b: u32, k: u32) -> u32 {
+    let lerp = |a: u32, b: u32| ((a * (256 - k) + b * k) >> 8) & 0x00FF_00FF;
+    lerp(a & 0x00FF_00FF, b & 0x00FF_00FF) | lerp(a >> 8 & 0x00FF_00FF, b >> 8 & 0x00FF_00FF) << 8
+}
+
+/// Finds the row's edge pixels into `s.edge_blends`: where its opaque spans meet (or meet
+/// the background), the polygon edge there is followed through the row's pixels, and each
+/// pixel it passes through takes as much of its neighbor across it as the edge leaves on
+/// that side (its area there, a box filter). An edge steeper than 45 degrees passes
+/// through about one pixel a row, which takes from its neighbor left or right; a
+/// shallower one runs along the row, each pixel taking from the one above or below.
+///
+/// Only where the surfaces differ: not between pieces of one surface (same material,
+/// lights and values on both sides; see [`continuous`]). Not in reflections, which are
+/// drawn at half rate; on a row with per-pixel actors, not where they are drawn.
+fn find_edges(s: &mut RowScratch, bins: &[ThreadBins], viewport: Viewport, per_pixel: bool) {
+    s.edge_blends.clear();
+    let (vx, end) = (viewport.x as i32, (viewport.x + viewport.width) as i32);
+    let n = s.spans.len();
+    // Each place spans meet, or meet the background: the span (if any) on either side,
+    // the pixel it is at, and how far each side's pixels reach from it.
+    let meet = |s: &mut RowScratch, a: Option<Span>, b: Option<Span>, lo: i32, at: i32, hi: i32| {
+        if lo < at && at < hi {
+            edge_pixels(s, bins, a, b, lo, at, hi, vx, per_pixel);
+        }
+    };
+    if n == 0 {
+        return;
+    }
+    let first = s.spans[0];
+    meet(s, None, Some(first), vx, first.x0, first.x1);
+    for i in 0..n {
+        let a = s.spans[i];
+        match s.spans.get(i + 1).copied() {
+            Some(b) if b.x0 == a.x1 => meet(s, Some(a), Some(b), a.x0, a.x1, b.x1),
+            next => {
+                let gap = next.map_or(end, |b| b.x0);
+                meet(s, Some(a), None, a.x0, a.x1, gap);
+                if let Some(b) = next {
+                    meet(s, None, Some(b), a.x1, b.x0, b.x1);
+                }
+            }
+        }
+    }
+}
+
+/// One place spans meet (see [`find_edges`]): `a`'s pixels (or the background's) are
+/// `lo..at`, `b`'s are `at..hi`.
+#[allow(clippy::too_many_arguments)]
+fn edge_pixels(
+    s: &mut RowScratch,
+    bins: &[ThreadBins],
+    a: Option<Span>,
+    b: Option<Span>,
+    lo: i32,
+    at: i32,
+    hi: i32,
+    vx: i32,
+    per_pixel: bool,
+) {
+    let states = &s.states;
+    let st = |sp: &Span| &states[sp.state as usize];
+    let poly = |sp: &Span| {
+        let (t, l) = split_id(st(sp).id);
+        &bins[t].polygons[l]
+    };
+    if a.is_some_and(|a| poly(&a).half_rate) || b.is_some_and(|b| poly(&b).half_rate) {
+        return; // a reflection
+    }
+    // The edge between them: a's right edge, if it ends there, or b's left edge, if it
+    // starts there (where both do, the nearer one's); where neither does, the surfaces
+    // meet where they pass through each other, which is left alone.
+    let on_a = a.filter(|a| a.x1 == pixel_edge(st(a).x_right));
+    let on_b = b.filter(|b| b.x0 == pixel_edge(st(b).x_left));
+    let right = |a: &Span| (st(a).x_right, st(a).right_edge);
+    let left = |b: &Span| (st(b).x_left, st(b).left_edge);
+    let (x, edge) = match (on_a, on_b) {
+        (Some(a), Some(b)) if a.w(at) >= b.w(at) => right(&a),
+        (_, Some(b)) => left(&b),
+        (Some(a), None) => right(&a),
+        (None, None) => return,
+    };
+    let y = s.row as f32 + 0.5;
+    if let (Some(a), Some(b)) = (a, b)
+        && continuous(bins, st(&a).id, st(&b).id, x, y)
+    {
+        return;
+    }
+    // Pixels drawn over by per-pixel actors are theirs.
+    let owner = |px: i32| {
+        let side = if px < at { a } else { b };
+        side.map_or(EMPTY, |sp| sp.state)
+    };
+    let shown = |px: i32| !per_pixel || s.vis_state[(px - vx) as usize] == owner(px);
+    let mut push = |px: i32, across: Across, k: f32| {
+        let k = (k * 256.0).round() as u32;
+        let neighbor = match across {
+            Across::Left => shown(px - 1),
+            Across::Right => shown(px + 1),
+            Across::Up | Across::Down => true,
+        };
+        if k > 0 && shown(px) && neighbor {
+            s.edge_blends.push(EdgeBlend { px: (px - vx) as u32, across, k: k.min(128) });
+        }
+    };
+    if !edge.dxdy.is_finite() {
+        return;
+    }
+    // Each pixel of the row the edge passes through (within its own ends) takes as much of
+    // its neighbor across the edge as the edge cuts off of it: left or right of a steep edge,
+    // above or below a shallow one.
+    let len = (1.0 + edge.dxdy * edge.dxdy).sqrt();
+    let normal = Vec2::new(1.0, -edge.dxdy) / len; // square to the edge, to its right
+    let reach = edge_reach(normal) * len; // along the row
+    for px in pixel_edge(x - reach).max(lo)..pixel_edge(x + reach).min(hi) {
+        let d = (px as f32 + 0.5 - x) / len; // its center's distance right of the edge
+        let foot = y + d * edge.dxdy / len; // the nearest point of the edge's line, its y
+        if foot < edge.top || foot > edge.bottom {
+            continue;
+        }
+        let across = if edge.dxdy.abs() <= 1.0 {
+            if d > 0.0 { Across::Left } else { Across::Right }
+        } else if (px as f32 + 0.5 - x) / edge.dxdy < 0.0 {
+            Across::Up // the edge passes above its center
+        } else {
+            Across::Down
+        };
+        push(px, across, 1.0 - covered(d.abs(), normal));
+    }
+}
+
+/// How much of a pixel lies on its center's side of a straight edge `d` from the center
+/// (square to it; negative past it), the edge's unit normal being `normal`: the area of
+/// the pixel's square there, a box filter.
+fn covered(d: f32, normal: Vec2) -> f32 {
+    let (a, b) = (normal.x.abs().max(normal.y.abs()), normal.x.abs().min(normal.y.abs()));
+    // Within `(a - b) / 2` of the center the edge crosses two opposite sides, and the area
+    // changes evenly; further out it cuts a corner off, a triangle.
+    let (corner, reach) = ((a - b) * 0.5, (a + b) * 0.5);
+    if d >= reach {
+        1.0
+    } else if d <= -reach {
+        0.0
+    } else if d.abs() <= corner {
+        0.5 + d / a
+    } else if d > 0.0 {
+        1.0 - (reach - d) * (reach - d) / (2.0 * a * b)
+    } else {
+        (reach + d) * (reach + d) / (2.0 * a * b)
+    }
+}
+
+/// How far (square to it) a straight edge with unit normal `normal` can be from a pixel's
+/// center and still cross the pixel.
+fn edge_reach(normal: Vec2) -> f32 {
+    (normal.x.abs() + normal.y.abs()) * 0.5
+}
+
+/// Whether two polygons meeting at screen point (`x`, `y`) look like one surface there:
+/// the same material and lights, and the same w and `sampled` values (but the level of
+/// detail) on both sides.
+fn continuous<'a>(bins: &'a [ThreadBins], a: u32, b: u32, x: f32, y: f32) -> bool {
+    if a == b {
+        return true;
+    }
+    let ((ta, la), (tb, lb)) = (split_id(a), split_id(b));
+    let (ba, bb) = (&bins[ta], &bins[tb]);
+    let (pa, pb) = (&ba.polygons[la], &bb.polygons[lb]);
+    if pa.material != pb.material
+        || pa.params != pb.params
+        || pa.textures != pb.textures
+        || pa.filters != pb.filters
+    {
+        return false;
+    }
+    // Not a hard shadow's edge: one in the full shadow of a light that reaches the other
+    // whole (polygons are carved along shadows' edges; where the other is split, its
+    // shadow pieces fade the light out to there). Their lights can differ otherwise, but
+    // only where a light has faded to nothing: past its range, outside its cone or behind
+    // them.
+    let lights = |b: &'a ThreadBins, p: &PolygonSetup| {
+        let range = p.first_light as usize..p.first_light as usize + p.light_count as usize;
+        b.lights[range.clone()].iter().zip(&b.light_split[range])
+    };
+    let differ = pa.shadowed ^ pb.shadowed;
+    if lights(ba, pa)
+        .chain(lights(bb, pb))
+        .any(|(l, &split)| split == NO_SPLIT && l.shadow.is_some_and(|k| differ >> k & 1 != 0))
+    {
+        return false;
+    }
+    let n = pa.n_vals as usize;
+    let qa = Planes::of(&ba.planes[pa.first_plane as usize..], pa.fans as usize, n);
+    let qb = Planes::of(&bb.planes[pb.first_plane as usize..], pb.fans as usize, n);
+    let (wa, wb) = (qa.w_at(x, y), qb.w_at(x, y));
+    if (wa - wb).abs() > 2e-3 * wa.abs().max(wb.abs()) || wa <= 0.0 || wb <= 0.0 {
+        return false;
+    }
+    let lod = pa.lod.map(|(_, lod, _, _)| lod as usize);
+    let (fa, fb) = (qa.fan_at(x, y), qb.fan_at(x, y));
+    (0..n).filter(|&k| Some(k) != lod).all(|k| {
+        let (va, vb) = (qa.value_at(fa, k, x, y) / wa, qb.value_at(fb, k, x, y) / wb);
+        (va - vb).abs() <= 2e-3 + 1e-3 * va.abs().max(vb.abs())
+    })
 }
 
 fn fill(color: &mut [u32], from: i32, to: i32, value: u32) {
@@ -1417,6 +1797,17 @@ fn edge_at_row(verts: &[SetupVertex], i: usize, row: i32) -> (f32, f32) {
     (a.w + (c.w - a.w) * t, alpha)
 }
 
+/// Edge `i`'s slope along the line it is walked on (see [`crossings`]), and its rows.
+fn edge_slope(verts: &[SetupVertex], lines: &[Option<EdgeLine>], i: usize) -> EdgeSlope {
+    let (a, c) = (verts[i], verts[(i + 1) % verts.len()]);
+    let line = lines[i].unwrap_or(EdgeLine::between((a.x, a.y), (c.x, c.y)));
+    EdgeSlope {
+        dxdy: (line.x1 - line.x0) / (line.y1 - line.y0),
+        top: a.y.min(c.y),
+        bottom: a.y.max(c.y),
+    }
+}
+
 /// The span a polygon covers on `row`, if any: its pixels and w along them. Only x and w;
 /// values are worked out when (and if) it is shaded.
 fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i32) -> Option<Span> {
@@ -1427,14 +1818,15 @@ fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i3
         return None;
     }
     let range = p.first_vertex as usize..p.first_vertex as usize + p.vertex_count as usize;
-    let verts = &b.vertices[range.clone()];
-    let ((li, x_left), (ri, x_right)) = crossings(verts, &b.lines[range], row)?;
+    let (verts, lines) = (&b.vertices[range.clone()], &b.lines[range]);
+    let ((li, x_left), (ri, x_right)) = crossings(verts, lines, row)?;
     let (x0, x1) = (pixel_edge(x_left), pixel_edge(x_right));
     if x0 >= x1 {
         return None; // an edge-on sliver on this row
     }
     let (w_left, _) = edge_at_row(verts, li, row);
     let (w_right, _) = edge_at_row(verts, ri, row);
+    let slope = |i: usize| edge_slope(verts, lines, i);
     let state = s.states.len() as u32;
     s.states.push(RowState {
         id,
@@ -1443,6 +1835,8 @@ fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i3
         x_right,
         w_left,
         w_right,
+        left_edge: slope(li),
+        right_edge: slope(ri),
     });
     let dwdx = if x_right > x_left {
         (w_right - w_left) / (x_right - x_left)
@@ -1531,6 +1925,7 @@ struct Planes<'a> {
     /// past one when `ex * dy - ey * dx > 0`.
     diagonals: &'a [f32],
     n_fans: usize,
+    n_in: usize,
 }
 
 impl<'a> Planes<'a> {
@@ -1545,7 +1940,29 @@ impl<'a> Planes<'a> {
             fans: &data[5..fans_end],
             diagonals: &data[fans_end..fans_end + 2 * n_fans.saturating_sub(1)],
             n_fans,
+            n_in,
         }
+    }
+
+    /// w at screen point (`x`, `y`).
+    fn w_at(&self, x: f32, y: f32) -> f32 {
+        self.w0 + self.wx * (x - self.ox) + self.wy * (y - self.oy)
+    }
+
+    /// The fan triangle whose planes hold at (`x`, `y`): how many diagonals it is past.
+    fn fan_at(&self, x: f32, y: f32) -> usize {
+        let (dx, dy) = (x - self.ox, y - self.oy);
+        self.diagonals
+            .chunks_exact(2)
+            .filter(|d| d[0] * dy - d[1] * dx > 0.0)
+            .count()
+            .min(self.n_fans - 1)
+    }
+
+    /// `sampled` value `k` times w at (`x`, `y`), on fan triangle `fan`.
+    fn value_at(&self, fan: usize, k: usize, x: f32, y: f32) -> f32 {
+        let c = &self.fans[(fan * self.n_in + k) * 3..][..3];
+        c[0] + c[1] * (x - self.ox) + c[2] * (y - self.oy)
     }
 }
 
@@ -2172,8 +2589,10 @@ fn shadow_run(
     x0: i32,
     x1: i32,
     dither: bool,
+    smooth: Option<(f32, f32)>,
 ) {
     let len = (x1 - x0).max(0) as usize;
+    s.shadow_edges.clear();
     s.reaches.clear();
     s.reaches.resize(p.splits as usize * len, 1.0);
     s.occluded.clear();
@@ -2226,6 +2645,18 @@ fn shadow_run(
         // the row (see `soft_stretch`). Otherwise the same at every vertex (in full shadow,
         // or only in a beam), the same all over.
         let flat = (softs.is_empty() && light.iter().all(|&l| l == light[0])).then_some(light[0]);
+        // A full shadow's edges, to be smoothed, but not where they are the polygon's own.
+        if let Some((x_left, x_right)) = smooth
+            && piece.dark
+        {
+            let split = piece.split;
+            for (i, x, out, own) in [(il, xl, -1.0, x_left), (ir, xr, 1.0, x_right)] {
+                let slope = edge_slope(verts, lines, i);
+                if (x - own).abs() > 1e-3 && slope.dxdy.is_finite() {
+                    s.shadow_edges.push(ShadowEdge { split, x, slope, side: out });
+                }
+            }
+        }
         let soft_row = &mut s.soft_row;
         soft_row.clear();
         if !softs.is_empty() {
@@ -2388,6 +2819,126 @@ fn shadow_run(
         stipple(out, i1.max(o0), o1);
         out[(o1.max(o0) - x0) as usize..(to - x0) as usize].fill(0.0);
     }
+    if smooth.is_some() {
+        smooth_shadow_edges(s, bins, p, x0, x1);
+    }
+}
+
+/// Smooths full shadows' edges in the shadow buffer where no penumbra a pixel wide is next
+/// to them (hard shadows, a soft edge's narrow end, or a far one). For each pixel near an
+/// edge, the light is taken one and two pixels out from the nearest point of the edge,
+/// square to it: where it is no brighter at two than at
+/// one, there is less than a pixel of penumbra, and each pixel the edge passes through
+/// gets that light for the part of it out of the shadow (its area there, a box filter),
+/// and pixels further out, to a pixel from the edge, at least that light (a penumbra
+/// narrower than that is taken in). Where the light is still rising, a penumbra wide enough
+/// to see is there, and the smoothing fades out (fully at half the light at one pixel as at
+/// two). Where full shadow goes on past the edge (no light a pixel out), nothing changes,
+/// so pieces meeting show no seam. Only within the run.
+fn smooth_shadow_edges(s: &mut RowScratch, bins: &ThreadBins, p: &PolygonSetup, x0: i32, x1: i32) {
+    let len = (x1 - x0) as usize;
+    let y = s.row as f32 + 0.5;
+    for e in &s.shadow_edges {
+        let ShadowEdge { split, x, slope, side } = *e;
+        let dxdy = slope.dxdy;
+        let out_dir = Vec2::new(1.0, -dxdy).normalize() * side;
+        let out = &mut s.reaches[split as usize * len..(split as usize + 1) * len];
+        // From the pixels the edge passes through, to a pixel out from it (square to it),
+        // along the row: a long way for a shallow edge.
+        let along = (1.0 + dxdy * dxdy).sqrt();
+        let reach = edge_reach(out_dir);
+        let (a, b) = (x - side * reach * along, x + side * along);
+        for px in pixel_edge(a.min(b)).max(x0)..pixel_edge(a.max(b)).min(x1) {
+            // How far out of the shadow its center is, square to the edge, and the nearest
+            // point of the edge's line, which must be on the edge.
+            let center = Vec2::new(px as f32 + 0.5, y);
+            let d = (center.x - x) * side / along;
+            let foot = center - d * out_dir;
+            if foot.y < slope.top || foot.y > slope.bottom {
+                continue;
+            }
+            // The light past the edge there, and how hard the edge is.
+            let at = |k: f32| light_at(bins, p, split, foot.x + out_dir.x * k, foot.y + out_dir.y * k);
+            let Some(light) = at(1.0).filter(|&l| l > 0.0) else { continue };
+            let hard = match at(2.0) {
+                Some(further) if further > light => ((light / further - 0.5) / 0.4).clamp(0.0, 1.0),
+                _ => 1.0,
+            };
+            let lit = covered(d, out_dir) * light;
+            let o = &mut out[(px - x0) as usize];
+            let smooth = if (0.0..reach).contains(&d) { lit } else { o.max(lit) };
+            *o += (smooth - *o) * hard;
+        }
+    }
+}
+
+/// How much of split light `split` reaches screen point (`x`, `y`) of polygon `p`, as its
+/// shadow pieces give it in the shadow buffer (see [`shadow_run`]; not counting blurred
+/// casters' shadows): the least of the pieces holding it, or all of it in none. `None`
+/// off the polygon.
+fn light_at(bins: &ThreadBins, p: &PolygonSetup, split: u8, x: f32, y: f32) -> Option<f32> {
+    let q = Vec2::new(x, y);
+    let corner = |v: &SetupVertex| Vec2::new(v.x, v.y);
+    // Within a convex outline, whichever way round it goes.
+    let inside = |vs: &[SetupVertex]| {
+        let (mut left, mut right) = (false, false);
+        for i in 0..vs.len() {
+            let (a, b) = (corner(&vs[i]), corner(&vs[(i + 1) % vs.len()]));
+            let c = (b - a).perp_dot(q - a);
+            left |= c > 0.0;
+            right |= c < 0.0;
+        }
+        !(left && right)
+    };
+    if !inside(&bins.vertices[p.first_vertex as usize..][..p.vertex_count as usize]) {
+        return None;
+    }
+    let mut light = 1.0f32;
+    for piece in &bins.shadows[p.first_shadow as usize..][..p.shadows as usize] {
+        if piece.split != split || (piece.occluded && piece.beam.is_none()) {
+            continue;
+        }
+        let first = piece.first as usize;
+        let vs = &bins.shadow_vertices[first..first + piece.count as usize];
+        if !inside(vs) {
+            continue;
+        }
+        if piece.dark {
+            return Some(0.0);
+        }
+        // Its corners' weights at the point, perspective-correct, in the triangle of its fan
+        // holding it.
+        let Some(weights) = (1..vs.len() - 1).find_map(|t| {
+            let (a, b, c) = (corner(&vs[0]), corner(&vs[t]), corner(&vs[t + 1]));
+            let area = (b - a).perp_dot(c - a);
+            if area.abs() < 1e-9 {
+                return None;
+            }
+            let (l1, l2) = ((q - a).perp_dot(c - a) / area, (b - a).perp_dot(q - a) / area);
+            let l0 = 1.0 - l1 - l2;
+            (l0 >= -1e-4 && l1 >= -1e-4 && l2 >= -1e-4).then(|| {
+                let (w0, w1, w2) = (l0 * vs[0].w, l1 * vs[t].w, l2 * vs[t + 1].w);
+                let sum = w0 + w1 + w2;
+                [(0, w0 / sum), (t, w1 / sum), (t + 1, w2 / sum)]
+            })
+        }) else {
+            continue;
+        };
+        let mix3 = |f: &dyn Fn(usize) -> Vec3| weights.iter().fold(Vec3::ZERO, |acc, &(i, k)| acc + f(i) * k);
+        let softs = &bins.shadow_softs[piece.softs.0 as usize..piece.softs.1 as usize];
+        let mut here = if softs.is_empty() {
+            weights.iter().map(|&(i, k)| bins.shadow_light[first + i] * k).sum::<f32>().clamp(0.0, 1.0)
+        } else {
+            moose_view::soft_reach(softs, &bins.shadow_wedges, mix3(&|i| bins.shadow_world[first + i]))
+        };
+        if let Some((scale, offset)) = piece.beam {
+            let ray = mix3(&|i| bins.shadow_rays[first + i]);
+            let c = (ray.x / ray.length().max(1e-12) * scale + offset).clamp(0.0, 1.0);
+            here *= c * c * (3.0 - 2.0 * c);
+        }
+        light = light.min(here);
+    }
+    Some(light)
 }
 
 /// Shades pixels `x0..x1` of a polygon's row into `out` (the row's colors, or the blend
@@ -2428,7 +2979,8 @@ fn shade_points(
     };
     row_points(s, index, p.n_out as usize, shown, x1);
     // The shadow buffer for the run: how much of each split light reaches each pixel.
-    shadow_run(s, &bins[t], p, x0, x1, config.beam_dither);
+    let smooth = config.smooth_edges && !config.beam_dither && !p.half_rate;
+    shadow_run(s, &bins[t], p, x0, x1, config.beam_dither, smooth.then_some((x_left, x_right)));
     if let Some(grid) = textures.blur {
         grid.soften(s, &bins[t], p, x0, x1);
         for (r, o) in s.reaches.iter_mut().zip(&s.occluded) {
