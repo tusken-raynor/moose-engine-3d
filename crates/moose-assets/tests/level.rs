@@ -1187,12 +1187,16 @@ fn vertices_carry_meta_values_that_cuts_blend_and_variety_paints() {
     for v in made {
         assert_eq!(doc.vertex_options[v], ["$tint=163,100,1.125"], "{:?}", doc.vertices[v]);
     }
-    // Variety on the floor's pieces: white where another face (a wall) meets them.
+    // Variety on a floor cut in two, half painted: white where the other half (the floor
+    // carrying on) meets it; painted where only walls do.
     let mut doc = LevelDoc::parse(Path::new("two_rooms.mmp"), LEVEL).unwrap();
     let floor = (0..doc.surfaces.len()).find(|&f| doc.surface_normal(f).y > 0.9 && doc.surfaces[f].sector == 0).unwrap();
+    let other = doc.cut_surface(floor, Vec3::X, Vec3::new(1.0, 0.0, 0.0)).unwrap();
     doc.vary_vertex_meta(&[floor], "tint", 1, 1.0);
+    let on_other = |v: usize| doc.surfaces[other].corners.iter().any(|c| c.0 == v);
     for c in &doc.surfaces[floor].corners {
-        assert_eq!(doc.vertex_options[c.0], ["$tint=255,255,255"], "a floor corner is a wall's too");
+        let white = doc.vertex_options[c.0] == ["$tint=255,255,255"];
+        assert_eq!(white, on_other(c.0), "vertex {} {:?}", c.0, doc.vertex_options[c.0]);
     }
     assert!(assets.parse_level("two_rooms.mmp", &doc.to_text()).is_ok());
 }

@@ -522,16 +522,18 @@ impl Materials {
     /// geometry mesh, every corner of a polygon whose material reads it taking the value of
     /// its source there (a `vertex:` meta value of the corner's vertex, or one for the whole
     /// polygon: a number, its face's, sector's or the level's), or its fallback where that
-    /// has none (or the wrong count); other polygons' corners 0 (their programs don't read
-    /// it). Only inputs some material reads are made, so vertex meta nothing reads costs
-    /// nothing. Call when the level is loaded or rebuilt.
+    /// has none (or the wrong count), and unset, white for a color (a tint of none) or 0;
+    /// other polygons' corners 0 (their programs don't read it). Only inputs some program
+    /// the materials use reads are made, so vertex meta nothing reads costs nothing. Call
+    /// when the level is loaded or rebuilt.
     pub fn fill_vertex_inputs(&self, assets: &mut Assets, world: &World) {
         use moose_assets::{Attrib, AttribData};
-        // The inputs read per vertex, by name, with their type.
+        // The inputs read per vertex, by name, with their type: those of the programs the
+        // materials use (set or not: an unset one is filled too, see below).
         let mut wanted: Vec<(&'static str, InputType)> = Vec::new();
         for c in &self.compiled {
-            for (k, input) in c.info.all_inputs().enumerate() {
-                if input.vertex && c.inputs.get(k).is_some_and(|s| s.is_some()) && !wanted.iter().any(|w| w.0 == input.name) {
+            for input in c.info.all_inputs() {
+                if input.vertex && !wanted.iter().any(|w| w.0 == input.name) {
                     wanted.push((input.name, input.ty));
                 }
             }
@@ -557,7 +559,9 @@ impl Materials {
                 let Some(binding) = world.bindings.get(polygon.material as usize) else { continue };
                 let c = &self.compiled[binding.material as usize];
                 let Some(k) = c.info.all_inputs().position(|i| i.name == name && i.vertex) else { continue };
-                let Some(source) = &c.inputs[k] else { continue };
+                // Unset, a color is white (a tint of none) and a number 0.
+                let unset = Source::Fixed(if ty == InputType::Color { vec![1.0; 3] } else { vec![0.0] });
+                let source = c.inputs[k].as_ref().unwrap_or(&unset);
                 let read = |meta: Option<&moose_assets::meta::MetaValues>, key: &str, fallback: &[f32]| -> Vec<f32> {
                     let found = world.meta_keys.id(key).and_then(|id| meta.and_then(|m| m.get(id)));
                     found.filter(|v| ty.check(v).is_ok()).unwrap_or(fallback).to_vec()

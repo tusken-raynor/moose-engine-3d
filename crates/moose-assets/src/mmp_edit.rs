@@ -533,19 +533,27 @@ impl LevelDoc {
     /// (0-255 each) on each vertex, for a material that reads `vertex:KEY` into a program's
     /// tint (`colored_bumpy`): each a little darker or lighter, warmer or cooler, picked by a
     /// hash of the vertex and `seed`, `strength` how much (1: up to 24% darker, ±6% warmth).
-    /// A vertex also a corner of a solid surface not among `faces` gets white (255,255,255:
-    /// no change), so the painted faces meet the others with no seam. Returns how many vertices were painted.
+    /// A vertex also a corner of a solid surface not among `faces` that faces the same way (the
+    /// ground carrying on: a puddle) gets white (255,255,255: no change), so the painted
+    /// faces meet it with no seam; one a wall shares is painted (the corner shows no seam). Returns how many vertices were painted.
     pub fn vary_vertex_meta(&mut self, faces: &[usize], key: &str, seed: u32, strength: f32) -> usize {
         let mut vertices: Vec<usize> = faces.iter().flat_map(|&f| self.surfaces[f].corners.iter().map(|c| c.0)).collect();
         vertices.sort_unstable();
         vertices.dedup();
+        // Shared with a face that carries on the painted one (another, facing the same way:
+        // a puddle in the dirt), where a tint would show a seam; a wall meeting it at a
+        // corner can't.
+        let normals: Vec<Vec3> = (0..self.surfaces.len()).map(|f| self.surface_normal(f)).collect();
         let shared: Vec<bool> = vertices
             .iter()
             .map(|&v| {
-                self.surfaces
-                    .iter()
-                    .enumerate()
-                    .any(|(i, s)| s.adjoin.is_none() && !faces.contains(&i) && s.corners.iter().any(|c| c.0 == v))
+                let here: Vec<Vec3> = faces.iter().filter(|&&f| self.surfaces[f].corners.iter().any(|c| c.0 == v)).map(|&f| normals[f]).collect();
+                self.surfaces.iter().enumerate().any(|(i, s)| {
+                    s.adjoin.is_none()
+                        && !faces.contains(&i)
+                        && s.corners.iter().any(|c| c.0 == v)
+                        && here.iter().any(|n| n.dot(normals[i]) > 0.98)
+                })
             })
             .collect();
         let hash = |v: usize, k: u32| {
