@@ -3691,6 +3691,13 @@ fn material_input(app: &mut App, display: &Display) {
         if (clicked || right)
             && let Some(act) = gui::under(&laid.widgets, at, false).and_then(|w| w.act.clone())
         {
+            // A click on Back (the picker's, or the editor's) while typing drops the text, as
+            // Esc does; a click on a line to type into types there instead.
+            if matches!(act, MAct::PickerBack | MAct::Close | MAct::Search | MAct::PickerSearch | MAct::Row(_))
+                && let Some(screen) = app.material_screen.as_mut()
+            {
+                screen.typing = None;
+            }
             run_mact(app, act, if right { -1 } else { 1 }, &textures);
         }
         let scroll = display.scroll();
@@ -4514,9 +4521,17 @@ fn run() -> Result<(), String> {
             material_input(&mut app, &display);
         } else if app.editor.on && app.editor.typing.is_some() {
             // Typing a number into the editor's panel: the keys are the text's, the view
-            // holds still.
+            // holds still. Back clicked drops it, as Esc does, and goes back.
             display.mouse_delta();
             look.clear();
+            if display.mouse_clicked(MouseButton::Left)
+                && let Some(at) = display.cursor_position()
+                && gui::under(&app.editor_layout().widgets, at, false).is_some_and(|w| w.act == Some(editor_panel::Act::Back))
+            {
+                app.editor.typing = None;
+                app.editor.say("not set");
+                run_act(&mut app, editor_panel::Act::Back, 1.0);
+            }
             if let Some((typing, text)) = &mut app.editor.typing {
                 text.push_str(display.text());
                 if display.key_repeated(Key::Backspace) {
