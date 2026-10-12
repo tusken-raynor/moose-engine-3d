@@ -1013,8 +1013,8 @@ impl App {
     }
 
     /// What's in the box from `a` to `b` on screen, by mode: the corners that can be picked,
-    /// the faces, or the sectors, whose middles are in it (in the 3D view, only those drawn
-    /// this frame: what's seen).
+    /// the faces whose middles are in it, or the sectors whose middles or one of whose faces'
+    /// middles are (in the 3D view, only what's drawn this frame: what's seen).
     fn boxed(&self, a: glam::Vec2, b: glam::Vec2, projection: &wire::Projection, two_d: bool) -> Vec<editor::Selection> {
         use editor::{Mode, Selection};
         let (lo, hi) = (a.min(b), a.max(b));
@@ -1049,15 +1049,20 @@ impl App {
                 .filter(|&f| inside(e.place_of(Selection::Surface(f))))
                 .map(Selection::Surface)
                 .collect(),
+            // A sector whose middle, or one of whose seen faces' middles, is in it.
             Mode::Sector => {
-                let mut sectors: Vec<usize> = seen.iter().map(|&f| e.doc.surfaces[f].sector).collect();
+                let mut sectors: Vec<usize> = seen
+                    .iter()
+                    .filter(|&&f| inside(e.place_of(Selection::Surface(f))))
+                    .map(|&f| e.doc.surfaces[f].sector)
+                    .collect();
+                let mut all: Vec<usize> = seen.iter().map(|&f| e.doc.surfaces[f].sector).collect();
+                all.sort_unstable();
+                all.dedup();
+                sectors.extend(all.into_iter().filter(|&s| inside(e.place_of(Selection::Sector(s)))));
                 sectors.sort_unstable();
                 sectors.dedup();
-                sectors
-                    .into_iter()
-                    .filter(|&s| inside(e.place_of(Selection::Sector(s))))
-                    .map(Selection::Sector)
-                    .collect()
+                sectors.into_iter().map(Selection::Sector).collect()
             }
         }
     }
@@ -4996,6 +5001,44 @@ mod tests {
         // Up from vertices: their faces.
         e.set_mode(Mode::Face);
         assert_eq!(e.selected_faces(), [a, b]);
+    }
+
+    #[test]
+    fn a_cut_takes_every_selected_sector_or_face_it_crosses() {
+        use editor::{Field, Mode, Selection, ViewMode};
+        let mut app = test_app("shiny_rooms.mmp");
+        app.editor.on = true;
+        app.editor.view = ViewMode::Ortho(wire::Axis::TOP);
+        // Three sectors Shift-clicked, C, then the cut's two ends clicked (as the editor's
+        // input does): all three cut, by a line through the rooms and the hallway.
+        app.editor.set_mode(Mode::Sector);
+        app.editor.click(Some(Selection::Sector(0)), false);
+        app.editor.click(Some(Selection::Sector(1)), true);
+        app.editor.click(Some(Selection::Sector(2)), true);
+        app.edit(Field::Cleave, 1.0);
+        assert!(app.editor.cutting.is_some());
+        app.editor.cut_point(Vec3::new(0.125, 0.0, -100.0));
+        app.editor.cut_point(Vec3::new(0.125, 0.0, 100.0));
+        app.cut();
+        assert_eq!(app.editor.doc.sectors.len(), 6);
+        app.travel(false);
+        // Two floors selected in face mode, cut by one line: both in two, nothing else.
+        app.editor.set_mode(Mode::Face);
+        let floor = |app: &App, s: usize| app.editor.doc.sector_surfaces(s).find(|&f| app.editor.doc.surface_normal(f).y > 0.9).unwrap();
+        let (a, b) = (floor(&app, 0), floor(&app, 2));
+        app.editor.click(Some(Selection::Surface(a)), false);
+        app.editor.click(Some(Selection::Surface(b)), true);
+        let faces = app.editor.doc.surfaces.len();
+        app.edit(Field::Cleave, 1.0);
+        app.editor.cut_point(Vec3::new(0.125, 0.0, -100.0));
+        app.editor.cut_point(Vec3::new(0.125, 0.0, 100.0));
+        app.cut();
+        assert_eq!(app.editor.doc.surfaces.len(), faces + 2, "{:?}", app.editor.status_for_tests());
+        // Still selected, as numbered now: floors still.
+        for f in app.editor.selected_faces() {
+            assert!(app.editor.doc.surface_normal(f).y > 0.9);
+        }
+        assert_eq!(app.editor.selected_faces().len(), 2);
     }
 
     #[test]

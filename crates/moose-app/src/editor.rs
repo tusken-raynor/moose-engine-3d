@@ -553,6 +553,11 @@ impl Editor {
         self.problem = Some((selection, Instant::now()));
     }
 
+    #[cfg(test)]
+    pub fn status_for_tests(&self) -> Option<String> {
+        self.status.as_ref().map(|(s, _)| s.clone())
+    }
+
     /// What the loader last refused the tables over (shown in red a while).
     pub fn problem_selection(&self) -> Option<Selection> {
         self.problem.map(|(selection, _)| selection).filter(|&s| self.exists(s))
@@ -1739,8 +1744,36 @@ impl Editor {
                 if normal.length_squared() < 1e-8 {
                     return Err("the cut's ends are the same point".into());
                 }
-                let other = self.doc.cut_surface(i, normal, cut.from)?;
-                Ok(format!("cut surface {i} in two: {i} and {other}"))
+                // Every selected solid face the cut crosses, the last first: a cut puts its
+                // second part right after it, so the faces before it keep their numbers.
+                let mut faces: Vec<usize> =
+                    self.selected_faces().into_iter().filter(|&f| self.doc.surfaces[f].adjoin.is_none()).collect();
+                if faces.is_empty() {
+                    faces.push(i);
+                }
+                faces.sort_unstable_by(|a, b| b.cmp(a));
+                faces.dedup();
+                let (mut cut_faces, mut why) = (Vec::new(), None);
+                for &f in &faces {
+                    match self.doc.cut_surface(f, normal, cut.from) {
+                        Ok(_) => cut_faces.push(f),
+                        Err(e) => why = Some(e),
+                    }
+                }
+                if cut_faces.is_empty() {
+                    return Err(why.unwrap_or_else(|| "the cut misses the faces".into()));
+                }
+                // The selection as numbered now: each face after a cut one moves on one.
+                let renumber = |s: Selection| match s {
+                    Selection::Surface(f) => Selection::Surface(f + cut_faces.iter().filter(|&&g| g < f).count()),
+                    other => other,
+                };
+                self.selection = self.selection.map(renumber);
+                self.multi = self.multi.iter().map(|&m| renumber(m)).collect();
+                Ok(match cut_faces.len() {
+                    1 => format!("cut surface {} in two", cut_faces[0]),
+                    k => format!("cut {k} faces in two"),
+                })
             }
             (Some(Selection::Surface(i)), Field::Push) => {
                 self.doc.push_surface(i, -step * dir.signum());
