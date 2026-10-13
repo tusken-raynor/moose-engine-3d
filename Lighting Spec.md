@@ -60,7 +60,7 @@ light = ambient + sum over the polygon's lights of
 ## In the materials
 
 - **Vertex color** (`VertexColor`, `VertexColorTranslucent`, both Fresnel ones): color (8.8) and light (16.16) are separate outputs, multiplied per pixel and clamped to 255.
-  - Multiplying at sample points would need a clamp there, and a clamp breaks the lattice's edge behavior. Sample points past a polygon's edge can carry colors beyond 255, which the wrapping 8.8 stepping brings back into range inside the polygon, but only if nothing clamps them.
+  - Multiplying at sample points would need a clamp there, and a clamp breaks the lattice's edge behavior. Sample points past a polygon's edge can carry colors beyond 255, which the wrapping 8.8 stepping brings back into range inside the polygon, but only if nothing clamps them. (On branch `vertex-anchored-samples`, Oct 13, no sample point is past an edge, so this reason is gone there; the outputs are still separate.)
 - **Textured** (`Textured`, `TexturedTranslucent`, `TexturedFresnel`, `Water`): the light is a 16.16 output that multiplies the texel's color per pixel. The texel's alpha (roughness, detail mask) is kept.
 - **Exactness:** a light of exactly 1 leaves every color bit-for-bit as before.
 - **Not lit:** `CubeReflection` (the mirror ball), which shows its baked lit surroundings.
@@ -69,6 +69,7 @@ light = ambient + sum over the polygon's lights of
 
 - A polygon that any light reaches uses a lattice spacing of at most `RasterConfig::light_spacing` (32 px by default since Sep 28, when 32 px on direct faces looked the same as 8 px to the eye) in both directions. The app changes it with `-` and `=`, or `--light-spacing`.
 - Materials and perspective can ask for less. Unlit polygons keep their material's spacing.
+- **Vertices and edges first (Oct 13, branch `vertex-anchored-samples`):** a polygon's vertices are sample points, its edges are sampled where they cross the grid, and the grid's points fill in between, all of them on the polygon (see the Material Pipeline Spec). A face smaller than a cell is lit at its own corners instead of at grid points beside it, which shimmered as the view moved. The spacing rules below are unchanged.
 - Spacing is chosen per 32×32 tile from the polygon's nearest depth there (see the Material Pipeline Spec), so a steep wall is sampled finely only toward its far end. Views pressed against walls render 28–36% faster than with one spacing per polygon (for example 2.59 → 1.72 ms), within 7 levels of the old image.
 - On steep surfaces, perspective would ask for a point every pixel. `RasterConfig::min_step` (4 by default) caps that, which is where lighting cost concentrated.
   - The cost: a light's bright spot that is only a few pixels across on a distant steep surface can fall between sample points. For example, a light 0.4 m below a ceiling seen from 11 m away: its spot dims, and can flicker as the view moves.

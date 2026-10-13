@@ -180,7 +180,17 @@ pub struct Over<'a> {         // what shade_over sees, as today
 
 ## The sample lattice
 
-The lattice is a fixed screen grid. Grid points are chosen first and hold no data until a polygon needs them. At each point the polygon's values come from its plane functions, even where the point lies past its edges. Pixels interpolate linearly between the four grid points around them. There is no edge machinery: no crossings, knots or end points carry values. (The first version anchored the lattice on polygon edges instead. It is kept on the `edge-anchored-lattice` branch, commit 685d9bc, in case lighting favors it.)
+Every sample point is on the polygon (Oct 13, branch `vertex-anchored-samples`). A polygon's own vertices come first, then its edges, then a fixed screen grid laid across what is left:
+
+- **Vertices:** each vertex is a sample point.
+- **Edges:** each edge has a sample point (a knot) wherever it crosses one of the grid's rows or columns.
+- **Grid:** the grid's points inside the polygon are sample points. A grid point just outside it is moved along its column onto the polygon's edge, where it is the edge's knot for that column.
+
+A pixel is interpolated between the points on either side of it on its row. Those are the row's two ends (where it crosses the polygon's edges, each interpolated along its edge between the knots on either side) and the grid columns between them (each interpolated down its column between its points above and below).
+
+**Why (Oct 13):** until then the lattice was the grid alone, and a polygon's values at grid points past its edges came from its plane functions carried past them. A face smaller than a cell was lit entirely at points that weren't on it, up to a cell away, and those points slid across it as the view moved, so small and distant lit faces shimmered. Now such a face is lit at its own vertices and edges, which stay put on it. See "Accuracy" and "Measured cost" below for what it bought and cost.
+
+(Earlier history: the first version anchored the lattice on polygon edges too, with sample rows and knots but skipped columns; it is on the `edge-anchored-lattice` branch, commit 685d9bc. The grid-only lattice that replaced it is on `main` up to b01c3c6.)
 
 ### Grid
 
@@ -192,8 +202,8 @@ The lattice is a fixed screen grid. Grid points are chosen first and hold no dat
 - **Tiles (Sep 28):** a polygon's grid in a block is split into tiles of 32 columns, and each tile picks its own spacing from the polygon's nearest depth within it. A wall running from beside the camera into the distance is sampled sparsely at its near end and finely only at its far end.
   - **One global grid:** spacings are powers of two up to the tile width, so every tile's points lie on the one global grid. Each point on a row belongs to exactly one tile, and a pixel interpolates between the points on either side of it whatever tiles they come from, so tiles leave no seams.
   - **Shared runs:** neighboring tiles with the same spacing share grid rows as one run, so a uniformly sampled surface costs what it did before tiles.
-  - **Evaluated together:** all of a polygon's tiles in a block are built at once. Its pixels on each row are found once, and every tile's grid points are evaluated together, 8 at a time.
-  - **Tried and dropped (Oct 2): small polygons lit at their corners.** A polygon smaller than its tiles' cells was shaded at its own corners and its grid points filled from perspective-correct planes through them (Gouraud), instead of from its planes carried past its edges. It cost nothing in accuracy or time, but changed under 1% of pixels on the canyon level's dense terrain, invisibly: the carried planes were already close.
+  - **Evaluated together:** all of a polygon's tiles in a block are built at once. Its pixels on each row are found once, and all its sample points (grid points, knots and vertices) are evaluated together, 8 at a time.
+  - **Tried and dropped (Oct 2): small polygons lit at their corners.** A polygon smaller than its tiles' cells was shaded at its own corners and its grid points filled from perspective-correct planes through them (Gouraud), instead of from its planes carried past its edges. It cost nothing in accuracy or time, but changed under 1% of pixels on the canyon level's dense terrain, invisibly: the carried planes were already close. (That terrain is lit by the sun, which lights a flat face evenly wherever it is sampled. Under point and spot lights the difference shows; see Oct 13 above.)
 - The grid belongs to the viewport, not to each polygon. So:
   - neighbors share rows and columns;
   - coarser grids are subsets of finer ones;
@@ -208,7 +218,7 @@ For a planar polygon, `w` is affine on screen, and so is `value × w` for any va
 - **Which triangle:** a point's triangle is the number of fan diagonals it lies past (sign tests against each diagonal), done in SIMD lanes. Past the edges, a point uses the wedge it falls in, extended.
 - **Slivers:** triangles under 2% of the widest one's area (or 1 pixel²) are too thin to trust, since extending their planes past the edges magnifies small errors. They take the nearest good triangle's planes.
 
-At a grid point, the `sampled` values are `plane(value × w) / plane(w)`: one reciprocal per point, 8 points at a time. `shade_sample` runs on them and its outputs are stored per grid row, output by output.
+At a sample point, the `sampled` values are `plane(value × w) / plane(w)`: one reciprocal per point, 8 points at a time. `shade_sample` runs on them and its outputs are stored per grid row, output by output (a knot's or a vertex's together). Since Oct 13 every point is on the polygon, where the planes are exact: at a vertex they give the vertex's own values.
 
 ### Spacing, per polygon per tile
 
@@ -224,6 +234,7 @@ Ny      = largest power of two ≤ max(min(spacing, threshold × w_min / |dw/dy|
 
 `threshold` is `step_threshold` (1/16): w may change by at most that fraction across one cell. `rate` is 2 at half rate, 1 otherwise.
 
+- **The spacing rules are unchanged by Oct 13.** Sample points no longer lie past the edges, so the notes below about w staying positive there are history; the rules still set how far apart points are, which is what perspective accuracy needs.
 - **Why w stays positive past the edges:** every grid point a pixel uses lies within one cell of it, and w changes by at most `threshold × w_min` per cell in each direction. So w at such a point is at least about `(1 - 2 × threshold) × w_min`, even off the polygon.
 - **min_step (default 4, Sep 28) caps the sample density on steep surfaces.** Perspective alone asks for sample points every pixel on surfaces seen at a grazing angle, which is costly once lighting runs at every point. With the cap, those surfaces get points at most `min_step` apart, at the cost of perspective accuracy (texture detail shifts by up to a pixel) and of coarser lighting there.
   - **It never goes past w/4 per cell.** A surface so steep that w would change by more than a quarter across such a cell (seen nearly edge-on) still goes finer. Grid points past its edges then stay where w is at least half its smallest value.
@@ -239,15 +250,26 @@ So:
 ### Grid rows and columns
 
 - A polygon's grid rows in a block run from the grid row at or above its first row there, to the one at or below its last. The last can be the next block's first row, which that block computes again: one duplicate row per polygon per block.
-- Each grid row holds the columns needed by the rows it serves (those within `Ny` of it): from the column at or before their first pixel to the one at or after their last. Columns past the edges are evaluated like any other.
+- Each grid row holds the columns that are among the pixels of the rows it serves (those within `Ny` of it). Columns outside the polygon on all of them are not evaluated.
+- **Moved points:** where the polygon doesn't reach the grid row along a column, the column's point is the nearest point of the polygon along it, on its edge. Each point keeps its y. A grid row whose points are all on it (the usual case, inside a polygon) is marked so, and is blended as before.
+
+### Edge knots and row ends
+
+- **Knots:** an edge's knots in a block are its vertices there (or, where it goes on past the block, its crossings of the block's first grid row and the next block's, which are grid rows for any spacing), and its crossings of the grid rows and columns of each tile it passes through, with that tile's spacing. A tile's edge is a column of the next tile, whatever their spacings, so knots agree across tiles.
+- **Row ends:** a row's end is where it crosses an edge. Its values are interpolated along the edge between the knots on either side of it. A row on a grid row ends exactly on a knot.
+- **Only what a band needs:** a band works out an edge's knots near its own rows and evaluates only the ones its rows lie between. The knots are the block's whatever the band, so no band size changes a pixel.
+- **A vertex is evaluated once per block** for both the edges that meet at it.
+- **Continuity:** where an edge crosses a column, the row end and the column's moved point are the same sample point, so a row's end meets the column's value there.
+- **Shared edges:** two polygons sharing an edge have the same vertices, and the same knots wherever their spacings agree, so their values along the edge match where their vertex values do.
 
 ### Rows and pixels
 
-- **Row points:** a row between grid rows `a` and `b` gets its points by linear interpolation in y of the two rows' outputs (a vectorized loop over contiguous values). A run uses only the columns around its pixels: from the column at or before the first pixel it shows, to the one at or after its last pixel.
-- **Intervals:** between consecutive points, every value is linear in x. A pixel belongs to the interval its center falls in, and the last point shades its own pixel.
+- **Row points:** a row's points are its left end, the grid columns among its pixels, and its right end. A column's value on a row between grid rows `a` and `b` is interpolated linearly in y between the column's two points (a vectorized loop over contiguous values; by each column's own distances where points were moved). A run uses only the points around its pixels: from the one at or before the first pixel it shows, to the one at or after its last pixel.
+- **Small polygons:** a polygon that no grid row or column crosses has only its vertices, and each row is interpolated between its two ends: Gouraud shading from its own corners.
+- **Intervals:** between consecutive points, every value is linear in x. A pixel belongs to the interval its center falls in.
 - **Lines:** each interval becomes a `Line` whose base is the value at its first pixel center and whose step is per pixel. The existing 8-lane block code runs over them.
 - **Half rate:** a pixel pair (starting at an even pixel counted from the viewport's left edge) shows its even pixel's values, or the row's first pixel's where the pair starts before the row. It belongs to the interval holding that shown pixel, even when the pixel is hidden by something in front. This matters on thin slivers, where neighboring pixels differ a lot.
-- No edge crossings, vertex values or divides are used on rows.
+- No divides are used on rows.
 
 ### Cache and laziness
 
@@ -265,6 +287,22 @@ So:
 
 The gain is mostly from `min_step` 1. The per-row design could not afford it everywhere.
 
+**Vertices and edges first (Oct 13), against the grid alone,** on the raster tests (320×180 unless noted):
+
+| Test | Grid alone | Vertices, edges, then grid |
+| --- | --- | --- |
+| Vertex colors, 300 views | 23 pixels off by more than 2 levels, worst 4 | 0, worst 2 |
+| Half-transparent crates | 21 off by more than 2, worst 3 | 0, worst 2 |
+| Fresnel floors | 14, 14 and 13 off by more than 2 | 1, 1 and 0 |
+| Floor texels exactly the one under the pixel | 92.9% | 93.3% |
+| Lit surfaces against exact lighting, default spacing | 1.75% off by more than 2 levels, worst 78 | 1.48%, worst 67 |
+| Lit faces under 32 px each way, at 160×90: off by more than 2 levels | 12.59% | 7.56% |
+| Those faces: off by more than 8 levels | 4.18% | 2.01% |
+| Those faces: mean error, in levels | 1.88 | 0.88 |
+| Those faces, the view creeping: pixels whose error jumps by more than 4 levels between frames | 0.025% | 0.008% |
+
+The last four rows are `small_lit_faces_hold_still_as_the_view_moves`: the test level's point and spot lights, 60 views each turned a little over 12 frames. The exact light of a surface point doesn't change with the view, so a change in a pixel's error between frames is the sampling's: shimmer.
+
 ### Measured cost (shiny_rooms, 1280×720, 2 bounces, water on)
 
 | Threads | Before the lattice | Edge-anchored lattice | Grid |
@@ -272,6 +310,10 @@ The gain is mostly from `min_step` 1. The per-row design could not afford it eve
 | 1 | 6.29 ms | 7.35 ms | 7.20 ms (+14%) |
 | 10 | 1.03 ms | 1.36 ms | 1.27 ms (+23%) |
 
+- **Vertices and edges first (Oct 13),** `timing`, 1 thread, best of 3, against the grid alone: shiny_rooms 5.61 → 5.89 ms at 1280×720 (+5%) and 0.74 → 0.84 ms at 320×180 (+14%); walker_rooms 3.23 → 3.45 ms (+7%) and 0.46 → 0.53 ms (+15%). On 8 threads shiny_rooms is within noise (about 1.0 ms both).
+  - The sample stage runs at about 4% more points (16,256 a frame against 15,561 on shiny_rooms): fewer grid points, as none lie outside a polygon, and the knots and vertices more.
+  - The rest is bookkeeping per lattice built: finding the knots (about 0.16 ms a frame) and where points are moved to (about 0.12 ms).
+  - **Bands of 32 rows would pay for it** (not done; `band_rows` is 8): a block's lattice is then built once, not by each of the four bands in it. shiny_rooms at 1280×720: 5.54 ms on 1 thread, and the same as now on 8.
 - **Where the time goes (1 thread):** pixel shading costs the same as before. Building lattices takes about 0.3 ms per frame, interpolating row points about 0.3 ms, and run setup and blending about 0.35 ms.
 - **Sample stage:** about 29,000 grid points a frame, against about 107,000 with every row sampled. That saving grows with each light a material evaluates. Every current material's sample stage is nearly free, so the bookkeeping isn't paid back yet.
 
@@ -303,7 +345,7 @@ The gain is mostly from `min_step` 1. The per-row design could not afford it eve
 - **Invariance:** a pixel's value is the same however a row is split into runs (the current bit-for-bit block test, extended to runs). Frames are identical for 1, 2 and many threads (the existing thread and band test).
 - **Vertex stage before clipping:** a polygon clipped by a window shows the same values as the unclipped polygon at the same points, with a nonlinear `shade_vertex` (normalize).
 - **Reference renderer:** it moves from modeling today's per-row sampling to exact per-pixel evaluation. Tolerances derive from the spacing threshold. The texel test keeps its footprint criterion.
-- **Debug overlay:** a config flag and an app setting (options menu, Sampling page: sample overlay) that tint grid rows red and mark grid points green, so sample placement is visible.
+- **Debug overlay:** a config flag and an app setting (options menu, Sampling page: sample overlay) that tint grid rows red and mark the sample points on each row, so sample placement is visible: grid points green, edge knots (and grid points moved onto an edge) yellow, vertices white.
 - **Timing:** `timing` before and after, on shiny_rooms at 1280×720, one thread and all threads.
 
 ## Implementation plan

@@ -1147,14 +1147,38 @@ fn textured_floors_show_the_texel_under_each_pixel() {
     assert!(exact * 100 > total * 92, "{exact} of {total} exact");
 }
 
-#[test]
-fn lit_surfaces_match_exact_lighting() {
-    // Point lights evaluated at the lattice's sample points and interpolated between them
-    // (gamma-encoded), against the exact light at every pixel (the same lights, falloff,
-    // cosine law and spot cone at the pixel's own world position), on vertex-colored walls,
-    // floors and crates.
+/// A reference pixel's color under the exact light at its own world position: the lights
+/// reaching its polygon, with the engine's falloff, cosine law and spot cone.
+fn exactly_lit(out: &ViewGeometry, assets: &Assets, w: &RefPixel) -> u32 {
+    let p = &out.polygons[w.polygon as usize - 1];
+    let mesh = assets.mesh(p.mesh);
+    let normal = out.objects[p.object as usize].rotation
+        * mesh.polygons[p.source_polygon() as usize].plane.normal;
+    let mut light = out.ambient;
+    for &i in out.polygon_lights(p) {
+        let l = out.lights[i as usize];
+        let d = l.position - w.pos;
+        let t = (1.0 - d.length_squared() / (l.range * l.range)).max(0.0);
+        let cos = (normal.dot(d) / d.length().max(1e-4)).max(0.0);
+        let (scale, offset) = l.cone();
+        let c = (offset - d.dot(l.direction) / d.length().max(1e-4) * scale).clamp(0.0, 1.0);
+        let cone = c * c * (3.0 - 2.0 * c);
+        light += l.color * t * t * cos * cone;
+    }
+    // Colors are gamma-encoded, so the lit color is the color times the light encoded as
+    // the engine encodes it (its square root), past white brought in as the engine's
+    // shoulder brings it.
+    let encoded = light.to_array().map(|l| l.max(0.0).sqrt());
+    let lit = |shift: u32, k: usize| ((w.color >> shift) & 255) as f32 * encoded[k];
+    let brightest = encoded[0].max(encoded[1]).max(encoded[2]);
+    let [wr, wg, wb] =
+        moose_raster::shaders::shoulder_reference([lit(16, 0), lit(8, 1), lit(0, 2)], brightest);
+    wr << 16 | wg << 8 | wb
+}
+
+/// The test lights of [`lit_surfaces_match_exact_lighting`].
+fn test_lights(world: &mut World) {
     use moose_assets::Light;
-    let (mut world, assets) = world();
     let light = |sector: u32, p: [f32; 3], c: [f32; 3], range: f32| {
         Light::point(sector, Vec3::from_array(p), Vec3::from_array(c), range)
     };
@@ -1178,6 +1202,96 @@ fn lit_surfaces_match_exact_lighting() {
         ],
         Vec3::new(0.12, 0.12, 0.14),
     );
+}
+
+#[test]
+fn small_lit_faces_hold_still_as_the_view_moves() {
+    // Faces smaller than a cell of the sample grid (32 px), lit at their own vertices and
+    // along their own edges, against the exact light at every pixel: how far off they are,
+    // and how much that error changes from one frame to the next as the camera creeps
+    // (shimmer: the exact light of a surface point doesn't change with the view, so
+    // whatever changes there is the sampling's).
+    let (mut world, assets) = world();
+    test_lights(&mut world);
+    // Small on screen: a low resolution, so most faces are under a cell.
+    let vp = Viewport { x: 0, y: 0, width: 160, height: 90 };
+    let mut out = ViewGeometry::new();
+    let mut r = renderer(RasterConfig::default());
+    let small = |out: &ViewGeometry, polygon: u32| {
+        let vs = &out.vertices[out.polygons[polygon as usize - 1].vertices()];
+        let span = |f: fn(&moose_view::ScreenVertex) -> f32| {
+            let (lo, hi) = vs.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(f(v)), hi.max(f(v))));
+            hi - lo
+        };
+        span(|v| v.x) <= 32.0 && span(|v| v.y) <= 32.0
+    };
+    let (mut pixels, mut off, mut far_off, mut error) = (0usize, 0usize, 0usize, 0u64);
+    let (mut pairs, mut change, mut jumps) = (0usize, 0u64, 0usize);
+    for start in random_views(&world, 60, 91, vp) {
+        // The last frame's error at each pixel of a small face, and the face.
+        let mut before: Vec<Option<(u32, [i32; 3])>> = Vec::new();
+        for frame in 0..12 {
+            let mut cam = start.clone();
+            cam.yaw += frame as f32 * 0.0015;
+            cam.pitch += frame as f32 * 0.0007;
+            out.build(&world, &assets, &cam.view());
+            let got = render(&mut r, &out, &assets, vp, None);
+            let want = reference(&out, &assets, vp);
+            let mut now = vec![None; got.len()];
+            for (i, (&g, w)) in got.iter().zip(&want).enumerate() {
+                if w.polygon == 0 || !small(&out, w.polygon) {
+                    continue;
+                }
+                let exact = exactly_lit(&out, &assets, w);
+                let err: [i32; 3] = std::array::from_fn(|k| {
+                    ((g >> (8 * k)) & 255) as i32 - ((exact >> (8 * k)) & 255) as i32
+                });
+                let worst = err.iter().map(|e| e.unsigned_abs()).max().unwrap();
+                pixels += 1;
+                off += (worst > 2) as usize;
+                far_off += (worst > 8) as usize;
+                error += worst as u64;
+                // The same source face under the pixel as a frame ago.
+                let p = &out.polygons[w.polygon as usize - 1];
+                let face = p.source_polygon() ^ (p.object << 16) ^ ((p.mirror.is_some() as u32) << 31);
+                now[i] = Some((face, err));
+                if let Some(Some((face_before, err_before))) = before.get(i)
+                    && *face_before == face
+                {
+                    let d = (0..3).map(|k| (err[k] - err_before[k]).unsigned_abs()).max().unwrap();
+                    pairs += 1;
+                    change += d as u64;
+                    jumps += (d > 4) as usize;
+                }
+            }
+            before = now;
+        }
+    }
+    println!(
+        "{pixels} pixels of small lit faces: {:.2}% off by more than 2 levels, {:.2}% by more than 8, mean error {:.3}; frame to frame the error changes by {:.3} levels on average, {:.3}% of pixels by more than 4",
+        100.0 * off as f64 / pixels as f64,
+        100.0 * far_off as f64 / pixels as f64,
+        error as f64 / pixels as f64,
+        change as f64 / pairs as f64,
+        100.0 * jumps as f64 / pairs as f64,
+    );
+    assert!(pixels > 200_000, "the views hardly saw a small face");
+    // With the grid alone (sample points past the faces' edges): 12.59% off by more than 2
+    // levels, 4.18% by more than 8, mean error 1.878, 0.025% of pixels jumping by more than
+    // 4 between frames. With vertices and edges first: 7.56%, 2.01%, 0.878 and 0.008%.
+    assert!(off * 100 < pixels * 9, "{off} of {pixels} pixels off by more than 2 levels");
+    assert!(far_off * 100 < pixels * 3, "{far_off} of {pixels} pixels off by more than 8 levels");
+    assert!(jumps * 5000 < pairs, "{jumps} of {pairs} pixels jump between frames");
+}
+
+#[test]
+fn lit_surfaces_match_exact_lighting() {
+    // Point lights evaluated at the lattice's sample points and interpolated between them
+    // (gamma-encoded), against the exact light at every pixel (the same lights, falloff,
+    // cosine law and spot cone at the pixel's own world position), on vertex-colored walls,
+    // floors and crates.
+    let (mut world, assets) = world();
+    test_lights(&mut world);
     let mut out = ViewGeometry::new();
     // Returns how many pixels were compared, how many are off by more than 2 levels, and
     // the worst difference.
@@ -1197,31 +1311,7 @@ fn lit_surfaces_match_exact_lighting() {
                 if w.polygon == 0 {
                     continue; // background
                 }
-                let p = &out.polygons[w.polygon as usize - 1];
-                let mesh = assets.mesh(p.mesh);
-                let normal = out.objects[p.object as usize].rotation
-                    * mesh.polygons[p.source_polygon() as usize].plane.normal;
-                let mut light = out.ambient;
-                for &i in out.polygon_lights(p) {
-                    let l = out.lights[i as usize];
-                    let d = l.position - w.pos;
-                    let t = (1.0 - d.length_squared() / (l.range * l.range)).max(0.0);
-                    let cos = (normal.dot(d) / d.length().max(1e-4)).max(0.0);
-                    let (scale, offset) = l.cone();
-                    let c = (offset - d.dot(l.direction) / d.length().max(1e-4) * scale)
-                        .clamp(0.0, 1.0);
-                    let cone = c * c * (3.0 - 2.0 * c);
-                    light += l.color * t * t * cos * cone;
-                }
-                // Colors are gamma-encoded, so the lit color is the color times the light
-                // encoded as the engine encodes it (its square root), past white brought in
-                // as the engine's shoulder brings it.
-                let encoded = light.to_array().map(|l| l.max(0.0).sqrt());
-                let lit = |shift: u32, k: usize| ((w.color >> shift) & 255) as f32 * encoded[k];
-                let brightest = encoded[0].max(encoded[1]).max(encoded[2]);
-                let [wr, wg, wb] =
-                    moose_raster::shaders::shoulder_reference([lit(16, 0), lit(8, 1), lit(0, 2)], brightest);
-                let want = wr << 16 | wg << 8 | wb;
+                let want = exactly_lit(&out, &assets, w);
                 pixels += 1;
                 let d = channel_diff(g, want);
                 worst = worst.max(d);
