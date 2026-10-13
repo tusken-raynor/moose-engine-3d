@@ -8,7 +8,8 @@
 //! they move costs about 0.13 ms 20 times a second, outside the frame).
 //!
 //! MIN_STEP and LIGHT_SPACING set `RasterConfig`'s spacing limits (in pixels), and
-//! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off).
+//! PENUMBRA_THRESHOLD its penumbra rule (0 turns it off), and REFINE its probe-and-refine
+//! threshold, in levels (0 turns it off).
 //! The level's lights are on; LIGHTS=0 turns them off (surfaces show their full color).
 //! SHADOWS=1 gives them shadows (each its own shadow slot), baked before timing.
 //! FLASHLIGHT=beam, sampled or soft adds the app's flashlight at the camera (shadow slot 0,
@@ -68,6 +69,8 @@ fn main() {
         light_spacing: setting("LIGHT_SPACING", defaults.light_spacing),
         penumbra_threshold: std::env::var("PENUMBRA_THRESHOLD")
             .map_or(defaults.penumbra_threshold, |v| v.parse().expect("a number")),
+        refine_threshold: std::env::var("REFINE")
+            .map_or(defaults.refine_threshold, |v| v.parse().expect("a number")),
         ..defaults
     });
     let shader = renderer.register_material::<VertexColor>();

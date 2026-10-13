@@ -1182,6 +1182,12 @@ pub const FACE_BITANGENT: &str = "face_bitangent";
 /// vertex's normal faces it.
 pub const NORMAL: &str = "normal";
 
+/// Name of the output (a 16.16 one, three values) holding the light a material's sample
+/// points work out, encoded (see the standard materials' `light_output`). The material
+/// fills it; the engine reads it to tell where sample points are too far apart for the
+/// light between them: it probes the light there, without knowing what it is of.
+pub const LIGHT: &str = "light";
+
 /// Name of the `sampled` value the level of detail built-in ([`LOD`]) is measured from:
 /// two texture coordinates for texture slot 0.
 pub const UV: &str = "uv";

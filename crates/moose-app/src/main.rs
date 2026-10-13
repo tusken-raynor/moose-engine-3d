@@ -91,6 +91,9 @@
 //!   --penumbra-threshold X  how much a spot light's cone may fade across a cell of sample
 //!                         points where its penumbra crosses (default 0.125; 0 for no
 //!                         limit)
+//!   --refine X            probe and refine: how far off, in levels, the light may be in the
+//!                         middle of a polygon's part of a tile before its sample points
+//!                         are put closer together (default 2; 0 for off)
 //!   --penumbra X          spot lights' penumbra as a multiple of their own (default 1)
 //!   --step-threshold X    how much depth may change across a cell before perspective asks
 //!                         for finer spacing (default 1/16 = 0.0625)
@@ -293,6 +296,7 @@ struct Options {
     steep_limit: Option<f32>,
     step_threshold: Option<f32>,
     penumbra_threshold: Option<f32>,
+    refine: Option<f32>,
     penumbra: f32,
 }
 
@@ -380,6 +384,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         steep_limit: None,
         step_threshold: None,
         penumbra_threshold: None,
+        refine: None,
         penumbra: 1.0,
     };
     let mut args = args.into_iter();
@@ -515,6 +520,7 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
                 })
             }
             "--penumbra" => o.penumbra = value()?.parse().map_err(|_| "bad --penumbra")?,
+            "--refine" => o.refine = Some(value()?.parse().map_err(|_| "bad --refine")?),
             "--penumbra-threshold" => {
                 o.penumbra_threshold =
                     Some(value()?.parse().map_err(|_| "bad --penumbra-threshold")?)
@@ -816,6 +822,7 @@ impl App {
             penumbra_threshold: options
                 .penumbra_threshold
                 .unwrap_or(defaults.penumbra_threshold),
+            refine_threshold: options.refine.unwrap_or(defaults.refine_threshold),
             ..defaults
         });
         let shaders = ShaderIds::register(&mut renderer);
@@ -2289,12 +2296,13 @@ impl App {
             s.softness, s.dynamic_softness, s.flashlight_fade, s.penumbra
         ));
         add(format!(
-            "--min-step {} --light-spacing {} --steep-limit {} --step-threshold {} --penumbra-threshold {}",
+            "--min-step {} --light-spacing {} --steep-limit {} --step-threshold {} --penumbra-threshold {} --refine {}",
             cfg.min_step,
             cfg.light_spacing,
             if cfg.steep_limit.is_finite() { cfg.steep_limit.to_string() } else { "off".into() },
             cfg.step_threshold,
             cfg.penumbra_threshold,
+            cfg.refine_threshold,
         ));
         add(format!("--cone {}", self.cone_name()));
         add(format!("--time {time}"));

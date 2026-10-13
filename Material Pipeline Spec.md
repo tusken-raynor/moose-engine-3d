@@ -247,6 +247,33 @@ So:
 - A face-on wall gets the material's spacing in both directions: an unlit material gets 32 × 8 cells.
 - A floor seen level gets wide columns (w doesn't change along its rows) and tight rows near the horizon.
 
+### Probe and refine (Oct 13, branch `vertex-anchored-samples`)
+
+The spacing rules above are set before any light is worked out: they know depth, the material and where a spot light's cone fades, but not where the light itself bends. A light's terminator across a smooth ball, a lamp's bright pool on a wall and a shadowed light's edge all change faster than 32 px cells (or a small face's own corners) follow. So lit polygons are probed:
+
+- **Per polygon, per tile, per block:** the polygon's part of the tile (the polygon clipped to the tile's square, or the whole square when it is inside).
+- **The probe:** the material's sample stage is run at the part's corners (up to 7) and at their mean, a point in the middle of it. Were the light linear across the part, the mean of the corners' light would be the light at that point exactly, whatever the part's shape. How far off it is, in levels of the encoded light, is the probe's answer. It looks at the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
+- **Refine:** past `RasterConfig::refine_threshold` (2 levels), the tile's spacing becomes the part's size times threshold over error, a power of two, no less than `refine_spacing` (4 px), both ways. That is right for an error that halves with the spacing (a terminator, a shadow's edge); a smooth bend shrinks faster and gets a little more than it needs.
+- **It knows nothing of lights:** only that the material's own answer in the middle isn't what its answers at the corners suggest. No light's kind, place or normal is looked at, and a tile where the light is even costs its probe and nothing more.
+- **Once per tile, for every band:** the answer is the polygon's and the tile's alone, so the first band to shade the tile works it out and stores it (`ThreadBins::refine`, atomics), and the others read it. Two bands that race get the same answer. Images stay identical for any band size and thread count.
+- **Lazy, like lattices:** hidden polygons are never probed.
+- **Shared corners:** neighboring whole tiles share their corners, so a row of them costs about 3 points a tile.
+- **What it misses:** a change smaller than the part that leaves its middle and corners alone (a light pool a few pixels across between them). The worst case of the lit test is still that one (67 levels).
+
+Measured (raster tests, 320×180; against exact light at every pixel):
+
+| | Off | Threshold 4 | Threshold 2 |
+| --- | --- | --- | --- |
+| Lit pixels off by more than 2 levels | 1.48% | 0.25% | 0.16% |
+| Small lit faces (160×90) off by more than 2 levels | 7.56% | 4.43% | 4.27% |
+| Small lit faces off by more than 8 levels | 2.01% | 0.53% | 0.53% |
+| The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 7.09% | 3.15% | 1.46% |
+| The same, off by more than 8 levels | 1.07% | 0.18% | 0.02% |
+
+Cost (`timing`, shiny_rooms, 1280×720, best of 5): on 1 thread 5.84 ms off, 6.13 ms probing without refining, 6.08 ms at threshold 4, 6.28 ms at threshold 2 (+0.44 ms, 7.5%). On 8 threads about 1.00 → 1.09 ms. walker_rooms: no measurable change. The probe is most of it: about 0.25 ms a frame on one thread, whatever the threshold.
+
+Settings: `--refine X` in the app (levels; 0 off), `REFINE` in `timing`.
+
 ### Grid rows and columns
 
 - A polygon's grid rows in a block run from the grid row at or above its first row there, to the one at or below its last. The last can be the next block's first row, which that block computes again: one duplicate row per polygon per block.

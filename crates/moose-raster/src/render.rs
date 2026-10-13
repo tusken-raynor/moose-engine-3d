@@ -5,7 +5,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use crate::shader::{
     F32s, Fill,
     Behind, Draw, FACE_BITANGENT, FACE_NORMAL, FACE_TANGENT, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, MAX_SPLIT, NO_SPLIT, split_outputs,
-    Material, MaterialEntry, MaterialId, NORMAL, POSITION, Params, SampleContext, SpanJob, TextureSet,
+    LIGHT, Material, MaterialEntry, MaterialId, NORMAL, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
 
@@ -74,6 +74,14 @@ pub struct RasterConfig {
     /// pixels, in both directions: lighting is evaluated at sample points and interpolated
     /// between them. Materials and perspective may ask for less.
     pub light_spacing: u32,
+    /// Probe and refine: how far off (in levels of 255, of the encoded light) a lit
+    /// polygon's light may be in the middle of its part of a tile, interpolated from that
+    /// part's corners, before the tile's sample points are moved closer together (see
+    /// [`probe_tiles`]). The light is probed there, whatever it is of: no light's kind or
+    /// place is looked at. 0 turns it off.
+    pub refine_threshold: f32,
+    /// The closest sample points `refine_threshold` asks for, in pixels.
+    pub refine_spacing: u32,
     /// Debug overlay of the sample lattice: grid rows tinted red, and each row's sample
     /// points marked: grid points green, edges' knots yellow, vertices white.
     pub show_samples: bool,
@@ -104,6 +112,8 @@ impl Default for RasterConfig {
             background: 0,
             parallel_setup: 1024,
             light_spacing: 32,
+            refine_threshold: 2.0,
+            refine_spacing: 4,
             penumbra_threshold: 0.125,
             penumbra_spacing: 4,
             penumbra_padding: 16,
@@ -296,6 +306,16 @@ struct PolygonSetup {
     lod: Option<(u16, u16, f32, f32)>,
     /// Its surface's back light (see [`Surface::back_light`]).
     back: f32,
+    /// Where its material's `light` output is among its outputs (see [`LIGHT`]), if it has
+    /// one and is lit: its tiles are probed and refined by it (see [`probe_tiles`]).
+    light_out: Option<u16>,
+    /// Its tiles' refined spacings in `ThreadBins::refine`: one per block of rows it is in
+    /// (from `refine_block`) and column strip (`refine_strips` of them, from
+    /// `refine_strip`), block by block.
+    refine: u32,
+    refine_block: i32,
+    refine_strip: i32,
+    refine_strips: u16,
 }
 
 #[derive(Default)]
@@ -322,6 +342,11 @@ struct ThreadBins {
     vertex_out: Vec<f32>,
     /// Every polygon's plane functions (see [`fan_planes`]).
     planes: Vec<f32>,
+    /// Every probed polygon's tiles' refined spacings (see `PolygonSetup::refine`), worked
+    /// out by the first band to shade the tile and read by the rest, so they agree: 0 not
+    /// yet, 1 as it is, else 2 more than the log2 of the spacing. Whichever band works one
+    /// out gets the same answer (it is the polygon's and the tile's alone).
+    refine: Vec<AtomicU8>,
 
     /// Each polygon's lights (see `PolygonSetup::first_light`), and per light, its split
     /// index ([`NO_SPLIT`] for none; see `SampleContext::light_split`).
@@ -510,6 +535,17 @@ struct RowScratch {
     vertex_values: Vec<u32>,
     /// Each strip's column and row spacing and its least w, while its lattice is built.
     spacings: Vec<(i32, i32, f32)>,
+    /// While a polygon's tiles are probed (see [`probe_tiles`]): its part of a tile (and
+    /// the clipping's other buffer), the probe points and their outputs, each probed
+    /// part's corners among the points (neighboring parts share theirs), and each probed
+    /// strip (the strip, its first corner in `probe_corners`, how many, the point in its
+    /// middle, and its part's size).
+    piece: Vec<Vec2>,
+    piece_next: Vec<Vec2>,
+    probes: Vec<Pending>,
+    probe_values: Vec<f32>,
+    probe_corners: Vec<u32>,
+    probed: Vec<(usize, usize, usize, usize, f32)>,
     world: Vec<u32>,
     span: Vec<u32>,
     pixel: Vec<u32>,
@@ -674,6 +710,7 @@ impl Renderer {
             bins.lines.clear();
             bins.values.clear();
             bins.planes.clear();
+            bins.refine.clear();
             bins.lights.clear();
             bins.light_split.clear();
             bins.shadows.clear();
@@ -827,6 +864,9 @@ struct Remap {
     /// Offset of the `sampled` normal the material lights with (see [`NORMAL`]), if it has
     /// one.
     normal: Option<usize>,
+    /// Offset of the material's `light` output among its outputs (see [`LIGHT`]), if it has
+    /// one.
+    light: Option<usize>,
 }
 
 /// Maps a material's vertex inputs onto a mesh's attributes by name, and finds its
@@ -877,7 +917,15 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
         uv: None,
         lod: None,
         normal: None,
+        light: None,
     };
+    let mut offset = 0;
+    for out in io.interp {
+        if out.name == LIGHT && out.count == 3 {
+            remap.light = Some(offset);
+        }
+        offset += out.count as usize;
+    }
     let mut offset = 0;
     for want in io.sampled {
         let expect = |count: u8| {
@@ -1223,6 +1271,24 @@ fn setup_polygon(
     bins.lines
         .extend_from_slice(&geometry.edge_lines[p.vertices()]);
     let local = bins.polygons.len();
+    // Its tiles' refined spacings, not yet worked out: for a lit polygon whose material
+    // says which of its outputs is the light.
+    let light_out = remap
+        .light
+        .filter(|_| bins.lights.len() as u32 > first_light && config.refine_threshold > 0.0)
+        .map(|at| at as u16);
+    let (min_x, max_x) = verts
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v.x), hi.max(v.x)));
+    let strip = |x: f32| (x.floor() as i32 - viewport.x as i32).div_euclid(TILE_COLS);
+    let block = |row: i32| (row - viewport.y as i32).div_euclid(BLOCK_ROWS);
+    let (refine_strip, refine_block) = (strip(min_x), block(row_top));
+    let refine_strips = strip(max_x) - refine_strip + 2;
+    let refine = bins.refine.len() as u32;
+    if light_out.is_some() {
+        let tiles = refine_strips * (block(row_end - 1) - refine_block + 1);
+        bins.refine.resize_with(refine as usize + tiles as usize, AtomicU8::default);
+    }
     bins.polygons.push(PolygonSetup {
         first_vertex,
         vertex_count: verts.len() as u16,
@@ -1254,6 +1320,11 @@ fn setup_polygon(
         position: remap.position.map(|p| p as u16),
         lod: lod_at,
         back,
+        light_out,
+        refine,
+        refine_block,
+        refine_strip,
+        refine_strips: refine_strips as u16,
     });
     // Bin a reference into every band the polygon's rows touch.
     let id = surface_id(thread, local);
@@ -2365,6 +2436,25 @@ fn build_tiles(
         );
         s.spacings.push((nx, ny, w_min));
     }
+    // Probe and refine: tiles where the light bends between their sample points get closer
+    // ones.
+    if let Some(light) = p.light_out {
+        let block = (block_r0 - vy).div_euclid(BLOCK_ROWS);
+        let first = p.refine as usize
+            + ((block - p.refine_block) * p.refine_strips as i32 + lattice.first_strip
+                - p.refine_strip) as usize;
+        let tiles = &b.refine[first..first + lattice.strips as usize];
+        if tiles.iter().any(|t| t.load(Ordering::Relaxed) == 0) {
+            probe_tiles(s, config, textures, lattice, p, b, entry, &planes, verts, tiles, light as usize);
+        }
+        for (spacing, tile) in s.spacings.iter_mut().zip(tiles) {
+            let refined = tile.load(Ordering::Relaxed);
+            if refined > 1 {
+                let to = 1 << (refined - 2);
+                (spacing.0, spacing.1) = (spacing.0.min(to), spacing.1.min(to));
+            }
+        }
+    }
     // The polygon's pixels on the last grid rows looked at outside the band's rows (runs of
     // strips mostly share them).
     let mut outside_rows = [(i32::MIN, (0, 0)); 2];
@@ -2634,14 +2724,193 @@ fn build_tiles(
         }
     }
 
-    // Every sample point, LANES at a time.
-    // The material's outputs, then the split lights' (see `SampleContext::light_split`).
+    shade_pending(&s.pending, &mut s.grid_values, p, b, entry, &planes, textures);
+    ends as u32
+}
+
+/// Probe and refine. Works out which of a polygon's tiles in a block need sample points
+/// closer together than their spacing (`s.spacings`), and how close, and stores it in
+/// `tiles` (see `ThreadBins::refine`) for every band that shades them.
+///
+/// A tile is probed over the polygon's part of it: the light (`light`: where the material's
+/// `light` output is, and the split lights' strengths) is worked out at the part's corners
+/// and at their mean, a point in the middle of it. Were the light linear across the part,
+/// the mean of the corners' light would be the light at that point exactly, whatever the
+/// part's shape; how far off it is says how far off pixels between sample points that far
+/// apart would be. Past `RasterConfig::refine_threshold`, the tile's points are put closer by
+/// as much as it is over (an error that halves with the spacing, as across a light's
+/// terminator or a shadow's edge; a smooth bend shrinks faster), no closer than
+/// `refine_spacing`.
+///
+/// Nothing here knows what the light is of: only that the material's own answer in the
+/// middle isn't what its answers at the corners suggest. It depends on the polygon and the
+/// tile alone, not on the band, so every band gets the same answer.
+#[allow(clippy::too_many_arguments)]
+fn probe_tiles(
+    s: &mut RowScratch,
+    config: &RasterConfig,
+    textures: &Textures,
+    lattice: Lattice,
+    p: &PolygonSetup,
+    b: &ThreadBins,
+    entry: &MaterialEntry,
+    planes: &Planes,
+    verts: &[SetupVertex],
+    tiles: &[AtomicU8],
+    light: usize,
+) {
+    /// Most corners probed: with the point in the middle, one batch of sample points.
+    const CORNERS: usize = LANES - 1;
+    let n_out = p.n_out as usize;
+    let floor = (config.refine_spacing.max(1) as i32).min(MAX_STEP);
+    let block_top = s.viewport_y + (lattice.rows.0 - s.viewport_y).div_euclid(BLOCK_ROWS) * BLOCK_ROWS;
+    let (top, bottom) = (block_top as f32, (block_top + BLOCK_ROWS) as f32);
+    let w_floor = if lattice.w_min.is_finite() { lattice.w_min / 8.0 } else { 0.0 };
+    s.probes.clear();
+    s.probe_corners.clear();
+    s.probed.clear();
+    // Which way round the polygon goes, to tell a point inside it.
+    let corner = |k: usize| Vec2::new(verts[k % verts.len()].x, verts[k % verts.len()].y);
+    let turn = (1..verts.len() - 1)
+        .map(|k| (corner(k) - corner(0)).perp_dot(corner(k + 1) - corner(0)))
+        .sum::<f32>()
+        .signum();
+    let inside = |q: Vec2| {
+        (0..verts.len()).all(|k| (corner(k + 1) - corner(k)).perp_dot(q - corner(k)) * turn >= 0.0)
+    };
+    for (i, tile) in tiles.iter().enumerate() {
+        if tile.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+        // Already as close as probing would put them: nothing to find out.
+        let (nx, ny, _) = s.spacings[i];
+        if nx.max(ny) <= floor {
+            tile.store(1, Ordering::Relaxed);
+            continue;
+        }
+        // The polygon's part of the tile: all of it, or the polygon clipped to its four
+        // sides in turn.
+        let left = (s.viewport_x + (lattice.first_strip + i as i32) * TILE_COLS) as f32;
+        let right = left + TILE_COLS as f32;
+        let whole = [
+            Vec2::new(left, top),
+            Vec2::new(right, top),
+            Vec2::new(right, bottom),
+            Vec2::new(left, bottom),
+        ];
+        s.piece.clear();
+        if whole.iter().all(|&q| inside(q)) {
+            s.piece.extend(whole);
+        } else {
+            s.piece.extend((0..verts.len()).map(corner));
+            let sides = [(Vec2::X, left), (Vec2::NEG_X, -right), (Vec2::Y, top), (Vec2::NEG_Y, -bottom)];
+            for (inward, at) in sides {
+                s.piece_next.clear();
+                for (k, &a) in s.piece.iter().enumerate() {
+                    let c = s.piece[(k + 1) % s.piece.len()];
+                    let (da, dc) = (inward.dot(a) - at, inward.dot(c) - at);
+                    if da >= 0.0 {
+                        s.piece_next.push(a);
+                    }
+                    if (da < 0.0) != (dc < 0.0) {
+                        s.piece_next.push(a + (c - a) * (da / (da - dc)));
+                    }
+                }
+                std::mem::swap(&mut s.piece, &mut s.piece_next);
+            }
+        }
+        let (lo, hi) = s
+            .piece
+            .iter()
+            .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &q| (lo.min(q), hi.max(q)));
+        let size = (hi - lo).max_element();
+        // Too small a part for points any closer to fall in it.
+        if s.piece.len() < 3 || size <= floor as f32 {
+            tile.store(1, Ordering::Relaxed);
+            continue;
+        }
+        // Its corners (evenly picked, where there are too many), then their mean. A corner
+        // the part before it has too (on the tiles' shared side) is probed once.
+        let before = match s.probed.last() {
+            Some(&(strip, first, n, ..)) if strip + 1 == i => first..first + n,
+            _ => 0..0,
+        };
+        let (first, n) = (s.probe_corners.len(), s.piece.len().min(CORNERS));
+        let mut mean = Vec2::ZERO;
+        let point = |q: Vec2, probes: &mut Vec<Pending>| {
+            probes.push(Pending { dx: q.x - planes.ox, dy: q.y - planes.oy, w_floor, at: 0, stride: 1 });
+            probes.len() as u32 - 1
+        };
+        for k in 0..n {
+            let q = s.piece[k * s.piece.len() / n];
+            mean += q / n as f32;
+            let (dx, dy) = (q.x - planes.ox, q.y - planes.oy);
+            let shared = s.probe_corners[before.clone()].iter().copied().find(|&at| {
+                let other = s.probes[at as usize];
+                (other.dx - dx).abs() < 1e-3 && (other.dy - dy).abs() < 1e-3
+            });
+            let at = shared.unwrap_or_else(|| point(q, &mut s.probes));
+            s.probe_corners.push(at);
+        }
+        let middle = point(mean, &mut s.probes) as usize;
+        s.probed.push((i, first, n, middle, size));
+    }
+    if s.probes.is_empty() {
+        return;
+    }
+    for (k, probe) in s.probes.iter_mut().enumerate() {
+        probe.at = (k * n_out) as u32;
+    }
+    s.probe_values.clear();
+    s.probe_values.resize(s.probes.len() * n_out, 0.0);
+    shade_pending(&s.probes, &mut s.probe_values, p, b, entry, planes, textures);
+    // The light's values: the material's, then each split light's strength.
+    let n_material = n_out - split_outputs(p.splits as usize);
+    let lights = (light..light + 3).chain(n_material..n_out);
+    for &(i, first, n, middle, size) in &s.probed {
+        let at = |point: usize, k: usize| s.probe_values[point * n_out + k];
+        let corners = &s.probe_corners[first..first + n];
+        let off = lights
+            .clone()
+            .map(|k| {
+                let mean = corners.iter().map(|&point| at(point as usize, k)).sum::<f32>() / n as f32;
+                (at(middle, k) - mean).abs()
+            })
+            .fold(0.0, f32::max)
+            * 255.0;
+        let refined = if off > config.refine_threshold {
+            let mut to = MAX_STEP;
+            while to > floor && to as f32 > size * config.refine_threshold / off {
+                to /= 2;
+            }
+            2 + to.trailing_zeros() as u8
+        } else {
+            1
+        };
+        tiles[i].store(refined, Ordering::Relaxed);
+    }
+}
+
+/// Runs `shade_sample` at sample points of polygon `p` (`pending`), [`LANES`] at a time, and
+/// stores their outputs in `values`: their `sampled` values from the polygon's plane
+/// functions ([`fan_planes`]), one reciprocal of w per point; the material's outputs, then
+/// the split lights' (see `SampleContext::light_split`).
+fn shade_pending(
+    pending: &[Pending],
+    values: &mut [f32],
+    p: &PolygonSetup,
+    b: &ThreadBins,
+    entry: &MaterialEntry,
+    planes: &Planes,
+    textures: &Textures,
+) {
+    let (n_in, n_out) = (p.n_vals as usize, p.n_out as usize);
     let (splits, n_material) = (p.splits as usize, n_out - split_outputs(p.splits as usize));
     let split: [Cell<F32s>; MAX_SPLIT] = Default::default();
     let mut inputs = [F32s::default(); MAX_VARYINGS];
     let mut outputs = [F32s::default(); MAX_VARYINGS];
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
-    for chunk in s.pending.chunks(LANES) {
+    for chunk in pending.chunks(LANES) {
         // Lanes past the points repeat the last one.
         let lane = |f: fn(&Pending) -> f32| {
             F32s::from(std::array::from_fn::<f32, LANES, _>(|j| {
@@ -2707,12 +2976,12 @@ fn build_tiles(
         for (k, out) in outputs[..n_out].iter().enumerate() {
             let out = out.to_array();
             for (j, q) in chunk.iter().enumerate() {
-                s.grid_values[(q.at + k as u32 * q.stride) as usize] = out[j];
+                values[(q.at + k as u32 * q.stride) as usize] = out[j];
             }
         }
     }
-    ends as u32
 }
+
 
 /// A sample point waiting to be evaluated (see [`build_tiles`]): where it is relative to the
 /// polygon's plane functions' origin, the least w allowed there, and where its first output
