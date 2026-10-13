@@ -485,8 +485,21 @@ fn per_pixel_path_matches_span_path() {
 #[test]
 fn threads_and_bands_do_not_change_the_image() {
     let (world, assets) = world();
+    bands_do_not_change(&world, &assets);
+}
+
+#[test]
+fn threads_and_bands_do_not_change_a_lit_image() {
+    // Lit, sample points are checked against the light between them and put closer where
+    // it bends: by the block of rows, whatever the bands.
+    let (mut world, assets) = world();
+    test_lights(&mut world);
+    bands_do_not_change(&world, &assets);
+}
+
+fn bands_do_not_change(world: &World, assets: &Assets) {
     let mut out = ViewGeometry::new();
-    let cams = random_views(&world, 20, 5, VP);
+    let cams = random_views(world, 20, 5, VP);
     let one = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
@@ -496,12 +509,12 @@ fn threads_and_bands_do_not_change_the_image() {
         .build()
         .unwrap();
     for cam in &cams {
-        out.build(&world, &assets, &cam.view());
+        out.build(world, assets, &cam.view());
         let base = one.install(|| {
             render(
                 &mut renderer(RasterConfig::default()),
                 &out,
-                &assets,
+                assets,
                 VP,
                 None,
             )
@@ -514,7 +527,7 @@ fn threads_and_bands_do_not_change_the_image() {
                     parallel_setup,
                     ..RasterConfig::default()
                 };
-                let img = many.install(|| render(&mut renderer(config), &out, &assets, VP, None));
+                let img = many.install(|| render(&mut renderer(config), &out, assets, VP, None));
                 assert!(
                     img == base,
                     "band_rows {band_rows}, parallel_setup {parallel_setup} changed the image"
@@ -1278,7 +1291,7 @@ fn small_lit_faces_hold_still_as_the_view_moves() {
     assert!(pixels > 200_000, "the views hardly saw a small face");
     // With the grid at its own spacing: 12.59% off by more than 2 levels, 4.18% by more
     // than 8, mean error 1.878, 0.025% of pixels jumping by more than 4 between frames.
-    // With tiles probed and refined: 5.89%, 0.99%, 0.768 and 0.007%.
+    // With the lattice checked and refined: 5.93%, 1.03%, 0.771 and 0.010%.
     assert!(off * 100 < pixels * 7, "{off} of {pixels} pixels off by more than 2 levels");
     assert!(far_off * 200 < pixels * 3, "{far_off} of {pixels} pixels off by more than 8 levels");
     assert!(jumps * 5000 < pairs, "{jumps} of {pairs} pixels jump between frames");
@@ -1327,7 +1340,7 @@ fn lit_surfaces_match_exact_lighting() {
     let (_, _, worst) = compare(1, 1, 0.0);
     assert!(worst <= 2, "worst difference {worst} with light spacing 1");
     // The default spacing (up to 32 px, at most 4 px where a spot light's penumbra
-    // crosses, or where a tile's probe finds the light bending): about 0.15% of pixels more
+    // crosses, or where checking the lattice finds the light bending): about 0.14% of pixels more
     // than 2 levels off. Without the probes, light changing faster than a cell follows is
     // interpolated coarsely: about 1.8% (2.5% without the penumbra rule too, 1.6% without
     // the spot light; at 8 px, 0.14%).

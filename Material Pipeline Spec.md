@@ -185,7 +185,7 @@ The lattice is a fixed screen grid. Grid points are chosen first and hold no dat
 ### Grid
 
 - Grid rows are the rows `y` with `(y - viewport.y) % Ny == 0`. Grid columns are the pixels `x` with `(x - viewport.x) % Nx == 0`. Points sit at pixel centers.
-- Lattices are built per polygon per **block** of 32 rows (8 until Sep 28), counted from the viewport's top, not per band. `Ny` is a power of two up to 32, so every block starts on a grid row. The spacing is chosen from the whole block, and each band builds only the grid rows its own rows need.
+- Lattices are built per polygon per **block** of 32 rows (8 until Sep 28), counted from the viewport's top, not per band. `Ny` is a power of two up to 32, so every block starts on a grid row. The spacing is chosen from the whole block. Since Oct 13 a block's lattice is built whole, once, by the first band to shade the polygon there, and shared by the block's other bands (before, each band built the grid rows its own rows needed, and points that bands shared were worked out by each).
   - A block's lattice doesn't depend on which band or thread draws it.
   - Images are identical for any band size and thread count; the band test checks bands of 1, 8 and more.
 - `Nx` is a power of two up to 32, the tile width (below), at half rate too. Steep surfaces are held to at least `min_step` (below).
@@ -236,43 +236,59 @@ So:
 - A face-on wall gets the material's spacing in both directions: an unlit material gets 32 × 8 cells.
 - A floor seen level gets wide columns (w doesn't change along its rows) and tight rows near the horizon.
 
-### Probe and refine (Oct 13, branch `vertex-anchored-samples`)
+### Check and refine (Oct 13, branch `vertex-anchored-samples`)
 
-The spacing rules above are set before any light is worked out: they know depth, the material and where a spot light's cone fades, but not where the light itself bends. A light's terminator across a smooth ball, a lamp's bright pool on a wall and a shadowed light's edge all change faster than 32 px cells follow. So lit polygons are probed:
+The spacing rules above are set before any light is worked out: they know depth, the material and where a spot light's cone fades, but not where the light itself bends. A light's terminator across a smooth ball, a lamp's bright pool on a wall and a shadowed light's edge all change faster than 32 px cells follow. So a lit polygon's lattice is checked against the light between its sample points, and built again closer where it is off:
 
-- **Per polygon, per tile, per block.** A pixel gets the light blended between the four grid points of the cell it is in (worked out from the polygon's planes, on it or past its edges).
-- **The probe:** the material's sample stage is run at points of the polygon in the tile, where its pixels are:
-  - the middle of a tile the polygon covers;
-  - or else the corners of the polygon's part of the tile (the polygon clipped to it; up to 7) and their mean;
-  - and at the four grid points of the cell each of those is in, at the tile's spacing as set so far (a grid point is probed once, whichever points' cells it is a corner of, in the tile or the one before).
-- **The error:** how far the light at each of those points is from its cell's blend there, in levels of the encoded light: how far off a pixel there is. The largest counts. It looks at the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
-- **The cells are the tile's own, not the tile (Oct 13).** At first the blend was of the tile's four corners, as if every tile had one 32 px cell. Where depth already has rows or columns closer than that, the grid points between the corners are the ones pixels get, and one past the polygon's edge can be in light that never reaches the polygon. Seen in cheese_1's dirt alley: a floor polygon ending 2 px short of a spot light's pool, its rows 4 px apart and its columns 32. Its grid points 16 px past its edge were in the pool on six rows, and lit a wedge of it; the tile's corners, above and below the pool, were dark, so the probe saw nothing. Against its real cells the probe finds it, and puts the columns 4 px apart.
-- **The slope (Oct 13):** the light is also worked out a pixel across and a pixel down from that middle point (the tile's middle, or the mean). The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off. That, times how far the cell (or the polygon's part of the tile, if nearer) goes from the middle each way, is how far off it would be by there, and counts as an error too.
-  - **Why:** a bend can leave the middle right on the blend. Seen on the beach ball (cheese_1): a terminator three quarters of the way across a tile, the light in the middle 0.527 and the blend there 0.527, and the blend 18 levels off a few pixels to the right. The tile kept 32 px cells beside neighbors at 4 px: a block of smeared rows across the terminator. The slope there was off by about 1 level a pixel, which over 16 px is 15: found. For the value and the slope both to agree by chance is far less likely.
-  - **Tried instead, and dropped:** a second round of points (halfway from the middle to each corner) where the first found nothing but the light changed a lot across the tile. It fixed the same tile at the same cost, but needed a rule for when to look again, and was more of the same probe.
-- **Refine:** past `RasterConfig::refine_threshold` (2 levels), the tile's spacing becomes its cells' size (the longer way) times threshold over error, a power of two, no less than `RasterConfig::min_step` (4 px; `--min-step 1` or `2` for finer, since Oct 13: it was a fixed 4 before), both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
-- **It knows nothing of lights:** only that the material's own answer where the polygon is isn't what its answers at the grid points give there. No light's kind, place or normal is looked at, and a tile where the light is even costs its probe and nothing more.
-- **Once per tile, for every band:** the answer is the polygon's and the tile's alone, so the first band to shade the tile works it out and stores it (`ThreadBins::refine`, atomics), and the others read it. Two bands that race get the same answer. Images stay identical for any band size and thread count.
-- **Lazy, like lattices:** hidden polygons are never probed.
-- **Shared grid points:** a tile's left grid points are the tile before's right ones where their rows agree, so a row of covered tiles costs 5 points a tile (2 grid points, the middle, and 2 for its slope).
-- **What it misses:** a change smaller than a tile that leaves the probed points and the slope in the middle alone (a light pool a few pixels across between them). The worst case of the lit test is still that one (67 levels).
-- **Probe points are thrown away:** none of them is kept as a sample point. Keeping each level's points, and testing slopes on points already there, is the next step if this holds up.
+1. **Build** the block's lattice at the spacing the rules above give.
+2. **Check** it. A pixel gets the light blended between the four sample points of the cell it is in, so the material's sample stage is run in the middle of every cell the polygon has a pixel in the middle of, and the light there compared with the cell's blend, read from the lattice itself.
+3. **Refine:** a tile with a cell off by more than `RasterConfig::refine_threshold` (2 levels of the encoded light) gets its cells' size (the longer way) times threshold over error, a power of two, no less than `RasterConfig::min_step`, both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
+4. **Build again,** once, if any tile changed. It isn't checked again.
 
-**First version, replaced the same day.** It compared the light at the mean of the part's corners with the mean of the light at those corners (exact for a linear light, whatever the part's shape) and scaled the spacing by the part's size. One point per part missed bends that left the middle alone, and neighboring faces in one tile came to different answers, so dense and sparse tiles alternated along a terminator, in blocks. Probing where the polygon's pixels are, against what the grid would really give them, closed the gaps.
+Details:
+
+- **Every cell,** as each blends its own points. A tile whose columns depth already has 4 px apart is eight cells side by side, and a pool of light ending in two of them shows in no other (seen in cheese_1: a spot light's pool on a wall seen at a steep angle, its top a few pixels inside a tile with columns 4 px apart and rows 32; the two cells it reached blended it 32 rows up the wall).
+  - Cells under 256 px² are only checked where their four points' light differs by more than 2 thresholds: a bend across one shows in them. Bigger ones are checked whatever their points say, as a pool of light can sit inside one.
+- **Edges:** where the polygon covers only part of a tile, the corners of its part (the polygon clipped to the tile; up to 7) and their mean are checked too, each against the cell it is in. Sample points past a polygon's edge can be in light that never reaches it (seen in cheese_1's dirt alley: a floor polygon ending 2 px short of a spot light's pool, its columns 32 px apart, had sample points 16 px past its edge in the pool, and a wedge of it was lit).
+- **Slope:** in a tile that is one cell, and at a part's mean, the light is also worked out a pixel across and a pixel down from the middle. The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off; times how far the cell (or the polygon's part, if nearer) goes each way, that counts as an error too. A bend can leave the middle right on the blend (seen on the beach ball: a terminator three quarters of the way across a tile, 0.527 against 0.527 in the middle, and the blend 18 levels off a few pixels on), but then the light isn't changing there as the blend is. For both to agree by chance is far less likely.
+- **What is looked at:** the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
+- **It knows nothing of lights:** only that the material's own answer between its sample points isn't what they blend to. No light's kind, place or normal is looked at.
+- **The cells' points are the lattice's own.** Only the points in the middles are extra (and the edges' and slopes'), and a middle is a sample point of the next spacing down.
+- **Per block, not per band:** the lattice is the block's, built once and shared (see "Cache and laziness"), so what checking finds doesn't depend on the bands. Images are identical for any band size and thread count; `threads_and_bands_do_not_change_a_lit_image` checks it lit.
+- **What it misses:** a change inside a cell that leaves its middle and its four points alone (a light pool a few pixels across). The worst case of the lit test is still that one (67 levels).
+
+**How it got here (Oct 13).** Four versions in a day, each replacing the last:
+
+1. **One point per part of a tile:** the light at the mean of the part's corners against the mean of the light at those corners. One point missed bends that left it alone, and neighboring faces in one tile came to different answers: dense and sparse tiles alternated along a terminator, in blocks.
+2. **Against the tile's four corners,** at the points of the polygon in the tile, with the slope in the middle (after a second round of points was tried for the same miss, and dropped as more of the same). It took the tile for one 32 px cell: wrong wherever depth already had closer rows or columns.
+3. **Against the cell each point is in,** at the tile's spacing. Right, but it looked at the middle cell only, and every grid point it used was worked out for the check and thrown away. Checking every cell that way cost another 0.27 ms a frame (shiny_rooms, one thread).
+4. **The lattice checks itself** (this one): built first, then checked against its own points.
 
 Measured (raster tests, 320×180; against exact light at every pixel):
 
 | | Off | On (threshold 2) |
 | --- | --- | --- |
-| Lit pixels off by more than 2 levels | 1.75% | 0.15% |
-| Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.89% |
-| Small lit faces off by more than 8 levels | 4.18% | 0.99% |
+| Lit pixels off by more than 2 levels | 1.75% | 0.14% |
+| Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.93% |
+| Small lit faces off by more than 8 levels | 4.18% | 1.03% |
 | The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 23.96% | 1.66% |
 | The same, off by more than 8 levels | 6.39% | 0.07% |
 
-Cost (`timing`, 1280×720, best of 4): shiny_rooms on 1 thread 5.54 ms off, 6.04 ms on (+0.50 ms, 9%; 5.91 ms before the slope was probed); on 8 threads about 0.94 → 1.01 ms. walker_rooms on 1 thread 3.22 → 3.22 ms.
+Cost, against `main` (b01c3c6: no checking, a lattice per band); a busy machine, best of 3:
 
-Settings: `--refine X` in the app (levels; 0 off), `REFINE` in `timing`.
+| | `main` | Checking off | Checking on |
+| --- | --- | --- | --- |
+| `timing`, shiny_rooms, 1280×720, 1 thread | 5.77 ms | 5.47 ms | 5.91 ms |
+| The same, 8 threads | 0.98 ms | 0.91 ms | 1.01 ms |
+| App bench, cheese_1, 1 thread | 14.02 ms | 13.92 ms | 14.64 ms |
+| The same, 10 threads | 2.15 ms | 2.17 ms | 2.35 ms |
+| App bench, canyon_rooms_dense, 1 thread | 17.64 ms | 16.45 ms | 18.75 ms |
+| The same, 10 threads | 3.21 ms | 3.31 ms | 3.75 ms |
+
+- Sharing a block's lattice between its bands pays for most of the checking: with checking off it is faster than `main`.
+- The canyon pays most: its terrain is small polygons, each a part of a tile with its own corners to check.
+
+Settings: `--refine X` in the app (levels; 0 off), `--min-step N` for how close it may go, `REFINE` in `timing`.
 
 **Tried and removed (Oct 13): sample points on the polygon.** For a day this branch put every sample point on the polygon: its vertices, its edges where they cross the grid's rows and columns, and the grid's points inside it (those just outside moved along their column onto its edge); rows ran from an edge point through the grid columns to an edge point (commit db827d5). Without probing it beat the grid alone (small lit faces off by more than 2 levels 7.56% against 12.59%; the ball 7.09% against 23.96%), at about 5% more raster time. With probing the two come out close (the ball 1.46% against 1.85%; small faces 4.27% against 5.89%), and the grid alone costs nothing extra, so it was taken out: anchoring points to a face doesn't put them closer where the light bends, which is what was wrong.
 
@@ -292,8 +308,9 @@ Settings: `--refine X` in the app (levels; 0 off), `REFINE` in `timing`.
 ### Cache and laziness
 
 - **Row spans are computed from x and w only** (crossings and w, for visibility).
-- **A polygon's block lattice is built the first time a visible run needs it,** and kept while the band is drawn. Hidden polygons never run the sample stage.
-- **The cache lives in the thread's row scratchpad.** It's indexed by the polygon's slot in the band's lists and the block, and reset at band start, so there's no allocation in steady state.
+- **A polygon's block lattice is built the first time a visible run needs it,** and kept for the frame. Hidden polygons never run the sample stage.
+- **The lattices are shared between bands (Oct 13).** Each polygon has one per block of rows it is in (`ThreadBins::lattices`, a once-cell each): the first band to shade it there builds it, a band that wants it meanwhile waits, and the rest read it. Their storage is kept from frame to frame (`Renderer::lattice_pool`), so there's no allocation in steady state. (Until then the cache lived in each thread's row scratchpad, per band.)
+  - **Why not bands of 32 rows,** one per block, each building its own? Tried first: it saves the same work, but with all threads a frame can't be faster than its heaviest band, and a 32-row band of ground is too much of the frame (canyon_rooms_dense on 10 threads: about 0.5 ms slower, with nothing else changed).
 
 ### Accuracy (against exact per-pixel evaluation)
 

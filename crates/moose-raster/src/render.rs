@@ -4,8 +4,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
@@ -75,11 +75,11 @@ pub struct RasterConfig {
     /// pixels, in both directions: lighting is evaluated at sample points and interpolated
     /// between them. Materials and perspective may ask for less.
     pub light_spacing: u32,
-    /// Probe and refine: how far off (in levels of 255, of the encoded light) a lit
-    /// polygon's light may be where the polygon is in a tile, blended from the tile's four
-    /// grid points, before the tile's sample points are put closer together (see
-    /// [`probe_tiles`]). The light is probed there, whatever it is of: no light's kind or
-    /// place is looked at. 0 turns it off. The closest it puts them is `min_step`.
+    /// Check and refine: how far off (in levels of 255, of the encoded light) a lit
+    /// polygon's light may be in the middle of a cell of its sample points, blended from
+    /// the cell's four, before the tile's sample points are put closer together (see
+    /// [`refine_tiles`]). The light is worked out there, whatever it is of: no light's kind
+    /// or place is looked at. 0 turns it off. The closest it puts them is `min_step`.
     pub refine_threshold: f32,
     /// Debug overlay of the sample lattice: grid rows tinted red, and the grid points on
     /// them marked green.
@@ -274,6 +274,10 @@ struct PolygonSetup {
     /// triangle count.
     first_plane: u32,
     fans: u16,
+    /// Its lattices in `ThreadBins::lattices`: one per block of rows it is in, from block
+    /// `first_block`.
+    first_lattice: u32,
+    first_block: i32,
     row_top: i32,
     row_end: i32,
     /// Nearest point: front-to-back sort key.
@@ -305,15 +309,8 @@ struct PolygonSetup {
     /// Its surface's back light (see [`Surface::back_light`]).
     back: f32,
     /// Where its material's `light` output is among its outputs (see [`LIGHT`]), if it has
-    /// one and is lit: its tiles are probed and refined by it (see [`probe_tiles`]).
+    /// one and is lit: its tiles are checked and refined by it (see [`refine_tiles`]).
     light_out: Option<u16>,
-    /// Its tiles' refined spacings in `ThreadBins::refine`: one per block of rows it is in
-    /// (from `refine_block`) and column strip (`refine_strips` of them, from
-    /// `refine_strip`), block by block.
-    refine: u32,
-    refine_block: i32,
-    refine_strip: i32,
-    refine_strips: u16,
 }
 
 #[derive(Default)]
@@ -340,11 +337,11 @@ struct ThreadBins {
     vertex_out: Vec<f32>,
     /// Every polygon's plane functions (see [`fan_planes`]).
     planes: Vec<f32>,
-    /// Every probed polygon's tiles' refined spacings (see `PolygonSetup::refine`), worked
-    /// out by the first band to shade the tile and read by the rest, so they agree: 0 not
-    /// yet, 1 as it is, else 2 more than the log2 of the spacing. Whichever band works one
-    /// out gets the same answer (it is the polygon's and the tile's alone).
-    refine: Vec<AtomicU8>,
+    /// Every polygon's lattices, one per block of rows it is in (see
+    /// `PolygonSetup::first_lattice`): each built by the first band to shade the polygon
+    /// there, whole, and shared by the rest, so the bands of a block work out its sample
+    /// points once between them and agree on them.
+    lattices: Vec<OnceLock<Lattice>>,
 
     /// Each polygon's lights (see `PolygonSetup::first_light`), and per light, its split
     /// index ([`NO_SPLIT`] for none; see `SampleContext::light_split`).
@@ -413,8 +410,6 @@ impl Span {
 /// Where a polygon's edges cross one row, and w there.
 struct RowState {
     id: u32,
-    /// The polygon's slot in the band (its lattice's index).
-    slot: u32,
     x_left: f32,
     x_right: f32,
     w_left: f32,
@@ -492,20 +487,9 @@ struct RowScratch {
     spans: Vec<Span>,
     spans_next: Vec<Span>,
     states: Vec<RowState>,
-    /// The viewport's corner, which the sample grid counts from, and the lattice blocks the
-    /// band's rows touch (`blocks` of them, from `first_block`).
+    /// The viewport's corner, which the sample grid counts from.
     viewport_x: i32,
     viewport_y: i32,
-    first_block: i32,
-    blocks: usize,
-    /// The band's framebuffer rows: lattices build only the grid rows these need.
-    band_rows: std::ops::Range<i32>,
-    /// Per polygon slot of the band and block, its lattice (`slot * blocks + block`), and
-    /// the lattices' tiles, grid rows and outputs.
-    lattices: Vec<Lattice>,
-    tiles: Vec<Tile>,
-    grid_rows: Vec<GridRow>,
-    grid_values: Vec<f32>,
     /// One row's sample points for the run being shaded: x, outputs, and whether each is on
     /// a grid row of its tile (for the overlay).
     points_x: Vec<f32>,
@@ -519,17 +503,16 @@ struct RowScratch {
     pending: Vec<Pending>,
     /// Each strip's column and row spacing and its least w, while its lattice is built.
     spacings: Vec<(i32, i32, f32)>,
-    /// While a polygon's tiles are probed (see [`probe_tiles`]): its part of a tile (and
-    /// the clipping's other buffer), the probe points and their outputs, the tiles probed,
-    /// their points to check, and the grid points probed so far (pixel column and row, and
-    /// which probe point).
+    /// While a polygon's tiles are checked (see [`refine_tiles`]): its part of a tile (and
+    /// the clipping's other buffer), the points worked out between its sample points and
+    /// their outputs, the tiles checked, and their points to check.
     piece: Vec<Vec2>,
     piece_next: Vec<Vec2>,
+    piece_edges: Vec<(Vec2, Vec2)>,
     probes: Vec<Pending>,
     probe_values: Vec<f32>,
     probed: Vec<Probed>,
     probe_checks: Vec<Check>,
-    probe_grid: Vec<(i32, i32, u32)>,
     world: Vec<u32>,
     span: Vec<u32>,
     pixel: Vec<u32>,
@@ -589,6 +572,8 @@ pub struct Renderer {
     blur: BlurGrid,
     /// Per band, its edge pixels waiting for the bands next to it.
     seams: Vec<Seam>,
+    /// Last frame's lattices, their storage kept for this frame's.
+    lattice_pool: Mutex<Vec<Lattice>>,
 }
 
 /// The textures polygons sample, and the frame's focal length and ambient light; and the
@@ -601,6 +586,8 @@ struct Textures<'a> {
     time: f32,
     ambient: Vec3,
     blur: Option<&'a BlurGrid>,
+    /// Lattices to build in (see `Renderer::lattice_pool`).
+    lattices: &'a Mutex<Vec<Lattice>>,
 }
 
 impl Textures<'_> {
@@ -626,6 +613,7 @@ impl Renderer {
             blank: Texture::solid("blank", 0xFFFF_FFFF),
             blur: BlurGrid::default(),
             seams: Vec::new(),
+            lattice_pool: Mutex::new(Vec::new()),
         }
     }
 
@@ -675,6 +663,7 @@ impl Renderer {
             time: self.time,
             ambient: geometry.ambient,
             blur: None,
+            lattices: &self.lattice_pool,
         };
         let setup_started = Instant::now();
         // ---- Phase 1: polygon setup and binning, split by polygon. Each thread writes only
@@ -688,13 +677,16 @@ impl Renderer {
         };
         let (surfaces, remaps, shaders, config) =
             (&self.surfaces, &self.remaps, &self.materials, &self.config);
+        let lattice_pool = &self.lattice_pool;
         let set_up = |(t, bins): (usize, &mut ThreadBins)| {
             bins.polygons.clear();
             bins.vertices.clear();
             bins.lines.clear();
             bins.values.clear();
             bins.planes.clear();
-            bins.refine.clear();
+            // Last frame's lattices' storage is kept for this frame's.
+            let built = bins.lattices.drain(..).filter_map(OnceLock::into_inner);
+            lattice_pool.lock().unwrap().extend(built);
             bins.lights.clear();
             bins.light_split.clear();
             bins.shadows.clear();
@@ -1255,24 +1247,17 @@ fn setup_polygon(
     bins.lines
         .extend_from_slice(&geometry.edge_lines[p.vertices()]);
     let local = bins.polygons.len();
-    // Its tiles' refined spacings, not yet worked out: for a lit polygon whose material
-    // says which of its outputs is the light.
+    // A lit polygon whose material says which of its outputs is the light has its tiles
+    // checked and refined by it.
     let light_out = remap
         .light
         .filter(|_| bins.lights.len() as u32 > first_light && config.refine_threshold > 0.0)
         .map(|at| at as u16);
-    let (min_x, max_x) = verts
-        .iter()
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), v| (lo.min(v.x), hi.max(v.x)));
-    let strip = |x: f32| (x.floor() as i32 - viewport.x as i32).div_euclid(TILE_COLS);
+    // A lattice per block of rows it is in, none built yet.
     let block = |row: i32| (row - viewport.y as i32).div_euclid(BLOCK_ROWS);
-    let (refine_strip, refine_block) = (strip(min_x), block(row_top));
-    let refine_strips = strip(max_x) - refine_strip + 2;
-    let refine = bins.refine.len() as u32;
-    if light_out.is_some() {
-        let tiles = refine_strips * (block(row_end - 1) - refine_block + 1);
-        bins.refine.resize_with(refine as usize + tiles as usize, AtomicU8::default);
-    }
+    let (first_lattice, first_block) = (bins.lattices.len() as u32, block(row_top));
+    let blocks = block(row_end - 1) - first_block + 1;
+    bins.lattices.resize_with(first_lattice as usize + blocks as usize, OnceLock::new);
     bins.polygons.push(PolygonSetup {
         first_vertex,
         vertex_count: verts.len() as u16,
@@ -1286,6 +1271,8 @@ fn setup_polygon(
         n_out: (layout_len(entry.io.interp) + split_outputs(splits)) as u16,
         first_plane,
         fans: fans as u16,
+        first_lattice,
+        first_block,
         row_top,
         row_end,
         max_w: verts.iter().map(|v| v.w).fold(0.0, f32::max),
@@ -1305,10 +1292,6 @@ fn setup_polygon(
         lod: lod_at,
         back,
         light_out,
-        refine,
-        refine_block,
-        refine_strip,
-        refine_strips: refine_strips as u16,
     });
     // Bin a reference into every band the polygon's rows touch.
     let id = surface_id(thread, local);
@@ -1344,14 +1327,7 @@ fn render_band(
     s.edge_down.clear();
     seam.up.clear();
     seam.down.clear();
-    // Lattices are built per block of rows, whatever the band size, so no band size or
-    // thread count changes a pixel.
-    let band_top = band as i32 * band_rows;
-    let band_end = band_top + (chunk.len() / width) as i32;
-    s.first_block = band_top.div_euclid(BLOCK_ROWS);
-    s.blocks = ((band_end - 1).div_euclid(BLOCK_ROWS) - s.first_block + 1) as usize;
     (s.viewport_x, s.viewport_y) = (vx, viewport.y as i32);
-    s.band_rows = viewport.y as i32 + band_top..viewport.y as i32 + band_end;
     s.color.resize(vw, 0);
     s.vis_w.resize(vw, 0.0);
     s.vis_state.resize(vw, EMPTY);
@@ -1380,13 +1356,6 @@ fn render_band(
     // Back to front for blending (farthest nearest-point first).
     s.translucent
         .sort_by(|&a, &b| poly(a).max_w.total_cmp(&poly(b).max_w));
-    // No lattices yet: each is built the first time its polygon is shaded.
-    let slots = s.world.len() + s.span.len() + s.pixel.len() + s.translucent.len();
-    s.lattices.clear();
-    s.lattices.resize(slots * s.blocks, Lattice::default());
-    s.tiles.clear();
-    s.grid_rows.clear();
-    s.grid_values.clear();
 
     let rows_in_chunk = chunk.len() / width;
     for r in 0..rows_in_chunk {
@@ -1396,10 +1365,9 @@ fn render_band(
         s.spans.clear();
 
         // World spans: portal clipping guarantees they never overlap. Append, sort by x.
-        let (n_world, n_span, n_pixel) = (s.world.len(), s.span.len(), s.pixel.len());
         for i in 0..s.world.len() {
             let id = s.world[i];
-            if let Some(span) = row_span(s, bins, id, i as u32, row) {
+            if let Some(span) = row_span(s, bins, id, row) {
                 s.spans.push(span);
             }
         }
@@ -1413,7 +1381,7 @@ fn render_band(
         // two-point overlap resolve.
         for i in 0..s.span.len() {
             let id = s.span[i];
-            if let Some(span) = row_span(s, bins, id, (n_world + i) as u32, row) {
+            if let Some(span) = row_span(s, bins, id, row) {
                 insert_resolved(&s.spans, span, &mut s.spans_next);
                 std::mem::swap(&mut s.spans, &mut s.spans_next);
             }
@@ -1423,7 +1391,7 @@ fn render_band(
         s.pixel_spans.clear();
         for i in 0..s.pixel.len() {
             let id = s.pixel[i];
-            if let Some(span) = row_span(s, bins, id, (n_world + n_span + i) as u32, row) {
+            if let Some(span) = row_span(s, bins, id, row) {
                 s.pixel_spans.push(span);
             }
         }
@@ -1432,8 +1400,7 @@ fn render_band(
         s.translucent_spans.clear();
         for i in 0..s.translucent.len() {
             let id = s.translucent[i];
-            let slot = (n_world + n_span + n_pixel + i) as u32;
-            if let Some(span) = row_span(s, bins, id, slot, row) {
+            if let Some(span) = row_span(s, bins, id, row) {
                 s.translucent_spans.push(span);
             }
         }
@@ -1909,7 +1876,7 @@ fn edge_slope(verts: &[SetupVertex], lines: &[Option<EdgeLine>], i: usize) -> Ed
 
 /// The span a polygon covers on `row`, if any: its pixels and w along them. Only x and w;
 /// values are worked out when (and if) it is shaded.
-fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i32) -> Option<Span> {
+fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, row: i32) -> Option<Span> {
     let (t, l) = split_id(id);
     let b = &bins[t];
     let p = &b.polygons[l];
@@ -1929,7 +1896,6 @@ fn row_span(s: &mut RowScratch, bins: &[ThreadBins], id: u32, slot: u32, row: i3
     let state = s.states.len() as u32;
     s.states.push(RowState {
         id,
-        slot,
         x_left,
         x_right,
         w_left,
@@ -1965,19 +1931,23 @@ const TILE_COLS: i32 = MAX_STEP;
 
 /// A polygon's grid in one block of rows (see the Material Pipeline Spec): one tile per
 /// column strip it covers (and the strip after, which holds the point closing its last
-/// interval), each built the first time a run there needs it.
-#[derive(Clone, Copy, Default)]
+/// interval). Built whole, the first time a band shades the polygon there, and shared by
+/// every band of the block (see `ThreadBins::lattices`).
+#[derive(Default)]
 struct Lattice {
-    started: bool,
-    /// Its first strip (from the viewport's left edge, in tiles), its strips, and their tiles
-    /// in `RowScratch::tiles`.
+    /// The viewport's corner, which the grid counts from.
+    origin: (i32, i32),
+    /// Its first strip (from the viewport's left edge, in tiles), and its strips.
     first_strip: i32,
     strips: u32,
-    tiles: u32,
     /// The smallest w of the polygon in the block: a lower bound for every tile's.
     w_min: f32,
     /// The polygon's rows in the block.
     rows: (i32, i32),
+    /// Its tiles, one per strip; their grid rows; and those rows' outputs.
+    tiles: Vec<Tile>,
+    grid_rows: Vec<GridRow>,
+    grid_values: Vec<f32>,
 }
 
 /// A polygon's grid in one tile: its spacing and grid rows. Neighboring tiles whose
@@ -1992,9 +1962,11 @@ struct Tile {
     /// Column spacing and row spacing, in pixels.
     nx: i32,
     ny: i32,
-    /// Its first grid row, and its grid rows (`ny` apart) in `RowScratch::grid_rows`.
+    /// Its first grid row, and its grid rows (`ny` apart; `grid_rows` of them, from `rows`
+    /// in `Lattice::grid_rows`).
     first_row: i32,
     rows: u32,
+    grid_rows: u32,
 }
 
 /// One grid row of a tile: the grid columns it holds, and their outputs.
@@ -2148,7 +2120,13 @@ fn sample_context<'a>(
 /// Starts a polygon's lattice for one block of rows: the column strips it covers there
 /// (and the one after, for the point closing its last interval), with a tile for each, not
 /// yet built; and its smallest w there, a lower bound for every tile's.
-fn start_lattice(s: &mut RowScratch, p: &PolygonSetup, verts: &[SetupVertex], block: i32) -> Lattice {
+fn start_lattice(
+    s: &RowScratch,
+    p: &PolygonSetup,
+    verts: &[SetupVertex],
+    block: i32,
+    mut lattice: Lattice,
+) -> Lattice {
     let block_top = s.viewport_y + block * BLOCK_ROWS;
     let (r0, r1) = (
         p.row_top.max(block_top),
@@ -2183,23 +2161,26 @@ fn start_lattice(s: &mut RowScratch, p: &PolygonSetup, verts: &[SetupVertex], bl
     } else {
         (0, 0)
     };
-    let tiles = s.tiles.len() as u32;
     let strips = (last_strip - first_strip + 1) as u32;
-    s.tiles
-        .resize(s.tiles.len() + strips as usize, Tile::default());
+    lattice.tiles.clear();
+    lattice.tiles.resize(strips as usize, Tile::default());
+    lattice.grid_rows.clear();
+    lattice.grid_values.clear();
     Lattice {
-        started: true,
+        origin: (s.viewport_x, s.viewport_y),
         first_strip,
         strips,
-        tiles,
         w_min,
         rows: (r0, r1),
+        ..lattice
     }
 }
 
-/// Builds every tile of a polygon's lattice in one block (for the band's rows): each tile's
-/// spacing, then its grid rows, each holding the outputs of `shade_sample` at the tile's grid
-/// columns that the rows it serves need. The polygon's pixels on each row are found once for
+/// Builds every tile of a polygon's lattice in one block (all its rows there, whichever band
+/// asks): each tile's spacing, then its grid rows, each holding the outputs of `shade_sample`
+/// at the tile's grid columns that the rows it serves need. A lit polygon's is then checked
+/// against the light between its points, and built again closer where it is off (see
+/// [`refine_tiles`]). The polygon's pixels on each row are found once for
 /// all its tiles, and the grid points of all its tiles are evaluated together, [`LANES`] at
 /// a time whichever tiles they belong to: values from the polygon's plane functions
 /// ([`fan_planes`]), one reciprocal of w per point.
@@ -2210,7 +2191,7 @@ fn build_tiles(
     shaders: &[MaterialEntry],
     config: &RasterConfig,
     textures: &Textures,
-    lattice: Lattice,
+    lattice: &mut Lattice,
     id: u32,
 ) {
     let (t, l) = split_id(id);
@@ -2223,8 +2204,9 @@ fn build_tiles(
     let planes = Planes::of(&b.planes[p.first_plane as usize..], p.fans as usize, n_in);
     let (vx, vy) = (s.viewport_x, s.viewport_y);
     let (block_r0, block_r1) = lattice.rows;
-    // The rows this band draws, and the polygon's pixels on each.
-    let (r0, r1) = (block_r0.max(s.band_rows.start), block_r1.min(s.band_rows.end));
+    // The polygon's pixels on each of its rows in the block: all of them, whatever the band
+    // draws, so the lattice (and what checking it finds) is the block's alone.
+    let (r0, r1) = (block_r0, block_r1);
     s.row_pixels.clear();
     s.row_pixels.extend((r0..r1).map(|r| match crossings(verts, lines, r) {
         Some(((_, xl), (_, xr))) => (pixel_edge(xl), pixel_edge(xr) - 1),
@@ -2353,25 +2335,10 @@ fn build_tiles(
         );
         s.spacings.push((nx, ny, w_min));
     }
-    // Probe and refine: tiles where the light bends between their sample points get closer
-    // ones.
-    if let Some(light) = p.light_out {
-        let block = (block_r0 - vy).div_euclid(BLOCK_ROWS);
-        let first = p.refine as usize
-            + ((block - p.refine_block) * p.refine_strips as i32 + lattice.first_strip
-                - p.refine_strip) as usize;
-        let tiles = &b.refine[first..first + lattice.strips as usize];
-        if tiles.iter().any(|t| t.load(Ordering::Relaxed) == 0) {
-            probe_tiles(s, config, textures, lattice, p, b, entry, &planes, verts, tiles, light as usize);
-        }
-        for (spacing, tile) in s.spacings.iter_mut().zip(tiles) {
-            let refined = tile.load(Ordering::Relaxed);
-            if refined > 1 {
-                let to = 1 << (refined - 2);
-                (spacing.0, spacing.1) = (spacing.0.min(to), spacing.1.min(to));
-            }
-        }
-    }
+    // Build, check, and where the light bends between sample points, build again closer.
+    let mut checked = p.light_out.is_none();
+    loop {
+    s.pending.clear();
     let mut i = 0;
     while i < lattice.strips as usize {
         // A run of strips with the same spacing; the least w of any of them guards all.
@@ -2397,7 +2364,7 @@ fn build_tiles(
         let first_row = r0 - (r0 - vy).rem_euclid(ny);
         let last = r1 - 1;
         let last_row = last + (ny - (last - vy).rem_euclid(ny)) % ny;
-        let rows = s.grid_rows.len() as u32;
+        let rows = lattice.grid_rows.len() as u32;
         let last_col = xe - nx;
         let mut g = first_row;
         while g <= last_row {
@@ -2412,7 +2379,7 @@ fn build_tiles(
                 last_px = last_px.max(c);
             }
             if first_px > last_px || first_px >= xe || last_px < xs - TILE_COLS {
-                s.grid_rows.push(GridRow::default());
+                lattice.grid_rows.push(GridRow::default());
                 g += ny;
                 continue;
             }
@@ -2423,8 +2390,8 @@ fn build_tiles(
                 (xs + (last_px - xs + nx - 1) / nx * nx).min(last_col)
             };
             let cols = (col_end - col0) / nx + 1;
-            let values = s.grid_values.len();
-            s.grid_values.resize(values + n_out * cols as usize, 0.0);
+            let values = lattice.grid_values.len();
+            lattice.grid_values.resize(values + n_out * cols as usize, 0.0);
             let dy = g as f32 + 0.5 - planes.oy;
             for j in 0..cols {
                 s.pending.push(Pending {
@@ -2435,7 +2402,7 @@ fn build_tiles(
                     stride: cols as u32,
                 });
             }
-            s.grid_rows.push(GridRow {
+            lattice.grid_rows.push(GridRow {
                 col0,
                 cols: cols as u32,
                 values: values as u32,
@@ -2451,115 +2418,187 @@ fn build_tiles(
             ny,
             first_row,
             rows,
+            grid_rows: lattice.grid_rows.len() as u32 - rows,
         };
         for k in i..end {
-            s.tiles[lattice.tiles as usize + k] = tile;
+            lattice.tiles[k] = tile;
         }
         i = end;
     }
 
-    shade_pending(&s.pending, &mut s.grid_values, p, b, entry, &planes, textures);
+    shade_pending(&s.pending, &mut lattice.grid_values, p, b, entry, &planes, textures);
+    // Check the lattice against the light between its points, once: tiles found off get
+    // closer points, and the lattice is built again with them.
+    if checked || !refine_tiles(s, config, textures, lattice, p, b, entry, &planes, verts) {
+        break;
+    }
+    checked = true;
+    lattice.grid_rows.clear();
+    lattice.grid_values.clear();
+    }
 }
 
-/// Probe and refine. Works out which of a polygon's tiles in a block need sample points
-/// closer together than their spacing (`s.spacings`), and how close, and stores it in
-/// `tiles` (see `ThreadBins::refine`) for every band that shades them.
+/// Check and refine. Checks a polygon's lattice in a block, as built, against the light
+/// between its sample points, and gives the tiles found off closer spacings (in
+/// `s.spacings`); whether any changed (the lattice is then built again).
 ///
-/// A pixel gets the light blended between the four grid points of the cell it is in
-/// (worked out there from the polygon's planes, on it or past its edges). The probe works
-/// out the light (`light`: where the material's `light` output is, and the split lights'
-/// strengths) at points of the polygon in the tile, where its pixels are (the middle of a
-/// tile it covers, or else the corners of its part of the tile and their mean), and at the
-/// grid points of the cell each of those is in, at the tile's spacing. How far the light at
-/// a point is from its cell's blend there is how far off a pixel there is.
+/// A pixel gets the light blended between the four sample points of the cell it is in. So
+/// the light (the material's `light` output and the split lights' strengths) is worked out
+/// in the middle of every cell the polygon has a pixel in the middle of, and compared with
+/// the cell's blend there, read from the lattice itself: how far off a pixel there is.
+/// Every cell, as each blends its own points: a tile whose columns depth already has 4 px
+/// apart is eight cells side by side, and a pool of light ending in two of them shows in
+/// no other.
 ///
-/// The cells are the tile's own, not the tile: where depth already has rows or columns
-/// closer than a tile, the grid points between its corners are the ones pixels get, and
-/// those past the polygon's edge can be in light that never reaches it (a spot light's
-/// pool beside the edge of a floor polygon that ends just short of it).
+/// Two more looks, where cells don't tell enough:
 ///
-/// The light's slope is probed too, at that middle point: the light a pixel across and a
-/// pixel down from it, against the blend's there. A bend can leave the light in the middle
-/// right on the blend (a terminator three quarters of the way across a tile, the middle
-/// exactly half as bright as the lit side), but then it isn't changing there as the blend
-/// is; for both to agree by chance is far less likely. A slope that is off puts pixels off
-/// by as much as it adds up to by the edge of the cell, or of the polygon's part of the
-/// tile.
+/// - **Edges:** where the polygon covers only part of a tile, the corners of its part and
+///   their mean are checked too. Sample points past its edge can be in light that never
+///   reaches it (a spot light's pool beside the edge of a floor polygon).
+/// - **Slope:** in a tile that is one cell (and at a part's mean), the light a pixel across
+///   and a pixel down from the middle, against the blend's there. A bend can leave the
+///   middle right on the blend (a terminator three quarters of the way across), but then
+///   the light isn't changing there as the blend is. A slope that is off puts pixels off by
+///   as much as it adds up to by the edge of the cell, or of the polygon's part.
 ///
-/// Past `RasterConfig::refine_threshold` either way, the tile's points are put closer by as
-/// much as it is over (an error that halves with the spacing, as across a light's
-/// terminator; a smooth bend shrinks faster), no closer than `RasterConfig::min_step`.
+/// Past `RasterConfig::refine_threshold`, the tile's points are put closer by as much as it
+/// is over (an error that halves with the spacing, as across a light's terminator; a
+/// smooth bend shrinks faster), no closer than `RasterConfig::min_step`.
 ///
-/// Nothing here knows what the light is of: only that the material's own answer where the
-/// polygon is isn't what its answers at the grid points give there. It depends on the
-/// polygon and the tile alone, not on the band, so every band gets the same answer.
+/// The cells' own points are the lattice's: only the points in the middles are extra, and
+/// those are sample points of the next spacing down. Nothing here knows what the light is
+/// of. It depends on the polygon and the block alone, not on the band.
 #[allow(clippy::too_many_arguments)]
-fn probe_tiles(
+fn refine_tiles(
     s: &mut RowScratch,
     config: &RasterConfig,
     textures: &Textures,
-    lattice: Lattice,
+    lattice: &Lattice,
     p: &PolygonSetup,
     b: &ThreadBins,
     entry: &MaterialEntry,
     planes: &Planes,
     verts: &[SetupVertex],
-    tiles: &[AtomicU8],
-    light: usize,
-) {
-    /// Most points probed in a part of a tile: its corners, and their mean.
+) -> bool {
+    /// Most points checked in a part of a tile: its corners, and their mean.
     const POINTS: usize = LANES;
+    let Some(light) = p.light_out.map(usize::from) else { return false };
     let n_out = p.n_out as usize;
     let floor = config.min_step.clamp(1, MAX_STEP as u32) as i32;
-    let block_top = s.viewport_y + (lattice.rows.0 - s.viewport_y).div_euclid(BLOCK_ROWS) * BLOCK_ROWS;
+    let (r0, r1) = lattice.rows;
+    let block_top = s.viewport_y + (r0 - s.viewport_y).div_euclid(BLOCK_ROWS) * BLOCK_ROWS;
     // Grid points are at pixel centers.
     let (top, bottom) = (block_top as f32 + 0.5, (block_top + BLOCK_ROWS) as f32 + 0.5);
     let w_floor = if lattice.w_min.is_finite() { lattice.w_min / 8.0 } else { 0.0 };
     s.probes.clear();
     s.probed.clear();
     s.probe_checks.clear();
-    s.probe_grid.clear();
-    // Which way round the polygon goes, to tell a point inside it.
-    let corner = |k: usize| Vec2::new(verts[k % verts.len()].x, verts[k % verts.len()].y);
+    // The polygon's edges (a corner, and the way to the next, turned so that inside is to
+    // the left whichever way round it goes), to tell a point inside it.
+    let corner = |k: usize| Vec2::new(verts[k].x, verts[k].y);
     let turn = (1..verts.len() - 1)
         .map(|k| (corner(k) - corner(0)).perp_dot(corner(k + 1) - corner(0)))
         .sum::<f32>()
         .signum();
-    let inside = |q: Vec2| {
-        (0..verts.len()).all(|k| (corner(k + 1) - corner(k)).perp_dot(q - corner(k)) * turn >= 0.0)
-    };
+    s.piece_edges.clear();
+    s.piece_edges.extend((0..verts.len()).map(|k| (corner(k), (corner((k + 1) % verts.len()) - corner(k)) * turn)));
     let point = |q: Vec2, probes: &mut Vec<Pending>| {
         probes.push(Pending { dx: q.x - planes.ox, dy: q.y - planes.oy, w_floor, at: 0, stride: 1 });
         probes.len() as u32 - 1
     };
-    // Where the tile before's grid points start among those seen: a tile's left ones are
-    // its right ones.
-    let mut before = 0;
-    for (i, tile) in tiles.iter().enumerate() {
-        if tile.load(Ordering::Relaxed) != 0 {
-            continue;
-        }
-        // Already as close as probing would put them: nothing to find out.
+    // The light's values: the material's, then each split light's strength.
+    let n_material = n_out - split_outputs(p.splits as usize);
+    let lights = (light..light + 3).chain(n_material..n_out);
+    for i in 0..lattice.strips as usize {
+        // Already as close as checking would put them: nothing to find out.
         let (nx, ny, _) = s.spacings[i];
         if nx.max(ny) <= floor {
-            tile.store(1, Ordering::Relaxed);
             continue;
         }
-        // The polygon's part of the tile: all of it, or the polygon clipped to its four
-        // sides in turn.
-        let origin = (s.viewport_x + (lattice.first_strip + i as i32) * TILE_COLS, block_top);
-        let left = origin.0 as f32 + 0.5;
-        let right = left + TILE_COLS as f32;
+        let origin = s.viewport_x + (lattice.first_strip + i as i32) * TILE_COLS;
+        let first = s.probe_checks.len();
+        // The middle of every cell the polygon has a pixel in the middle of, and the cell's
+        // four sample points: in the tile's grid rows above and below it, side by side (the
+        // last cell's far ones are the next tile's).
+        let tile = lattice.tiles[i];
+        let run_end = s.viewport_x + tile.end_strip * TILE_COLS;
+        let down = if ny > 1 { 0.5 } else { 0.0 };
+        for row in (block_top..block_top + BLOCK_ROWS).step_by(ny as usize) {
+            let middle = row + ny / 2;
+            let index = (row - tile.first_row) / ny;
+            if !(r0..r1).contains(&middle) || row < tile.first_row || index + 1 >= tile.grid_rows as i32 {
+                continue;
+            }
+            let (from, to) = s.row_pixels[(middle - r0) as usize];
+            let above = lattice.grid_rows[tile.rows as usize + index as usize];
+            let below = lattice.grid_rows[tile.rows as usize + index as usize + 1];
+            // A grid row's point at a column, if it has one.
+            let at = |grid: GridRow, col: i32| {
+                let j = (col - grid.col0) >> nx.trailing_zeros();
+                (col >= grid.col0 && j < grid.cols as i32).then(|| (grid.values as usize + j as usize, grid.stride as usize))
+            };
+            let between = |col: i32| Some(Between { above: at(above, col)?, below: at(below, col)?, f: down });
+            for col in (origin..origin + TILE_COLS).step_by(nx as usize) {
+                if !(from..=to).contains(&(col + nx / 2)) {
+                    continue;
+                }
+                let q = Vec2::new((col + nx / 2) as f32 + 0.5, middle as f32 + 0.5);
+                let far = if col + nx < run_end { between(col + nx) } else { lattice_at(lattice, col + nx, q.y) };
+                if let (Some(near), Some(far)) = (between(col), far) {
+                    // A small cell whose four points have nearly the same light has little
+                    // to be off by: a bend across it shows in them. A big one is checked
+                    // whatever they say (a pool of light can sit inside it).
+                    if nx * ny < CHECKED_CELL {
+                        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                        for k in lights.clone() {
+                            for (at, stride) in [near.above, near.below, far.above, far.below] {
+                                let v = lattice.grid_values[at + k * stride];
+                                (lo, hi) = (lo.min(v), hi.max(v));
+                            }
+                            if (hi - lo) * 255.0 > 2.0 * config.refine_threshold {
+                                break;
+                            }
+                            (lo, hi) = (f32::INFINITY, f32::NEG_INFINITY);
+                        }
+                        if hi < lo {
+                            continue;
+                        }
+                    }
+                    let across = if nx > 1 { 0.5 } else { 0.0 };
+                    s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend: (near, far, across) });
+                }
+            }
+        }
+        // The polygon's part of the tile, where it isn't all of it: the polygon clipped to
+        // the tile's four sides in turn.
+        let (left, right) = (origin as f32 + 0.5, (origin + TILE_COLS) as f32 + 0.5);
         let square = [
             Vec2::new(left, top),
             Vec2::new(right, top),
             Vec2::new(left, bottom),
             Vec2::new(right, bottom),
         ];
-        let whole = square.iter().all(|&q| inside(q));
-        s.piece.clear();
-        let (mut lo, mut hi) = (square[0], square[3]);
-        if !whole {
+        // All of the tile is the polygon's where its first and last rows are (it is convex),
+        // and their grid points past them.
+        let covers = |row: i32| {
+            (r0..r1).contains(&row) && {
+                let (from, to) = s.row_pixels[(row - r0) as usize];
+                from <= origin && to >= origin + TILE_COLS - 1
+            }
+        };
+        let whole = covers(block_top)
+            && covers(block_top + BLOCK_ROWS - 1)
+            && [square[1], square[2], square[3]]
+                .iter()
+                .all(|&q| s.piece_edges.iter().all(|&(a, along)| along.perp_dot(q - a) >= 0.0));
+        let mut slope = None;
+        if whole {
+            // One cell: its middle's slope too.
+            if (nx, ny) == (TILE_COLS, BLOCK_ROWS) && s.probe_checks.len() > first {
+                slope = Some((s.probe_checks.len() - 1, Vec2::splat(TILE_COLS as f32 * 0.5)));
+            }
+        } else {
+            s.piece.clear();
             s.piece.extend((0..verts.len()).map(corner));
             let sides = [(Vec2::X, left), (Vec2::NEG_X, -right), (Vec2::Y, top), (Vec2::NEG_Y, -bottom)];
             for (inward, at) in sides {
@@ -2576,75 +2615,45 @@ fn probe_tiles(
                 }
                 std::mem::swap(&mut s.piece, &mut s.piece_next);
             }
-            // None of the polygon in the tile to speak of.
-            (lo, hi) = s
+            let (lo, hi) = s
                 .piece
                 .iter()
                 .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &q| (lo.min(q), hi.max(q)));
-            if s.piece.len() < 3 || (hi - lo).max_element() < 1.0 {
-                tile.store(1, Ordering::Relaxed);
-                continue;
-            }
-        }
-        // A point of the polygon to check, and the grid points of the cell it is in (each
-        // probed once, whichever of the tile's points, or the tile before's, are in cells
-        // it is a corner of).
-        let (first, seen) = (s.probe_checks.len(), s.probe_grid.len());
-        let check = |q: Vec2, probes: &mut Vec<Pending>, grid: &mut Vec<(i32, i32, u32)>| {
-            let cell = |v: f32, origin: i32, n: i32| {
-                origin + (((v - 0.5 - origin as f32) / n as f32).floor() as i32).clamp(0, TILE_COLS / n - 1) * n
-            };
-            let (col, row) = (cell(q.x, origin.0, nx), cell(q.y, origin.1, ny));
-            let corners = [(col, row), (col + nx, row), (col, row + ny), (col + nx, row + ny)];
-            let corners = corners.map(|(c, r)| {
-                let known = grid[before..].iter().find(|g| (g.0, g.1) == (c, r)).map(|g| g.2);
-                known.unwrap_or_else(|| {
-                    let at = point(Vec2::new(c as f32 + 0.5, r as f32 + 0.5), probes);
-                    grid.push((c, r, at));
-                    at
-                })
-            });
-            Check {
-                point: point(q, probes),
-                grid: corners,
-                corner: Vec2::new(col as f32 + 0.5, row as f32 + 0.5),
-            }
-        };
-        // Where the polygon is in it: the middle of all of it, or its part's corners
-        // (evenly picked, where there are too many; not those that are the tile's own
-        // corners) and their mean.
-        let (middle, reach) = if whole {
-            ((square[0] + square[3]) * 0.5, Vec2::splat(TILE_COLS as f32 * 0.5))
-        } else {
-            let n = s.piece.len().min(POINTS - 1);
-            let mut mean = Vec2::ZERO;
-            for k in 0..n {
-                let q = s.piece[k * s.piece.len() / n];
-                mean += q / n as f32;
-                if square.iter().all(|&g| (g - q).abs().max_element() > 1e-3) {
-                    let checked = check(q, &mut s.probes, &mut s.probe_grid);
-                    s.probe_checks.push(checked);
+            // Its corners (evenly picked, where there are too many; not the tile's own, which
+            // are sample points) and their mean, each in the cell it is in; the mean's slope.
+            if s.piece.len() >= 3 && (hi - lo).max_element() >= 1.0 {
+                let n = s.piece.len().min(POINTS - 1);
+                let mut mean = Vec2::ZERO;
+                for k in 0..=n {
+                    // The mean last.
+                    let q = if k < n { s.piece[k * s.piece.len() / n] } else { mean };
+                    mean += q / n as f32;
+                    if k < n && square.iter().any(|&g| (g - q).abs().max_element() <= 1e-3) {
+                        continue;
+                    }
+                    let col = origin + (((q.x - left) / nx as f32).floor() as i32).clamp(0, TILE_COLS / nx - 1) * nx;
+                    if let Some(blend) = blend_at(lattice, col, nx, q) {
+                        s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend });
+                        if k == n {
+                            slope = Some((s.probe_checks.len() - 1, (hi - mean).max(mean - lo)));
+                        }
+                    }
                 }
             }
-            // As far as its part of the tile goes from there, each way.
-            (mean, (hi - mean).max(mean - lo))
-        };
-        // The middle last, then a pixel across and a pixel down from it, for the slope.
-        let checked = check(middle, &mut s.probes, &mut s.probe_grid);
-        s.probe_checks.push(checked);
-        s.probed.push(Probed {
-            strip: i,
-            first,
-            count: s.probe_checks.len() - first,
-            across: point(middle + Vec2::X, &mut s.probes),
-            down: point(middle + Vec2::Y, &mut s.probes),
-            reach,
-            cell: Vec2::new(nx as f32, ny as f32),
+        }
+        if s.probe_checks.len() == first {
+            continue;
+        }
+        // A pixel across and a pixel down from the point whose slope is checked.
+        let slope = slope.map(|(at, reach)| {
+            let q = s.probes[s.probe_checks[at].point as usize];
+            let q = Vec2::new(q.dx + planes.ox, q.dy + planes.oy);
+            (at, reach, point(q + Vec2::X, &mut s.probes), point(q + Vec2::Y, &mut s.probes))
         });
-        before = seen;
+        s.probed.push(Probed { strip: i, first, count: s.probe_checks.len() - first, slope });
     }
     if s.probes.is_empty() {
-        return;
+        return false;
     }
     for (k, probe) in s.probes.iter_mut().enumerate() {
         probe.at = (k * n_out) as u32;
@@ -2652,75 +2661,135 @@ fn probe_tiles(
     s.probe_values.clear();
     s.probe_values.resize(s.probes.len() * n_out, 0.0);
     shade_pending(&s.probes, &mut s.probe_values, p, b, entry, planes, textures);
-    // The light's values: the material's, then each split light's strength.
-    let n_material = n_out - split_outputs(p.splits as usize);
-    let lights = (light..light + 3).chain(n_material..n_out);
-    for probed in &s.probed {
-        let at = |point: u32, k: usize| s.probe_values[point as usize * n_out + k];
+    let mut changed = false;
+    for index in 0..s.probed.len() {
+        let probed = s.probed[index];
+        let (nx, ny, _) = s.spacings[probed.strip];
         let place = |point: u32| Vec2::new(s.probes[point as usize].dx + planes.ox, s.probes[point as usize].dy + planes.oy);
-        // How far the light `k` at a point is from the blend of a cell's grid points there.
-        let off_at = |cell: &Check, point: u32, k: usize| {
-            let Vec2 { x: u, y: v } = (place(point) - cell.corner) / probed.cell;
-            let [g00, g10, g01, g11] = cell.grid;
-            let (above, below) = (
-                at(g00, k) + (at(g10, k) - at(g00, k)) * u,
-                at(g01, k) + (at(g11, k) - at(g01, k)) * u,
-            );
-            at(point, k) - (above + (below - above) * v)
+        // How far the light `k` at a point is from a cell's blend there.
+        let off_at = |(near, far, across): (Between, Between, f32), point: u32, k: usize| {
+            let (near, far) = (near.value(&lattice.grid_values, k), far.value(&lattice.grid_values, k));
+            s.probe_values[point as usize * n_out + k] - (near + (far - near) * across)
         };
-        // The points' own, and what the slope at the middle adds up to by the edge of its
-        // cell, or of the polygon's part: the blend's slope is the same a pixel on, so how
-        // much further off the light is there is how much its slope is.
         let checks = &s.probe_checks[probed.first..probed.first + probed.count];
-        let middle = &checks[checks.len() - 1];
-        let within = place(middle.point) - middle.corner;
-        let reach = probed.reach.min(within.max(probed.cell - within));
         let mut off = 0.0f32;
-        for k in lights.clone() {
-            for checked in checks {
-                off = off.max(off_at(checked, checked.point, k).abs());
+        for checked in checks {
+            for k in lights.clone() {
+                off = off.max(off_at(checked.blend, checked.point, k).abs());
             }
-            let here = off_at(middle, middle.point, k);
-            let slope = Vec2::new(off_at(middle, probed.across, k) - here, off_at(middle, probed.down, k) - here);
-            off = off.max(slope.abs().dot(reach));
+        }
+        // What the slope adds up to by the edge of the cell, or of the polygon's part: the
+        // blend's slope is the same a pixel on, so how much further off the light is there
+        // is how much its slope is.
+        if let Some((at, reach, across, down)) = probed.slope {
+            let middle = s.probe_checks[at];
+            let within = place(middle.point) - Vec2::new(middle.col as f32 + 0.5, top);
+            let cell = Vec2::new(nx as f32, ny as f32);
+            let within = Vec2::new(within.x, within.y.rem_euclid(cell.y));
+            let reach = reach.min(within.max(cell - within));
+            // The same cell's blend a pixel across, and a pixel down.
+            let (near, far, u) = middle.blend;
+            let right = (near, far, u + 1.0 / cell.x);
+            let lower = |column: Between| Between { f: column.f + 1.0 / cell.y, ..column };
+            let below = (lower(near), lower(far), u);
+            for k in lights.clone() {
+                let off_here = off_at(middle.blend, middle.point, k);
+                let slope = Vec2::new(off_at(right, across, k) - off_here, off_at(below, down, k) - off_here);
+                off = off.max(slope.abs().dot(reach));
+            }
         }
         let off = off * 255.0;
-        let refined = if off > config.refine_threshold {
+        if off > config.refine_threshold {
             let mut to = MAX_STEP;
-            while to > floor && to as f32 > probed.cell.max_element() * config.refine_threshold / off {
+            while to > floor && to as f32 > nx.max(ny) as f32 * config.refine_threshold / off {
                 to /= 2;
             }
-            2 + to.trailing_zeros() as u8
-        } else {
-            1
-        };
-        tiles[probed.strip].store(refined, Ordering::Relaxed);
+            let closer = (nx.min(to), ny.min(to));
+            changed |= closer != (nx, ny);
+            (s.spacings[probed.strip].0, s.spacings[probed.strip].1) = closer;
+        }
+    }
+    changed
+}
+
+/// The blend of a lattice's cell from grid column `col` (`nx` wide) at point `q`, as the
+/// lattice has it: its two columns there (see [`lattice_at`]), and how far across the point
+/// is. `None` where no pixel of the polygon is in that cell.
+fn blend_at(lattice: &Lattice, col: i32, nx: i32, q: Vec2) -> Option<(Between, Between, f32)> {
+    let (near, far) = (lattice_at(lattice, col, q.y)?, lattice_at(lattice, col + nx, q.y)?);
+    Some((near, far, (q.x - 0.5 - col as f32) / nx as f32))
+}
+
+/// Where a polygon's lattice, as built, has its outputs at grid column `col` (a pixel) and
+/// height `y`: between the column's tile's grid rows above and below, as a row's points are
+/// blended (see [`row_points`]). `None` where the lattice has no such point: no pixel of the
+/// polygon is beside it.
+fn lattice_at(lattice: &Lattice, col: i32, y: f32) -> Option<Between> {
+    let strip = (col - lattice.origin.0).div_euclid(TILE_COLS) - lattice.first_strip;
+    if !(0..lattice.strips as i32).contains(&strip) {
+        return None;
+    }
+    let tile = lattice.tiles[strip as usize];
+    let above = lattice.origin.1 + ((y - 0.5 - lattice.origin.1 as f32) / tile.ny as f32).floor() as i32 * tile.ny;
+    // A grid row's point at the column: where its first output is, and how far apart the
+    // rest are.
+    let at = |row: i32| {
+        let index = (row - tile.first_row).div_euclid(tile.ny);
+        if !(0..tile.grid_rows as i32).contains(&index) {
+            return None;
+        }
+        let grid = lattice.grid_rows[tile.rows as usize + index as usize];
+        let j = (col - grid.col0).div_euclid(tile.nx);
+        (0..grid.cols as i32).contains(&j).then(|| (grid.values as usize + j as usize, grid.stride as usize))
+    };
+    let f = (y - 0.5 - above as f32) / tile.ny as f32;
+    let here = at(above)?;
+    let below = if f > 0.0 { at(above + tile.ny)? } else { here };
+    Some(Between { above: here, below, f })
+}
+
+/// A point between two of a lattice's sample points, one above the other (see
+/// [`lattice_at`]): where each one's first output is in `RowScratch::grid_values` and how
+/// far apart its outputs are, and how far down from the first the point is.
+#[derive(Clone, Copy)]
+struct Between {
+    above: (usize, usize),
+    below: (usize, usize),
+    f: f32,
+}
+
+impl Between {
+    /// Output `k` there.
+    fn value(&self, values: &[f32], k: usize) -> f32 {
+        let (a, b) = (values[self.above.0 + k * self.above.1], values[self.below.0 + k * self.below.1]);
+        a + (b - a) * self.f
     }
 }
 
-/// A tile being probed (see [`probe_tiles`]): its strip, the points of the polygon in it to
-/// check (`count` from `first` in `RowScratch::probe_checks`, the middle one last), the
-/// points a pixel across and a pixel down from the middle, for the slope, how far the
-/// polygon's part of the tile goes from the middle, across and down, and its cells' size.
+/// The size (in pixels, squared) from which a cell's middle is checked whatever its four
+/// sample points' light: smaller ones only where those differ (see [`refine_tiles`]).
+const CHECKED_CELL: i32 = 256;
+
+/// A tile being checked (see [`refine_tiles`]): its strip, its points to check (`count`
+/// from `first` in `RowScratch::probe_checks`), and the one whose slope is checked, if any:
+/// which, how far the polygon's part of the tile goes from it across and down, and the
+/// probe points a pixel across and a pixel down from it.
 #[derive(Clone, Copy)]
 struct Probed {
     strip: usize,
     first: usize,
     count: usize,
-    across: u32,
-    down: u32,
-    reach: Vec2,
-    cell: Vec2,
+    slope: Option<(usize, Vec2, u32, u32)>,
 }
 
-/// A point of a polygon being probed (see [`probe_tiles`]), among the probe points, and the
-/// cell of its tile's grid it is in: the cell's four grid points among the probe points (top
-/// left, top right, bottom left, bottom right), and where the first is.
+/// A point of a polygon being checked (see [`refine_tiles`]), among the probe points, the
+/// first grid column (a pixel) of the cell it is in, and the cell's blend there (see
+/// [`blend_at`]).
 #[derive(Clone, Copy)]
 struct Check {
     point: u32,
-    grid: [u32; 4],
-    corner: Vec2,
+    col: i32,
+    blend: (Between, Between, f32),
 }
 
 /// Runs `shade_sample` at sample points of polygon `p` (`pending`), [`LANES`] at a time, and
@@ -2832,8 +2901,7 @@ struct Pending {
 /// `x1 - 1`, tile by tile, each tile's outputs blended between its grid rows above and
 /// below (output by output). The points are the grid's, so no pixel depends on how the row
 /// was split.
-fn row_points(s: &mut RowScratch, index: usize, n_out: usize, x0: i32, x1: i32) {
-    let lattice = s.lattices[index];
+fn row_points(s: &mut RowScratch, lattice: &Lattice, n_out: usize, x0: i32, x1: i32) {
     let (vx, row) = (s.viewport_x, s.row);
     s.points_x.clear();
     s.points_exact.clear();
@@ -2845,14 +2913,14 @@ fn row_points(s: &mut RowScratch, index: usize, n_out: usize, x0: i32, x1: i32) 
             (lattice.first_strip..lattice.first_strip + lattice.strips as i32).contains(&strip),
             "row {row}: strip {strip} outside the polygon's"
         );
-        let tile = s.tiles[(lattice.tiles as i32 + strip - lattice.first_strip) as usize];
+        let tile = lattice.tiles[(strip - lattice.first_strip) as usize];
         debug_assert!(tile.built);
         let (nx, ny) = (tile.nx, tile.ny);
         let g = row - (row - s.viewport_y).rem_euclid(ny);
         let fy = (row - g) as f32 / ny as f32;
         let above = tile.rows as usize + ((g - tile.first_row) / ny) as usize;
-        let a = s.grid_rows[above];
-        let b = if fy > 0.0 { s.grid_rows[above + 1] } else { a };
+        let a = lattice.grid_rows[above];
+        let b = if fy > 0.0 { lattice.grid_rows[above + 1] } else { a };
         // The run of strips sharing this tile's grid, from the strip holding x0 (or its
         // first) to its end.
         let (xs, xe) = (vx + tile.first_strip * TILE_COLS, vx + tile.end_strip * TILE_COLS);
@@ -2898,9 +2966,9 @@ fn row_points(s: &mut RowScratch, index: usize, n_out: usize, x0: i32, x1: i32) 
         let (start, count) = (seg.start as usize, seg.count as usize);
         let (a, b) = (seg.a, seg.b);
         for k in 0..n_out {
-            let va = &s.grid_values[a.values as usize + k * a.stride as usize + seg.ia as usize..]
+            let va = &lattice.grid_values[a.values as usize + k * a.stride as usize + seg.ia as usize..]
                 [..count];
-            let vb = &s.grid_values[b.values as usize + k * b.stride as usize + seg.ib as usize..]
+            let vb = &lattice.grid_values[b.values as usize + k * b.stride as usize + seg.ib as usize..]
                 [..count];
             let out = &mut s.points_v[k * m + start..k * m + start + count];
             for ((o, &p), &q) in out.iter_mut().zip(va).zip(vb) {
@@ -3352,19 +3420,20 @@ fn shade_points(
     translucent: bool,
 ) {
     let st = &s.states[state as usize];
-    let (id, slot) = (st.id, st.slot);
+    let id = st.id;
     let (x_left, x_right, w_left, w_right) = (st.x_left, st.x_right, st.w_left, st.w_right);
-    // The lattice of the block holding this row.
+    // The polygon's lattice in the block holding this row: built now if no band has yet (a
+    // band building it holds up any other that wants it until it is done).
     let block = (s.row - s.viewport_y).div_euclid(BLOCK_ROWS);
-    let index = slot as usize * s.blocks + (block - s.first_block) as usize;
     let (t, l) = split_id(id);
     let p = &bins[t].polygons[l];
-    if !s.lattices[index].started {
+    let lattice = bins[t].lattices[(p.first_lattice as i32 + block - p.first_block) as usize].get_or_init(|| {
         let range = p.first_vertex as usize..p.first_vertex as usize + p.vertex_count as usize;
-        let lattice = start_lattice(s, p, &bins[t].vertices[range], block);
-        s.lattices[index] = lattice;
-        build_tiles(s, bins, shaders, config, textures, lattice, id);
-    }
+        let kept = textures.lattices.lock().unwrap().pop().unwrap_or_default();
+        let mut lattice = start_lattice(s, p, &bins[t].vertices[range], block, kept);
+        build_tiles(s, bins, shaders, config, textures, &mut lattice, id);
+        lattice
+    });
     // A half-rate pair shows its even pixel, or the row's first where the pair starts
     // before the row, even if hidden.
     let shown = if p.half_rate {
@@ -3372,7 +3441,7 @@ fn shade_points(
     } else {
         x0
     };
-    row_points(s, index, p.n_out as usize, shown, x1);
+    row_points(s, lattice, p.n_out as usize, shown, x1);
     // The shadow buffer for the run: how much of each split light reaches each pixel.
     let smooth = config.smooth_edges && !config.beam_dither && !p.half_rate;
     shadow_run(s, &bins[t], p, x0, x1, config.beam_dither, smooth.then_some((x_left, x_right)));
@@ -4071,20 +4140,20 @@ fn mask_band(
         s.states.clear();
         s.spans.clear();
         for i in 0..s.world.len() {
-            if let Some(span) = row_span(s, bins, s.world[i], 0, row) {
+            if let Some(span) = row_span(s, bins, s.world[i], row) {
                 s.spans.push(span);
             }
         }
         s.spans.sort_by_key(|sp| sp.x0);
         for i in 0..s.span.len() {
-            if let Some(span) = row_span(s, bins, s.span[i], 0, row) {
+            if let Some(span) = row_span(s, bins, s.span[i], row) {
                 insert_resolved(&s.spans, span, &mut s.spans_next);
                 std::mem::swap(&mut s.spans, &mut s.spans_next);
             }
         }
         s.pixel_spans.clear();
         for i in 0..s.pixel.len() {
-            if let Some(span) = row_span(s, bins, s.pixel[i], 0, row) {
+            if let Some(span) = row_span(s, bins, s.pixel[i], row) {
                 s.pixel_spans.push(span);
             }
         }
