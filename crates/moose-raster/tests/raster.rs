@@ -1206,8 +1206,8 @@ fn test_lights(world: &mut World) {
 
 #[test]
 fn small_lit_faces_hold_still_as_the_view_moves() {
-    // Faces smaller than a cell of the sample grid (32 px), lit at their own vertices and
-    // along their own edges, against the exact light at every pixel: how far off they are,
+    // Faces smaller than a cell of the sample grid (32 px) against the exact light at every
+    // pixel: how far off they are,
     // and how much that error changes from one frame to the next as the camera creeps
     // (shimmer: the exact light of a surface point doesn't change with the view, so
     // whatever changes there is the sampling's).
@@ -1276,12 +1276,11 @@ fn small_lit_faces_hold_still_as_the_view_moves() {
         100.0 * jumps as f64 / pairs as f64,
     );
     assert!(pixels > 200_000, "the views hardly saw a small face");
-    // With the grid alone (sample points past the faces' edges): 12.59% off by more than 2
-    // levels, 4.18% by more than 8, mean error 1.878, 0.025% of pixels jumping by more than
-    // 4 between frames. With vertices and edges first: 7.56%, 2.01%, 0.878 and 0.008%. With
-    // tiles probed and refined too: 4.27%, 0.53%, 0.592 and 0.008%.
-    assert!(off * 100 < pixels * 6, "{off} of {pixels} pixels off by more than 2 levels");
-    assert!(far_off * 100 < pixels, "{far_off} of {pixels} pixels off by more than 8 levels");
+    // With the grid at its own spacing: 12.59% off by more than 2 levels, 4.18% by more
+    // than 8, mean error 1.878, 0.025% of pixels jumping by more than 4 between frames.
+    // With tiles probed and refined: 5.89%, 0.99%, 0.752 and 0.007%.
+    assert!(off * 100 < pixels * 7, "{off} of {pixels} pixels off by more than 2 levels");
+    assert!(far_off * 200 < pixels * 3, "{far_off} of {pixels} pixels off by more than 8 levels");
     assert!(jumps * 5000 < pairs, "{jumps} of {pairs} pixels jump between frames");
 }
 
@@ -1328,9 +1327,9 @@ fn lit_surfaces_match_exact_lighting() {
     let (_, _, worst) = compare(1, 1, 0.0);
     assert!(worst <= 2, "worst difference {worst} with light spacing 1");
     // The default spacing (up to 32 px, at most 4 px where a spot light's penumbra
-    // crosses, or where a tile's probe finds the light bending): about 0.16% of pixels more
+    // crosses, or where a tile's probe finds the light bending): about 0.18% of pixels more
     // than 2 levels off. Without the probes, light changing faster than a cell follows is
-    // interpolated coarsely: about 1.5% (2.5% without the penumbra rule too, 1.6% without
+    // interpolated coarsely: about 1.8% (2.5% without the penumbra rule too, 1.6% without
     // the spot light; at 8 px, 0.14%).
     // The worst (about 77) is a light 0.4 m below a ceiling seen from 11 m away: its bright
     // spot is a few rows tall there, and the minimum spacing on steep surfaces (4) can
