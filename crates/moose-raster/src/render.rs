@@ -513,6 +513,8 @@ struct RowScratch {
     probe_values: Vec<f32>,
     probed: Vec<Probed>,
     probe_checks: Vec<Check>,
+    /// The tiles' spacings as checking leaves them (see [`refine_tiles`]).
+    refined: Vec<(i32, i32)>,
     world: Vec<u32>,
     span: Vec<u32>,
     pixel: Vec<u32>,
@@ -2341,8 +2343,10 @@ fn build_tiles(
         );
         s.spacings.push((nx, ny, w_min));
     }
-    // Build, check, and where the light bends between sample points, build again closer.
-    let mut checked = p.light_out.is_none();
+    // Build, check, and where the light bends between sample points, build again closer:
+    // a few times, as a tile's closer points are its neighbor's last cells' too, which can
+    // put those off in turn.
+    let mut checks = if p.light_out.is_some() { REFINE_ROUNDS } else { 0 };
     loop {
     s.pending.clear();
     let mut i = 0;
@@ -2433,12 +2437,13 @@ fn build_tiles(
     }
 
     shade_pending(&s.pending, &mut lattice.grid_values, p, b, entry, &planes, textures);
-    // Check the lattice against the light between its points, once: tiles found off get
-    // closer points, and the lattice is built again with them.
-    if checked || !refine_tiles(s, config, textures, lattice, p, b, entry, &planes, verts) {
+    // Check the lattice against the light between its points: tiles found off get closer
+    // points, and the lattice is built again with them.
+    let again = checks < REFINE_ROUNDS;
+    if checks == 0 || !refine_tiles(s, config, textures, lattice, p, b, entry, &planes, verts, again) {
         break;
     }
-    checked = true;
+    checks -= 1;
     lattice.grid_rows.clear();
     lattice.grid_values.clear();
     }
@@ -2485,6 +2490,7 @@ fn refine_tiles(
     entry: &MaterialEntry,
     planes: &Planes,
     verts: &[SetupVertex],
+    again: bool,
 ) -> bool {
     /// Most points checked in a part of a tile: its corners, and their mean.
     const POINTS: usize = LANES;
@@ -2516,18 +2522,27 @@ fn refine_tiles(
     let n_material = n_out - split_outputs(p.splits as usize);
     let lights = (light..light + 3).chain(n_material..n_out);
     for i in 0..lattice.strips as usize {
-        // Already as close as checking would put them: nothing to find out.
         let (nx, ny, _) = s.spacings[i];
-        if nx.max(ny) <= floor {
-            continue;
-        }
         let origin = s.viewport_x + (lattice.first_strip + i as i32) * TILE_COLS;
         let first = s.probe_checks.len();
         // The middle of every cell the polygon has a pixel in the middle of, and the cell's
-        // four sample points: in the tile's grid rows above and below it, side by side (the
-        // last cell's far ones are the next tile's).
+        // four sample points: in the tile's grid rows above and below it, side by side.
         let tile = lattice.tiles[i];
         let run_end = s.viewport_x + tile.end_strip * TILE_COLS;
+        // The last cells' far points are the next run of tiles' first column, blended
+        // between that run's own grid rows: `next_ny` apart.
+        let next = (tile.end_strip - lattice.first_strip) as usize;
+        let next_ny = (next < lattice.strips as usize).then(|| s.spacings[next].1);
+        // Only its last cells, against the next run's column, where that is all there is to
+        // find out: in a tile already as close as checking would put it, where the next
+        // run's rows are further apart (its points are theirs); and in a lattice checked
+        // before, where the two runs' rows differ (the rest was checked then, and only what
+        // was built closer since can have put a neighbor's last cells off).
+        let close = if again { true } else { nx.max(ny) <= floor };
+        let differs = |next_ny: i32| if again { next_ny != ny } else { next_ny > ny };
+        if close && !next_ny.is_some_and(differs) {
+            continue;
+        }
         let down = if ny > 1 { 0.5 } else { 0.0 };
         for row in (block_top..block_top + BLOCK_ROWS).step_by(ny as usize) {
             let middle = row + ny / 2;
@@ -2545,11 +2560,32 @@ fn refine_tiles(
             };
             let between = |col: i32| Some(Between { above: at(above, col)?, below: at(below, col)?, f: down });
             for col in (origin..origin + TILE_COLS).step_by(nx as usize) {
+                let far_next = col + nx >= run_end;
+                if close && !far_next {
+                    continue;
+                }
+                // Where the next run's rows are closer, its first column changes between
+                // this cell's rows as this tile's doesn't: the cell is as many cells, one
+                // above the other, and each one's middle is checked.
+                if let Some(next_ny) = next_ny.filter(|&next_ny| far_next && next_ny < ny) {
+                    for sub in (row..row + ny).step_by(next_ny as usize) {
+                        let middle = sub + next_ny / 2;
+                        if !(r0..r1).contains(&middle) {
+                            continue;
+                        }
+                        let (from, to) = s.row_pixels[(middle - r0) as usize];
+                        let q = Vec2::new((col + nx / 2) as f32 + 0.5, middle as f32 + 0.5);
+                        if let Some(blend) = blend_at(lattice, col, nx, q).filter(|_| (from..=to).contains(&(col + nx / 2))) {
+                            s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend, far_next });
+                        }
+                    }
+                    continue;
+                }
                 if !(from..=to).contains(&(col + nx / 2)) {
                     continue;
                 }
                 let q = Vec2::new((col + nx / 2) as f32 + 0.5, middle as f32 + 0.5);
-                let far = if col + nx < run_end { between(col + nx) } else { lattice_at(lattice, col + nx, q.y) };
+                let far = if far_next { lattice_at(lattice, col + nx, q.y) } else { between(col + nx) };
                 if let (Some(near), Some(far)) = (between(col), far) {
                     // A small cell whose four points have nearly the same light has little
                     // to be off by: a bend across it shows in them. A big one is checked
@@ -2571,9 +2607,15 @@ fn refine_tiles(
                         }
                     }
                     let across = if nx > 1 { 0.5 } else { 0.0 };
-                    s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend: (near, far, across) });
+                    s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend: (near, far, across), far_next });
                 }
             }
+        }
+        if close {
+            if s.probe_checks.len() > first {
+                s.probed.push(Probed { strip: i, next, first, count: s.probe_checks.len() - first, slope: None });
+            }
+            continue;
         }
         // The polygon's part of the tile, where it isn't all of it: the polygon clipped to
         // the tile's four sides in turn.
@@ -2639,7 +2681,7 @@ fn refine_tiles(
                     }
                     let col = origin + (((q.x - left) / nx as f32).floor() as i32).clamp(0, TILE_COLS / nx - 1) * nx;
                     if let Some(blend) = blend_at(lattice, col, nx, q) {
-                        s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend });
+                        s.probe_checks.push(Check { point: point(q, &mut s.probes), col, blend, far_next: false });
                         if k == n {
                             slope = Some((s.probe_checks.len() - 1, (hi - mean).max(mean - lo)));
                         }
@@ -2656,7 +2698,7 @@ fn refine_tiles(
             let q = Vec2::new(q.dx + planes.ox, q.dy + planes.oy);
             (at, reach, point(q + Vec2::X, &mut s.probes), point(q + Vec2::Y, &mut s.probes))
         });
-        s.probed.push(Probed { strip: i, first, count: s.probe_checks.len() - first, slope });
+        s.probed.push(Probed { strip: i, next, first, count: s.probe_checks.len() - first, slope });
     }
     if s.probes.is_empty() {
         return false;
@@ -2667,7 +2709,9 @@ fn refine_tiles(
     s.probe_values.clear();
     s.probe_values.resize(s.probes.len() * n_out, 0.0);
     shade_pending(&s.probes, &mut s.probe_values, p, b, entry, planes, textures);
-    let mut changed = false;
+    // The tiles' spacings, as closer as each is found to need.
+    s.refined.clear();
+    s.refined.extend(s.spacings.iter().map(|&(nx, ny, _)| (nx, ny)));
     for index in 0..s.probed.len() {
         let probed = s.probed[index];
         let (nx, ny, _) = s.spacings[probed.strip];
@@ -2677,11 +2721,17 @@ fn refine_tiles(
             let (near, far) = (near.value(&lattice.grid_values, k), far.value(&lattice.grid_values, k));
             s.probe_values[point as usize * n_out + k] - (near + (far - near) * across)
         };
+        // How far off its cells are: all of them, and those blended with the next run's
+        // first column.
         let checks = &s.probe_checks[probed.first..probed.first + probed.count];
-        let mut off = 0.0f32;
+        let (mut off, mut off_next) = (0.0f32, 0.0f32);
         for checked in checks {
             for k in lights.clone() {
-                off = off.max(off_at(checked.blend, checked.point, k).abs());
+                let here = off_at(checked.blend, checked.point, k).abs();
+                off = off.max(here);
+                if checked.far_next {
+                    off_next = off_next.max(here);
+                }
             }
         }
         // What the slope adds up to by the edge of the cell, or of the polygon's part: the
@@ -2704,16 +2754,30 @@ fn refine_tiles(
                 off = off.max(slope.abs().dot(reach));
             }
         }
-        let off = off * 255.0;
-        if off > config.refine_threshold {
+        // Closer by as much as it is over. A cell blended with the next run's column is as
+        // far off as that column's points are apart too: the next run's tile likewise.
+        let closer = |off: f32, (nx, ny): (i32, i32)| {
             let mut to = MAX_STEP;
-            while to > floor && to as f32 > nx.max(ny) as f32 * config.refine_threshold / off {
+            while to > floor && to as f32 > nx.max(ny) as f32 * config.refine_threshold / (off * 255.0) {
                 to /= 2;
             }
-            let closer = (nx.min(to), ny.min(to));
-            changed |= closer != (nx, ny);
-            (s.spacings[probed.strip].0, s.spacings[probed.strip].1) = closer;
+            to
+        };
+        if off * 255.0 > config.refine_threshold {
+            let to = closer(off, (nx, ny));
+            let tile = &mut s.refined[probed.strip];
+            *tile = (tile.0.min(to), tile.1.min(to));
         }
+        if off_next * 255.0 > config.refine_threshold && probed.next < s.refined.len() {
+            let to = closer(off_next, (nx, ny));
+            let tile = &mut s.refined[probed.next];
+            *tile = (tile.0.min(to), tile.1.min(to));
+        }
+    }
+    let mut changed = false;
+    for (spacing, &(nx, ny)) in s.spacings.iter_mut().zip(&s.refined) {
+        changed |= (spacing.0, spacing.1) != (nx, ny);
+        (spacing.0, spacing.1) = (nx, ny);
     }
     changed
 }
@@ -2772,30 +2836,36 @@ impl Between {
     }
 }
 
+/// Most times a lattice is checked and built again closer (see [`build_tiles`]).
+const REFINE_ROUNDS: u32 = 3;
+
 /// The size (in pixels, squared) from which a cell's middle is checked whatever its four
 /// sample points' light: smaller ones only where those differ (see [`refine_tiles`]).
 const CHECKED_CELL: i32 = 256;
 
-/// A tile being checked (see [`refine_tiles`]): its strip, its points to check (`count`
-/// from `first` in `RowScratch::probe_checks`), and the one whose slope is checked, if any:
+/// A tile being checked (see [`refine_tiles`]): its strip, the next run of tiles' first
+/// strip, its points to check (`count` from `first` in `RowScratch::probe_checks`), and the
+/// one whose slope is checked, if any:
 /// which, how far the polygon's part of the tile goes from it across and down, and the
 /// probe points a pixel across and a pixel down from it.
 #[derive(Clone, Copy)]
 struct Probed {
     strip: usize,
+    next: usize,
     first: usize,
     count: usize,
     slope: Option<(usize, Vec2, u32, u32)>,
 }
 
 /// A point of a polygon being checked (see [`refine_tiles`]), among the probe points, the
-/// first grid column (a pixel) of the cell it is in, and the cell's blend there (see
-/// [`blend_at`]).
+/// first grid column (a pixel) of the cell it is in, the cell's blend there (see
+/// [`blend_at`]), and whether the cell's far points are the next run of tiles'.
 #[derive(Clone, Copy)]
 struct Check {
     point: u32,
     col: i32,
     blend: (Between, Between, f32),
+    far_next: bool,
 }
 
 /// Runs `shade_sample` at sample points of polygon `p` (`pending`), [`LANES`] at a time, and

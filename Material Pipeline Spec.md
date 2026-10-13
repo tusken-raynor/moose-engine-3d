@@ -243,12 +243,13 @@ The spacing rules above are set before any light is worked out: they know depth,
 1. **Build** the block's lattice at the spacing the rules above give.
 2. **Check** it. A pixel gets the light blended between the four sample points of the cell it is in, so the material's sample stage is run in the middle of every cell the polygon has a pixel in the middle of, and the light there compared with the cell's blend, read from the lattice itself.
 3. **Refine:** a tile with a cell off by more than `RasterConfig::refine_threshold` (2 levels of the encoded light) gets its cells' size (the longer way) times threshold over error, a power of two, no less than `RasterConfig::min_step`, both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
-4. **Build again,** once, if any tile changed. It isn't checked again.
+4. **Build again** if any tile changed, and check again, up to three times: a tile's closer points are also its neighbor's last cells' far points, which can put those off in turn. After the first check only such cells are looked at (the last cells of a tile whose next run of tiles has rows another distance apart).
 
 Details:
 
 - **Every cell,** as each blends its own points. A tile whose columns depth already has 4 px apart is eight cells side by side, and a pool of light ending in two of them shows in no other (seen in cheese_1: a spot light's pool on a wall seen at a steep angle, its top a few pixels inside a tile with columns 4 px apart and rows 32; the two cells it reached blended it 32 rows up the wall).
   - Cells under 256 px² are only checked where their four points' light differs by more than 2 thresholds: a bend across one shows in them. Bigger ones are checked whatever their points say, as a pool of light can sit inside one.
+- **Between tiles of different spacing:** a tile's last cells blend toward the next run of tiles' first column, which is blended between that run's own grid rows. Where those are closer than the tile's, the column changes between the tile's rows as the tile's own doesn't: the cell is as many cells one above the other, and each one's middle is checked. A cell found off this way puts the next run's tile closer too, as it is off by how far apart either's points are. (Seen in cheese_1: the flashlight's pool on a far wall, its tip just inside a tile at 4 px; the tile to its left, at 32 px, blended the tip's column across all its width on the rows the tip was on, and its one middle, above them, showed nothing.)
 - **Edges:** where the polygon covers only part of a tile, the corners of its part (the polygon clipped to the tile; up to 7) and their mean are checked too, each against the cell it is in. Sample points past a polygon's edge can be in light that never reaches it (seen in cheese_1's dirt alley: a floor polygon ending 2 px short of a spot light's pool, its columns 32 px apart, had sample points 16 px past its edge in the pool, and a wedge of it was lit).
 - **Slope:** in a tile that is one cell, and at a part's mean, the light is also worked out a pixel across and a pixel down from the middle. The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off; times how far the cell (or the polygon's part, if nearer) goes each way, that counts as an error too. A bend can leave the middle right on the blend (seen on the beach ball: a terminator three quarters of the way across a tile, 0.527 against 0.527 in the middle, and the blend 18 levels off a few pixels on), but then the light isn't changing there as the blend is. For both to agree by chance is far less likely.
 - **What is looked at:** the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
@@ -268,9 +269,9 @@ Measured (raster tests, 320×180; against exact light at every pixel):
 
 | | Off | On (threshold 2) |
 | --- | --- | --- |
-| Lit pixels off by more than 2 levels | 1.75% | 0.14% |
-| Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.93% |
-| Small lit faces off by more than 8 levels | 4.18% | 1.03% |
+| Lit pixels off by more than 2 levels | 1.75% | 0.13% |
+| Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.72% |
+| Small lit faces off by more than 8 levels | 4.18% | 0.85% |
 | The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 23.96% | 1.66% |
 | The same, off by more than 8 levels | 6.39% | 0.07% |
 
@@ -287,6 +288,7 @@ Cost, against `main` (b01c3c6: no checking, a lattice per band); a busy machine,
 
 - Sharing a block's lattice between its bands pays for most of the checking: with checking off it is faster than `main`.
 - The canyon pays most: its terrain is small polygons, each a part of a tile with its own corners to check.
+- Measured before tiles of different spacing were checked against each other and lattices checked more than once; those cost little more (shiny_rooms, 1 thread: within the noise of 6.0 to 6.3 ms either way).
 
 Settings: `--refine X` in the app (levels; 0 off), `--min-step N` for how close it may go, `REFINE` in `timing`.
 
