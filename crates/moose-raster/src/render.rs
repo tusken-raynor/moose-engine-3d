@@ -2472,10 +2472,18 @@ fn build_tiles(
 /// strengths) at those corners, and at points of the polygon in the tile, where its pixels
 /// are: the middle of a tile it covers, or else the corners of its part of the tile and
 /// their mean. How far the light at each is from the corners' blend there is how far off a
-/// pixel there would be. Past `RasterConfig::refine_threshold` at any of them, the tile's
-/// points are put closer by as much as it is over (an error that halves with the spacing,
-/// as across a light's terminator; a smooth bend shrinks faster), no closer than
-/// `refine_spacing`.
+/// pixel there would be.
+///
+/// The light's slope is probed too, at that middle point: the light a pixel across and a
+/// pixel down from it, against the blend's there. A bend can leave the light in the middle
+/// right on the blend (a terminator three quarters of the way across a tile, the middle
+/// exactly half as bright as the lit side), but then it isn't changing there as the blend
+/// is; for both to agree by chance is far less likely. A slope that is off puts pixels off
+/// by as much as it adds up to by the edge of the polygon's part of the tile.
+///
+/// Past `RasterConfig::refine_threshold` either way, the tile's points are put closer by as
+/// much as it is over (an error that halves with the spacing, as across a light's
+/// terminator; a smooth bend shrinks faster), no closer than `refine_spacing`.
 ///
 /// Nothing here knows what the light is of: only that the material's own answer where the
 /// polygon is isn't what its answers at the grid points give there. It depends on the
@@ -2539,6 +2547,7 @@ fn probe_tiles(
         ];
         let whole = grid.iter().all(|&q| inside(q));
         s.piece.clear();
+        let (mut lo, mut hi) = (grid[0], grid[3]);
         if !whole {
             s.piece.extend((0..verts.len()).map(corner));
             let sides = [(Vec2::X, left), (Vec2::NEG_X, -right), (Vec2::Y, top), (Vec2::NEG_Y, -bottom)];
@@ -2557,7 +2566,7 @@ fn probe_tiles(
                 std::mem::swap(&mut s.piece, &mut s.piece_next);
             }
             // None of the polygon in the tile to speak of.
-            let (lo, hi) = s
+            (lo, hi) = s
                 .piece
                 .iter()
                 .fold((Vec2::INFINITY, Vec2::NEG_INFINITY), |(lo, hi), &q| (lo.min(q), hi.max(q)));
@@ -2581,8 +2590,8 @@ fn probe_tiles(
         // (evenly picked, where there are too many; not those that are the grid's own
         // points) and their mean.
         let first = s.probes.len();
-        if whole {
-            point((grid[0] + grid[3]) * 0.5, &mut s.probes);
+        let (middle, reach) = if whole {
+            ((grid[0] + grid[3]) * 0.5, Vec2::splat(TILE_COLS as f32 * 0.5))
         } else {
             let n = s.piece.len().min(POINTS - 1);
             let mut mean = Vec2::ZERO;
@@ -2593,9 +2602,15 @@ fn probe_tiles(
                     point(q, &mut s.probes);
                 }
             }
-            point(mean, &mut s.probes);
-        }
-        s.probed.push(Probed { strip: i, grid: grid_at, first, count: s.probes.len() - first, left });
+            // As far as its part of the tile goes from there, each way.
+            (mean, (hi - mean).max(mean - lo))
+        };
+        // The middle last, then a pixel across and a pixel down from it, for the slope.
+        point(middle, &mut s.probes);
+        let count = s.probes.len() - first;
+        point(middle + Vec2::X, &mut s.probes);
+        point(middle + Vec2::Y, &mut s.probes);
+        s.probed.push(Probed { strip: i, grid: grid_at, first, count, left, reach });
     }
     if s.probes.is_empty() {
         return;
@@ -2613,21 +2628,35 @@ fn probe_tiles(
     for probed in &s.probed {
         let at = |point: usize, k: usize| s.probe_values[point * n_out + k];
         let [g00, g10, g01, g11] = probed.grid.map(|g| g as usize);
-        let mut off = 0.0f32;
-        for point in probed.first..probed.first + probed.count {
-            // Where the point is in the tile, and the grid points' blend there.
+        // How far the light `k` at a point is from the grid points' blend there.
+        let off_at = |point: usize, k: usize| {
             let q = s.probes[point];
             let (u, v) = (
                 (q.dx + planes.ox - probed.left) / cell,
                 (q.dy + planes.oy - top) / cell,
             );
-            for k in lights.clone() {
-                let (above, below) = (
-                    at(g00, k) + (at(g10, k) - at(g00, k)) * u,
-                    at(g01, k) + (at(g11, k) - at(g01, k)) * u,
-                );
-                off = off.max((at(point, k) - (above + (below - above) * v)).abs());
+            let (above, below) = (
+                at(g00, k) + (at(g10, k) - at(g00, k)) * u,
+                at(g01, k) + (at(g11, k) - at(g01, k)) * u,
+            );
+            at(point, k) - (above + (below - above) * v)
+        };
+        // The points' own, and what the slope at the middle adds up to by the edge of the
+        // polygon's part: the blend's slope is the same a pixel on, so how much further off
+        // the light is there is how much its slope is.
+        let (middle, across, down) = (
+            probed.first + probed.count - 1,
+            probed.first + probed.count,
+            probed.first + probed.count + 1,
+        );
+        let mut off = 0.0f32;
+        for k in lights.clone() {
+            for point in probed.first..=middle {
+                off = off.max(off_at(point, k).abs());
             }
+            let here = off_at(middle, k);
+            let slope = Vec2::new(off_at(across, k) - here, off_at(down, k) - here);
+            off = off.max(slope.abs().dot(probed.reach));
         }
         let off = off * 255.0;
         let refined = if off > config.refine_threshold {
@@ -2645,7 +2674,9 @@ fn probe_tiles(
 
 /// A tile being probed (see [`probe_tiles`]): its strip, its four grid points among the
 /// probe points (top left, top right, bottom left, bottom right), the points of the polygon
-/// in it (`count` from `first`), and its left grid points' x.
+/// in it (`count` from `first`, the middle one last; then the points a pixel across and a
+/// pixel down from the middle, for the slope), its left grid points' x, and how far the
+/// polygon's part of the tile goes from the middle, across and down.
 #[derive(Clone, Copy)]
 struct Probed {
     strip: usize,
@@ -2653,6 +2684,7 @@ struct Probed {
     first: usize,
     count: usize,
     left: f32,
+    reach: Vec2,
 }
 
 /// Runs `shade_sample` at sample points of polygon `p` (`pending`), [`LANES`] at a time, and

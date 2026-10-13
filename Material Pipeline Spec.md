@@ -245,12 +245,16 @@ The spacing rules above are set before any light is worked out: they know depth,
   - the middle of a tile the polygon covers;
   - or else the corners of the polygon's part of the tile (the polygon clipped to it; up to 7) and their mean.
 - **The error:** how far the light at each of those points is from the four grid points' blend there, in levels of the encoded light: how far off a pixel there would be. The largest counts. It looks at the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
+- **The slope (Oct 13):** the light is also worked out a pixel across and a pixel down from that middle point (the tile's middle, or the mean). The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off. That, times how far the polygon's part of the tile goes from the middle each way, is how far off it would be by the part's edge, and counts as an error too.
+  - **Why:** a bend can leave the middle right on the blend. Seen on the beach ball (cheese_1): a terminator three quarters of the way across a tile, the light in the middle 0.527 and the blend there 0.527, and the blend 18 levels off a few pixels to the right. The tile kept 32 px cells beside neighbors at 4 px: a block of smeared rows across the terminator. The slope there was off by about 1 level a pixel, which over 16 px is 15: found. For the value and the slope both to agree by chance is far less likely.
+  - **Tried instead, and dropped:** a second round of points (halfway from the middle to each corner) where the first found nothing but the light changed a lot across the tile. It fixed the same tile at the same cost, but needed a rule for when to look again, and was more of the same probe.
 - **Refine:** past `RasterConfig::refine_threshold` (2 levels), the tile's spacing becomes 32 px times threshold over error, a power of two, no less than `refine_spacing` (4 px), both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
 - **It knows nothing of lights:** only that the material's own answer where the polygon is isn't what its answers at the grid points give there. No light's kind, place or normal is looked at, and a tile where the light is even costs its probe and nothing more.
 - **Once per tile, for every band:** the answer is the polygon's and the tile's alone, so the first band to shade the tile works it out and stores it (`ThreadBins::refine`, atomics), and the others read it. Two bands that race get the same answer. Images stay identical for any band size and thread count.
 - **Lazy, like lattices:** hidden polygons are never probed.
-- **Shared grid points:** a tile's left grid points are the tile before's right ones, so a row of covered tiles costs 3 points a tile.
-- **What it misses:** a change smaller than a tile that leaves the probed points alone (a light pool a few pixels across between them). The worst case of the lit test is still that one (67 levels).
+- **Shared grid points:** a tile's left grid points are the tile before's right ones, so a row of covered tiles costs 5 points a tile (2 grid points, the middle, and 2 for its slope).
+- **What it misses:** a change smaller than a tile that leaves the probed points and the slope in the middle alone (a light pool a few pixels across between them). The worst case of the lit test is still that one (67 levels).
+- **Probe points are thrown away:** none of them is kept as a sample point. Keeping each level's points, and testing slopes on points already there, is the next step if this holds up.
 
 **First version, replaced the same day.** It compared the light at the mean of the part's corners with the mean of the light at those corners (exact for a linear light, whatever the part's shape) and scaled the spacing by the part's size. One point per part missed bends that left the middle alone, and neighboring faces in one tile came to different answers, so dense and sparse tiles alternated along a terminator, in blocks. Probing where the polygon's pixels are, against what the grid would really give them, closed the gaps.
 
@@ -258,13 +262,13 @@ Measured (raster tests, 320×180; against exact light at every pixel):
 
 | | Off | On (threshold 2) |
 | --- | --- | --- |
-| Lit pixels off by more than 2 levels | 1.75% | 0.18% |
+| Lit pixels off by more than 2 levels | 1.75% | 0.14% |
 | Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.89% |
 | Small lit faces off by more than 8 levels | 4.18% | 0.99% |
-| The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 23.96% | 1.85% |
+| The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 23.96% | 1.66% |
 | The same, off by more than 8 levels | 6.39% | 0.07% |
 
-Cost (`timing`, 1280×720, best of 4): shiny_rooms on 1 thread 5.55 ms off, 5.71 ms probing without refining, 5.90 ms on (+0.35 ms, 6%); on 8 threads about 0.94 → 0.98 ms. walker_rooms on 1 thread 3.21 → 3.22 ms.
+Cost (`timing`, 1280×720, best of 4): shiny_rooms on 1 thread 5.53 ms off, 6.04 ms on (+0.51 ms, 9%; 5.91 ms before the slope was probed); on 8 threads about 0.93 → 1.01 ms. walker_rooms on 1 thread 3.21 → 3.21 ms.
 
 Settings: `--refine X` in the app (levels; 0 off), `REFINE` in `timing`.
 
