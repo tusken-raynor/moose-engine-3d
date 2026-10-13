@@ -83,7 +83,8 @@
 //!   --show-shadow-mesh    overlay the shadow pieces' outlines (F4; see `draw_shadow_mesh`)
 //!   --show-samples        overlay where shading is sampled (sample rows red, sample
 //!                         points green)
-//!   --min-step N          smallest sample spacing on steep surfaces, in pixels
+//!   --min-step N          smallest sample spacing, in pixels: on steep surfaces, and where
+//!                         probing puts sample points closer (see --refine)
 //!   --light-spacing N     widest sample spacing on lit surfaces, in pixels
 //!   --steep-limit X       how much depth may change across a cell held to the minimum
 //!                         spacing before steep surfaces go finer anyway (default 0.25;

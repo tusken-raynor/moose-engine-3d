@@ -240,19 +240,21 @@ So:
 
 The spacing rules above are set before any light is worked out: they know depth, the material and where a spot light's cone fades, but not where the light itself bends. A light's terminator across a smooth ball, a lamp's bright pool on a wall and a shadowed light's edge all change faster than 32 px cells follow. So lit polygons are probed:
 
-- **Per polygon, per tile, per block.** A tile is one cell of the widest grid: its four corners are grid points whatever the spacing, and at the widest, pixels in it get the light blended between those four (worked out from the polygon's planes, on it or past its edges).
-- **The probe:** the material's sample stage is run at those four grid points, and at points of the polygon in the tile, where its pixels are:
+- **Per polygon, per tile, per block.** A pixel gets the light blended between the four grid points of the cell it is in (worked out from the polygon's planes, on it or past its edges).
+- **The probe:** the material's sample stage is run at points of the polygon in the tile, where its pixels are:
   - the middle of a tile the polygon covers;
-  - or else the corners of the polygon's part of the tile (the polygon clipped to it; up to 7) and their mean.
-- **The error:** how far the light at each of those points is from the four grid points' blend there, in levels of the encoded light: how far off a pixel there would be. The largest counts. It looks at the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
-- **The slope (Oct 13):** the light is also worked out a pixel across and a pixel down from that middle point (the tile's middle, or the mean). The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off. That, times how far the polygon's part of the tile goes from the middle each way, is how far off it would be by the part's edge, and counts as an error too.
+  - or else the corners of the polygon's part of the tile (the polygon clipped to it; up to 7) and their mean;
+  - and at the four grid points of the cell each of those is in, at the tile's spacing as set so far (a grid point is probed once, whichever points' cells it is a corner of, in the tile or the one before).
+- **The error:** how far the light at each of those points is from its cell's blend there, in levels of the encoded light: how far off a pixel there is. The largest counts. It looks at the material's `light` output (`shader::LIGHT`) and the split lights' strengths.
+- **The cells are the tile's own, not the tile (Oct 13).** At first the blend was of the tile's four corners, as if every tile had one 32 px cell. Where depth already has rows or columns closer than that, the grid points between the corners are the ones pixels get, and one past the polygon's edge can be in light that never reaches the polygon. Seen in cheese_1's dirt alley: a floor polygon ending 2 px short of a spot light's pool, its rows 4 px apart and its columns 32. Its grid points 16 px past its edge were in the pool on six rows, and lit a wedge of it; the tile's corners, above and below the pool, were dark, so the probe saw nothing. Against its real cells the probe finds it, and puts the columns 4 px apart.
+- **The slope (Oct 13):** the light is also worked out a pixel across and a pixel down from that middle point (the tile's middle, or the mean). The blend's slope is the same a pixel on, so how much further off the light is there is how much its slope is off. That, times how far the cell (or the polygon's part of the tile, if nearer) goes from the middle each way, is how far off it would be by there, and counts as an error too.
   - **Why:** a bend can leave the middle right on the blend. Seen on the beach ball (cheese_1): a terminator three quarters of the way across a tile, the light in the middle 0.527 and the blend there 0.527, and the blend 18 levels off a few pixels to the right. The tile kept 32 px cells beside neighbors at 4 px: a block of smeared rows across the terminator. The slope there was off by about 1 level a pixel, which over 16 px is 15: found. For the value and the slope both to agree by chance is far less likely.
   - **Tried instead, and dropped:** a second round of points (halfway from the middle to each corner) where the first found nothing but the light changed a lot across the tile. It fixed the same tile at the same cost, but needed a rule for when to look again, and was more of the same probe.
-- **Refine:** past `RasterConfig::refine_threshold` (2 levels), the tile's spacing becomes 32 px times threshold over error, a power of two, no less than `refine_spacing` (4 px), both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
+- **Refine:** past `RasterConfig::refine_threshold` (2 levels), the tile's spacing becomes its cells' size (the longer way) times threshold over error, a power of two, no less than `RasterConfig::min_step` (4 px; `--min-step 1` or `2` for finer, since Oct 13: it was a fixed 4 before), both ways. That is right for an error that halves with the spacing (a terminator); a smooth bend shrinks faster and gets a little more than it needs.
 - **It knows nothing of lights:** only that the material's own answer where the polygon is isn't what its answers at the grid points give there. No light's kind, place or normal is looked at, and a tile where the light is even costs its probe and nothing more.
 - **Once per tile, for every band:** the answer is the polygon's and the tile's alone, so the first band to shade the tile works it out and stores it (`ThreadBins::refine`, atomics), and the others read it. Two bands that race get the same answer. Images stay identical for any band size and thread count.
 - **Lazy, like lattices:** hidden polygons are never probed.
-- **Shared grid points:** a tile's left grid points are the tile before's right ones, so a row of covered tiles costs 5 points a tile (2 grid points, the middle, and 2 for its slope).
+- **Shared grid points:** a tile's left grid points are the tile before's right ones where their rows agree, so a row of covered tiles costs 5 points a tile (2 grid points, the middle, and 2 for its slope).
 - **What it misses:** a change smaller than a tile that leaves the probed points and the slope in the middle alone (a light pool a few pixels across between them). The worst case of the lit test is still that one (67 levels).
 - **Probe points are thrown away:** none of them is kept as a sample point. Keeping each level's points, and testing slopes on points already there, is the next step if this holds up.
 
@@ -262,13 +264,13 @@ Measured (raster tests, 320×180; against exact light at every pixel):
 
 | | Off | On (threshold 2) |
 | --- | --- | --- |
-| Lit pixels off by more than 2 levels | 1.75% | 0.14% |
+| Lit pixels off by more than 2 levels | 1.75% | 0.15% |
 | Small lit faces (160×90) off by more than 2 levels | 12.59% | 5.89% |
 | Small lit faces off by more than 8 levels | 4.18% | 0.99% |
 | The beach ball under a lamp (cheese_1, 1280×720), its pixels off by more than 2 levels | 23.96% | 1.66% |
 | The same, off by more than 8 levels | 6.39% | 0.07% |
 
-Cost (`timing`, 1280×720, best of 4): shiny_rooms on 1 thread 5.53 ms off, 6.04 ms on (+0.51 ms, 9%; 5.91 ms before the slope was probed); on 8 threads about 0.93 → 1.01 ms. walker_rooms on 1 thread 3.21 → 3.21 ms.
+Cost (`timing`, 1280×720, best of 4): shiny_rooms on 1 thread 5.54 ms off, 6.04 ms on (+0.50 ms, 9%; 5.91 ms before the slope was probed); on 8 threads about 0.94 → 1.01 ms. walker_rooms on 1 thread 3.22 → 3.22 ms.
 
 Settings: `--refine X` in the app (levels; 0 off), `REFINE` in `timing`.
 
