@@ -139,7 +139,6 @@ Sep 29. The flashlight's cone is drawn pixel by pixel with its shadow, not lit a
 **Cheap looks, for low settings:**
 - **Hard (0° fade):** a crisp theatrical disc. No fade at all: every pixel takes a fast path.
 - **Dithered** (`RasterConfig::beam_dither`; the Flashlight page's Dither; `--dither-beam`): the fade as a 1-bit stipple, each pixel lit or not by a 4×4 ordered (Bayer) dither (`BEAM_DITHER`), retro like early Mac or Game Boy shading. It's applied where a pixel may be partly lit: the fade, and inside the inner cone when a soft shadow crosses it. The fade is still worked out, but the combine is the per-pixel pick.
-  - **Turned each frame (Oct 13, to see how it looks):** the pattern is turned a quarter each frame (`Renderer::frame`, which the app counts), so over four frames each pixel of a four by four group takes four of its entries. A screenshot is frame 0: the pattern as it was.
 
 **Results:** at full resolution the beam matches the sampled cone (0.04% of pixels differ by more than 6 levels, with crate shadows in it). At 320×180 with a narrow penumbra the spot is round and crisp, where the sampled one is blurred into cells.
 
