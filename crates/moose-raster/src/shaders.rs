@@ -238,6 +238,56 @@ pub mod vertex_color {
 
 pub use vertex_color::VertexColor;
 
+/// [`VertexColor`], smoothly lit: lighting uses the mesh's own `normal`s, interpolated to
+/// the sample points (Gouraud shading), rather than the polygon's, so a round mesh looks
+/// round, not faceted. For models with smooth normals: a ball.
+pub mod vertex_color_smooth {
+    use crate::shader::{F32s, Fill, Material, PixelContext, SampleContext, U32s, VertexContext};
+
+    crate::material_io! {
+        vertex { color: 3, normal: 3 }
+        sampled { color: 3, normal: 3, position: 3 }
+        fixed32 { light: 3 }
+        fixed16 { color: 3 }
+        float {}
+    }
+
+    pub struct VertexColorSmooth;
+
+    impl Material for VertexColorSmooth {
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(v: &Vertex, ctx: &VertexContext) -> Sampled {
+            let n = ctx.object.rotation * glam::Vec3::from_array(v.normal);
+            Sampled {
+                color: v.color,
+                normal: n.to_array(),
+                ..Default::default()
+            }
+        }
+
+        #[inline(always)]
+        fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
+            // Interpolated normals are shorter between the vertices.
+            let n = &s.normal;
+            let inv = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).max(F32s::fill(1e-12)).recip_sqrt();
+            let light = super::diffuse(ctx, &s.position, &n.map(|c| c * inv));
+            Interp {
+                color: s.color,
+                light: super::light_output(light),
+            }
+        }
+
+        #[inline(always)]
+        fn shade_pixel(a: &Fixed32, b: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+            super::lit_rgb(&b.color, &ctx.light(&a.light))
+        }
+    }
+}
+
+pub use vertex_color_smooth::VertexColorSmooth;
+
 /// Per-vertex color times a detail texture, smoothly lit: for terrain. The mesh's `color`
 /// (three 0-255 values) is multiplied by texture 0 (from `uv`) at twice its value, so a
 /// texel of 128 leaves the color as it is and the texture adds grain around it. Lighting

@@ -17,7 +17,7 @@ use moose_raster::shaders::{
     BasicBumpy, BasicBumpyMirrored, ColoredBumpy, ColoredBumpyMirrored, CubeReflection, RandomSections, RandomSectionsMirrored, ReflectiveBumpy,
     ReflectiveBumpyMirrored, ReflectiveBumpyReflected, SkyBox, Textured, TexturedFresnel, TexturedLitMirrored, TexturedNormal, TexturedNormalSpecular,
     TexturedSpecular, TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel,
-    VertexColorNoise, VertexColorTranslucent, Water, filter,
+    VertexColorNoise, VertexColorSmooth, VertexColorTranslucent, Water, filter,
 };
 use moose_raster::{MAX_TEXTURES, MaterialId, Params, Renderer, Surface};
 use moose_scene::World;
@@ -26,6 +26,7 @@ use moose_scene::World;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     VertexColor,
+    VertexColorSmooth,
     Sky,
     VertexColorTranslucent,
     VertexColorFresnel,
@@ -211,8 +212,9 @@ const FADE: Input = input("fade", Number, "Meters past the surface over which it
 const OPACITY: Input = input("opacity", Unit, "How solid it is, 0 (unseen) to 255.");
 const DETAIL: Input = input("detail", Unit, "Fine noise added close up, where the texture is magnified (0: none); the color's alpha masks it.");
 
-pub const SHADERS: [ShaderInfo; 17] = [
+pub const SHADERS: [ShaderInfo; 18] = [
     ShaderInfo { name: "vertex_color", about: "The mesh's vertex colors, lit.", kind: Kind::VertexColor, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
+    ShaderInfo { name: "vertex_color_smooth", about: "The mesh's vertex colors, smoothly lit by its normals: round things.", kind: Kind::VertexColorSmooth, slots: &[], inputs: &[], engine: &[], attribs: &["color", "normal"] },
     ShaderInfo { name: "sky", about: "The mesh's vertex colors, unlit: shown as they are, whatever the lights.", kind: Kind::Sky, slots: &[], inputs: &[], engine: &[], attribs: &["color"] },
     ShaderInfo { name: "vertex_color_translucent", about: "Vertex colors, lit, seen through at one opacity.", kind: Kind::VertexColorTranslucent, slots: &[], inputs: &[OPACITY], engine: &[], attribs: &["color"] },
     ShaderInfo { name: "vertex_color_fresnel", about: "Vertex colors over a reflection: nearly solid head-on, reflecting more at grazing angles (Fresnel).", kind: Kind::VertexColorFresnel, slots: &[], inputs: &[REFLECTANCE], engine: &[], attribs: &["color"] },
@@ -260,6 +262,7 @@ const REFLECTED: usize = 3;
 #[derive(Clone, Copy)]
 pub struct ShaderIds {
     vertex_color: MaterialId,
+    vertex_color_smooth: MaterialId,
     sky: MaterialId,
     vertex_color_translucent: MaterialId,
     vertex_color_fresnel: MaterialId,
@@ -288,6 +291,7 @@ impl ShaderIds {
     pub fn register(r: &mut Renderer) -> Self {
         Self {
             vertex_color: r.register_material::<VertexColor>(),
+            vertex_color_smooth: r.register_material::<VertexColorSmooth>(),
             sky: r.register_material::<UnlitColor>(),
             vertex_color_translucent: r.register_material::<VertexColorTranslucent>(),
             vertex_color_fresnel: r.register_material::<VertexColorFresnel>(),
@@ -857,6 +861,7 @@ impl Table {
         let (values, engine) = b.values.split_at(b.params);
         let (material, params) = match b.kind {
             Kind::VertexColor => (ids.vertex_color, Params::default()),
+            Kind::VertexColorSmooth => (ids.vertex_color_smooth, Params::default()),
             Kind::Sky => (ids.sky, Params::default()),
             Kind::VertexColorTranslucent => (ids.vertex_color_translucent, Params::new(values)),
             Kind::VertexColorFresnel => (ids.vertex_color_fresnel, Params::new(values)),

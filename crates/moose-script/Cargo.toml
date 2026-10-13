@@ -1,0 +1,7 @@
+[package]
+name = "moose-script"
+description = "Scripts for the Moose engine: a strict subset of TypeScript, compiled to bytecode and run with no garbage collector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

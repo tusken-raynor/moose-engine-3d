@@ -359,3 +359,21 @@ fn the_sun_reaches_sectors_through_sky_and_on_through_openings() {
     assert_eq!(world.sector_lights(2), [0]);
     assert!(world.sector_lights(1).is_empty() && world.sector_lights(0).is_empty());
 }
+
+#[test]
+fn the_world_keeps_the_levels_scripts_and_its_entities() {
+    // A script of the level's own, and one on the first crate.
+    let src = include_str!("../../../assets/levels/two_rooms.mmp")
+        .replacen("1.00   crate_a1", "1.00   crate_a1 script=spin.ts input:speed=2", 1)
+        + "\nscripts 1\n   0   rules.ts  rounds=3\n";
+    let mut assets = Assets::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets"));
+    let level = assets.parse_level("two_rooms.mmp", &src).unwrap();
+    let (scripts, spawned) = (level.scripts.clone(), level.spawns[1].script.clone());
+    let world = World::new(level, &assets);
+    assert_eq!(world.scripts, scripts);
+    assert_eq!((world.scripts[0].file.as_str(), world.scripts[0].inputs.len()), ("rules.ts", 1));
+    let scripted = world.entities.iter().find(|e| e.name == "crate_a1").unwrap();
+    assert_eq!(scripted.script, spawned);
+    assert_eq!(scripted.script.as_ref().unwrap().file, "spin.ts");
+    assert!(world.entities.iter().filter(|e| e.name != "crate_a1").all(|e| e.script.is_none()));
+}

@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use glam::{Affine3A, Quat, Vec3};
 use moose_assets::{LightMask, MetaKeys, MetaValues,
-    Aabb, Assets, Binding, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
-    Sector,
+    Aabb, Assets, Binding, Body, DirectionalLight, EntityKind, Level, Light, MeshId, Occluder, ShadowKind, Plane, Portal,
+    ScriptPlacement, Sector,
 };
 
 /// Distance tolerance for containment and crossing tests, in meters.
@@ -56,6 +56,9 @@ pub struct World {
     pub face_excluded_lights: Vec<LightMask>,
     /// Per level light (in the level's order), its name, if it has one.
     pub light_names: Vec<Option<String>>,
+    /// The level's own scripts (its `scripts` section), as the file places them. Entities'
+    /// are theirs ([`Entity::script`]).
+    pub scripts: Vec<ScriptPlacement>,
     /// The level's lights. Set them with [`World::set_lights`], which finds where each
     /// reaches.
     lights: Vec<Light>,
@@ -106,6 +109,11 @@ pub struct Entity {
     pub meta: MetaValues,
     /// The lights its model isn't lit by (`exclude_lights=`).
     pub excluded_lights: LightMask,
+    /// The script the level gives it (`script=FILE`, with its inputs), if any, as the file
+    /// places it.
+    pub script: Option<ScriptPlacement>,
+    /// Its body, if physics moves it (`mass=`; see the Physics Spec).
+    pub body: Option<Body>,
 }
 
 
@@ -232,6 +240,8 @@ impl World {
                     binding: spawn.binding,
                     meta: spawn.meta,
                     excluded_lights: spawn.excluded_lights,
+                    script: spawn.script,
+                    body: spawn.body,
                 }),
                 (_, None) => unreachable!("the level loader gives every prop and actor a mesh"),
             }
@@ -263,6 +273,7 @@ impl World {
             vertex_meta: level.vertex_meta,
             face_excluded_lights: level.face_excluded_lights,
             light_names: level.light_names,
+            scripts: level.scripts,
             lights: Vec::new(),
             sector_lights: Vec::new(),
             boundaries,
@@ -459,6 +470,18 @@ impl World {
         let entity = &mut self.entities[index];
         entity.bounds = bounds;
         entity.sectors = sectors;
+    }
+
+    /// Moves an entity (physics does, each step): its position and rotation, the sector
+    /// its origin is in (kept where it was while it is outside every sector), and what
+    /// [`place_entity`](Self::place_entity) derives.
+    pub fn move_entity(&mut self, index: usize, position: Vec3, rotation: Quat, assets: &Assets) {
+        let home = self.entities[index].sector;
+        let sector = if self.sector_contains(home, position) { Some(home) } else { self.find_sector(position) };
+        let entity = &mut self.entities[index];
+        (entity.position, entity.rotation) = (position, rotation);
+        entity.sector = sector.unwrap_or(home);
+        self.place_entity(index, assets);
     }
 
     /// True if `p` is inside `sector` (surfaces count as inside).

@@ -32,6 +32,7 @@ pub struct LevelDoc {
     pub ambient: Option<Vec3>,
     pub lights: Vec<LightDoc>,
     pub directional: Vec<DirectionalDoc>,
+    pub scripts: Vec<ScriptDoc>,
 }
 
 /// A declared attribute, with its values table (each row's values as written).
@@ -111,6 +112,14 @@ pub struct DirectionalDoc {
     pub direction: Vec3,
     pub color: Vec3,
     pub angle: f32,
+    pub options: Vec<String>,
+}
+
+/// One of the level's own scripts: its file, under `assets/scripts`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScriptDoc {
+    pub file: String,
+    /// Its inputs, as written (`NAME=VALUE`).
     pub options: Vec<String>,
 }
 
@@ -327,6 +336,16 @@ impl LevelDoc {
                 });
             }
         }
+        let mut scripts = Vec::new();
+        if at(&c, "scripts") {
+            let section = c.section("scripts", false, None)?;
+            for r in &section.rows {
+                let Some(file) = r.tokens.first() else {
+                    return Err(c.err(r.no, "script row needs a file"));
+                };
+                scripts.push(ScriptDoc { file: file.clone(), options: r.tokens[1..].to_vec() });
+            }
+        }
         if let Some(extra) = c.lines.get(c.pos) {
             return Err(c.err(extra.no, format!("unexpected '{}' after the last section", extra.tokens[0])));
         }
@@ -344,6 +363,7 @@ impl LevelDoc {
             ambient,
             lights,
             directional,
+            scripts,
         })
     }
 
@@ -418,7 +438,7 @@ impl LevelDoc {
             line(format!("templates {}", self.templates.len()));
             line("#  id  name  model  [options]".into());
             for (i, t) in self.templates.iter().enumerate() {
-                line(format!("   {i:<3} {:<10} {:<12} {}", t.name, t.model, t.options.join(" ")));
+                line(format!("   {i:<3} {:<10} {:<12} {}", t.name, t.model, words(&t.options)));
             }
         }
         line(String::new());
@@ -443,7 +463,7 @@ impl LevelDoc {
                 number(roll.to_degrees()),
                 number(e.scale),
                 quoted(&e.name),
-                e.options.join(" "),
+                words(&e.options),
             ));
         }
         if let Some(a) = self.ambient {
@@ -501,6 +521,14 @@ impl LevelDoc {
                     number(d.angle),
                     d.options.join(" ")
                 ));
+            }
+        }
+        if !self.scripts.is_empty() {
+            line(String::new());
+            line(format!("scripts {}", self.scripts.len()));
+            line("#  id  file  [inputs]".into());
+            for (i, s) in self.scripts.iter().enumerate() {
+                line(format!("   {i:<3} {}  {}", s.file, words(&s.options)));
             }
         }
         out
@@ -615,6 +643,15 @@ fn quoted(name: &str) -> String {
     }
 }
 
+/// Options as a row's tokens: each as it is, but quoted if it has spaces or a comment mark
+/// in it, as a script input's value can (`"input:greeting=Hello there"`).
+fn words(options: &[String]) -> String {
+    let word = |o: &String| {
+        if o.contains(|c: char| c.is_whitespace() || c == '#') { format!("\"{o}\"") } else { o.clone() }
+    };
+    options.iter().map(word).collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +663,42 @@ mod tests {
         assert_eq!(number(0.3), "0.30");
         assert_eq!(number(1.2345), "1.2345");
         assert_eq!(number(12.125), "12.125");
+    }
+
+    #[test]
+    fn scripts_are_read_and_written_back_as_they_were() {
+        let path = Path::new("two_rooms.mmp");
+        let level = include_str!("../../../assets/levels/two_rooms.mmp");
+        // Without the section: no scripts, and none written.
+        let plain = LevelDoc::parse(path, level).unwrap();
+        assert!(plain.scripts.is_empty() && !plain.to_text().contains("scripts"));
+        // With it, after everything else, and a template and an entity with a script.
+        let src = format!(
+            "{level}\nambient 0.1 0.1 0.1\n\nscripts 2\n   0   rules.ts\n   1   doors/slide.ts  speed=2.5 \"greeting=Hello there\"  # the front door\n"
+        )
+        .replacen("entities ", "templates 1\n   0   spinner  crate.obj  script=spin.ts input:speed=2\n\nentities ", 1)
+        .replacen("1.00   crate_a1", "1.00   crate_a1 script=spin.ts \"input:label=a # b\"", 1);
+        let doc = LevelDoc::parse(path, &src).unwrap();
+        assert_eq!(
+            doc.scripts,
+            [
+                ScriptDoc { file: "rules.ts".into(), options: vec![] },
+                ScriptDoc {
+                    file: "doors/slide.ts".into(),
+                    options: vec!["speed=2.5".into(), "greeting=Hello there".into()],
+                },
+            ]
+        );
+        assert_eq!(doc.templates[0].options, ["script=spin.ts", "input:speed=2"]);
+        assert!(doc.entities[1].options.contains(&"input:label=a # b".to_string()));
+        // Written and read again, it is the same document, and its rows are found by line.
+        let text = doc.to_text();
+        assert_eq!(LevelDoc::parse(path, &text).unwrap(), doc);
+        let line = text.lines().position(|l| l.contains("doors/slide.ts")).unwrap() + 1;
+        assert_eq!(doc.row_at_line(line), Some(("scripts".to_string(), 1)));
+        // A row needs its file.
+        let bad = format!("{level}\nscripts 1\n   0\n");
+        let err = LevelDoc::parse(path, &bad).unwrap_err().to_string();
+        assert!(err.contains("script row needs a file"), "{err}");
     }
 }

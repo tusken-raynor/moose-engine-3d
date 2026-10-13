@@ -133,6 +133,7 @@ Each program is registered under a name with what it reads, so materials are che
 | Name | Program | Textures | Inputs |
 | --- | --- | --- | --- |
 | `vertex_color` | `VertexColor` | none | |
+| `vertex_color_smooth` | `VertexColorSmooth` | none | |
 | `sky` | `UnlitColor` | none | |
 | `vertex_color_translucent` | `VertexColorTranslucent` | none | `opacity` (unit) |
 | `vertex_color_fresnel` | `VertexColorFresnel` | none | `reflectance` (unit) |

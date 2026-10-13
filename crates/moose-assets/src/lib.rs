@@ -1,6 +1,6 @@
 //! Asset loading for the Moose engine: in-memory mesh, level and texture types, the
-//! [`Assets`] store that owns them, and loaders for `.obj` models, `.mmp` levels and `.png`
-//! textures, and Half-Life style rippling water ([`Ripples`]).
+//! [`Assets`] store that owns them, and loaders for `.obj` models, `.mmp` levels, `.png`
+//! textures and `.wav` sounds, and Half-Life style rippling water ([`Ripples`]).
 //!
 //! Meshes keep their positions as authored, never merged (each transformed once per frame), and
 //! polygons that own their vertices. Each polygon vertex is a position index plus
@@ -31,6 +31,7 @@ mod obj;
 mod clouds;
 mod ripples;
 mod skin;
+mod sound;
 mod store;
 mod terrain;
 mod text;
@@ -39,11 +40,11 @@ mod texture;
 pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
-    DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
-    Portal, PortalFlags, Sector, Sky, Terrain,
+    Body, BodyShape, DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
+    Portal, PortalFlags, ScriptPlacement, Sector, Sky, Terrain,
 };
 pub use mmp_doc::{
-    AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, SectorDoc, SurfaceDoc,
+    AdjoinDoc, AttributeDoc, DirectionalDoc, EntityDoc, LevelDoc, LightDoc, ScriptDoc, SectorDoc, SurfaceDoc,
     TemplateDoc,
     number, occluder_value,
 };
@@ -53,7 +54,8 @@ pub use obj::parse_obj;
 pub use clouds::{CLOUD_SIZE, Clouds, PERIOD as CLOUD_PERIOD, SOFTNESS as CLOUD_SOFTNESS, cut as cloud_cut, density as cloud_density};
 pub use ripples::{RIPPLE_SIZE, RIPPLE_STEP, Ripples};
 pub use skin::{Animation, Bone, Pose, Skin};
-pub use store::{Assets, MeshId, TextureId};
+pub use sound::{Sound, decode_wav, encode_wav};
+pub use store::{Assets, MeshId, SoundId, TextureId};
 pub use texture::{CUBE_FACES, MipLevel, Texture, decode_png};
 
 pub use glam;

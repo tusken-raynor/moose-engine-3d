@@ -3004,6 +3004,7 @@ pub fn new_level_doc(title: &str) -> Result<LevelDoc, String> {
         ambient: Some(Vec3::splat(0.1)),
         lights: Vec::new(),
         directional: Vec::new(),
+        scripts: Vec::new(),
     };
     let min = Vec3::new(-LEVEL_ROOM.x / 2.0, 0.0, -LEVEL_ROOM.z / 2.0);
     let sector = doc.add_box(min, min + LEVEL_ROOM, "room")?;

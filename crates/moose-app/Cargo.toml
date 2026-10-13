@@ -11,7 +11,10 @@ path = "src/main.rs"
 [dependencies]
 moose-assets = { path = "../moose-assets" }
 moose-scene = { path = "../moose-scene" }
+moose-script = { path = "../moose-script" }
 moose-view = { path = "../moose-view" }
+moose-physics = { path = "../moose-physics" }
+moose-audio = { path = "../moose-audio" }
 moose-raster = { path = "../moose-raster" }
 moose-present = { path = "../moose-present" }
 glam.workspace = true

@@ -64,6 +64,10 @@
 //!                         degree edge (default 8; 0 is a hard edge)
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
 //!   --smooth-edges        smooth the edges between surfaces (anti-aliasing)
+//!   --fly                 start flying (no gravity; Space/C rise and sink) rather than
+//!                         walking (see the Physics Spec)
+//!   --no-sound            don't open a sound device (see the Sound Spec)
+//!   --volume X            the loudness of everything, 0-1 (default 1)
 //!   --no-level-lights     start with the level's own lights off, leaving the flashlight and
 //!                         the ambient light (on by default; --level-lights is accepted too)
 //!   --time T              seconds into the water's animation (and the day), for --screenshot
@@ -91,8 +95,8 @@
 //!   --step-threshold X    how much depth may change across a cell before perspective asks
 //!                         for finer spacing (default 1/16 = 0.0625)
 //!
-//! Controls: WASD move, mouse/trackpad or arrows look, Q/E roll, Space/C up/down, Shift
-//! faster, U lock the flashlight in place (again: back on the shoulder), Esc options menu
+//! Controls: WASD walk, Space jump, C crouch, Shift run (flying, in the menu's Controls:
+//! Space/C up and down, Shift faster), mouse/trackpad or arrows look, E use what you look at (a hotkey: bind another on the Controls page), U lock the flashlight in place (again: back on the shoulder), Esc options menu
 //! (arrows choose and change, Enter picks, Backspace goes back), F1 print a command line that
 //! reproduces this view, F3 debug HUD, F4 shadow mesh, Alt+Enter fullscreen, F12 screenshot. Every other setting
 //! is in the menu, where B on a setting binds a key to it (pressed while playing, it does
@@ -108,6 +112,7 @@ mod material_edit;
 mod material_screen;
 mod materials;
 mod mesh_edit;
+mod scripts;
 mod ui;
 mod wire;
 
@@ -115,7 +120,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use moose_assets::{Assets, LevelDoc, Light, MATERIAL_SLOTS, MaterialLibrary, ModelDoc, Ripples, Texture, TextureId};
+use moose_assets::{Assets, LevelDoc, Light, MATERIAL_SLOTS, MaterialLibrary, ModelDoc, Ripples, SoundId, Texture, TextureId};
+use moose_audio::{Audio, Listener, Play, Playing};
+use moose_physics::{CharacterConfig, CharacterId, Physics};
 use moose_present::{Display, Key, MouseButton};
 use materials::{FrameSettings, Materials, ShaderIds};
 use moose_raster::post::{Bloom, BloomConfig};
@@ -126,8 +133,10 @@ use moose_view::{MAX_SHADOW_SLOTS, PolygonSource, ViewGeometry};
 const EYE_HEIGHT: f32 = 1.7;
 const MOVE_SPEED: f32 = 3.0; // m/s
 const FAST: f32 = 3.0;
+/// Running (Shift, while walking) is this many times walking speed, and crouching this many.
+const RUN: f32 = 2.0;
+const CROUCH: f32 = 0.5;
 const TURN_SPEED: f32 = 2.0; // rad/s
-const ROLL_SPEED: f32 = 1.5;
 /// Mouse look, as in v1: radians per pixel the pointer moves (pi * 1.5 / 1000).
 const MOUSE_TURN: f32 = std::f32::consts::PI * 1.5 / 1000.0;
 /// Mouse look smoothing, cycled with M: a window in seconds (0 for none). The pointer's
@@ -143,6 +152,12 @@ const MAX_FPS: u32 = 60;
 /// Reflectance of shiny surfaces seen head-on (Schlick's F0), cycled with F. 0.04 is about
 /// glass or polished stone; 1 is a perfect mirror.
 const REFLECTANCE: [f32; 4] = [0.04, 0.15, 0.4, 1.0];
+/// The Volume setting's choices.
+const VOLUMES: [f32; 6] = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0];
+/// How far the player walks between footsteps, in meters.
+const STRIDE: f32 = 1.3;
+/// Footsteps' pitches, in turn, so no two in a row sound the same.
+const STEP_PITCHES: [f32; 4] = [1.0, 0.92, 1.06, 0.97];
 /// How far past a textured shiny surface its reflection fades out, in meters (0 = no fade),
 /// cycled with G.
 const FADE_RANGE: [f32; 5] = [0.0, 1.0, 2.5, 5.0, 10.0];
@@ -267,6 +282,11 @@ struct Options {
     show_shadow_mesh: bool,
     dither_beam: bool,
     smooth_edges: bool,
+    /// Start flying rather than walking.
+    fly: bool,
+    /// Don't open a sound device; and the loudness of everything.
+    no_sound: bool,
+    volume: f32,
     /// `RasterConfig` spacing limits, if given.
     min_step: Option<u32>,
     light_spacing: Option<u32>,
@@ -352,6 +372,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         show_shadow_mesh: false,
         dither_beam: false,
         smooth_edges: false,
+        fly: false,
+        no_sound: false,
+        volume: 1.0,
         min_step: None,
         light_spacing: None,
         steep_limit: None,
@@ -474,6 +497,11 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             "--show-shadow-mesh" => o.show_shadow_mesh = true,
             "--dither-beam" => o.dither_beam = true,
             "--smooth-edges" => o.smooth_edges = true,
+            "--fly" => o.fly = true,
+            "--no-sound" => o.no_sound = true,
+            "--volume" => {
+                o.volume = value()?.parse().ok().filter(|v| (0.0..=1.0).contains(v)).ok_or("--volume is 0 to 1")?;
+            }
             "--min-step" => o.min_step = Some(value()?.parse().map_err(|_| "bad --min-step")?),
             "--light-spacing" => {
                 o.light_spacing = Some(value()?.parse().map_err(|_| "bad --light-spacing")?)
@@ -573,6 +601,22 @@ struct Settings {
     hud: bool,
     /// The shadow pieces' outlines are drawn over the frame; F4 toggles.
     shadow_mesh: bool,
+    /// The player flies (no gravity, kept clear of walls only) rather than walks.
+    fly: bool,
+    /// The loudness of everything, 0 to 1.
+    volume: f32,
+    /// The player's footsteps are played (off unless switched on: Esc > Sound).
+    footsteps: bool,
+}
+
+/// The sounds the app itself plays (files in assets/sounds), where they could be loaded.
+#[derive(Clone, Copy, Default)]
+struct Sounds {
+    /// A footstep, and landing from a jump or a fall.
+    step: Option<SoundId>,
+    land: Option<SoundId>,
+    /// A hum that loops, for the Test sound setting.
+    test: Option<SoundId>,
 }
 
 /// A mirror ball's baked surroundings.
@@ -649,6 +693,25 @@ impl BloomMode {
 struct App {
     assets: Assets,
     world: World,
+    /// The level's colliders and the player's body in them (see the Physics Spec), and
+    /// where walking last left the camera: anywhere else, something else moved it, and the
+    /// player is put there.
+    physics: Physics,
+    player: CharacterId,
+    walked_to: Option<Vec3>,
+    /// Physics has moved the level's bodies since they were last where the level has them
+    /// (see `App::rest_bodies`).
+    bodies_moved: bool,
+    /// The sound engine (see the Sound Spec): silent until `run` opens a device.
+    audio: Audio,
+    sounds: Sounds,
+    /// The Test sound setting's sound, while it is on.
+    test_sound: Option<Playing>,
+    /// For footsteps: how far the player has walked since the last one, how many there
+    /// have been, and whether the player was on the ground a frame ago.
+    stride: f32,
+    steps: usize,
+    was_grounded: bool,
     /// The level's lights and ambient light, for switching them back on (K).
     lights: (Vec<Light>, Vec3),
     camera: Camera,
@@ -696,6 +759,10 @@ struct App {
     asked_weather: Option<f32>,
     /// Seconds since the start: for the water's ripples and moving lights.
     time: f32,
+    /// The level's scripts (see the Scripting Spec), run each frame while playing.
+    scripts: scripts::Scripts,
+    /// The player pressed Use (`Setting::Use`'s key) this frame.
+    using: bool,
     pixels: Vec<u32>,
     width: u32,
     height: u32,
@@ -761,10 +828,28 @@ impl App {
         let (level_filters, entity_filters) = binding_filters_of(&world)?;
         let cube_maps = vec![None; world.entities.len()];
         let doc = LevelDoc::parse(&level_path, &level_src).map_err(|e| e.to_string())?;
+        let mut physics = Physics::new(&world, &assets);
+        let player = physics.add_character(camera.position - Vec3::Y * EYE_HEIGHT, CharacterConfig::default());
+        // (A sound that can't be loaded just isn't played.)
+        let sounds = Sounds {
+            step: assets.load_sound("step.wav").ok(),
+            land: assets.load_sound("land.wav").ok(),
+            test: assets.load_sound("test_hum.wav").ok(),
+        };
         let mut app = App {
             assets,
             lights: (world.lights().to_vec(), world.ambient),
             world,
+            physics,
+            player,
+            walked_to: None,
+            bodies_moved: false,
+            audio: Audio::silent(),
+            sounds,
+            test_sound: None,
+            stride: 0.0,
+            steps: 0,
+            was_grounded: true,
             camera,
             geometry: {
                 let mut g = ViewGeometry::new();
@@ -826,8 +911,13 @@ impl App {
                 start_cap: if options.fps == 0 { MAX_FPS } else { options.fps },
                 hud: options.hud,
                 shadow_mesh: options.show_shadow_mesh,
+                fly: options.fly,
+                volume: options.volume,
+                footsteps: false,
             },
             time: 0.0,
+            scripts: scripts::Scripts::new(Path::new(root).join("scripts")),
+            using: false,
             levels: level_files(root),
             level: options.level.clone(),
             material: None,
@@ -855,6 +945,7 @@ impl App {
         app.settings.level_lights = options.level_lights;
         app.day = app.day_of(options.time_of_day);
         app.show_clouds();
+        app.place_scripts(false);
         Ok(app)
     }
 
@@ -895,6 +986,11 @@ impl App {
             .or_else(|| world.spawn_points.first().map(|s| s.sector))
             .unwrap_or(0);
         self.world = world;
+        // Its colliders, and the player put back in them where the camera is.
+        self.physics = Physics::new(&self.world, &self.assets);
+        self.player = self.physics.add_character(self.camera.position - Vec3::Y * EYE_HEIGHT, CharacterConfig::default());
+        self.walked_to = None;
+        self.bodies_moved = false;
         self.lights = (self.world.lights().to_vec(), self.world.ambient);
         // The day goes on from where it was, with the sun's options as they are now.
         let mut day = self.day_of(None);
@@ -916,6 +1012,8 @@ impl App {
         let baked = self.bake_cube_maps();
         self.settings.level_lights = level_lights;
         self.editor.learn_animations(&self.world, &self.assets);
+        // Its scripts start over, with the level's things as they are now.
+        self.place_scripts(false);
         baked
     }
 
@@ -1367,6 +1465,7 @@ impl App {
     /// textures (then rebuilds the level, as entities' shapes may have changed), and the
     /// level's own file unless the editor has changes of its own.
     fn hot_reload(&mut self) {
+        self.reload_scripts();
         let root = self.assets.root().to_path_buf();
         let material_files: Vec<PathBuf> = std::fs::read_dir(root.join("materials"))
             .map(|entries| {
@@ -1389,6 +1488,18 @@ impl App {
             match self.reload_materials() {
                 Ok(()) => self.editor.say("reloaded the materials"),
                 Err(e) => self.editor.warn(e),
+            }
+        }
+        for name in self.assets.loaded_sounds() {
+            let path = root.join("sounds").join(&name);
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if self.watched.insert(path, modified).is_some_and(|before| before != modified) {
+                match self.assets.reload_sound(&name) {
+                    Ok(_) => self.editor.say(format!("reloaded {name}")),
+                    Err(e) => self.editor.warn(e.to_string()),
+                }
             }
         }
         let (models, textures) = self.assets.loaded_files();
@@ -1936,6 +2047,20 @@ impl App {
                 w => format!("{} ms", (w * 1000.0).round()),
             },
             Setting::Hud => on(s.hud),
+            Setting::Fly => on(s.fly),
+            Setting::Use => match self.bindings.iter().find(|(_, s)| *s == Setting::Use) {
+                Some((key, _)) => key.name().to_string(),
+                None => "no key".into(),
+            },
+            Setting::Volume => match s.volume {
+                0.0 => "off".into(),
+                v => format!("{:.0}%", v * 100.0),
+            },
+            Setting::Footsteps => on(s.footsteps),
+            Setting::TestSound => match (self.sounds.test, self.test_sound) {
+                (None, _) => "no assets/sounds/test_hum.wav".into(),
+                (_, playing) => on(playing.is_some()),
+            },
         }
     }
 
@@ -2048,6 +2173,21 @@ impl App {
             }
             Setting::MouseSmoothing => s.smoothing = wrap(s.smoothing, MOUSE_SMOOTHING.len()),
             Setting::Hud => s.hud = !s.hud,
+            Setting::Fly => s.fly = !s.fly,
+            Setting::Use => self.using = true,
+            Setting::Volume => {
+                s.volume = cycle(&VOLUMES, s.volume, dir);
+                self.audio.set_volume(s.volume);
+            }
+            Setting::Footsteps => s.footsteps = !s.footsteps,
+            // Left where the player is, to walk away from and round corners.
+            Setting::TestSound => match self.test_sound.take() {
+                Some(playing) => self.audio.stop(playing),
+                None => {
+                    let here = (self.camera.sector, self.camera.position);
+                    self.test_sound = self.sounds.test.map(|hum| self.audio.play(Play::new(hum).at(here.0, here.1).looped()));
+                }
+            },
         }
     }
 
@@ -2098,6 +2238,10 @@ impl App {
                 )
             } else {
                 "lighting off".into()
+            },
+            match self.audio.counts() {
+                (0, _) => "no sounds".into(),
+                (playing, mixed) => format!("{playing} sounds, {mixed} mixed"),
             },
         ]
     }
@@ -2179,6 +2323,7 @@ impl App {
             (s.shadow_mesh, "--show-shadow-mesh"),
             (cfg.beam_dither, "--dither-beam"),
             (cfg.smooth_edges, "--smooth-edges"),
+            (s.fly, "--fly"),
         ] {
             if on {
                 add(flag.to_string());
@@ -2453,6 +2598,101 @@ impl App {
         self.camera.move_to(&self.world, clear);
     }
 
+    /// Plays the player's footsteps for a frame of `dt` seconds of walking: one each
+    /// `STRIDE` across the ground (quieter crouched), and a thump on landing.
+    fn footsteps(&mut self, dt: f32) {
+        let player = self.physics.character(self.player);
+        let (grounded, crouching) = (player.grounded(), player.crouching());
+        let speed = (player.velocity() * Vec3::new(1.0, 0.0, 1.0)).length();
+        let landed = grounded && !self.was_grounded;
+        self.was_grounded = grounded;
+        if grounded {
+            self.stride += speed * dt;
+        }
+        if !self.settings.footsteps {
+            self.stride = 0.0;
+            return;
+        }
+        let sound = if landed { self.sounds.land } else { self.sounds.step };
+        if let Some(sound) = sound
+            && (landed || self.stride >= STRIDE)
+        {
+            self.stride = 0.0;
+            self.steps += 1;
+            let play = if landed {
+                Play::new(sound)
+            } else {
+                let pitch = STEP_PITCHES[self.steps % STEP_PITCHES.len()];
+                Play::new(sound).pitch(pitch).volume(if crouching { 0.5 } else { 1.0 })
+            };
+            self.audio.play(play);
+        }
+    }
+
+    /// Walks the player for a frame of `dt` seconds (see the Physics Spec): `wish` is the
+    /// velocity wanted across the ground, and `jump` and `crouch` whether jumping and
+    /// crouching are. The camera's eye follows, traced from where it was so its sector is
+    /// kept; it is as far under the top of the player's head crouched as standing.
+    fn walk(&mut self, wish: Vec3, jump: bool, crouch: bool, dt: f32) {
+        let eye = Vec3::Y * EYE_HEIGHT;
+        // (To a centimeter: by a portal, the camera's trace keeps it a hair clear of it.)
+        if self.walked_to.is_none_or(|eye| eye.distance(self.camera.position) > 0.01) {
+            // Something else put the camera here: the player stands under it, or on the
+            // floor if that is nearer than the eye is high (it is never put into the floor,
+            // which it would fall through).
+            let floor = self.physics.ray(self.camera.position, Vec3::NEG_Y, EYE_HEIGHT, Some(self.player));
+            let feet = floor.map_or(self.camera.position - eye, |hit| hit.point);
+            self.physics.teleport(self.player, feet);
+        }
+        let player = self.physics.character_mut(self.player);
+        (player.wish, player.jump, player.crouch, player.ghost) = (wish, jump, crouch, false);
+        let standing = player.config.height;
+        self.physics.advance(dt);
+        self.follow_bodies();
+        self.footsteps(dt);
+        let lowered = Vec3::Y * (standing - self.physics.height(self.player));
+        let target = self.physics.feet(self.player) + eye - lowered;
+        self.walked_to = Some(target);
+        if self.camera.move_to(&self.world, target) {
+            // The eye was stopped short: it cut a corner the player went around, so its
+            // sector is found from scratch. Outside every sector, the player has left the
+            // level (through a gap in it), and is put back where the eye stopped.
+            match self.world.find_sector(target) {
+                Some(sector) => (self.camera.position, self.camera.sector) = (target, sector),
+                None => self.walked_to = None,
+            }
+        }
+    }
+
+    /// A frame of `dt` seconds of physics while the player flies: the level's bodies go on
+    /// moving, and the player's own isn't there for them to meet.
+    fn drift(&mut self, dt: f32) {
+        self.physics.character_mut(self.player).ghost = true;
+        self.physics.advance(dt);
+        self.follow_bodies();
+    }
+
+    /// Moves the entities physics moves to where their bodies are now.
+    fn follow_bodies(&mut self) {
+        self.bodies_moved = true;
+        for (entity, position, rotation) in self.physics.bodies() {
+            let e = &self.world.entities[entity as usize];
+            if e.position != position || e.rotation != rotation {
+                self.world.move_entity(entity as usize, position, rotation, &self.assets);
+            }
+        }
+    }
+
+    /// Puts the level's bodies back where the level has them, at rest: in the editor, which
+    /// shows the level as it is written.
+    fn rest_bodies(&mut self) {
+        if self.bodies_moved {
+            self.physics.reset_bodies();
+            self.follow_bodies();
+            self.bodies_moved = false;
+        }
+    }
+
     fn save_png(&self, path: &Path) -> Result<(), String> {
         let file = std::fs::File::create(path)
             .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
@@ -2676,6 +2916,7 @@ enum Page {
     Flashlight,
     Rendering,
     Sampling,
+    Sound,
     Controls,
 }
 
@@ -2739,10 +2980,16 @@ enum Setting {
     PenumbraThreshold,
     MouseSmoothing,
     Hud,
+    Fly,
+    /// Not a setting but a key to bind: uses what the player looks at (see `App::using`).
+    Use,
+    Volume,
+    Footsteps,
+    TestSound,
 }
 
 impl Page {
-    const ALL: [Page; 9] = [
+    const ALL: [Page; 10] = [
         Page::Main,
         Page::Levels,
         Page::Materials,
@@ -2751,6 +2998,7 @@ impl Page {
         Page::Flashlight,
         Page::Rendering,
         Page::Sampling,
+        Page::Sound,
         Page::Controls,
     ];
 
@@ -2764,6 +3012,7 @@ impl Page {
             Page::Flashlight => "flashlight",
             Page::Rendering => "rendering",
             Page::Sampling => "sampling",
+            Page::Sound => "sound",
             Page::Controls => "controls",
         }
     }
@@ -2782,6 +3031,7 @@ impl Page {
             Page::Flashlight => "Flashlight",
             Page::Rendering => "Rendering",
             Page::Sampling => "Sampling (debug)",
+            Page::Sound => "Sound",
             Page::Controls => "Controls",
         }
     }
@@ -2797,6 +3047,7 @@ impl Page {
                 Open(Page::Flashlight),
                 Open(Page::Rendering),
                 Open(Page::Sampling),
+                Open(Page::Sound),
                 Open(Page::Controls),
                 Respawn,
                 Quit,
@@ -2844,7 +3095,8 @@ impl Page {
                 Set(StepThreshold),
                 Set(PenumbraThreshold),
             ],
-            Page::Controls => &[Set(MouseSmoothing), Set(Hud)],
+            Page::Sound => &[Set(Volume), Set(Footsteps), Set(TestSound)],
+            Page::Controls => &[Set(Use), Set(Fly), Set(MouseSmoothing), Set(Hud)],
             // The levels found in assets/levels, the materials, and a material's rows (see
             // `App::items`).
             Page::Levels | Page::Materials | Page::Material => &[],
@@ -2855,7 +3107,7 @@ impl Page {
     fn notes(self) -> &'static [&'static str] {
         match self {
             Page::Controls => &[
-                "WASD move, mouse or arrows look, Q/E roll",
+                "WASD move, mouse or arrows look",
                 "Space/C up/down, Shift faster",
                 "U lock the flashlight in place / remount it",
                 "Esc menu, F1 print a command line for this view",
@@ -2867,6 +3119,10 @@ impl Page {
                 "to see its shadows. U does it from anywhere.",
             ],
             Page::Sampling => &["How shading is sampled: for tuning and debugging."],
+            Page::Sound => &[
+                "The test sound is a hum left where you stand: walk",
+                "away and round corners to hear it through the level.",
+            ],
             Page::Levels => &[
                 "Settings carry over; you start at its spawn.",
                 "Ctrl+S in the editor (Tab) saves the level too.",
@@ -2900,6 +3156,7 @@ impl Item {
                 Page::Flashlight => "Flashlight",
                 Page::Rendering => "Rendering",
                 Page::Sampling => "Sampling (debug)",
+                Page::Sound => "Sound",
                 Page::Controls => "Controls",
                 Page::Levels => "Levels",
                 Page::Materials => "Materials",
@@ -2944,15 +3201,23 @@ impl Item {
                 Setting::PenumbraThreshold => "Penumbra threshold",
                 Setting::MouseSmoothing => "Mouse smoothing",
                 Setting::Hud => "Debug HUD",
+                Setting::Fly => "Fly",
+                Setting::Use => "Use what you look at",
+                Setting::Volume => "Volume",
+                Setting::Footsteps => "Footsteps",
+                Setting::TestSound => "Test sound here",
             },
         }
     }
 }
 
+/// The key Use has until it is bound to another (see `bindings_from`).
+const USE_KEY: Key = Key::E;
+
 /// Keys the game, the editor or the menu use, which can't be hotkeys (B binds one in the
 /// menu).
 const RESERVED: &[Key] = &[
-    Key::W, Key::A, Key::S, Key::D, Key::Q, Key::E, Key::C, Key::U, Key::V, Key::G, Key::M,
+    Key::W, Key::A, Key::S, Key::D, Key::C, Key::U, Key::V, Key::G, Key::M,
     Key::P, Key::Z, Key::Y, Key::B, Key::Space, Key::Tab, Key::Escape, Key::Enter,
     Key::Backspace, Key::Delete, Key::Up, Key::Down, Key::Left, Key::Right, Key::PageUp,
     Key::PageDown, Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::LeftBracket,
@@ -3001,20 +3266,29 @@ fn all_settings() -> Vec<Setting> {
 }
 
 /// The saved hotkeys (see `bindings_path`); none if there are none. Lines that name no
-/// key or setting (left from another version) are skipped.
+/// key or setting (left from another version) are skipped. Use has E until they give it
+/// another key (or give E to something else).
 fn load_bindings() -> Vec<(Key, Setting)> {
-    let Some(text) = bindings_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-        return Vec::new();
-    };
+    let text = bindings_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    bindings_from(&text)
+}
+
+/// The hotkeys in `text`, as [`save_bindings`] writes them.
+fn bindings_from(text: &str) -> Vec<(Key, Setting)> {
     let settings = all_settings();
-    text.lines()
+    let mut bindings: Vec<(Key, Setting)> = text
+        .lines()
         .filter_map(|line| {
             let (key, setting) = line.split_once(' ')?;
             let key = Key::named(key.trim()).filter(|k| !RESERVED.contains(k))?;
             let setting = settings.iter().find(|s| format!("{s:?}") == setting.trim())?;
             Some((key, *setting))
         })
-        .collect()
+        .collect();
+    if !bindings.iter().any(|&(key, setting)| key == USE_KEY || setting == Setting::Use) {
+        bindings.push((USE_KEY, Setting::Use));
+    }
+    bindings
 }
 
 /// Saves the hotkeys (see `bindings_path`).
@@ -3351,6 +3625,9 @@ fn edit_input(app: &mut App, display: &Display) -> bool {
     if pressed(Action::Find) {
         app.editor.menus = vec![editor_panel::Menu::World];
         app.editor.typing = Some((Typing::Find, String::new()));
+    }
+    if pressed(Action::ReloadScripts) {
+        app.restart_scripts();
     }
     if app.editor.model.is_none() {
         for (action, mode) in [(Action::SectorMode, Mode::Sector), (Action::FaceMode, Mode::Face), (Action::VertexMode, Mode::Vertex)] {
@@ -4077,6 +4354,9 @@ fn switch_level(
     loaded.geometry.config = app.geometry.config;
     loaded.start_size = app.start_size;
     loaded.set_size(app.width, app.height);
+    // The sound device goes on to the new level; the old level's sounds stop.
+    std::mem::swap(&mut loaded.audio, &mut app.audio);
+    loaded.audio.stop_all();
     *app = loaded;
     *options = next;
     display.set_title(&format!("Moose - {}", app.world.name));
@@ -4250,6 +4530,14 @@ fn run() -> Result<(), String> {
     let s = &app.settings;
     let mut display =
         Display::open(&title, app.width, app.height, if s.capped { s.cap } else { 0 })?;
+    if !options.no_sound {
+        app.audio = Audio::open();
+        match (app.audio.device(), app.audio.problem()) {
+            (Some((name, rate, channels)), _) => println!("sound on {name}: {rate} Hz, {channels} channels"),
+            (None, problem) => eprintln!("no sound: {}", problem.unwrap_or("no device")),
+        }
+    }
+    app.audio.set_volume(app.settings.volume);
     display.set_fullscreen(options.fullscreen);
     let mut capped = s.capped;
     let mut shots = 0;
@@ -4603,13 +4891,6 @@ fn run() -> Result<(), String> {
                         c.pitch -= turn;
                     }
                 }
-                // (Not in the editor, whose keys are its own.)
-                if !app.editor.on && display.key_down(Key::Q) {
-                    c.roll += ROLL_SPEED * dt;
-                }
-                if !app.editor.on && display.key_down(Key::E) {
-                    c.roll -= ROLL_SPEED * dt;
-                }
                 // Mouse look is always on (no button), as in v1, smoothed over time: this
                 // frame's motion (made since the last) is turned evenly over the window from
                 // then on.
@@ -4657,12 +4938,32 @@ fn run() -> Result<(), String> {
                 local.x += key(right) - key(left);
                 let up = key(rise) - key(sink);
                 let fast = display.key_down(Key::LeftShift) || display.key_down(Key::RightShift);
-                let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
-                let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
-                if delta != Vec3::ZERO {
-                    app.fly(delta);
+                if app.editor.on || app.settings.fly {
+                    let speed = MOVE_SPEED * dt * if fast { FAST } else { 1.0 };
+                    let delta = (app.camera.rotation() * local + Vec3::Y * up) * speed;
+                    if delta != Vec3::ZERO {
+                        app.fly(delta);
+                    }
+                    // Flying while playing, the level's bodies go on moving.
+                    if !app.editor.on {
+                        app.drift(dt);
+                    }
+                } else {
+                    // Walking: across the ground the way the camera faces, whatever its
+                    // pitch; Space jumps and C crouches (slower, and no running, for as
+                    // long as the player is down).
+                    let (jump, crouch) = (key(rise) > 0.0, key(sink) > 0.0);
+                    let facing = glam::Quat::from_rotation_y(app.camera.yaw);
+                    let crouching = crouch || app.physics.character(app.player).crouching();
+                    let speed = MOVE_SPEED * if crouching { CROUCH } else if fast { RUN } else { 1.0 };
+                    let wish = (facing * local).normalize_or_zero() * speed;
+                    app.walk(wish, jump, crouch, dt);
                 }
             }
+        }
+        // The editor shows the level as written: what physics moved goes back.
+        if app.editor.on {
+            app.rest_bodies();
         }
         if reload_at.elapsed() >= Duration::from_secs(1) {
             reload_at = Instant::now();
@@ -4685,8 +4986,11 @@ fn run() -> Result<(), String> {
             for (key, setting) in app.bindings.clone() {
                 if display.key_pressed(key) {
                     app.change(setting, 1);
-                    let said = format!("{}: {}", Item::Set(setting).label(), app.value(setting));
-                    app.toast = Some((said, Instant::now()));
+                    // (Using something says nothing: what is used answers.)
+                    if setting != Setting::Use {
+                        let said = format!("{}: {}", Item::Set(setting).label(), app.value(setting));
+                        app.toast = Some((said, Instant::now()));
+                    }
                 }
             }
         }
@@ -4695,6 +4999,13 @@ fn run() -> Result<(), String> {
             display.set_max_fps(if capped { app.settings.cap } else { 0 });
         }
 
+        // The level's scripts, while playing: the Use key (a hotkey, above) uses what the
+        // player looks at.
+        let using = std::mem::take(&mut app.using);
+        if !app.editor.on && !menu.open {
+            app.run_scripts(dt, using);
+        }
+        app.audio.update(&app.world, &app.assets, &Listener::of(&app.camera), dt);
         let time = started.elapsed().as_secs_f32();
         if display.key_pressed(Key::F1) {
             println!("{}", app.command_line(&options, time));
@@ -4748,6 +5059,232 @@ mod tests {
     fn test_app(level: &str) -> App {
         let args = ["--level", level, "--size", "64x36"].map(String::from);
         App::new(&parse_options(args).unwrap()).unwrap()
+    }
+
+    /// Walks `app`'s player for `seconds`, wishing `wish` (m/s), a frame of 1/60 s at a time.
+    fn walk_for(app: &mut App, wish: Vec3, seconds: f32) {
+        for _ in 0..(seconds * 60.0).round() as u32 {
+            app.walk(wish, false, false, 1.0 / 60.0);
+        }
+    }
+
+    /// Where the entity called `name` is.
+    fn entity_at(app: &App, name: &str) -> Vec3 {
+        app.world.entities.iter().find(|e| e.name == name).unwrap().position
+    }
+
+    #[test]
+    fn the_ball_falls_to_the_road_and_rests_there() {
+        // cheese_1's ball starts half a meter up, over a road at y = -0.25; its radius is 0.3.
+        let mut app = test_app("cheese_1.mmp");
+        let start = entity_at(&app, "ball");
+        walk_for(&mut app, Vec3::ZERO, 0.1);
+        assert!(entity_at(&app, "ball").y < start.y, "it isn't falling");
+        walk_for(&mut app, Vec3::ZERO, 4.0);
+        let rested = entity_at(&app, "ball");
+        assert!((rested.y - 0.05).abs() < 0.01, "resting at {rested}");
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        assert!(entity_at(&app, "ball").distance(rested) < 1e-3, "still moving");
+        // Its entity's box and sectors follow it.
+        let ball = app.world.entities.iter().find(|e| e.name == "ball").unwrap();
+        assert!((ball.bounds.min.y + 0.25).abs() < 0.01 && (ball.bounds.max.y - 0.35).abs() < 0.01, "{:?}", ball.bounds);
+        // In the editor it is back where the level has it.
+        app.rest_bodies();
+        assert_eq!(entity_at(&app, "ball"), start);
+    }
+
+    #[test]
+    fn the_player_pushes_the_ball_which_rolls_on_and_slows_to_a_stop() {
+        let mut app = test_app("cheese_1.mmp");
+        walk_for(&mut app, Vec3::ZERO, 3.0);
+        let rested = entity_at(&app, "ball");
+        // From 1.5 m behind it, walking at it (toward -z): into it, and on, pushing it.
+        app.place_camera([rested.x, EYE_HEIGHT - 0.25, rested.z + 1.5, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED, 1.0);
+        let pushed = entity_at(&app, "ball");
+        assert!(pushed.z < rested.z - 0.5, "pushed from {rested} only to {pushed}");
+        // It is never inside the player: its near side stays ahead of the player's.
+        assert!(pushed.z + 0.3 < app.camera.position.z - 0.25 + 0.05, "ball at {pushed}, player at {}", app.camera.position);
+        // Let go, it rolls on (it has momentum, and it turns as it goes)...
+        let turned = app.world.entities.iter().find(|e| e.name == "ball").unwrap().rotation;
+        walk_for(&mut app, Vec3::ZERO, 0.5);
+        let rolling = entity_at(&app, "ball");
+        assert!(rolling.z < pushed.z - 0.3, "it stopped dead: {pushed} to {rolling}");
+        assert!(app.world.entities.iter().find(|e| e.name == "ball").unwrap().rotation.angle_between(turned) > 0.3, "it slid without rolling");
+        // ...slower and slower, to a stop, on the road, inside the level.
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        let later = entity_at(&app, "ball");
+        assert!(later.distance(rolling) / 1.0 < pushed.distance(rolling) / 0.5, "it isn't slowing");
+        walk_for(&mut app, Vec3::ZERO, 20.0);
+        let stopped = entity_at(&app, "ball");
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        assert!(entity_at(&app, "ball").distance(stopped) < 1e-3, "still rolling after 20 s");
+        let ball = app.world.entities.iter().find(|e| e.name == "ball").unwrap();
+        assert!(app.world.sector_contains(ball.sector, ball.position), "{} isn't in its sector", ball.position);
+    }
+
+    #[test]
+    fn the_ball_bounces_off_the_player_and_passes_through_a_flying_one() {
+        let mut app = test_app("cheese_1.mmp");
+        walk_for(&mut app, Vec3::ZERO, 3.0);
+        let rested = entity_at(&app, "ball");
+        // Pushed toward -z, then the player is put in its way, and it comes back off them.
+        app.place_camera([rested.x, EYE_HEIGHT - 0.25, rested.z + 1.5, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED * RUN, 0.7);
+        let rolling = entity_at(&app, "ball");
+        app.place_camera([rolling.x, EYE_HEIGHT - 0.25, rolling.z - 1.0, 0.0, 0.0, 0.0], "test").unwrap();
+        let mut nearest = f32::INFINITY;
+        for _ in 0..120 {
+            app.walk(Vec3::ZERO, false, false, 1.0 / 60.0);
+            let ball = entity_at(&app, "ball");
+            nearest = nearest.min(Vec3::new(ball.x - app.camera.position.x, 0.0, ball.z - app.camera.position.z).length());
+        }
+        // Its middle never nearer than its radius and the player's (0.3 + 0.25).
+        assert!(nearest > 0.5 && nearest < 0.65, "the ball came to {nearest} m of the player");
+        // Flying, the player isn't in its way.
+        app.rest_bodies();
+        let start = entity_at(&app, "ball");
+        app.place_camera([start.x, start.y - 0.5, start.z, 0.0, 0.0, 0.0], "test").unwrap();
+        for _ in 0..180 {
+            app.drift(1.0 / 60.0);
+        }
+        assert!(entity_at(&app, "ball").distance(rested) < 0.02, "{} flying, {rested} before", entity_at(&app, "ball"));
+    }
+
+    #[test]
+    fn crouching_lowers_the_eye_and_letting_go_raises_it_again() {
+        let mut app = test_app("two_rooms.mmp");
+        walk_for(&mut app, Vec3::ZERO, 0.5);
+        let standing = app.camera.position.y;
+        for _ in 0..30 {
+            app.walk(Vec3::ZERO, false, true, 1.0 / 60.0);
+        }
+        // By what the player is shorter crouched: 1.8 m to 1 m.
+        assert!((standing - app.camera.position.y - 0.8).abs() < 0.02, "{} from {standing}", app.camera.position.y);
+        assert!(app.physics.character(app.player).crouching());
+        // Halfway up, the eye is between the two: it doesn't jump.
+        for _ in 0..6 {
+            app.walk(Vec3::ZERO, false, false, 1.0 / 60.0);
+        }
+        let rising = standing - app.camera.position.y;
+        assert!(rising > 0.2 && rising < 0.6, "{rising} under standing");
+        walk_for(&mut app, Vec3::ZERO, 0.5);
+        assert!((standing - app.camera.position.y).abs() < 0.02);
+    }
+
+    #[test]
+    fn walking_goes_down_the_hallway_and_the_cameras_sector_follows() {
+        // two_rooms: the spawn point faces the hallway (toward -z), which has a crate in it.
+        let mut app = test_app("two_rooms.mmp");
+        let start = app.camera.position;
+        assert_eq!(app.world.sectors[app.camera.sector as usize].name, "room_a");
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED, 4.0);
+        let c = &app.camera;
+        assert_eq!(app.world.sectors[c.sector as usize].name, "hallway");
+        // On the floor, eye high, and stopped by the crate (at z = -6, a meter wide).
+        assert!((c.position.y - start.y).abs() < 0.03, "{}", c.position);
+        assert!(c.position.z < -4.0 && c.position.z > -5.5, "{}", c.position);
+        assert!(app.world.sector_contains(c.sector, c.position));
+    }
+
+    #[test]
+    fn walking_stops_at_a_crate_slides_past_a_turned_one_and_stops_at_a_wall() {
+        // crate_a1 is a meter cube at x = -2.5, z = 2, square to the room: walked straight
+        // at, it stops the player a radius from its face.
+        let mut app = test_app("two_rooms.mmp");
+        app.place_camera([0.0, EYE_HEIGHT, 2.0, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::NEG_X * MOVE_SPEED, 3.0);
+        let x = app.camera.position.x;
+        assert!((x + 1.75).abs() < 0.05, "stopped at x = {x}");
+        // crate_a3 (x = 2.5, z = 5) is turned 30 degrees: the player slides along its face
+        // and on past it, to the wall, a radius from it.
+        app.place_camera([0.0, EYE_HEIGHT, 5.0, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::X * MOVE_SPEED, 6.0);
+        let c = &app.camera;
+        assert!(app.world.sector_contains(c.sector, c.position), "{}", c.position);
+        let wall = app.world.sectors[c.sector as usize].bounds.max.x;
+        assert!((wall - c.position.x - 0.25).abs() < 0.05, "{} from a wall at {wall}", c.position.x);
+        assert!((c.position.z - 5.0).abs() > 0.3, "it went through the crate: {}", c.position);
+    }
+
+    #[test]
+    fn walking_and_jumping_about_never_leaves_a_level() {
+        // Every level: from its spawn point, eight ways in turn, walking then running,
+        // jumping every so often. The player stays inside the level (a gap in its colliders,
+        // or falling through them, would put it out), and on its feet.
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets");
+        for level in level_files(root) {
+            let mut app = test_app(&level);
+            let floor = app.world.sectors.iter().map(|s| s.bounds.min.y).fold(f32::INFINITY, f32::min);
+            for k in 0..16 {
+                let angle = k as f32 * std::f32::consts::FRAC_PI_4 + 0.1;
+                let speed = MOVE_SPEED * if k < 8 { 1.0 } else { RUN };
+                let wish = Vec3::new(angle.cos(), 0.0, angle.sin()) * speed;
+                for frame in 0..240 {
+                    // (Crouched for a while every so often, too.)
+                    app.walk(wish, frame % 50 < 3, frame % 120 > 90, 1.0 / 60.0);
+                    let c = &app.camera;
+                    assert!(app.walked_to.is_some(), "{level}: left the level at {}", c.position);
+                    assert!(app.world.sector_contains(c.sector, c.position), "{level}: {} isn't in its sector", c.position);
+                    // (Crouched, the eye is 0.9 m over the feet.)
+                    assert!(c.position.y > floor + 0.5, "{level}: under the floor at {}", c.position);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_camera_put_in_the_air_falls_to_the_floor_and_one_put_low_stands_up() {
+        let mut app = test_app("two_rooms.mmp");
+        let floor = app.world.spawn_points[0].position.y;
+        app.place_camera([0.0, floor + 3.0, 5.0, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::ZERO, 0.2);
+        assert!(app.camera.position.y < floor + 3.0 && app.camera.position.y > floor + EYE_HEIGHT + 0.5);
+        walk_for(&mut app, Vec3::ZERO, 2.0);
+        assert!((app.camera.position.y - floor - EYE_HEIGHT).abs() < 0.03, "{}", app.camera.position);
+        // The eye near the floor: the player isn't put into it.
+        app.place_camera([1.0, floor + 0.4, 5.0, 0.0, 0.0, 0.0], "test").unwrap();
+        walk_for(&mut app, Vec3::ZERO, 0.5);
+        assert!((app.camera.position.y - floor - EYE_HEIGHT).abs() < 0.03, "{}", app.camera.position);
+    }
+
+    #[test]
+    fn walking_makes_footsteps_and_the_test_sound_stays_where_it_was_left() {
+        let mut app = test_app("two_rooms.mmp");
+        assert!(app.sounds.step.is_some() && app.sounds.land.is_some() && app.sounds.test.is_some(), "run tools/gen_test_sounds.py");
+        // They are off until switched on.
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED, 1.0);
+        assert_eq!((app.steps, app.audio.counts()), (0, (0, 0)));
+        app.change(Setting::Footsteps, 1);
+        // Standing, there are none.
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        let landed = app.steps;
+        walk_for(&mut app, Vec3::ZERO, 1.0);
+        assert_eq!(app.steps, landed);
+        // 3 m at a walk is two strides.
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED, 1.0);
+        assert_eq!(app.steps, landed + 2);
+        // Jumping: none in the air, one on landing.
+        app.walk(Vec3::ZERO, true, false, 1.0 / 60.0);
+        walk_for(&mut app, Vec3::ZERO, 2.0);
+        assert_eq!(app.steps, landed + 3);
+
+        // The test sound is left here; with no device it plays on all the same.
+        let here = app.camera.position;
+        app.change(Setting::TestSound, 1);
+        let hum = app.test_sound.unwrap();
+        walk_for(&mut app, Vec3::NEG_Z * MOVE_SPEED, 1.0);
+        // (Time passes for a sound from the first update after it was played.)
+        let listener = Listener::of(&app.camera);
+        app.audio.update(&app.world, &app.assets, &listener, 0.0);
+        app.audio.update(&app.world, &app.assets, &listener, 5.0);
+        assert!(app.audio.is_playing(hum) && here.distance(app.camera.position) > 2.0);
+        assert_eq!(app.value(Setting::TestSound), "on");
+        app.change(Setting::TestSound, 1);
+        assert!(!app.audio.is_playing(hum) && app.test_sound.is_none());
+        // (The footsteps, a sixth of a second each, have ended.)
+        assert_eq!(app.audio.counts(), (0, 0));
     }
 
     #[test]
@@ -5761,9 +6298,10 @@ mod tests {
         app.bind(Setting::ShadowMesh, Key::H);
         assert_eq!((app.binding(Setting::Bump), app.binding(Setting::ShadowMesh)), (None, Some(Key::H)));
         app.bind(Setting::ShadowMesh, Key::F7);
-        assert_eq!(app.bindings, vec![(Key::F7, Setting::ShadowMesh)]);
+        // (Use has E from the start: see `bindings_from`.)
+        assert_eq!(app.bindings, vec![(Key::E, Setting::Use), (Key::F7, Setting::ShadowMesh)]);
         app.unbind(Setting::ShadowMesh);
-        assert!(app.bindings.is_empty());
+        assert_eq!(app.bindings, vec![(Key::E, Setting::Use)]);
         // Every setting and key is found again by its saved name.
         for setting in all_settings() {
             assert!(all_settings().iter().any(|s| format!("{s:?}") == format!("{setting:?}")));
@@ -6065,6 +6603,27 @@ mod tests {
         app.edit(Field::Y, 1.0);
         let why = format!("{:?}", app.editor.problem_for_tests());
         assert!(why.contains("Surface"), "{why}");
+    }
+
+    #[test]
+    fn use_has_e_until_the_hotkeys_say_otherwise() {
+        assert_eq!(bindings_from(""), [(Key::E, Setting::Use)]);
+        assert_eq!(bindings_from("F Flashlight\n"), [(Key::F, Setting::Flashlight), (Key::E, Setting::Use)]);
+        // Bound to another key, or E given to something else: left as they are.
+        assert_eq!(bindings_from("T Use\nF Flashlight\n"), [(Key::T, Setting::Use), (Key::F, Setting::Flashlight)]);
+        assert_eq!(bindings_from("E Fly\n"), [(Key::E, Setting::Fly)]);
+        // The keys that rolled the view are free to bind; the game's own still aren't.
+        assert_eq!(bindings_from("Q Hud\nW Fly\n"), [(Key::Q, Setting::Hud), (Key::E, Setting::Use)]);
+        // Pressed, it is what the scripts are told this frame, and its row shows its key.
+        let mut app = test_app("two_rooms.mmp");
+        assert_eq!(app.value(Setting::Use), "E");
+        assert!(!app.using);
+        app.change(Setting::Use, 1);
+        assert!(app.using);
+        app.unbind(Setting::Use);
+        assert_eq!(app.value(Setting::Use), "no key");
+        assert_eq!(app.bind(Setting::Use, Key::W), "W is taken: the game uses it");
+        assert_eq!(app.bind(Setting::Use, Key::Q), "Q bound to Use what you look at");
     }
 
     #[test]

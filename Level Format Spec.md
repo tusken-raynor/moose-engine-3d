@@ -33,7 +33,7 @@ Models referenced by entities are `.obj` files or `.mmdl` files (see the Model F
 - Quoted strings may contain spaces.
 - The file begins with the header `MOOSEMAP 1`.
 - Each remaining section begins with its keyword and a row count. Rows start with an `id` that must equal the row's position, counting from 0.
-- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, optionally `templates`, `entities`, then optionally `ambient`, optionally `lights` and optionally `directional`.
+- Sections appear in this order: `name`, `vertices`, `attributes`, one `values` block per attribute (in declaration order), `sectors`, `surfaces`, `adjoins`, optionally `templates`, `entities`, then optionally `ambient`, optionally `lights`, optionally `directional` and, last, optionally `scripts`.
 - Some rows take **options** after their fixed columns: words like `static`, or `key=value` pairs like `radius=0.05`. Options are optional and can come in any order.
 - **Meta values** are options written `$KEY=VALUE`: numbers the level puts on itself (after its name on the `name` line), a sector, a surface, a template or an entity (over its template's), for materials to read (see the Material Format Spec's sources) and scripts to change. `KEY` is letters, digits and `_`; `VALUE` is one or more numbers separated by commas (`$wet=200`, `$team=204,51,51`), written as the material inputs that read them are typed (colors and 0-255 values as whole numbers). The engine gives them no meaning, but checks the other options strictly: a word that isn't an option is still an error, and only `$` marks a meta value.
 - **Light exclusion lists:** `exclude_lights=NAME,NAME` on a sector, a solid surface, a template or a drawn entity (prop, actor, terrain) names the lights it isn't lit by: none of their light, bumps, highlights or shadows reach it, though it still casts their shadows. Lights are named with `name=` (lights and directional lights share the names), and `flashlight` is the player's flashlight. A sector's list keeps its lights off all its surfaces, along with each surface's own; entities have their own lists (a sector's doesn't reach them), and an entity's list replaces its template's (`exclude_lights=none` for none over a template's). Only the level's first 63 lights (its lights, then its directional lights) can be excluded.
@@ -149,7 +149,7 @@ templates 1
 | `name` | What entities write in their `model` column to place it |
 | `model` | Model file name, resolved from `assets/models/` |
 
-Its options are any of an entity's (below). An entity placed by a template gets the template's options, except those it sets itself, key by key: `shadow=hard` on the instance replaces the template's `shadow=`. A flag is turned off with `=off` (`static=off`), and a template's animation with `anim=none`.
+Its options are any of an entity's (below). An entity placed by a template gets the template's options, except those it sets itself, key by key: `shadow=hard` on the instance replaces the template's `shadow=`. A flag is turned off with `=off` (`static=off`), a template's animation with `anim=none`, and its script with `script=none`.
 
 **`entities`**
 
@@ -173,6 +173,10 @@ Options, after `name` (props and actors; terrains take only `material=` and `fil
 | `occluder=...` | What the entity casts shadows with. Without it, `mesh`. |
 | `shadow=soft\|blurred\|hard` | How its shadows' edges are drawn, from a light with a size. `soft` (the default) carves their soft edges: exact, and cached for static props. `blurred` carves them hard and blurs them on screen, as wide as their soft edge would be: for figures casting shadows with simple proxies, whose blur hides how simple they are; worked out every frame. `hard` carves them from the light's center: the cheapest. |
 | `anim=NAME` | It plays its model's animation `NAME` over and over (or holds its last frame, for one that doesn't loop), from when the level starts. Not with `static`. `anim=none` turns off a template's. |
+| `script=FILE` | The script it runs, a file from `assets/scripts/` (see `scripts` below for how files are written). `script=none` drops a template's. |
+| `input:NAME=VALUE` | A value for its script's input `NAME` (see `scripts` below for names and values). An entity's replace its template's one by one, by name: `input:speed=5` over a template's `input:speed=2` leaves the template's other inputs as they are. They belong to the script: an entity with a script of its own over its template's keeps the template's inputs, one with no script (none, or `script=none`) loses them, and its own inputs then are an error. |
+| `mass=KG` | It has a body: physics moves it (it falls, rolls, and is pushed about; see the Physics Spec), weighing `KG` kilograms. Props only, and not with `static`. `mass=none` drops a template's. |
+| `shape=hull\|ball\|box` | What its body collides as, around its model: its convex hull (the default), the ball around its box, or its box. Needs a mass. |
 
 Occluders are the artist's choice. Any shape works; a complex one only costs more to shadow with.
 
@@ -183,6 +187,18 @@ Occluders are the artist's choice. Any shape works; a complex one only costs mor
 | `lod:N` | Level of detail `N` of its model (its own model until models have levels of detail) |
 | `model:FILE` | A separate proxy model from `assets/models/`, placed like the entity |
 | `facing:SIDES:RADIUS[:X:Y:Z]` | A polygon of 3 to 64 sides that always faces the light: on the outline, seen from the light, of a ball of `RADIUS` around `X Y Z` (model space, default the origin). A round thing's shadow with no silhouette to find. |
+
+Scripts and their inputs, by a template: `door_a` slides at the template's speed, `door_b` at its own (and to the template's height), and `door_c` runs no script.
+
+```
+templates 1
+   0   door     door.mmdl    script=doors/slide.ts input:speed=2 input:height=2.4
+
+entities 3
+   0   prop   0   door   0.00  0.00  -4.00   0  0  0   1.00   door_a
+   1   prop   1   door   0.00  0.00  -12.00  0  0  0   1.00   door_b  input:speed=5
+   2   prop   2   door   6.00  0.00  -16.00  0  0  0   1.00   door_c  script=none
+```
 
 **`ambient r g b`** (optional): light that reaches every surface, in linear RGB, where 1 shows a surface's full color. Without it, ambient light is 1 1 1, so a level with no lights looks as it always did.
 
@@ -221,6 +237,23 @@ Options: `shadows=on|off` (default on), and `name=NAME`, as a light's. The first
 
 The sky's faces show the night and the clouds when drawn with a sky that has them (`sky_cycle`).
 
+**`scripts`** (optional, the last section): the level's own scripts, which belong to no entity. An entity's script is its `script=` option instead.
+
+```
+scripts 2
+#  id  file            [inputs]
+   0   rules.ts
+   1   doors/alarm.ts  delay=2.5 door=door_a "message=Stay where you are"
+```
+
+| Column | Meaning |
+| --- | --- |
+| `file` | The script's file, a path under `assets/scripts/`: lowercase letters, digits, `_` and `/` (for folders), ending in `.ts`. It doesn't start with `/` or go up with `..`. |
+
+Then its inputs, each `NAME=VALUE`: a row takes nothing else. `NAME` is letters, digits and `_`, not starting with a digit, and a script gets each of its inputs once. `VALUE` is anything but nothing, kept as written up to the end of the word (it can have `=` in it); one with spaces has its whole word quoted, as above, and so does an entity's (`"input:message=Stay where you are"`). The same file can be placed more than once, each with its own inputs.
+
+The level only says which scripts are placed where, and with what. The loader keeps that as written, with the line it is on, and checks only how it is written: whether the file is there, which inputs the script has and what their values mean are the script engine's, when it compiles them.
+
 ## Terrain
 
 Open ground (hills, canyons, a valley) is too big and too open for a prop, and too uneven for sectors. It is authored in two layers:
@@ -256,6 +289,7 @@ A **`blocker`** entity places a model whose polygons are never drawn, but hide f
 12. Each directional light has 7 fields before its options, a direction that is not zero, a color that is not negative, and an angle from 0 to 45 degrees.
 13. Each name an `exclude_lights=` list holds is a light's (`name=`) or `flashlight`, and one of the level's first 63 lights.
 14. Options are known ones: anything else is an error. An oscillation has four numbers and a positive period, and both ends of its swing lie inside the level.
+15. A script's file (a `scripts` row's, a `script=`'s) is a path in lowercase letters, digits, `_` and `/` ending in `.ts`. Each input has a name that is an identifier and a value, and no script is given the same one twice. Only props and actors take `script=` and `input:`, and an entity's own `input:` needs a script (its own or its template's). A `scripts` row has a file, and nothing after it but inputs.
 
 ## Planned extensions
 

@@ -492,6 +492,40 @@ fn rejects_entity_option_errors() {
 }
 
 #[test]
+fn a_prop_with_a_mass_has_a_body_of_the_shape_it_names() {
+    use moose_assets::{Body, BodyShape};
+    let row = "1.00   crate_a1";
+    let with = |options: &str| {
+        let src = LEVEL.replacen(row, &format!("{row} {options}"), 1);
+        assets().parse_level("two_rooms.mmp", &src).unwrap().spawns[1].body
+    };
+    assert_eq!(with(""), None);
+    assert_eq!(with("mass=5"), Some(Body { mass: 5.0, shape: BodyShape::Hull }));
+    assert_eq!(with("mass=0.25 shape=ball"), Some(Body { mass: 0.25, shape: BodyShape::Ball }));
+    assert_eq!(with("shape=box mass=12"), Some(Body { mass: 12.0, shape: BodyShape::Box }));
+    // A template's, unless the entity drops it.
+    let templated = |options: &str| {
+        let src = LEVEL
+            .replacen("entities ", "templates 1\n   0   ball  crate.obj  mass=3 shape=ball\n\nentities ", 1)
+            .replacen("crate.obj  -2.50   0.00    2.00    0      0     0     1.00   crate_a1", &format!("ball       -2.50   0.00    2.00    0      0     0     1.00   crate_a1 {options}"), 1);
+        assets().parse_level("two_rooms.mmp", &src).map(|l| l.spawns[1].body).map_err(|e| e.to_string())
+    };
+    assert_eq!(templated(""), Ok(Some(Body { mass: 3.0, shape: BodyShape::Ball })));
+    assert_eq!(templated("mass=8"), Ok(Some(Body { mass: 8.0, shape: BodyShape::Ball })));
+    assert!(templated("mass=none").unwrap_err().contains("shape= needs a mass"));
+
+    let options = |o: &str| format!("{row} {o}");
+    assert_rejects(row, &options("mass=heavy"), "mass 'heavy' isn't a number of kilograms over 0");
+    assert_rejects(row, &options("mass=0"), "isn't a number of kilograms over 0");
+    assert_rejects(row, &options("mass=5 shape=blob"), "unknown shape 'blob' (expected hull, ball or box)");
+    assert_rejects(row, &options("shape=ball"), "shape= needs a mass");
+    assert_rejects(row, &options("mass=5 static"), "a prop with a mass moves: it can't be static");
+    let actor = LEVEL.replacen("   1   prop   0", "   1   actor  0", 1).replacen(row, &options("mass=5"), 1);
+    let msg = assets().parse_level("two_rooms.mmp", &actor).err().unwrap().to_string();
+    assert!(msg.contains("only props can have a mass"), "{msg}");
+}
+
+#[test]
 fn loads_light_options_sky_and_directional_lights() {
     let src = with_lights(
         "ambient 0 0 0",
@@ -1226,4 +1260,171 @@ fn vertices_a_cut_missed_by_a_little_weld_into_one_and_the_sliver_goes() {
     }
     assert_eq!((gone, doc.surfaces.len()), (1, faces - 1));
     assert!(assets().parse_level("two_rooms.mmp", &doc.to_text()).is_ok());
+}
+
+/// two_rooms.mmp with `scripts` rows appended.
+fn with_scripts(rows: &[&str]) -> String {
+    let mut src = format!("{LEVEL}\nscripts {}\n", rows.len());
+    for (i, r) in rows.iter().enumerate() {
+        src += &format!("   {i}   {r}\n");
+    }
+    src
+}
+
+#[test]
+fn loads_scripts_and_entity_scripts() {
+    use moose_assets::ScriptPlacement;
+    let placed = |file: &str, inputs: &[(&str, &str)], line: usize| ScriptPlacement {
+        file: file.into(),
+        inputs: inputs.iter().map(|&(n, v)| (n.to_string(), v.to_string())).collect(),
+        line,
+    };
+    // Without them: none.
+    let level = assets().parse_level("two_rooms.mmp", LEVEL).unwrap();
+    assert!(level.scripts.is_empty() && level.spawns.iter().all(|s| s.script.is_none()));
+    // The level's own: each a file and its inputs as written (a quoted one with a space in
+    // it), by the line it is on.
+    let src = with_scripts(&["rules.ts", "doors/slide_2.ts speed=2.5 target=crate_a1 \"greeting=Hello there\" sum=a=b"]);
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    let line = src.lines().position(|l| l.contains("slide_2.ts")).unwrap() + 1;
+    assert_eq!(
+        level.scripts,
+        [
+            placed("rules.ts", &[], line - 1),
+            placed(
+                "doors/slide_2.ts",
+                &[("speed", "2.5"), ("target", "crate_a1"), ("greeting", "Hello there"), ("sum", "a=b")],
+                line
+            ),
+        ]
+    );
+    // Entities 1 to 4 placed by a template with a script and two inputs: as it is, with one
+    // input its own (after the template's others), with no script, and with another script
+    // (the template's inputs are still its). Entity 5 has its own, and no template.
+    let src = LEVEL
+        .replacen("crate.obj  -2.50   0.00    2.00", "spinner  -2.50   0.00    2.00", 1)
+        .replacen("crate.obj  -2.50   1.00    2.00", "spinner  -2.50   1.00    2.00", 1)
+        .replacen("crate.obj  2.50    0.00    5.00", "spinner  2.50    0.00    5.00", 1)
+        .replacen("crate.obj  0.30    0.00    -6.00", "spinner  0.30    0.00    -6.00", 1)
+        .replacen("1.00   crate_a2_stacked", "1.00   crate_a2_stacked input:speed=5", 1)
+        .replacen("1.00   crate_a3", "1.00   crate_a3 script=none", 1)
+        .replacen("1.00   crate_hall", "1.00   crate_hall script=props/bob.ts", 1)
+        .replacen("1.00   crate_b1", "1.00   crate_b1 script=props/bob.ts input:height=0.5", 1)
+        .replacen(
+            "entities ",
+            "templates 1\n   0   spinner  crate.obj  script=spin.ts input:speed=2 input:axis=y\n\nentities ",
+            1,
+        );
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    let row = |name: &str| src.lines().position(|l| l.contains(name)).unwrap() + 1;
+    let script = |e: usize| level.spawns[e].script.clone();
+    assert_eq!(script(0), None);
+    assert_eq!(script(1), Some(placed("spin.ts", &[("speed", "2"), ("axis", "y")], row("1.00   crate_a1"))));
+    assert_eq!(script(2), Some(placed("spin.ts", &[("axis", "y"), ("speed", "5")], row("crate_a2_stacked"))));
+    assert_eq!(script(3), None);
+    assert_eq!(script(4), Some(placed("props/bob.ts", &[("speed", "2"), ("axis", "y")], row("crate_hall"))));
+    assert_eq!(script(5), Some(placed("props/bob.ts", &[("height", "0.5")], row("1.00   crate_b1"))));
+    assert_eq!(script(6), None);
+    assert!(level.scripts.is_empty());
+    // A template's inputs with no script anywhere are nobody's.
+    let unscripted = src
+        .replacen("script=spin.ts input:speed=2", "input:speed=2", 1)
+        .replacen(" input:speed=5", "", 1)
+        .replacen(" script=none", "", 1);
+    let level = assets().parse_level("two_rooms.mmp", &unscripted).unwrap();
+    assert_eq!((level.spawns[1].script.clone(), level.spawns[3].script.clone()), (None, None));
+    assert!(level.spawns[4].script.is_some());
+}
+
+#[test]
+fn rejects_script_errors() {
+    let reject = |src: &str, expected: &str| {
+        let msg = match assets().parse_level("two_rooms.mmp", src) {
+            Ok(_) => panic!("loaded despite the edit expecting '{expected}'"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains(expected), "expected '{expected}' in: {msg}");
+    };
+    // The level's own.
+    for file in ["Rules.ts", "rules.js", "rules", ".ts", "/rules.ts", "../rules.ts", "a//b.ts", "a/.ts", "my-rules.ts"] {
+        reject(&with_scripts(&[file]), &format!("script 0: '{file}' is not a script file"));
+    }
+    reject(&with_scripts(&["rules.ts", "rules.ts speed"]), "script 1: 'speed' is not an input (NAME=VALUE)");
+    reject(&with_scripts(&["rules.ts 2fast=1"]), "script 0: '2fast' is not an input name");
+    reject(&with_scripts(&["rules.ts input:speed=1"]), "script 0: 'input:speed' is not an input name");
+    reject(&with_scripts(&["rules.ts =1"]), "script 0: '' is not an input name");
+    reject(&with_scripts(&["rules.ts speed="]), "script 0: input 'speed' has no value");
+    reject(&with_scripts(&["rules.ts speed=1 mode=on speed=2"]), "script 0: input 'speed' is given twice");
+    reject(&with_scripts(&[""]), "script row needs a file");
+    // It is the last section.
+    reject(&format!("{}\nambient 1 1 1\n", with_scripts(&["rules.ts"])), "unexpected 'ambient' after the last section");
+    // An entity's.
+    let row = "1.00   crate_a1";
+    let options = |o: &str| LEVEL.replacen(row, &format!("{row} {o}"), 1);
+    reject(&options("script=Spin.ts"), "entity 'crate_a1': 'Spin.ts' is not a script file");
+    reject(&options("script="), "entity 'crate_a1': '' is not a script file");
+    reject(&options("script=spin.ts input:2fast=1"), "entity 'crate_a1': '2fast' is not an input name");
+    reject(&options("script=spin.ts input:speed="), "entity 'crate_a1': input 'speed' has no value");
+    reject(&options("script=spin.ts input:speed=1 input:speed=2"), "entity 'crate_a1': input 'speed' is given twice");
+    reject(&options("script=spin.ts input:speed"), "entity 'crate_a1': unknown option 'input:speed'");
+    reject(&options("input:speed=1"), "entity 'crate_a1': input:speed needs a script");
+    // Its own input, with its template's script dropped (the template's inputs just go).
+    let templated = |own: &str| {
+        LEVEL
+            .replacen("crate.obj", "spinner", 1)
+            .replacen(row, &format!("{row} {own}"), 1)
+            .replacen("entities ", "templates 1\n   0   spinner  crate.obj  script=spin.ts input:speed=2\n\nentities ", 1)
+    };
+    assert!(assets().parse_level("two_rooms.mmp", &templated("script=none")).is_ok());
+    reject(&templated("script=none input:speed=3"), "entity 'crate_a1': input:speed needs a script");
+    // Only props and actors take them.
+    reject(
+        &LEVEL.replacen("1.00   player_start", "1.00   player_start script=spin.ts", 1),
+        "spawn points take no options ('script=spin.ts')",
+    );
+    let blocker = |o: &str| {
+        LEVEL.replacen("   1   prop   0", "   1   blocker  0", 1).replacen("crate_a1 material=crate", &format!("crate_a1 {o}"), 1)
+    };
+    assert!(assets().parse_level("two_rooms.mmp", &blocker("")).is_ok());
+    reject(&blocker("script=spin.ts"), "entity 'crate_a1': blocker entities take no options ('script=spin.ts')");
+    reject(&blocker("input:speed=1"), "entity 'crate_a1': blocker entities take no options ('input:speed=1')");
+}
+
+#[test]
+fn scripts_written_back_load_the_same() {
+    use moose_assets::{LevelDoc, ScriptDoc, TemplateDoc};
+    // The editor's tables keep the section and the options as written, and write them
+    // back as they were (a value with a space in it quoted again).
+    let src = with_scripts(&["rules.ts", "doors/slide_2.ts speed=2.5 \"greeting=Hello there\""])
+        .replacen("1.00   crate_a1", "1.00   crate_a1 script=spin.ts \"input:label=a # b\"", 1);
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    let path = std::path::Path::new("two_rooms.mmp");
+    let mut d = LevelDoc::parse(path, &src).unwrap();
+    assert_eq!(
+        d.scripts,
+        [
+            ScriptDoc { file: "rules.ts".into(), options: vec![] },
+            ScriptDoc { file: "doors/slide_2.ts".into(), options: vec!["speed=2.5".into(), "greeting=Hello there".into()] },
+        ]
+    );
+    assert!(d.entities[1].options.contains(&"input:label=a # b".to_string()));
+    let again = assets().parse_level("two_rooms.mmp", &d.to_text()).unwrap();
+    let files = |l: &moose_assets::Level| -> Vec<_> { l.scripts.iter().map(|s| (s.file.clone(), s.inputs.clone())).collect() };
+    assert_eq!(files(&again), files(&level));
+    assert_eq!(again.spawns[1].script.as_ref().map(|s| &s.inputs), level.spawns[1].script.as_ref().map(|s| &s.inputs));
+    // Rows the editor adds are a file's too: a script of the level's, and a template's.
+    d.scripts.push(ScriptDoc { file: "weather.ts".into(), options: vec!["rain=0.3".into()] });
+    d.templates.push(TemplateDoc {
+        name: "spinner".into(),
+        model: "crate.obj".into(),
+        options: vec!["script=spin.ts".into(), "input:speed=2".into()],
+    });
+    d.entities[2].model = Some("spinner".into());
+    let level = loads(&d);
+    assert_eq!(level.scripts.len(), 3);
+    assert_eq!(level.scripts[2].inputs, [("rain".to_string(), "0.3".to_string())]);
+    assert_eq!(level.spawns[2].script.as_ref().unwrap().file, "spin.ts");
+    // Without any, the section isn't written.
+    d.scripts.clear();
+    assert!(!d.to_text().contains("scripts"));
 }

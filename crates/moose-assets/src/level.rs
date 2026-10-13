@@ -40,6 +40,24 @@ pub struct Level {
     pub vertex_meta: Vec<crate::meta::MetaValues>,
     /// Per `geometry` polygon, the lights it isn't lit by: its surface's and its sector's.
     pub face_excluded_lights: Vec<LightMask>,
+    /// The level's own scripts (its `scripts` section), in the file's order. Entities'
+    /// are theirs ([`EntitySpawn::script`]).
+    pub scripts: Vec<ScriptPlacement>,
+}
+
+/// A script placed in a level: by a row of its `scripts` section, or on an entity
+/// (`script=FILE`, with its `input:NAME=VALUE` options). It is what the file says and no
+/// more: compiling the script and reading its inputs as what the script declares them to
+/// be is the script engine's job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptPlacement {
+    /// The script's file, a path under `assets/scripts` (`doors/slide.ts`).
+    pub file: String,
+    /// Its inputs by name, each value as written. Names are unique.
+    pub inputs: Vec<(String, String)>,
+    /// The line of the level file that places it (1-based; the entity's row for an
+    /// entity's script), for errors about it.
+    pub line: usize,
 }
 
 /// Light from so far away that it arrives along one direction everywhere, like sunlight. It
@@ -441,6 +459,31 @@ pub struct EntitySpawn {
     pub meta: crate::meta::MetaValues,
     /// The lights its model isn't lit by (`exclude_lights=`; its own, else its template's).
     pub excluded_lights: LightMask,
+    /// The script it runs (`script=FILE`; its own, else its template's), with its inputs
+    /// (`input:NAME=VALUE`, over its template's). Props and actors only.
+    pub script: Option<ScriptPlacement>,
+    /// Its body, if physics moves it (`mass=`; see the Physics Spec). Props only.
+    pub body: Option<Body>,
+}
+
+/// A prop that physics moves: it falls, rolls, and is pushed about.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Body {
+    /// In kilograms.
+    pub mass: f32,
+    pub shape: BodyShape,
+}
+
+/// What a [`Body`] collides as, around its model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BodyShape {
+    /// The convex hull of its model's points.
+    #[default]
+    Hull,
+    /// The ball around its model's box: its center, out to its widest half.
+    Ball,
+    /// Its model's box.
+    Box,
 }
 
 /// How an entity's shadows' edges are drawn, from a light with a size.

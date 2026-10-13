@@ -9,8 +9,8 @@ use glam::{EulerRot, Quat, Vec3};
 use crate::error::LoadError;
 use crate::geom::{Aabb, Plane, TOLERANCE, convex_polygon_plane};
 use crate::level::{
-    DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, Occluder,
-    ShadowKind, Oscillation, Portal, PortalFlags, Sector, Sky, Terrain,
+    Body, BodyShape, DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, Occluder,
+    ScriptPlacement, ShadowKind, Oscillation, Portal, PortalFlags, Sector, Sky, Terrain,
 };
 use crate::material::{Binding, binding_of};
 use crate::meta::{MetaKeys, MetaValues, take_meta};
@@ -67,6 +67,8 @@ struct EntityRec {
     meta: MetaValues,
     binding: Option<Binding>,
     exclude: Vec<String>,
+    script: Option<ScriptPlacement>,
+    body: Option<Body>,
 }
 
 /// The light names in an `exclude_lights=` option among `options`, if any, and the other
@@ -107,6 +109,40 @@ pub fn merged_options(template: &[String], own: &[String]) -> Vec<String> {
         .chain(own)
         .cloned()
         .collect()
+}
+
+/// Checks a script's file as levels name it (`script=FILE`, a `scripts` row): a path
+/// under `assets/scripts`, in lowercase letters, digits, `_` and `/`, ending in `.ts`.
+fn script_file(file: &str) -> Result<String, String> {
+    let word = |part: &str| {
+        !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    };
+    if file.strip_suffix(".ts").is_some_and(|stem| stem.split('/').all(word)) {
+        Ok(file.to_string())
+    } else {
+        Err(format!(
+            "'{file}' is not a script file (lowercase letters, digits, '_' and '/', ending in .ts)"
+        ))
+    }
+}
+
+/// Adds input `name` to a script's `inputs`, with its value as written (what it means is
+/// the script's to say). A name is an identifier, and a script gets each of its inputs once.
+fn add_script_input(inputs: &mut Vec<(String, String)>, name: &str, value: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!("'{name}' is not an input name (letters, digits and '_', not starting with a digit)"));
+    }
+    if value.is_empty() {
+        return Err(format!("input '{name}' has no value"));
+    }
+    if inputs.iter().any(|(n, _)| n == name) {
+        return Err(format!("input '{name}' is given twice"));
+    }
+    inputs.push((name.to_string(), value.to_string()));
+    Ok(())
 }
 
 /// An entity's occluder as written: a proxy model is loaded with the entity's.
@@ -619,6 +655,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
         let (mut shadow, mut animation) = (ShadowKind::Soft, None);
         let mut exclude = Vec::new();
+        let (mut script, mut inputs) = (None, Vec::new());
+        let (mut mass, mut shape) = (None, None);
         let options = merged_options(template.map_or(&[][..], |t| &t.2), &r.tokens[11..]);
         // What it's drawn with (props, actors and terrains).
         let (binding, options) = binding_of(assets.materials(), &options)
@@ -655,8 +693,54 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 Some(("anim", value)) if !value.is_empty() => animation = (value != "none").then(|| value.to_string()),
                 // Its own replace its template's.
                 Some(("exclude_lights", _)) => exclude = take_exclusions([option]).map_err(fail)?.0,
+                // `none` drops a template's.
+                Some(("script", value)) => {
+                    script = if value == "none" { None } else { Some(script_file(value).map_err(fail)?) };
+                }
+                Some((key, value)) if key.starts_with("input:") => {
+                    add_script_input(&mut inputs, &key["input:".len()..], value).map_err(fail)?;
+                }
+                // A body, for physics to move it (props only; `mass=none` drops a
+                // template's).
+                Some(("mass", value)) => {
+                    mass = match value {
+                        "none" => None,
+                        _ => match value.parse::<f32>() {
+                            Ok(kg) if kg > 0.0 && kg.is_finite() => Some(kg),
+                            _ => return Err(fail(format!("mass '{value}' isn't a number of kilograms over 0"))),
+                        },
+                    };
+                }
+                Some(("shape", value)) => {
+                    shape = Some(match value {
+                        "hull" => BodyShape::Hull,
+                        "ball" => BodyShape::Ball,
+                        "box" => BodyShape::Box,
+                        _ => return Err(fail(format!("unknown shape '{value}' (expected hull, ball or box)"))),
+                    })
+                }
                 _ => return Err(fail(format!("unknown option '{option}'"))),
             }
+        }
+        // Inputs are a script's. With none (or its template's dropped), its template's
+        // inputs go with it, but its own have nothing to go to.
+        if script.is_none() {
+            if let Some(input) = r.tokens[11..].iter().find(|o| o.starts_with("input:")) {
+                return Err(c.err(r.no, format!("entity '{name}': {} needs a script", option_key(input))));
+            }
+        }
+        let script = script.map(|file| ScriptPlacement { file, inputs, line: r.no });
+        // A body is a prop's, that can move; its shape is the body's.
+        let body = mass.map(|mass| Body { mass, shape: shape.unwrap_or_default() });
+        let fail = |m: &str| c.err(r.no, format!("entity '{name}': {m}"));
+        if body.is_some() && kind != EntityKind::Prop {
+            return Err(fail("only props can have a mass"));
+        }
+        if body.is_some() && is_static {
+            return Err(fail("a prop with a mass moves: it can't be static"));
+        }
+        if body.is_none() && shape.is_some() {
+            return Err(fail("shape= needs a mass"));
         }
         entities.push(EntityRec {
             line: r.no,
@@ -674,6 +758,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             binding,
             meta,
             exclude,
+            script,
+            body,
         });
     }
 
@@ -886,6 +972,28 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                 sky,
             });
             light_names.push(name);
+        }
+    }
+
+    // Optional: the level's own scripts, each a file and its inputs. They are kept as
+    // written: the script engine compiles them, and knows what their inputs should be.
+    let mut scripts = Vec::new();
+    if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "scripts") {
+        let section = c.section("scripts", false, None)?;
+        for (i, r) in section.rows.iter().enumerate() {
+            let fail = |m: String| c.err(r.no, format!("script {i}: {m}"));
+            let Some(file) = r.tokens.first() else {
+                return Err(c.err(r.no, "script row needs a file"));
+            };
+            let file = script_file(file).map_err(fail)?;
+            let mut inputs = Vec::new();
+            for input in &r.tokens[1..] {
+                let (name, value) = input
+                    .split_once('=')
+                    .ok_or_else(|| fail(format!("'{input}' is not an input (NAME=VALUE)")))?;
+                add_script_input(&mut inputs, name, value).map_err(fail)?;
+            }
+            scripts.push(ScriptPlacement { file, inputs, line: r.no });
         }
     }
 
@@ -1240,6 +1348,8 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             binding: e.binding,
             meta: e.meta,
             excluded_lights,
+            script: e.script,
+            body: e.body,
         });
     }
     let mut outlines: Vec<&mut Vec<u32>> = portals.iter_mut().map(|p| &mut p.positions).collect();
@@ -1312,5 +1422,6 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         meta: level_meta,
         faces,
         face_excluded_lights,
+        scripts,
     })
 }

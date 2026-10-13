@@ -137,6 +137,7 @@ The editor's keys are its own (`editor_keys.rs`): the game's hotkeys don't work 
 | Arrows (2D) | Turn the view by the turn step |
 | F5, G, O | Wireframe over 3D; grid step (1/16, 1/8, 1/4, 1/2, 1 m); pick openings in 3D |
 | / | Find by number |
+| F9 | Reload the scripts: read them again and start them over (see the Scripting Spec) |
 | C, M, X (sector) | Cleave; merge; delete |
 | C, E, M, J (face) | Cut; extrude; merge faces (several selected: the ones that merge; one: then click the other); open to a match |
 | M, X (entity) | Mesh editor; delete |

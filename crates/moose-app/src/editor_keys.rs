@@ -70,6 +70,8 @@ pub enum Action {
     Openings,
     /// Types a sector, face, vertex or light number (or an entity's name) to go to.
     Find,
+    /// Reads the level's scripts again and starts them over.
+    ReloadScripts,
     // With a sector selected.
     Cleave,
     MergeSectors,
@@ -91,12 +93,12 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the gear menu lists them.
-    pub const ALL: [Action; 37] = {
+    pub const ALL: [Action; 38] = {
         use Action::*;
         [
             Forward, Backward, StrafeLeft, StrafeRight, Ascend, Descend, SectorMode, FaceMode, VertexMode, ViewTop,
             ViewBottom, ViewFront, ViewBack, ViewLeft, ViewRight, View3d, TurnLeft, TurnRight, TurnUp, TurnDown, Wire,
-            Grid, Openings, Find, Cleave, MergeSectors, DeleteSector, CutFace, Extrude, MergeFaces, OpenToMatch, MeshEditor,
+            Grid, Openings, Find, ReloadScripts, Cleave, MergeSectors, DeleteSector, CutFace, Extrude, MergeFaces, OpenToMatch, MeshEditor,
             DeleteEntity, DeleteLight, PickProxies, DeletePolygon, LeaveMesh,
         ]
     };
@@ -140,6 +142,7 @@ impl Action {
             Grid => "Grid step",
             Openings => "Pick openings in 3D",
             Find => "Find by number",
+            ReloadScripts => "Reload the scripts",
             Cleave => "Cleave (then the cut)",
             MergeSectors => "Merge sectors",
             DeleteSector => "Delete sector",
@@ -183,6 +186,7 @@ impl Action {
             Grid => Key::G,
             Openings => Key::O,
             Find => Key::Slash,
+            ReloadScripts => Key::F9,
             Cleave => Key::C,
             MergeSectors => Key::M,
             DeleteSector => Key::X,

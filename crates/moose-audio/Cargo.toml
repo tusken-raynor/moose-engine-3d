@@ -1,0 +1,11 @@
+[package]
+name = "moose-audio"
+description = "Sound for the Moose engine: a software mixer, and what the listener hears of each sound through the level's sectors and portals"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+moose-assets = { path = "../moose-assets" }
+moose-scene = { path = "../moose-scene" }
+glam.workspace = true
+cpal = "0.18"

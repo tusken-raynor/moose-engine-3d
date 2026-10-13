@@ -1,0 +1,15 @@
+{
+  // For the editor only: Moose compiles scripts itself as it loads them. This makes
+  // VSCode check and complete them against moose.d.ts, with plain TypeScript's library
+  // and nothing of the browser's or Node's.
+  "compilerOptions": {
+    "target": "es2017",
+    "lib": ["es2017"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": [],
+    "strict": true,
+    "noEmit": true
+  },
+  "include": ["**/*.ts"]
+}

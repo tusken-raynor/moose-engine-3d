@@ -5,6 +5,7 @@ use crate::error::LoadError;
 use crate::level::Level;
 use crate::material::MaterialLibrary;
 use crate::mesh::Mesh;
+use crate::sound::{Sound, decode_wav};
 use crate::texture::{Texture, decode_png};
 use crate::{mmp, obj};
 
@@ -16,8 +17,12 @@ pub struct MeshId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TextureId(pub u32);
 
-/// Owns every loaded mesh and texture. Everything else refers to them by [`MeshId`] and
-/// [`TextureId`].
+/// Handle to a sound owned by [`Assets`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SoundId(pub u32);
+
+/// Owns every loaded mesh, texture and sound. Everything else refers to them by
+/// [`MeshId`], [`TextureId`] and [`SoundId`].
 ///
 /// Load between frames through `&mut Assets`; during a frame, threads share `&Assets`.
 pub struct Assets {
@@ -26,6 +31,8 @@ pub struct Assets {
     by_name: HashMap<String, MeshId>,
     textures: Vec<Texture>,
     textures_by_name: HashMap<String, TextureId>,
+    sounds: Vec<Sound>,
+    sounds_by_name: HashMap<String, SoundId>,
     materials: MaterialLibrary,
     /// Whether `materials` has been read (levels read it when they need it).
     materials_read: bool,
@@ -33,7 +40,7 @@ pub struct Assets {
 
 impl Assets {
     /// `root` is the asset directory: models are read from `root/models`, levels from
-    /// `root/levels`, textures from `root/textures`.
+    /// `root/levels`, textures from `root/textures`, sounds from `root/sounds`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -41,6 +48,8 @@ impl Assets {
             by_name: HashMap::new(),
             textures: Vec::new(),
             textures_by_name: HashMap::new(),
+            sounds: Vec::new(),
+            sounds_by_name: HashMap::new(),
             materials: MaterialLibrary::default(),
             materials_read: false,
         }
@@ -212,6 +221,65 @@ impl Assets {
     pub fn add_texture(&mut self, texture: Texture) -> TextureId {
         self.textures.push(texture);
         TextureId((self.textures.len() - 1) as u32)
+    }
+
+    pub fn sound(&self, id: SoundId) -> &Sound {
+        &self.sounds[id.0 as usize]
+    }
+
+    pub fn sounds(&self) -> &[Sound] {
+        &self.sounds
+    }
+
+    pub fn sound_id(&self, name: &str) -> Option<SoundId> {
+        self.sounds_by_name.get(name).copied()
+    }
+
+    /// Loads `root/sounds/<name>` (WAV), or returns the existing handle if it is already
+    /// loaded.
+    pub fn load_sound(&mut self, name: &str) -> Result<SoundId, LoadError> {
+        if let Some(id) = self.sound_id(name) {
+            return Ok(id);
+        }
+        let sound = self.read_sound(name)?;
+        let id = self.add_sound(sound);
+        self.sounds_by_name.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    /// Reads a loaded sound's file again, into the same handle. Returns whether it was
+    /// loaded. What is already playing it plays on as it was.
+    pub fn reload_sound(&mut self, name: &str) -> Result<bool, LoadError> {
+        let Some(id) = self.sound_id(name) else {
+            return Ok(false);
+        };
+        self.sounds[id.0 as usize] = self.read_sound(name)?;
+        Ok(true)
+    }
+
+    fn read_sound(&self, name: &str) -> Result<Sound, LoadError> {
+        let path = self.root.join("sounds").join(name);
+        let bytes = std::fs::read(&path)
+            .map_err(|e| LoadError::new(&path, None, format!("cannot read file: {e}")))?;
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("wav") => decode_wav(&path, name, &bytes),
+            _ => Err(LoadError::new(
+                &path,
+                None,
+                "unsupported sound format (expected .wav)",
+            )),
+        }
+    }
+
+    /// Adds a sound without a name; it can only be reached through the returned handle.
+    pub fn add_sound(&mut self, sound: Sound) -> SoundId {
+        self.sounds.push(sound);
+        SoundId((self.sounds.len() - 1) as u32)
+    }
+
+    /// The names of the sounds loaded from files.
+    pub fn loaded_sounds(&self) -> Vec<String> {
+        self.sounds_by_name.keys().cloned().collect()
     }
 
     /// Loads `root/levels/<name>`, loading any models its entities use.
