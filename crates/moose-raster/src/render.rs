@@ -560,6 +560,9 @@ pub struct Renderer {
     /// The frame's time in seconds, for pixels that move with it (see
     /// `PixelContext::time`); the app sets it each frame.
     pub time: f32,
+    /// The frame's number, for patterns that change from frame to frame (a dithered beam's
+    /// stipple, turned a quarter each frame); the app counts it.
+    pub frame: u32,
     materials: Vec<MaterialEntry>,
     /// Per (mesh, material): where each vertex stage input comes from, and the `sampled`
     /// built-ins. Validated once, then reused.
@@ -584,6 +587,7 @@ struct Textures<'a> {
     blank: &'a Texture,
     focal: f32,
     time: f32,
+    frame: u32,
     ambient: Vec3,
     blur: Option<&'a BlurGrid>,
     /// Lattices to build in (see `Renderer::lattice_pool`).
@@ -605,6 +609,7 @@ impl Renderer {
         Self {
             config,
             time: 0.0,
+            frame: 0,
             materials: Vec::new(),
             remaps: HashMap::new(),
             surfaces: Vec::new(),
@@ -661,6 +666,7 @@ impl Renderer {
             blank: &self.blank,
             focal: geometry.focal,
             time: self.time,
+            frame: self.frame,
             ambient: geometry.ambient,
             blur: None,
             lattices: &self.lattice_pool,
@@ -2993,7 +2999,9 @@ struct Segment {
 }
 
 /// A 4×4 ordered (Bayer) dither: a pixel of a dithered beam is lit where the light reaching
-/// it is over its entry (plus a half, over 16) at its row and column, modulo 4.
+/// it is over its entry (plus a half, over 16) at its row and column, modulo 4. The pattern
+/// is turned a quarter each frame (see [`shadow_run`]), so over four frames each pixel of a
+/// group of four by four takes four of its entries.
 const BEAM_DITHER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// Pixels between the points where a soft shadow piece's light is worked out (see
@@ -3044,14 +3052,14 @@ const BEAM_BLEND: f32 = 1.0 / 8.0;
 /// which each give their vertices' values interpolated along their edges to the row, then
 /// across it (perspective-correct, like Gouraud shading). A beam's piece fades it by its
 /// cone too, and with `dither`, each of its pixels gets all of the light or none, by
-/// `BEAM_DITHER`.
+/// `BEAM_DITHER` turned that many quarters.
 fn shadow_run(
     s: &mut RowScratch,
     bins: &ThreadBins,
     p: &PolygonSetup,
     x0: i32,
     x1: i32,
-    dither: bool,
+    dither: Option<u32>,
     smooth: Option<(f32, f32)>,
 ) {
     let len = (x1 - x0).max(0) as usize;
@@ -3262,13 +3270,19 @@ fn shadow_run(
         out[(from - x0) as usize..(o0 - x0) as usize].fill(0.0);
         // Dithered: each pixel all of the light or none, where it may be partly lit (in the
         // fade, and within the inner cone unless the piece is all lit or all dark there).
-        let thresholds = &BEAM_DITHER[(row & 3) as usize];
         let stipple = |out: &mut [f32], a: i32, b: i32| {
-            if dither {
+            if let Some(turn) = dither {
                 for x in a..b {
+                    // The pattern's entry at the pixel, the pattern turned.
+                    let (i, j) = ((row & 3) as usize, (x & 3) as usize);
+                    let entry = match turn & 3 {
+                        0 => BEAM_DITHER[i][j],
+                        1 => BEAM_DITHER[j][3 - i],
+                        2 => BEAM_DITHER[3 - i][3 - j],
+                        _ => BEAM_DITHER[3 - j][i],
+                    };
                     let o = &mut out[(x - x0) as usize];
-                    let threshold = (thresholds[(x & 3) as usize] as f32 + 0.5) / 16.0;
-                    *o = if *o > threshold { 1.0 } else { 0.0 };
+                    *o = if *o > (entry as f32 + 0.5) / 16.0 { 1.0 } else { 0.0 };
                 }
             }
         };
@@ -3444,7 +3458,8 @@ fn shade_points(
     row_points(s, lattice, p.n_out as usize, shown, x1);
     // The shadow buffer for the run: how much of each split light reaches each pixel.
     let smooth = config.smooth_edges && !config.beam_dither && !p.half_rate;
-    shadow_run(s, &bins[t], p, x0, x1, config.beam_dither, smooth.then_some((x_left, x_right)));
+    let dither = config.beam_dither.then_some(textures.frame);
+    shadow_run(s, &bins[t], p, x0, x1, dither, smooth.then_some((x_left, x_right)));
     if let Some(grid) = textures.blur {
         grid.soften(s, &bins[t], p, x0, x1);
         for (r, o) in s.reaches.iter_mut().zip(&s.occluded) {

@@ -62,7 +62,8 @@
 //!                         lighting, flashlight, rendering, sampling, controls), over it
 //!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
 //!                         degree edge (default 8; 0 is a hard edge)
-//!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
+//!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither,
+//!                         turned a quarter each frame)
 //!   --smooth-edges        smooth the edges between surfaces (anti-aliasing)
 //!   --fly                 start flying (no gravity; Space/C rise and sink) rather than
 //!                         walking (see the Physics Spec)
@@ -2584,6 +2585,8 @@ impl App {
         self.renderer
             .render(&mut target, camera.viewport, &self.geometry, &self.assets, surface_of)
             .map_err(|e| e.to_string())?;
+        // The next frame's number (a dithered beam's stipple turns with it).
+        self.renderer.frame = self.renderer.frame.wrapping_add(1);
         let t2 = Instant::now();
         Ok((
             (t1 - t0).as_secs_f64() * 1000.0,
