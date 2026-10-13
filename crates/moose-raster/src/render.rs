@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use crate::shader::{
     F32s, Fill,
     Behind, Draw, FACE_BITANGENT, FACE_NORMAL, FACE_TANGENT, LANES, LOD, MAX_STEP, MAX_TEXTURES, MAX_VARYINGS, MAX_SPLIT, NO_SPLIT, split_outputs,
-    Material, MaterialEntry, MaterialId, POSITION, Params, SampleContext, SpanJob, TextureSet,
+    Material, MaterialEntry, MaterialId, NORMAL, POSITION, Params, SampleContext, SpanJob, TextureSet,
     U32s, UV, VertexContext, blend, blend_lanes, layout_len,
 };
 
@@ -824,6 +824,9 @@ struct Remap {
     position: Option<usize>,
     uv: Option<usize>,
     lod: Option<usize>,
+    /// Offset of the `sampled` normal the material lights with (see [`NORMAL`]), if it has
+    /// one.
+    normal: Option<usize>,
 }
 
 /// Maps a material's vertex inputs onto a mesh's attributes by name, and finds its
@@ -873,6 +876,7 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
         position: None,
         uv: None,
         lod: None,
+        normal: None,
     };
     let mut offset = 0;
     for want in io.sampled {
@@ -896,6 +900,7 @@ fn remap(assets: &Assets, mesh: MeshId, material: &MaterialEntry) -> Result<Rema
                 expect(1)?;
                 remap.lod = Some(offset);
             }
+            NORMAL if want.count == 3 => remap.normal = Some(offset),
             _ => {}
         }
         offset += want.count as usize;
@@ -933,6 +938,17 @@ fn split_priority(light: &Light, center: Vec3, normal: Vec3) -> f32 {
 /// may be from the light, where the angle is smallest).
 fn lights_face(height: f32, far: f32, back: f32) -> bool {
     height > 0.0 || (back > 0.0 && height > -back * far)
+}
+
+/// Whether any normal on a polygon faces a light at `light`, the polygon's vertices being at
+/// `positions` and lit by `normals` of their own (a smooth mesh's), one each: whether some
+/// vertex's normal faces the light as seen from some vertex. Every normal and position on
+/// the polygon is a blend of its vertices', so where none does, no normal anywhere on it
+/// faces the light: its cosine is 0 all over the polygon, and leaving the light out changes
+/// nothing (sample points are all on the polygon). Each normal against the light from its
+/// own vertex only would miss a light close to a big polygon.
+fn normals_face(normals: impl Iterator<Item = Vec3>, positions: &[Vec3], light: Vec3) -> bool {
+    normals.into_iter().any(|n| positions.iter().any(|&q| n.dot(light - q) > 0.0))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1087,6 +1103,18 @@ fn setup_polygon(
     let (center, radius) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
     // Lights up to the surface's back light angle behind its plane reach it too (its bumps).
     let back = s.back_light.clamp(0.0, 1.0);
+    // A polygon lit by normals of its own (a smooth mesh's, not its plane's) is lit by a
+    // light behind its plane too, as long as some normal on it faces the light (see
+    // `normals_face`).
+    let values = &bins.values;
+    let own_normals = remap
+        .normal
+        .map(|at| (0..positions.len()).map(move |v| Vec3::from_slice(&values[v * n_vals + at..][..3])))
+        .filter(|normals| {
+            normals.clone().any(|n| {
+                n.cross(normal).length_squared() > 1e-6 * n.length_squared() || n.dot(normal) < 0.0
+            })
+        });
     let lights_it = |light: &Light| {
         let height = normal.dot(light.position - positions[0]);
         let far = light.position.distance(center) + radius;
@@ -1094,10 +1122,13 @@ fn setup_polygon(
         let in_shadow = light.shadow.is_some_and(|k| p.shadowed >> k & 1 != 0);
         !in_shadow
             && !light.excluded_by(s.excluded_lights)
-            && lights_face(height, far, back)
             && height.abs() < light.range
             && near < light.range
             && light.cone_reaches(center, radius)
+            && (lights_face(height, far, back)
+                || own_normals
+                    .clone()
+                    .is_some_and(|normals| normals_face(normals, positions, light.position)))
     };
     // Its split lights: those whose shadow covers part of it (see `SampleContext`), as
     // many as it has room for, by priority (see `split_priority`). The rest are lit whole
@@ -4205,6 +4236,28 @@ mod tests {
         assert!(lights_face(-0.33, 1.0, back) && !lights_face(-0.35, 1.0, back));
         // On the plane, a face doesn't face it.
         assert!(!lights_face(0.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn a_smooth_face_turned_from_a_light_is_lit_while_a_normal_on_it_faces_the_light() {
+        // A triangle in the floor, the light under it: its plane faces away.
+        let positions = [Vec3::ZERO, Vec3::X, Vec3::Z];
+        let light = Vec3::new(-2.0, -0.5, 0.0);
+        let up = [Vec3::Y; 3];
+        assert!(!normals_face(up.into_iter(), &positions, light));
+        // One corner's normal leans over toward the light: that corner is lit.
+        let leaning = [Vec3::new(-1.0, 0.2, 0.0), Vec3::Y, Vec3::Y];
+        assert!(normals_face(leaning.into_iter(), &positions, light));
+        // All of them lean away: none of it is.
+        let away = [Vec3::new(1.0, 0.2, 0.0); 3];
+        assert!(!normals_face(away.into_iter(), &positions, light));
+        // A light close under the middle of a big face: no corner's normal faces it from its
+        // own corner, but the far corner's does from the near one, as it does in between.
+        let positions = [Vec3::ZERO, Vec3::X * 10.0, Vec3::Z];
+        let light = Vec3::new(5.0, -0.5, 0.0);
+        let normals = [Vec3::new(-1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::Y];
+        let own = normals.iter().zip(&positions).any(|(n, &q)| n.dot(light - q) > 0.0);
+        assert!(!own && normals_face(normals.into_iter(), &positions, light));
     }
 
     #[test]

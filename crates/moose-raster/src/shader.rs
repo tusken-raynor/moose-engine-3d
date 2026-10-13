@@ -1175,6 +1175,13 @@ pub const FACE_NORMAL: &str = "face_normal";
 pub const FACE_TANGENT: &str = "face_tangent";
 pub const FACE_BITANGENT: &str = "face_bitangent";
 
+/// Name of the `sampled` value holding the normal a material lights with, in world space
+/// (three values, any length): the polygon's plane normal passed on, or the mesh's own
+/// (smooth) normals. The material fills it; the engine reads it at a polygon's vertices to
+/// tell which lights can reach the polygon: one behind its plane still lights it if some
+/// vertex's normal faces it.
+pub const NORMAL: &str = "normal";
+
 /// Name of the `sampled` value the level of detail built-in ([`LOD`]) is measured from:
 /// two texture coordinates for texture slot 0.
 pub const UV: &str = "uv";
