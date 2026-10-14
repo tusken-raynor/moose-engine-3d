@@ -1019,6 +1019,7 @@ dependencies = [
  "glam 0.33.9",
  "moose-assets",
  "moose-scene",
+ "rayon",
 ]
 
 [[package]]

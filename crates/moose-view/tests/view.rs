@@ -1,7 +1,7 @@
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{Quat, Vec2, Vec3};
-use moose_assets::Assets;
+use moose_assets::{Assets, Light};
 use moose_scene::{Camera, PORTAL_CLEARANCE, Viewport, World};
 use moose_view::{EdgeLine, PolygonKind, PolygonSource, ViewGeometry, ViewPolygon, pixel_edge};
 
@@ -817,4 +817,64 @@ fn terrain_is_drawn_in_pieces_by_sector_and_blockers_hide_what_is_behind_them() 
     out.build(&world, &assets, &far.view());
     assert_eq!(out.stats.entities_blocked, 0);
     assert!(hidden.iter().all(|&e| drawn(&out, e)));
+}
+
+/// The shadows cast on what is in view are worked out across threads (see
+/// `ViewConfig::parallel_shadows`): the view is the same whether one thread does it all or
+/// several share it from the start, the first time (static lights' shadows carved as their
+/// surfaces are seen) and after (those kept).
+#[test]
+fn threads_do_not_change_the_shadows() {
+    let many = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+    for level in ["shiny_rooms.mmp", "walker_rooms.mmp", "mirror_rooms.mmp"] {
+        let (mut world, assets) = load(level);
+        // Every light casts shadows, and a flashlight at the camera, a beam, is carved
+        // every frame.
+        let mut lights = world.lights().to_vec();
+        for (i, light) in lights.iter_mut().enumerate() {
+            light.shadow = Some(i as u8 + 1);
+        }
+        let geometry = assets.mesh(world.geometry);
+        let (lo, hi) = geometry
+            .positions
+            .iter()
+            .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &p| (lo.min(p), hi.max(p)));
+        let mut rng = Lcg(11);
+        let alone = moose_view::ViewConfig {
+            max_reflections: 2,
+            parallel_shadows: std::time::Duration::MAX,
+            ..Default::default()
+        };
+        let shared = moose_view::ViewConfig { parallel_shadows: std::time::Duration::ZERO, ..alone };
+        let (mut one, mut several) = (ViewGeometry::new(), ViewGeometry::new());
+        (one.config, several.config) = (alone, shared);
+        let (mut views, mut pieces) = (0, 0);
+        while views < 12 {
+            let p = Vec3::new(rng.range(lo.x, hi.x), rng.range(lo.y, hi.y), rng.range(lo.z, hi.z));
+            let Some(sector) = world.find_sector(p) else { continue };
+            let mut cam = Camera::at_spawn(&world.spawn_points[0], SMALL);
+            (cam.position, cam.sector) = (p, sector);
+            (cam.yaw, cam.pitch) = (rng.range(0.0, TAU), rng.range(-1.0, 1.0));
+            let mut flashlight = Light::spot(sector, p, Vec3::ONE, 16.0, cam.forward(), 12.0, 20.0);
+            (flashlight.shadow, flashlight.radius, flashlight.beam) = (Some(0), 0.05, true);
+            let mut all = lights.clone();
+            all.push(flashlight);
+            world.set_lights(all, world.ambient);
+            one.build(&world, &assets, &cam.view());
+            many.install(|| several.build(&world, &assets, &cam.view()));
+            let what = format!("{level}, view {views}");
+            assert_eq!(one.polygons, several.polygons, "{what}");
+            assert_eq!(one.vertices, several.vertices, "{what}");
+            assert_eq!(one.edge_lines, several.edge_lines, "{what}");
+            assert_eq!(one.world_positions, several.world_positions, "{what}");
+            assert_eq!(one.weights, several.weights, "{what}");
+            assert_eq!(one.shadow_pieces, several.shadow_pieces, "{what}");
+            assert_eq!(one.shadow_vertices, several.shadow_vertices, "{what}");
+            assert_eq!(one.shadow_softs, several.shadow_softs, "{what}");
+            assert_eq!(one.shadow_wedges, several.shadow_wedges, "{what}");
+            views += 1;
+            pieces += one.shadow_pieces.len();
+        }
+        assert!(pieces > 100, "{level}: shadows were cast ({pieces} pieces)");
+    }
 }

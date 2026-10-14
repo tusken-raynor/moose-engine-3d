@@ -456,7 +456,10 @@ struct Volume {
     size: Source,
 }
 
-/// Carves polygons for every shadow-casting light. Reuse one; buffers keep their capacity.
+/// What blocks every shadow-casting light this frame (see [`Carver::prepare`]), and the
+/// shadows kept from frame to frame. Polygons are carved by it into [`Pieces`]: it doesn't
+/// change while they are, so threads carve at once, each into its own. Reuse one; buffers
+/// keep their capacity.
 #[derive(Default)]
 pub(crate) struct Carver {
     casters: Vec<Caster>,
@@ -466,18 +469,6 @@ pub(crate) struct Carver {
     volumes: Vec<Volume>,
     volume_edges: Vec<VolumeEdge>,
     wedges: Vec<Wedge>,
-    // Per polygon: each piece's soft shadows, as indices into `volumes`.
-    volume_lists: Vec<u32>,
-    // Per polygon.
-    stride: usize,
-    records: Vec<f32>,
-    edges: Vec<PieceEdge>,
-    pieces: Vec<Piece>,
-    work: Vec<Piece>,
-    rest: Vec<Piece>,
-    distances: Vec<f32>,
-    front: Vec<(usize, Tag)>,
-    back: Vec<(usize, Tag)>,
     // Scratch.
     points: Vec<Vec3>,
     /// An occluder's faces, as ranges of `points`.
@@ -490,11 +481,31 @@ pub(crate) struct Carver {
     stack: Vec<(u32, Option<Window>, u16, Range<usize>)>,
     /// Windows' edges (see [`Carver::window_edges_of`]), for the windows beyond.
     window_edges: Vec<WindowEdge>,
-    /// While building a cache: edges along the polygon's own keep that label.
-    keep_polygon_edges: bool,
     /// Cached shadows: per (shadow slot, polygon key), and per slot what they were carved for.
     cache: HashMap<(u8, (u8, u32, u32)), Cached>,
     cache_keys: [Option<CacheKey>; MAX_SHADOW_SLOTS as usize],
+    /// The pieces the tests carve into.
+    #[cfg(test)]
+    own: Pieces,
+}
+
+/// A polygon carved (see [`Pieces::carve`]): its pieces, and the space to carve the next
+/// in. One per thread carving; buffers keep their capacity.
+#[derive(Default)]
+pub(crate) struct Pieces {
+    /// Each piece's soft shadows, as indices into `Carver::volumes`.
+    volume_lists: Vec<u32>,
+    stride: usize,
+    records: Vec<f32>,
+    edges: Vec<PieceEdge>,
+    pieces: Vec<Piece>,
+    work: Vec<Piece>,
+    rest: Vec<Piece>,
+    distances: Vec<f32>,
+    front: Vec<(usize, Tag)>,
+    back: Vec<(usize, Tag)>,
+    /// While building a cache: edges along the polygon's own keep that label.
+    keep_polygon_edges: bool,
 }
 
 impl Carver {
@@ -826,6 +837,12 @@ impl Carver {
         // Meshes may have been replaced (models reloaded, posed copies reused).
         self.convex.clear();
         self.cache_keys = [None; MAX_SHADOW_SLOTS as usize];
+    }
+
+    /// Whether any light this frame casts shadows, or is a beam: whether there is anything
+    /// to carve.
+    pub fn casts(&self) -> bool {
+        !self.casters.is_empty()
     }
 
     /// Whether any light this frame is a beam (see [`Light::beam`]).
@@ -1167,98 +1184,115 @@ impl Carver {
         best.map_or(0.0, |(_, w)| w)
     }
 
+    /// The shadow slot bits of static lights: those whose shadows' static parts (windows and
+    /// static occluders) are cached on static polygons.
+    pub fn static_slots(&self) -> u32 {
+        self.casters.iter().filter(|c| c.is_static).fold(0, |bits, c| bits | c.bit)
+    }
+
     /// The shadow slot bits of static lights, for a static polygon (world space, in its own
     /// order: `polygon`, facing `receiver.normal`): what their shadows' cached static parts
-    /// would cover it with. Carves them the first time (see [`Parts::Static`]).
-    pub fn cache(&mut self, key: (u8, u32, u32), polygon: &[Vec3], receiver: &Receiver) -> u32 {
-        let mut bits = 0;
-        for c in 0..self.casters.len() {
-            let caster = &self.casters[c];
-            if !caster.is_static {
-                continue;
+    /// would cover it with. Carves them the first time (see [`Carver::carve_cached`]).
+    pub fn cache(&mut self, pieces: &mut Pieces, key: (u8, u32, u32), polygon: &[Vec3], receiver: &Receiver) -> u32 {
+        let bits = self.static_slots();
+        let mut rest = bits;
+        while rest != 0 {
+            let slot = rest.trailing_zeros() as u8;
+            rest &= rest - 1;
+            if !self.cache.contains_key(&(slot, key)) {
+                let cached = self.carve_cached(pieces, slot, polygon, receiver);
+                self.cache.insert((slot, key), cached);
             }
-            let (bit, slot) = (caster.bit, caster.bit.trailing_zeros() as u8);
-            bits |= bit;
-            if self.cache.contains_key(&(slot, key)) {
-                continue;
-            }
-            // Carve it in world space: world positions in place of clip coordinates, so
-            // cuts carry world points, and edges along the polygon keep saying so.
-            let n = polygon.len();
-            let stride = 6 + n;
-            let mut records = Vec::with_capacity(n * stride);
-            for (i, p) in polygon.iter().enumerate() {
-                records.extend_from_slice(&[p.x, p.y, p.z, p.x, p.y, p.z]);
-                records.extend((0..n).map(|k| if k == i { 1.0 } else { 0.0 }));
-            }
-            let edges: Vec<Edge> = (0..n as u16).map(Edge::Input).collect();
-            self.keep_polygon_edges = true;
-            let only = Receiver {
-                parts: Parts::Static(bit),
-                hard: false,
-                ..*receiver
-            };
-            let count = self.carve(&records, &edges, stride, 0, &only).len();
-            self.keep_polygon_edges = false;
-            let mut cached = Cached {
-                full: count > 0,
-                ..Cached::default()
-            };
-            // Soft edges already copied: volume index to index in `cached.soft`.
-            let mut copied: HashMap<u32, u32> = HashMap::new();
-            for i in 0..count {
-                let piece = self.pieces[i];
-                let dark = piece.shadowed & bit != 0;
-                let soft = !dark && self.soft_slots(&piece) & bit != 0;
-                cached.full &= dark;
-                if !dark && !soft {
-                    continue;
-                }
-                // The soft edges it is in, kept with it (the renderer takes them at each pixel).
-                let first_soft = cached.piece_soft.len() as u32;
-                if soft {
-                    let volumes = &self.volume_lists
-                        [piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
-                    for &v in volumes {
-                        let volume = &self.volumes[v as usize];
-                        if volume.slot != slot {
-                            continue;
-                        }
-                        let index = *copied.entry(v).or_insert_with(|| {
-                            let start = cached.wedges.len() as u32;
-                            cached.wedges.extend_from_slice(
-                                &self.wedges[volume.wedges.start as usize..volume.wedges.end as usize],
-                            );
-                            cached.soft.push((start..cached.wedges.len() as u32, volume.window));
-                            cached.soft.len() as u32 - 1
-                        });
-                        cached.piece_soft.push(index);
-                    }
-                }
-                let piece_soft = first_soft..cached.piece_soft.len() as u32;
-                let start = cached.vertices.len() as u32;
-                let piece_records = self.records(&piece);
-                let piece_edges = self.edges(&piece);
-                let corners: Vec<Vec3> =
-                    piece_records.chunks_exact(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
-                for (&world, &edge) in corners.iter().zip(piece_edges) {
-                    let edge = match edge {
-                        PieceEdge::Clip(Edge::Input(e)) => CachedEdge::Polygon(e),
-                        PieceEdge::Line(a, b) => (0..n)
-                            .find(|&e| {
-                                let (p, q) = (polygon[e], polygon[(e + 1) % n]);
-                                (a, b) == (p, q) || (a, b) == (q, p)
-                            })
-                            .map_or(CachedEdge::Line(a, b), |e| CachedEdge::Polygon(e as u16)),
-                        PieceEdge::Clip(Edge::Plane(_)) => unreachable!("no clip planes here"),
-                    };
-                    cached.vertices.push(CachedVertex { world, edge });
-                }
-                cached.pieces.push((start..cached.vertices.len() as u32, piece_soft));
-            }
-            self.cache.insert((slot, key), cached);
         }
         bits
+    }
+
+    /// Keeps a static polygon's shadow from the static light in shadow slot `slot` (see
+    /// [`Carver::carve_cached`]), unless it has one already.
+    pub fn keep(&mut self, slot: u8, key: (u8, u32, u32), cached: Cached) {
+        self.cache.entry((slot, key)).or_insert(cached);
+    }
+
+    /// Carves the shadow of the static light in shadow slot `slot` on a static polygon
+    /// (world space, in its own order: `polygon`, facing `receiver.normal`), to keep: its
+    /// static parts (see [`Parts::Static`]).
+    pub fn carve_cached(&self, pieces: &mut Pieces, slot: u8, polygon: &[Vec3], receiver: &Receiver) -> Cached {
+        let bit = 1u32 << slot;
+        // Carve it in world space: world positions in place of clip coordinates, so
+        // cuts carry world points, and edges along the polygon keep saying so.
+        let n = polygon.len();
+        let stride = 6 + n;
+        let mut records = Vec::with_capacity(n * stride);
+        for (i, p) in polygon.iter().enumerate() {
+            records.extend_from_slice(&[p.x, p.y, p.z, p.x, p.y, p.z]);
+            records.extend((0..n).map(|k| if k == i { 1.0 } else { 0.0 }));
+        }
+        let edges: Vec<Edge> = (0..n as u16).map(Edge::Input).collect();
+        pieces.keep_polygon_edges = true;
+        let only = Receiver {
+            parts: Parts::Static(bit),
+            hard: false,
+            ..*receiver
+        };
+        let count = pieces.carve(self, &records, &edges, stride, 0, &only).len();
+        pieces.keep_polygon_edges = false;
+        let mut cached = Cached {
+            full: count > 0,
+            ..Cached::default()
+        };
+        // Soft edges already copied: volume index to index in `cached.soft`.
+        let mut copied: HashMap<u32, u32> = HashMap::new();
+        for i in 0..count {
+            let piece = pieces.pieces[i];
+            let dark = piece.shadowed & bit != 0;
+            let soft = !dark && pieces.soft_slots(self, &piece) & bit != 0;
+            cached.full &= dark;
+            if !dark && !soft {
+                continue;
+            }
+            // The soft edges it is in, kept with it (the renderer takes them at each pixel).
+            let first_soft = cached.piece_soft.len() as u32;
+            if soft {
+                let volumes = &pieces.volume_lists
+                    [piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
+                for &v in volumes {
+                    let volume = &self.volumes[v as usize];
+                    if volume.slot != slot {
+                        continue;
+                    }
+                    let index = *copied.entry(v).or_insert_with(|| {
+                        let start = cached.wedges.len() as u32;
+                        cached.wedges.extend_from_slice(
+                            &self.wedges[volume.wedges.start as usize..volume.wedges.end as usize],
+                        );
+                        cached.soft.push((start..cached.wedges.len() as u32, volume.window));
+                        cached.soft.len() as u32 - 1
+                    });
+                    cached.piece_soft.push(index);
+                }
+            }
+            let piece_soft = first_soft..cached.piece_soft.len() as u32;
+            let start = cached.vertices.len() as u32;
+            let piece_records = pieces.records(&piece);
+            let piece_edges = pieces.edges(&piece);
+            let corners: Vec<Vec3> =
+                piece_records.chunks_exact(stride).map(|r| Vec3::new(r[3], r[4], r[5])).collect();
+            for (&world, &edge) in corners.iter().zip(piece_edges) {
+                let edge = match edge {
+                    PieceEdge::Clip(Edge::Input(e)) => CachedEdge::Polygon(e),
+                    PieceEdge::Line(a, b) => (0..n)
+                        .find(|&e| {
+                            let (p, q) = (polygon[e], polygon[(e + 1) % n]);
+                            (a, b) == (p, q) || (a, b) == (q, p)
+                        })
+                        .map_or(CachedEdge::Line(a, b), |e| CachedEdge::Polygon(e as u16)),
+                    PieceEdge::Clip(Edge::Plane(_)) => unreachable!("no clip planes here"),
+                };
+                cached.vertices.push(CachedVertex { world, edge });
+            }
+            cached.pieces.push((start..cached.vertices.len() as u32, piece_soft));
+        }
+        cached
     }
 
     /// A static polygon's cached shadow from the static light in shadow slot `slot` (see
@@ -1266,20 +1300,22 @@ impl Carver {
     pub fn cached(&self, slot: u8, key: (u8, u32, u32)) -> Option<&Cached> {
         self.cache.get(&(slot, key))
     }
+}
 
+impl Pieces {
     /// The shadow slots of the lights whose soft edges `piece` is in.
-    pub fn soft_slots(&self, piece: &Piece) -> u32 {
+    pub fn soft_slots(&self, carver: &Carver, piece: &Piece) -> u32 {
         self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize]
             .iter()
-            .fold(0u32, |bits, &v| bits | 1 << self.volumes[v as usize].slot)
+            .fold(0u32, |bits, &v| bits | 1 << carver.volumes[v as usize].slot)
     }
 
     /// How much of each light whose soft edges `piece` is in reaches its corners (as the
     /// renderer takes it at each pixel, see `soft_reach`), slot by slot in order, each twice
     /// (as arriving and leaving the corner); returns their slots.
     #[cfg(test)]
-    pub fn soft_values(&self, piece: &Piece, out: &mut Vec<(f32, f32)>) -> u32 {
-        let slots = self.soft_slots(piece);
+    pub fn soft_values(&self, carver: &Carver, piece: &Piece, out: &mut Vec<(f32, f32)>) -> u32 {
+        let slots = self.soft_slots(carver, piece);
         let (mut softs, mut wedges) = (Vec::new(), Vec::new());
         for r in self.records(piece).chunks_exact(self.stride) {
             let p = Vec3::new(r[3], r[4], r[5]);
@@ -1289,7 +1325,7 @@ impl Carver {
                 bits &= bits - 1;
                 softs.clear();
                 wedges.clear();
-                self.piece_softs(piece, slot, &mut softs, &mut wedges);
+                self.piece_softs(carver, piece, slot, &mut softs, &mut wedges);
                 let v = crate::frame::soft_reach(&softs, &wedges, p);
                 out.push((v, v));
             }
@@ -1300,16 +1336,16 @@ impl Carver {
     /// The soft edges of `piece` from the light in shadow slot `slot` (those of the windows
     /// and occluders it is in the soft edge of), appended to `softs` and `wedges` for the
     /// renderer to take at each pixel (see [`crate::frame::soft_reach`]).
-    pub fn piece_softs(&self, piece: &Piece, slot: u8, softs: &mut Vec<ShadowSoft>, wedges: &mut Vec<ShadowWedge>) {
+    pub fn piece_softs(&self, carver: &Carver, piece: &Piece, slot: u8, softs: &mut Vec<ShadowSoft>, wedges: &mut Vec<ShadowWedge>) {
         let volumes =
             &self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize];
         for &v in volumes {
-            let volume = &self.volumes[v as usize];
+            let volume = &carver.volumes[v as usize];
             if volume.slot != slot {
                 continue;
             }
             let start = wedges.len() as u32;
-            wedges.extend(self.wedges[volume.wedges.start as usize..volume.wedges.end as usize].iter().map(Wedge::shadow));
+            wedges.extend(carver.wedges[volume.wedges.start as usize..volume.wedges.end as usize].iter().map(Wedge::shadow));
             softs.push(ShadowSoft { wedges: start..wedges.len() as u32, window: volume.window });
         }
     }
@@ -1331,11 +1367,13 @@ impl Carver {
     }
 
     /// Carves a clipped polygon (`records` of `stride` floats: clip x, y, w, then world
-    /// x, y, z, then weights; `edges` from the clipper) for every shadow-casting light.
+    /// x, y, z, then weights; `edges` from the clipper) for every shadow-casting light of
+    /// `carver`.
     /// Clip-plane edges numbered `lined` or more have no line of their own. Returns its
     /// pieces.
     pub fn carve(
         &mut self,
+        carver: &Carver,
         records: &[f32],
         edges: &[Edge],
         stride: usize,
@@ -1368,9 +1406,9 @@ impl Carver {
             first_volume: 0,
             volume_count: 0,
         });
-        for c in 0..self.casters.len() {
+        for c in 0..carver.casters.len() {
             let (bit, source, range, light) = {
-                let c = &self.casters[c];
+                let c = &carver.casters[c];
                 (c.bit, c.source, c.range, c.light)
             };
             // Which of its parts: static ones (windows too), moving ones, or all.
@@ -1379,7 +1417,7 @@ impl Carver {
                 Parts::Static(mask) if mask & bit != 0 => (true, false),
                 Parts::Static(_) => continue,
                 Parts::Cached(mask) => (mask & bit == 0, true),
-                Parts::Beams if self.casters[c].beam.is_some() => (false, true),
+                Parts::Beams if carver.casters[c].beam.is_some() => (false, true),
                 Parts::Beams => continue,
             };
             // Facing away from the light, or out of its reach (all of it beyond its range, or
@@ -1397,7 +1435,7 @@ impl Carver {
             }
             // A beam: outside the pyramid around its cone is dark, and inside it the cone
             // fades the light (see `Light::beam`), unless all of it is within the inner cone.
-            if moving && receiver.beams && let Some(beam) = self.casters[c].beam.clone() {
+            if moving && receiver.beams && let Some(beam) = carver.casters[c].beam.clone() {
                 let within = records.chunks_exact(stride).all(|r| {
                     let ray = beam.frame.ray(Vec3::new(r[3], r[4], r[5]));
                     ray.x >= light.cos_inner * ray.length()
@@ -1407,7 +1445,7 @@ impl Carver {
                     self.pieces.clear();
                     for i in 0..self.work.len() {
                         self.rest.clear();
-                        let inside = self.split_region(self.work[i], beam.planes.clone(), lined);
+                        let inside = self.split_region(carver, self.work[i], beam.planes.clone(), lined);
                         for mut outside in self.rest.drain(..) {
                             outside.shadowed |= bit;
                             self.pieces.push(outside);
@@ -1419,13 +1457,13 @@ impl Carver {
                     }
                 }
             }
-            if receiver.parts == Parts::Beams || !self.casters[c].shadows {
+            if receiver.parts == Parts::Beams || !carver.casters[c].shadows {
                 continue;
             }
             // Portals: unless it is in the light's own sector, only what some window into
             // its sectors reaches is lit (softly at its edges, from a light with a size).
             // What is dark already stays so.
-            if statics && !self.casters[c].whole.is_some_and(|w| sectors.contains(&w)) {
+            if statics && !carver.casters[c].whole.is_some_and(|w| sectors.contains(&w)) {
                 std::mem::swap(&mut self.work, &mut self.pieces);
                 self.pieces.clear();
                 self.work.retain(|piece| {
@@ -1435,12 +1473,12 @@ impl Carver {
                     }
                     !dark
                 });
-                for w in self.casters[c].windows.clone() {
-                    let (sector, v) = self.windows[w as usize];
+                for w in carver.casters[c].windows.clone() {
+                    let (sector, v) = carver.windows[w as usize];
                     if !sectors.contains(&sector) {
                         continue;
                     }
-                    let volume = &self.volumes[v as usize];
+                    let volume = &carver.volumes[v as usize];
                     let planes = if receiver.hard { volume.hard.clone() } else { volume.planes.clone() };
                     // What no window has reached yet waits for the next, and so does what
                     // one lets only part of the light through (its soft edge): another
@@ -1448,14 +1486,14 @@ impl Carver {
                     let mut next = Vec::new();
                     for piece in std::mem::take(&mut self.work) {
                         self.rest.clear();
-                        let inside = self.split_region(piece, planes.clone(), lined);
+                        let inside = self.split_region(carver, piece, planes.clone(), lined);
                         next.append(&mut self.rest);
                         if let Some(inside) = inside {
                             if receiver.hard {
                                 self.pieces.push(inside);
                             } else {
                                 let done = self.pieces.len();
-                                self.soft_split(inside, v, bit, lined);
+                                self.soft_split(carver, inside, v, bit, lined);
                                 let mut k = done;
                                 while k < self.pieces.len() {
                                     if self.in_volume(&self.pieces[k], v) {
@@ -1471,15 +1509,15 @@ impl Carver {
                 }
                 // Outside every window: dark. In some window's soft edge: lit that much.
                 for mut piece in std::mem::take(&mut self.work) {
-                    if !self.in_window(&piece, bit) {
+                    if !self.in_window(carver, &piece, bit) {
                         piece.shadowed |= bit;
                     }
                     self.pieces.push(piece);
                 }
             }
             // Occluders: each lit piece is split by each shadow volume.
-            for v in self.casters[c].volumes.clone() {
-                let volume = &self.volumes[v as usize];
+            for v in carver.casters[c].volumes.clone() {
+                let volume = &carver.volumes[v as usize];
                 // Blurred (not in reflections), hard, or soft.
                 let blur = volume.blur && !receiver.hard;
                 let planes = if receiver.hard { volume.hard.clone() } else { volume.planes.clone() };
@@ -1502,7 +1540,7 @@ impl Carver {
                         continue;
                     }
                     self.rest.clear();
-                    let inside = self.split_region(piece, planes.clone(), lined);
+                    let inside = self.split_region(carver, piece, planes.clone(), lined);
                     let rest = std::mem::take(&mut self.rest);
                     self.pieces.extend_from_slice(&rest);
                     self.rest = rest;
@@ -1514,7 +1552,7 @@ impl Carver {
                             inside.shadowed |= bit;
                             self.pieces.push(inside);
                         } else {
-                            self.soft_split(inside, v, bit, lined);
+                            self.soft_split(carver, inside, v, bit, lined);
                         }
                     }
                 }
@@ -1527,14 +1565,14 @@ impl Carver {
     /// occluder's full shadow (marked with `bit`) or lit by the window; otherwise it is
     /// carved sector by sector, each split by its wedge's core plane, the core carved out
     /// of what is past it, and the rest of it in the soft edge. Pieces go to `self.pieces`.
-    fn soft_split(&mut self, piece: Piece, v: u32, bit: u32, lined: usize) {
-        let volume = &self.volumes[v as usize];
+    fn soft_split(&mut self, carver: &Carver, piece: Piece, v: u32, bit: u32, lined: usize) {
+        let volume = &carver.volumes[v as usize];
         let (core, sectors, window) = (volume.core.clone(), volume.sectors.clone(), volume.window);
         if core.is_empty() {
             let mut piece = piece;
             if window {
                 // All of the light comes through: whatever other windows let through.
-                piece = self.without_windows(piece, bit);
+                piece = self.without_windows(carver, piece, bit);
             } else {
                 piece.shadowed |= bit;
             }
@@ -1548,24 +1586,24 @@ impl Carver {
             let mut next = Vec::new();
             for part in work {
                 self.rest.clear();
-                let held = self.split_region(part, planes.clone(), lined);
+                let held = self.split_region(carver, part, planes.clone(), lined);
                 next.append(&mut self.rest);
                 if let Some(held) = held {
-                    let core_k = self.planes[(core.start + k as u32) as usize];
+                    let core_k = carver.planes[(core.start + k as u32) as usize];
                     let (past, before) = self.split(held, core_k, lined);
                     if let Some(before) = before {
                         let before = self.with_volume(before, v);
                         self.pieces.push(before);
                     }
                     if let Some(past) = past {
-                        self.soft_core(past, core.clone(), v, bit, window, lined);
+                        self.soft_core(carver, past, core.clone(), v, bit, window, lined);
                     }
                 }
             }
             work = next;
         }
         for part in work {
-            self.soft_core(part, core.clone(), v, bit, window, lined);
+            self.soft_core(carver, part, core.clone(), v, bit, window, lined);
         }
         self.rest = saved;
     }
@@ -1573,8 +1611,10 @@ impl Carver {
     /// Carves volume `v`'s core (within its `core` planes) out of `piece`: an occluder's
     /// full shadow (marked with `bit`), or the part a window lets all of the light through;
     /// the rest of `piece` is in the soft edge.
+    #[allow(clippy::too_many_arguments)]
     fn soft_core(
         &mut self,
+        carver: &Carver,
         piece: Piece,
         core: Range<u32>,
         v: u32,
@@ -1583,10 +1623,10 @@ impl Carver {
         lined: usize,
     ) {
         let saved = std::mem::take(&mut self.rest);
-        if let Some(mut inside) = self.split_region(piece, core, lined) {
+        if let Some(mut inside) = self.split_region(carver, piece, core, lined) {
             if window {
                 // All of the light comes through: whatever other windows let through.
-                inside = self.without_windows(inside, bit);
+                inside = self.without_windows(carver, inside, bit);
             } else {
                 inside.shadowed |= bit;
             }
@@ -1606,24 +1646,24 @@ impl Carver {
     }
 
     /// Whether `piece` is in the soft edge of a window of the light with shadow bit `bit`.
-    fn in_window(&self, piece: &Piece, bit: u32) -> bool {
+    fn in_window(&self, carver: &Carver, piece: &Piece, bit: u32) -> bool {
         self.volume_lists[piece.first_volume as usize..(piece.first_volume + piece.volume_count) as usize]
             .iter()
             .any(|&v| {
-                let volume = &self.volumes[v as usize];
+                let volume = &carver.volumes[v as usize];
                 volume.window && 1 << volume.slot == bit
             })
     }
 
     /// `piece` without the soft edges of the light with shadow bit `bit`'s windows.
-    fn without_windows(&mut self, piece: Piece, bit: u32) -> Piece {
-        if !self.in_window(&piece, bit) {
+    fn without_windows(&mut self, carver: &Carver, piece: Piece, bit: u32) -> Piece {
+        if !self.in_window(carver, &piece, bit) {
             return piece;
         }
         let first = self.volume_lists.len() as u32;
         for k in piece.first_volume..piece.first_volume + piece.volume_count {
             let v = self.volume_lists[k as usize];
-            let volume = &self.volumes[v as usize];
+            let volume = &carver.volumes[v as usize];
             if !(volume.window && 1 << volume.slot == bit) {
                 self.volume_lists.push(v);
             }
@@ -1648,12 +1688,12 @@ impl Carver {
         }
     }
 
-    /// Splits `piece` by the region inside every plane of `planes` (in `self.planes`):
+    /// Splits `piece` by the region inside every plane of `planes` (in `carver.planes`):
     /// returns the part inside, if any, and appends the parts outside to `self.rest`.
-    fn split_region(&mut self, piece: Piece, planes: Range<u32>, lined: usize) -> Option<Piece> {
+    fn split_region(&mut self, carver: &Carver, piece: Piece, planes: Range<u32>, lined: usize) -> Option<Piece> {
         let mut current = piece;
         for k in planes {
-            let plane = self.planes[k as usize];
+            let plane = carver.planes[k as usize];
             let (front, back) = self.split(current, plane, lined);
             if let Some(back) = back {
                 self.rest.push(back);
@@ -1984,6 +2024,32 @@ fn clip_points(points: &mut Vec<Vec3>, next: &mut Vec<Vec3>, plane: Half) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As the tests carve: one polygon at a time, into the carver's own pieces.
+    impl Carver {
+        fn carve(&mut self, records: &[f32], edges: &[Edge], stride: usize, lined: usize, receiver: &Receiver) -> &[Piece] {
+            let mut own = std::mem::take(&mut self.own);
+            own.carve(self, records, edges, stride, lined, receiver);
+            self.own = own;
+            &self.own.pieces
+        }
+
+        fn piece(&self, i: usize) -> Piece {
+            self.own.piece(i)
+        }
+
+        fn records(&self, piece: &Piece) -> &[f32] {
+            self.own.records(piece)
+        }
+
+        fn edges(&self, piece: &Piece) -> &[PieceEdge] {
+            self.own.edges(piece)
+        }
+
+        fn soft_values(&self, piece: &Piece, out: &mut Vec<(f32, f32)>) -> u32 {
+            self.own.soft_values(self, piece, out)
+        }
+    }
 
     /// A carver with one caster: a light at `light` casting the shadows of the given
     /// convex occluders (each a list of faces), lighting its own sector 0 whole.
@@ -2978,7 +3044,7 @@ mod tests {
             Vec3::new(3.0, 0.0, -3.0),
         ];
         let receiver = at(Vec3::Y, floor[0]);
-        assert_eq!(c.cache((0, 7, 0), &floor, &receiver), 1);
+        assert_eq!(c.cache(&mut Pieces::default(), (0, 7, 0), &floor, &receiver), 1);
         // Carved directly.
         let stride = RECORD_FLOATS + 4;
         let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();

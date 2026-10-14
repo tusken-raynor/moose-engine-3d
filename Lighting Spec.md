@@ -395,6 +395,28 @@ Sep 29. `ViewConfig::dynamic_shadows` (the options menu's Lighting page, and `--
 - **Cost saved:** in a sunny_rooms view with the flashlight, the moving lamp and the sun, the view takes about 0.054 ms off against 0.33 ms on.
 - **Lighting stays correct:** a light's reach is still clipped to the openings it passes through (see Lights and where they reach); only occlusion inside the sectors it reaches is lost.
 
+## Carving across threads
+
+Oct 13. Shadows carved every frame are worked out by every thread, a polygon at a time (`ViewGeometry::cast_shadows`).
+
+- **Two steps:** the view is walked as before, on one thread, and each polygon drawn is queued with what its shadows need (its clipped records, the planes it was clipped to, its sectors). Once everything is drawn, the queue is carved.
+- **What threads share:** the carver (`Carver`), which holds what blocks each light this frame and the cached shadows, and doesn't change while polygons are carved. Each thread carves into pieces of its own (`Pieces`).
+- **A polygon at a time:** some polygons take a thousand times longer than others (those many shadows cross), so whichever thread is free takes the next one.
+- **The same view:** each thread puts its shadow pieces in lists of its own, and they are joined to the view's in the polygons' order. The view is bit for bit the same for any number of threads; `threads_do_not_change_the_shadows` checks it.
+- **Cached shadows carved for the first time** are carved by the thread that meets them and kept once the lists are joined. A polygon seen twice in such a frame has them carved twice, the same.
+- **One thread starts alone** (`ViewConfig::parallel_shadows`, 250 µs): waking the pool costs 30 to 70 µs, more than all the carving in the test levels takes (their whole view is 0.01 to 0.2 ms). The others are woken for what is left after that. Counting polygons instead didn't tell: canyon_day has many in view and little to carve.
+- **Baking** is still one thread's.
+
+`tools/gen_shadow_stress_level.py` generates `shadow_stress.mmp`, for timing it: two rooms of 1 m squares joined by a doorway, 20 lights that cast shadows (6 of them moving) and 70 crates (28 of them not static).
+
+| shadow_stress, M1 Pro (8 + 2 cores) | Before | 1 thread | 2 | 4 | 8 | 10 |
+| --- | --- | --- | --- | --- | --- | --- |
+| View, from the spawn point (app bench) | 707 ms | 713 ms | 378 ms | 194 ms | 107 ms | 104 ms |
+| View, 10 random views | 155 ms | 153 ms | 82 ms | 45 ms | 27 ms | 26 ms |
+
+- **What is left on one thread:** walking the view (1.5 to 2.5 ms there), joining the lists (2 to 3 ms for 100,000 to 200,000 shadow pieces), and the longest single polygon (8 ms).
+- **The test levels** are as before, within noise (shiny_rooms 0.09 ms, cheese_1 0.18 ms, canyon_day 0.13 ms).
+
 ## Sky box and bloom (experiment, Oct 4; branch `sky-hdr`)
 
 - **Sky box:** sky surfaces can be drawn with `SkyBox`: a cube map seen from the eye (the direction from the eye, affine on the polygon, so exact between sample points), so the sky looks the same whichever surfaces it's drawn on. The faces are baked by `cargo run --release -p moose-assets --example bake_sky` (`sky_px.png` ... `sky_nz.png`, 512 square): a gradient, haze below the horizon, and clouds from 3D noise. The sun isn't baked: the shader draws a disk (2.5 times the light's angle, `SUN_DISK_SCALE`) and glare toward the level's first directional light, tinted by its color, so it always matches the lighting.

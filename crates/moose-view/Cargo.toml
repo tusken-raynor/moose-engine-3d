@@ -8,3 +8,4 @@ edition.workspace = true
 moose-assets = { path = "../moose-assets" }
 moose-scene = { path = "../moose-scene" }
 glam.workspace = true
+rayon.workspace = true

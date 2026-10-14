@@ -1,12 +1,15 @@
 use std::ops::Range;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A, Vec4};
 use moose_assets::{
     Assets, EntityKind, Mesh, MeshId, Plane, Light, PolyFlags, Polygon, Portal,
 };
 use moose_scene::{View, World};
+use rayon::prelude::*;
 
-use crate::carve::{CachedEdge, Carver, Parts, PieceEdge, Receiver};
+use crate::carve::{Cached, CachedEdge, Carver, Parts, PieceEdge, Pieces, Receiver};
 use crate::clip::{ClipPlane, Clipper, Edge};
 
 /// Tolerance for treating the eye as lying exactly on a portal's plane, in meters. Camera
@@ -263,6 +266,11 @@ pub struct ViewConfig {
     /// light's size as given (0: hard): all of a dynamic light's, and moving occluders' of
     /// static lights. Cached (baked) shadows keep the light's size.
     pub dynamic_softness: f32,
+    /// How long one thread works out the shadows on the polygons in view before the rest
+    /// are shared across threads: waking the pool costs tens of microseconds, more than
+    /// all of them take where few shadows fall. Zero shares them from the start, and
+    /// `Duration::MAX` never does. The view is the same either way.
+    pub parallel_shadows: Duration,
 }
 
 impl Default for ViewConfig {
@@ -272,6 +280,7 @@ impl Default for ViewConfig {
             cache_shadows: true,
             dynamic_shadows: true,
             dynamic_softness: 1.0,
+            parallel_shadows: Duration::from_micros(250),
         }
     }
 }
@@ -372,8 +381,12 @@ struct Scratch {
     /// pieces, when shadows carve it).
     mirror_polygons: Vec<(u32, Range<usize>)>,
     carver: Carver,
-    /// For cached shadow pieces: clipping them, and a static polygon's corners.
-    piece_clipper: Clipper,
+    /// The polygons drawn, waiting for their shadows; where each one's were put; and each
+    /// thread's own space to work them out in.
+    jobs: Jobs,
+    casts: Vec<Cast>,
+    workers: Vec<Mutex<Worker>>,
+    /// A static polygon's corners.
     polygon_points: Vec<Vec3>,
     window: WindowScratch,
     blockers: Blockers,
@@ -511,10 +524,6 @@ struct Out<'a> {
     world_positions: &'a mut Vec<Vec3>,
     weights: &'a mut Vec<f32>,
     polygons: &'a mut Vec<ViewPolygon>,
-    shadow_pieces: &'a mut Vec<ShadowPiece>,
-    shadow_vertices: &'a mut Vec<ShadowVertex>,
-    shadow_softs: &'a mut Vec<ShadowSoft>,
-    shadow_wedges: &'a mut Vec<ShadowWedge>,
     edges: Vec<PieceEdge>,
 }
 
@@ -646,6 +655,7 @@ impl ViewGeometry {
     /// many (light, surface) pairs have a shadow: some of the surface in the light's shadow.
     pub fn bake_shadows(&mut self, world: &World, assets: &Assets) -> usize {
         let carver = &mut self.scratch.carver;
+        let carving = &mut Pieces::default();
         carver.prepare(world, assets, world.lights(), (false, 1.0));
         let geometry = assets.mesh(world.geometry);
         let mut points = Vec::new();
@@ -668,7 +678,7 @@ impl ViewGeometry {
                     beams: false,
                     hard: false,
                 };
-                let bits = carver.cache((0, pi, 0), &points, &receiver);
+                let bits = carver.cache(carving, (0, pi, 0), &points, &receiver);
                 count += shadowed(carver, bits, (0, pi, 0));
             }
         }
@@ -690,7 +700,7 @@ impl ViewGeometry {
                         hard: false,
                     };
                     let key = (2, terrain.entity, pi);
-                    let bits = carver.cache(key, &points, &receiver);
+                    let bits = carver.cache(carving, key, &points, &receiver);
                     count += shadowed(carver, bits, key);
                 }
             }
@@ -717,7 +727,7 @@ impl ViewGeometry {
                     hard: false,
                 };
                 let key = (1, ei as u32, pi as u32);
-                let bits = carver.cache(key, &points, &receiver);
+                let bits = carver.cache(carving, key, &points, &receiver);
                 count += shadowed(carver, bits, key);
             }
         }
@@ -788,12 +798,9 @@ impl ViewGeometry {
             world_positions: &mut self.world_positions,
             weights: &mut self.weights,
             polygons: &mut self.polygons,
-            shadow_pieces: &mut self.shadow_pieces,
-            shadow_vertices: &mut self.shadow_vertices,
-            shadow_softs: &mut self.shadow_softs,
-            shadow_wedges: &mut self.shadow_wedges,
             edges: Vec::new(),
         };
+        s.jobs.clear(s.carver.casts());
         s.entity_objects.clear();
         s.entity_objects.resize(world.entities.len(), u32::MAX);
         let geometry = assets.mesh(world.geometry);
@@ -885,6 +892,7 @@ impl ViewGeometry {
                 if visit.near {
                     s.planes.push(ClipPlane::near(view.near));
                 }
+                let shared = s.jobs.group(&space, &s.planes, visit.window.clone(), &[visit.sector]);
                 s.mirror_polygons.clear();
                 for pi in sector.polygons.clone() {
                     let polygon = &geometry.polygons[pi as usize];
@@ -913,16 +921,13 @@ impl ViewGeometry {
                     }
                     s.polygon_points.clear();
                     s.polygon_points.extend(geometry.polygon_points(polygon));
-                    let drawn = emit_pieces(
+                    let drawn = emit_shadowed(
                         &mut out,
-                        &mut s.carver,
+                        &mut s.jobs,
                         view,
                         Receiving {
-                            space: &space,
-                            planes: &s.planes,
-                            clipper: &mut s.piece_clipper,
+                            group: shared,
                             is_static: self.config.cache_shadows,
-                            dynamic: self.config.dynamic_shadows,
                             polygon: &s.polygon_points,
                         },
                         clipped,
@@ -938,7 +943,6 @@ impl ViewGeometry {
                         },
                         polygon.flags,
                         group,
-                        &[visit.sector],
                         polygon.plane.normal,
                     );
                     self.stats.world_drawn += 1;
@@ -985,16 +989,13 @@ impl ViewGeometry {
                             self.stats.terrain_outside += 1;
                             continue;
                         }
-                        emit_pieces(
+                        emit_shadowed(
                             &mut out,
-                            &mut s.carver,
+                            &mut s.jobs,
                             view,
                             Receiving {
-                                space: &space,
-                                planes: &s.planes,
-                                clipper: &mut s.piece_clipper,
+                                group: shared,
                                 is_static: self.config.cache_shadows,
-                                dynamic: self.config.dynamic_shadows,
                                 polygon: &s.polygon_points,
                             },
                             clipped,
@@ -1011,7 +1012,6 @@ impl ViewGeometry {
                             },
                             polygon.flags,
                             group,
-                            &[visit.sector],
                             polygon.plane.normal,
                         );
                         self.stats.terrain_drawn += 1;
@@ -1210,6 +1210,8 @@ impl ViewGeometry {
                         .push(start as u32..self.light_lists.len() as u32);
                 }
                 let object = s.entity_objects[ei];
+                // Entities are not clipped to portals: every edge between its endpoints.
+                let shared = s.jobs.group(&space, &s.planes, 0..0, &entity.sectors);
                 let kind = if entity.kind == EntityKind::Actor {
                     PolygonKind::Actor
                 } else {
@@ -1245,21 +1247,18 @@ impl ViewGeometry {
                                 .map(|v| s.entity_world[mesh.vertex_positions[v] as usize]),
                         );
                     }
-                    emit_pieces(
+                    emit_shadowed(
                         &mut out,
-                        &mut s.carver,
+                        &mut s.jobs,
                         view,
                         Receiving {
-                            space: &space,
-                            planes: &s.planes,
-                            clipper: &mut s.piece_clipper,
+                            group: shared,
                             is_static: entity.is_static && self.config.cache_shadows,
-                            dynamic: self.config.dynamic_shadows,
                             polygon: &s.polygon_points,
                         },
                         clipped,
                         edges,
-                        &[], // entities are not clipped to portals: every edge between its endpoints
+                        &[],
                         polygon.vertex_count as usize,
                         entity.mesh,
                         object,
@@ -1270,13 +1269,13 @@ impl ViewGeometry {
                         },
                         polygon.flags,
                         group,
-                        &entity.sectors,
                         entity.rotation * polygon.plane.normal,
                     );
                 }
                 self.stats.entities_drawn += 1;
             }
         }
+        self.cast_shadows(view);
     }
 }
 
@@ -1495,19 +1494,15 @@ fn border_lines(view: &View) -> [EdgeLine; 4] {
     ]
 }
 
-/// Emits a clipped polygon whole, with the shadows cast on it: it is carved for the lights
-/// that cast shadows (see the carve module), and the pieces in a light's shadow (fully, or
-/// softly with how much of the light reaches their vertices) become its shadow pieces for
-/// that light, which the rasterizer draws into a shadow buffer as it shades the polygon. A
-/// light whose shadow covers all of it is simply left out of its lights. `sectors` are the
-/// sectors it is in, and `normal` its world-space normal. Returns its output index (as a
-/// range).
+/// Emits a clipped polygon whole, and queues it for the shadows cast on it (see
+/// [`ViewGeometry::cast_shadows`]), which it gets once everything in view is drawn. `normal`
+/// is its world-space normal. Returns its output index (as a range).
 #[allow(clippy::too_many_arguments)]
-fn emit_pieces(
+fn emit_shadowed(
     out: &mut Out,
-    carver: &mut Carver,
+    jobs: &mut Jobs,
     view: &View,
-    mut receiving: Receiving,
+    receiving: Receiving,
     records: &[f32],
     edges: &[Edge],
     plane_lines: &[EdgeLine],
@@ -1518,54 +1513,357 @@ fn emit_pieces(
     source: PolygonSource,
     flags: PolyFlags,
     mirror: Option<u32>,
-    sectors: &[u32],
     normal: Vec3,
 ) -> Range<usize> {
     let first = out.polygons.len();
-    let stride = RECORD + source_vertices;
+    if jobs.casting {
+        let points = jobs.points.len() as u32;
+        if receiving.is_static {
+            jobs.points.extend_from_slice(receiving.polygon);
+        }
+        jobs.list.push(Job {
+            polygon: first as u32,
+            group: receiving.group,
+            records: jobs.records.len() as u32,
+            edges: jobs.edges.len() as u32,
+            vertex_count: edges.len() as u16,
+            source_vertices: source_vertices as u16,
+            points: points..jobs.points.len() as u32,
+            normal,
+            is_static: receiving.is_static,
+        });
+        jobs.records.extend_from_slice(records);
+        jobs.edges.extend_from_slice(edges);
+    }
+    let mut whole_edges = std::mem::take(&mut out.edges);
+    whole_edges.clear();
+    whole_edges.extend(edges.iter().map(|&e| PieceEdge::Clip(e)));
+    emit(
+        out,
+        view,
+        records,
+        &whole_edges,
+        plane_lines,
+        source_vertices,
+        id,
+        object,
+        kind,
+        source,
+        flags,
+        mirror,
+    );
+    out.edges = whole_edges;
+    first..out.polygons.len()
+}
+
+/// What [`emit_shadowed`] queues with a polygon: what it shares with the others clipped as
+/// it was (see [`Group`]), whether it is static, and its corners in world space (in its own
+/// order) if so.
+struct Receiving<'a> {
+    group: u32,
+    is_static: bool,
+    polygon: &'a [Vec3],
+}
+
+/// What the polygons of one visit to a sector, or of one entity seen in one space, share
+/// when their shadows are worked out: the space they are seen in, the planes they were
+/// clipped to (a range of `Jobs::planes`; cached shadow pieces are clipped to them too),
+/// those planes' lines (a range of `ViewGeometry::window_lines`; none for an entity's),
+/// and the sectors they are in (a range of `Jobs::sectors`).
+struct Group {
+    space: Space,
+    planes: Range<u32>,
+    lines: Range<u32>,
+    sectors: Range<u32>,
+}
+
+/// A polygon drawn, waiting for its shadows: its output index, its group, its clipped
+/// records and their edges (from `records` in `Jobs::records` and `edges` in
+/// `Jobs::edges`), its corners in world space if it is static (a range of `Jobs::points`),
+/// and its world-space normal.
+struct Job {
+    polygon: u32,
+    group: u32,
+    records: u32,
+    edges: u32,
+    vertex_count: u16,
+    source_vertices: u16,
+    points: Range<u32>,
+    normal: Vec3,
+    is_static: bool,
+}
+
+/// The polygons drawn this frame, waiting for their shadows (see
+/// [`ViewGeometry::cast_shadows`]), with what the threads that work them out read.
+#[derive(Default)]
+struct Jobs {
+    /// Whether any light casts shadows (or is a beam) this frame: without one, nothing is
+    /// queued.
+    casting: bool,
+    list: Vec<Job>,
+    groups: Vec<Group>,
+    records: Vec<f32>,
+    edges: Vec<Edge>,
+    planes: Vec<ClipPlane>,
+    points: Vec<Vec3>,
+    sectors: Vec<u32>,
+}
+
+impl Jobs {
+    /// Empties it for a new frame.
+    fn clear(&mut self, casting: bool) {
+        self.casting = casting;
+        self.list.clear();
+        self.groups.clear();
+        self.records.clear();
+        self.edges.clear();
+        self.planes.clear();
+        self.points.clear();
+        self.sectors.clear();
+    }
+
+    /// Adds a group (see [`Group`]); returns its index.
+    fn group(&mut self, space: &Space, planes: &[ClipPlane], lines: Range<u32>, sectors: &[u32]) -> u32 {
+        if !self.casting {
+            return 0;
+        }
+        let (first_plane, first_sector) = (self.planes.len() as u32, self.sectors.len() as u32);
+        self.planes.extend_from_slice(planes);
+        self.sectors.extend_from_slice(sectors);
+        self.groups.push(Group {
+            space: *space,
+            planes: first_plane..self.planes.len() as u32,
+            lines,
+            sectors: first_sector..self.sectors.len() as u32,
+        });
+        self.groups.len() as u32 - 1
+    }
+}
+
+/// Shadow pieces and what they refer to, as [`ViewGeometry`]'s lists of them.
+#[derive(Default)]
+struct Shadows {
+    shadow_pieces: Vec<ShadowPiece>,
+    shadow_vertices: Vec<ShadowVertex>,
+    shadow_softs: Vec<ShadowSoft>,
+    shadow_wedges: Vec<ShadowWedge>,
+}
+
+impl Shadows {
+    /// How long its lists are: pieces, vertices, soft edges, wedges.
+    fn lens(&self) -> [u32; 4] {
+        [
+            self.shadow_pieces.len() as u32,
+            self.shadow_vertices.len() as u32,
+            self.shadow_softs.len() as u32,
+            self.shadow_wedges.len() as u32,
+        ]
+    }
+}
+
+/// A polygon's cached shadow (see [`Carver::cached`]), by its shadow slot and the
+/// polygon's key.
+type Kept = ((u8, (u8, u32, u32)), Cached);
+
+/// A thread's own space to work shadows out in, and those it has this frame: in lists of
+/// its own, which refer to each other, a polygon's together (see [`Cast`]).
+#[derive(Default)]
+struct Worker {
+    pieces: Pieces,
+    /// For clipping cached shadow pieces.
+    clipper: Clipper,
+    shadows: Shadows,
+    /// Static polygons' shadows carved for the first time, for the carver to keep.
+    kept: Vec<Kept>,
+}
+
+/// Where a queued polygon's shadows were put: the shadow slots of the lights whose shadow
+/// covers all of it and part of it, the thread that worked them out, and where its part of
+/// each of that thread's lists starts and ends (see [`Shadows::lens`]).
+#[derive(Clone, Default)]
+struct Cast {
+    whole: u32,
+    split: u32,
+    worker: u32,
+    start: [u32; 4],
+    end: [u32; 4],
+}
+
+/// What every thread working shadows out reads.
+struct Casting<'a> {
+    carver: &'a Carver,
+    view: &'a View,
+    jobs: &'a Jobs,
+    polygons: &'a [ViewPolygon],
+    window_lines: &'a [EdgeLine],
+    /// Carve what isn't cached (see `ViewConfig::dynamic_shadows`).
+    dynamic: bool,
+}
+
+impl ViewGeometry {
+    /// Gives every polygon queued (see [`Jobs`]) the shadows cast on it: each is carved for
+    /// the lights that cast shadows (see the carve module), and the pieces in a light's
+    /// shadow become its shadow pieces for that light (see [`shadows_of`]).
+    ///
+    /// Carving is most of a frame's work where many shadows fall, and each polygon's is
+    /// its own, so threads share it, a polygon at a time: some take a thousand times
+    /// longer than others (those many shadows cross), and whichever thread is free takes
+    /// the next. This thread starts alone, and the others are woken for what is left
+    /// after `ViewConfig::parallel_shadows`: most frames are done by then. Each thread puts
+    /// the shadows it works out in lists of its own, and they are then joined to the
+    /// view's in the polygons' order: the view is the same however many threads there are,
+    /// and whenever they start.
+    fn cast_shadows(&mut self, view: &View) {
+        let s = &mut self.scratch;
+        let threads = rayon::current_num_threads().max(1);
+        if s.workers.len() < threads {
+            s.workers.resize_with(threads, || Mutex::new(Worker::default()));
+        }
+        for worker in &mut s.workers {
+            let worker = worker.get_mut().unwrap();
+            worker.shadows.shadow_pieces.clear();
+            worker.shadows.shadow_vertices.clear();
+            worker.shadows.shadow_softs.clear();
+            worker.shadows.shadow_wedges.clear();
+        }
+        s.casts.clear();
+        s.casts.resize(s.jobs.list.len(), Cast::default());
+        let casting = Casting {
+            carver: &s.carver,
+            view,
+            jobs: &s.jobs,
+            polygons: &self.polygons,
+            window_lines: &self.window_lines,
+            dynamic: self.config.dynamic_shadows,
+        };
+        let workers = &s.workers;
+        let work = |(cast, job): (&mut Cast, &Job)| {
+            let t = rayon::current_thread_index().unwrap_or(0) % workers.len();
+            let mut worker = workers[t].lock().unwrap();
+            cast.worker = t as u32;
+            cast.start = worker.shadows.lens();
+            (cast.whole, cast.split) = shadows_of(&mut worker, &casting, job);
+            cast.end = worker.shadows.lens();
+        };
+        let (started, alone) = (Instant::now(), self.config.parallel_shadows);
+        let mut done = 0;
+        while done < s.jobs.list.len() && (threads == 1 || alone == Duration::MAX || started.elapsed() < alone) {
+            work((&mut s.casts[done], &s.jobs.list[done]));
+            done += 1;
+        }
+        let (casts, jobs) = (&mut s.casts[done..], &s.jobs.list[done..]);
+        if jobs.len() > 1 {
+            casts.par_iter_mut().zip(jobs.par_iter()).for_each(work);
+        } else {
+            casts.iter_mut().zip(jobs).for_each(work);
+        }
+        // Joined in order: each polygon's shadows after those before it, referring to
+        // each other where they now are (each list's part moved by `to`).
+        for (cast, job) in s.casts.iter().zip(&s.jobs.list) {
+            let from = &s.workers[cast.worker as usize].get_mut().unwrap().shadows;
+            let part = |k: usize| cast.start[k] as usize..cast.end[k] as usize;
+            let first_piece = self.shadow_pieces.len() as u32;
+            let to = [
+                first_piece,
+                self.shadow_vertices.len() as u32,
+                self.shadow_softs.len() as u32,
+                self.shadow_wedges.len() as u32,
+            ];
+            let moved = |at: u32, k: usize| at - cast.start[k] + to[k];
+            self.shadow_pieces.extend(from.shadow_pieces[part(0)].iter().map(|piece| ShadowPiece {
+                first_vertex: moved(piece.first_vertex, 1),
+                first_soft: moved(piece.first_soft, 2),
+                ..*piece
+            }));
+            self.shadow_vertices.extend_from_slice(&from.shadow_vertices[part(1)]);
+            self.shadow_softs.extend(from.shadow_softs[part(2)].iter().map(|soft| ShadowSoft {
+                wedges: moved(soft.wedges.start, 3)..moved(soft.wedges.end, 3),
+                window: soft.window,
+            }));
+            self.shadow_wedges.extend_from_slice(&from.shadow_wedges[part(3)]);
+            let polygon = &mut self.polygons[job.polygon as usize];
+            polygon.shadowed = cast.whole;
+            polygon.split = cast.split;
+            polygon.first_shadow = first_piece;
+            polygon.shadow_count = (cast.end[0] - cast.start[0]) as u16;
+        }
+        for worker in &mut s.workers {
+            for ((slot, key), cached) in worker.get_mut().unwrap().kept.drain(..) {
+                s.carver.keep(slot, key, cached);
+            }
+        }
+    }
+}
+
+/// Works out the shadows cast on a queued polygon, at the end of `worker`'s lists: it is
+/// carved for the lights that cast shadows (see the carve module), and the pieces in a
+/// light's shadow (fully, or softly with how much of the light reaches their vertices)
+/// become its shadow pieces for that light, which the rasterizer draws into a shadow buffer
+/// as it shades the polygon. A light whose shadow covers all of it is simply left out of
+/// its lights. Returns the shadow slots of the lights whose shadow covers all of it, and
+/// part of it.
+fn shadows_of(worker: &mut Worker, casting: &Casting, job: &Job) -> (u32, u32) {
+    let Worker { pieces, clipper, shadows: out, kept } = worker;
+    // The shadows carved for it for the first time, below.
+    let first_kept = kept.len();
+    let (carver, view, jobs) = (casting.carver, casting.view, casting.jobs);
+    let polygon = &casting.polygons[job.polygon as usize];
+    let group = &jobs.groups[job.group as usize];
+    let stride = RECORD + job.source_vertices as usize;
+    let count = job.vertex_count as usize;
+    let records = &jobs.records[job.records as usize..job.records as usize + count * stride];
+    let edges = &jobs.edges[job.edges as usize..job.edges as usize + count];
+    let plane_lines = &casting.window_lines[range(&group.lines)];
+    let points = &jobs.points[range(&job.points)];
     let mut receiver = Receiver {
-        sectors,
-        entity: match source {
+        sectors: &jobs.sectors[range(&group.sectors)],
+        entity: match polygon.source {
             PolygonSource::Entity { entity, .. } => Some(entity),
             PolygonSource::World { .. } | PolygonSource::Terrain { .. } => None,
         },
-        normal,
+        normal: job.normal,
         point: Vec3::from_slice(&records[3..6]),
         parts: Parts::All,
         // In reflections, beams are lit at sample points: cheaper, and half-rate there.
-        beams: mirror.is_none(),
+        beams: polygon.mirror.is_none(),
         // In reflections, shadows carved every frame are hard.
-        hard: mirror.is_some(),
+        hard: polygon.mirror.is_some(),
     };
     // A static polygon's shadows from static lights are cached (carved the first time it
     // is seen); only moving occluders are carved for them every frame.
-    let key = match source {
+    let key = match polygon.source {
         PolygonSource::World { polygon, .. } => (0, polygon, 0),
         PolygonSource::Entity { entity, polygon } => (1, entity, polygon),
         PolygonSource::Terrain { entity, polygon, .. } => (2, entity, polygon),
     };
-    let cached = if receiving.is_static {
-        receiver.point = receiving.polygon[0];
-        let bits = carver.cache(key, receiving.polygon, &receiver);
-        receiver.point = Vec3::from_slice(&records[3..6]);
-        bits
-    } else {
-        0
-    };
+    let cached = if job.is_static { carver.static_slots() } else { 0 };
+    // Those not carved by an earlier frame are carved now, and kept once every polygon's
+    // shadows are joined. (A polygon seen twice in such a frame, through two windows or
+    // in a mirror, has them carved twice, the same.)
+    let mut bits = cached;
+    while bits != 0 {
+        let slot = bits.trailing_zeros() as u8;
+        bits &= bits - 1;
+        if carver.cached(slot, key).is_none() {
+            let first = Receiver { point: points[0], ..receiver };
+            kept.push(((slot, key), carver.carve_cached(pieces, slot, points, &first)));
+        }
+    }
+    let kept = &kept[first_kept..];
     // Without dynamic shadows, only beams are carved every frame (see `Light::beam`).
-    receiver.parts = if receiving.dynamic { Parts::Cached(cached) } else { Parts::Beams };
-    let pieces = if receiving.dynamic || carver.has_beams() {
-        carver
-            .carve(records, edges, stride, plane_lines.len(), &receiver)
+    receiver.parts = if casting.dynamic { Parts::Cached(cached) } else { Parts::Beams };
+    let carved = if casting.dynamic || carver.has_beams() {
+        pieces
+            .carve(carver, records, edges, stride, plane_lines.len(), &receiver)
             .len()
     } else {
         0
     };
     // Per shadow slot: whether any piece is in its shadow, and whether all are fully.
     let (mut touched, mut dark) = (0u32, u32::MAX);
-    for i in 0..pieces {
-        let piece = carver.piece(i);
-        touched |= piece.shadowed | piece.beamed | piece.blurred | carver.soft_slots(&piece);
+    for i in 0..carved {
+        let piece = pieces.piece(i);
+        touched |= piece.shadowed | piece.beamed | piece.blurred | pieces.soft_slots(carver, &piece);
         dark &= piece.shadowed;
     }
     // And the cached ones.
@@ -1574,7 +1872,7 @@ fn emit_pieces(
     while bits != 0 {
         let slot = bits.trailing_zeros();
         bits &= bits - 1;
-        if let Some(c) = carver.cached(slot as u8, key) {
+        if let Some(c) = kept_shadow(carver, kept, slot as u8, key) {
             if c.full {
                 cached_full |= 1 << slot;
             } else if !c.pieces.is_empty() {
@@ -1586,13 +1884,12 @@ fn emit_pieces(
     // part of it gets its shadow pieces.
     let whole = (touched & dark) | cached_full;
     let split = (touched | cached_touched) & !whole;
-    let first_shadow = out.shadow_pieces.len() as u32;
     if split != 0 {
-        for i in 0..pieces {
-            let piece = carver.piece(i);
-            let soft = carver.soft_slots(&piece);
+        for i in 0..carved {
+            let piece = pieces.piece(i);
+            let soft = pieces.soft_slots(carver, &piece);
             let slots = (piece.shadowed | piece.beamed | piece.blurred | soft) & split;
-            let (records, edges) = (carver.records(&piece), carver.edges(&piece));
+            let (records, edges) = (pieces.records(&piece), pieces.edges(&piece));
             let mut bits = slots;
             while bits != 0 {
                 let slot = bits.trailing_zeros();
@@ -1611,7 +1908,7 @@ fn emit_pieces(
                 // In soft edges: they're taken at each pixel (see `soft_reach`).
                 let first_soft = out.shadow_softs.len() as u32;
                 if in_soft {
-                    carver.piece_softs(&piece, slot as u8, out.shadow_softs, out.shadow_wedges);
+                    pieces.piece_softs(carver, &piece, slot as u8, &mut out.shadow_softs, &mut out.shadow_wedges);
                 }
                 let first_vertex = out.shadow_vertices.len() as u32;
                 for (r, edge) in records.chunks_exact(stride).zip(edges) {
@@ -1645,39 +1942,31 @@ fn emit_pieces(
             }
         }
         // The cached pieces, clipped as the polygon was and projected.
+        let mut placing = Placing {
+            space: &group.space,
+            planes: &jobs.planes[range(&group.planes)],
+            clipper,
+            polygon: points,
+        };
         let mut bits = split & cached;
         while bits != 0 {
             let slot = bits.trailing_zeros();
             bits &= bits - 1;
-            let Some(c) = carver.cached(slot as u8, key) else {
+            let Some(c) = kept_shadow(carver, kept, slot as u8, key) else {
                 continue;
             };
-            emit_cached(out, view, &mut receiving, c, slot as u8, (records, edges, stride), plane_lines);
+            emit_cached(out, view, &mut placing, c, slot as u8, (records, edges, stride), plane_lines);
         }
     }
-    let shadow_count = (out.shadow_pieces.len() as u32 - first_shadow) as u16;
-    // The polygon itself, whole.
-    let mut whole_edges = std::mem::take(&mut out.edges);
-    whole_edges.clear();
-    whole_edges.extend(edges.iter().map(|&e| PieceEdge::Clip(e)));
-    emit(
-        out,
-        view,
-        records,
-        &whole_edges,
-        plane_lines,
-        source_vertices,
-        id,
-        object,
-        kind,
-        source,
-        flags,
-        mirror,
-        whole,
-        (split, first_shadow, shadow_count),
-    );
-    out.edges = whole_edges;
-    first..out.polygons.len()
+    (whole, split)
+}
+
+/// The shadow of the static light in shadow slot `slot` on the static polygon `key`: the
+/// carver's (see [`Carver::cached`]), or one carved in this run (`kept`).
+fn kept_shadow<'a>(carver: &'a Carver, kept: &'a [Kept], slot: u8, key: (u8, u32, u32)) -> Option<&'a Cached> {
+    carver
+        .cached(slot, key)
+        .or_else(|| kept.iter().find(|(k, _)| *k == (slot, key)).map(|(_, c)| c))
 }
 
 /// How many of the lights with shadow slot bits `bits` have a cached shadow on the polygon
@@ -1689,17 +1978,13 @@ fn shadowed(carver: &Carver, bits: u32, key: (u8, u32, u32)) -> usize {
         .count()
 }
 
-/// What [`emit_pieces`] needs to place a static polygon's cached shadow pieces on screen:
+/// What [`emit_cached`] needs to place a static polygon's cached shadow pieces on screen:
 /// the space it's seen in and the planes it was clipped to (the pieces are clipped to them
-/// too), a clipper, whether it is static, and its corners in world space (in its own order)
-/// if so.
-struct Receiving<'a> {
+/// too), a clipper, and its corners in world space (in its own order).
+struct Placing<'a> {
     space: &'a Space,
     planes: &'a [ClipPlane],
     clipper: &'a mut Clipper,
-    is_static: bool,
-    /// Carve what isn't cached (see `ViewConfig::dynamic_shadows`).
-    dynamic: bool,
     polygon: &'a [Vec3],
 }
 
@@ -1709,10 +1994,10 @@ struct Receiving<'a> {
 /// (`polygon`: its records, edges and stride) walks them, along clip planes as it does, and
 /// along cuts through the cuts' world points.
 fn emit_cached(
-    out: &mut Out,
+    out: &mut Shadows,
     view: &View,
-    receiving: &mut Receiving,
-    cached: &crate::carve::Cached,
+    receiving: &mut Placing,
+    cached: &Cached,
     slot: u8,
     (records, edges, stride): (&[f32], &[Edge], usize),
     plane_lines: &[EdgeLine],
@@ -1757,7 +2042,7 @@ fn emit_cached(
         }
         // In soft edges (taken at each pixel), or in full shadow.
         let first_soft = out.shadow_softs.len() as u32;
-        cached.softs(soft, out.shadow_softs, out.shadow_wedges);
+        cached.softs(soft, &mut out.shadow_softs, &mut out.shadow_wedges);
         let first_vertex = out.shadow_vertices.len() as u32;
         for (r, &edge) in clipped.chunks_exact(STRIDE).zip(clip_edges) {
             let (x, y) = to_screen(view, Vec3::from_slice(r));
@@ -1809,8 +2094,6 @@ fn emit(
     source: PolygonSource,
     flags: PolyFlags,
     mirror: Option<u32>,
-    shadowed: u32,
-    (split, first_shadow, shadow_count): (u32, u32, u16),
 ) {
     let stride = RECORD + source_vertices;
     let first_vertex = out.vertices.len() as u32;
@@ -1837,10 +2120,11 @@ fn emit(
         source,
         flags,
         mirror,
-        shadowed,
-        split,
-        first_shadow,
-        shadow_count,
+        // Its shadows come once everything is drawn (see `ViewGeometry::cast_shadows`).
+        shadowed: 0,
+        split: 0,
+        first_shadow: 0,
+        shadow_count: 0,
         reflection: None,
     });
 }
