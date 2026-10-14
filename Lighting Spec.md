@@ -414,8 +414,27 @@ Oct 13. Shadows carved every frame are worked out by every thread, a polygon at 
 | View, from the spawn point (app bench) | 707 ms | 713 ms | 378 ms | 194 ms | 107 ms | 104 ms |
 | View, 10 random views | 155 ms | 153 ms | 82 ms | 45 ms | 27 ms | 26 ms |
 
+- **Measured cutting what regions miss,** as carving did then (see What a region misses stays whole).
 - **What is left on one thread:** walking the view (1.5 to 2.5 ms there), joining the lists (2 to 3 ms for 100,000 to 200,000 shadow pieces), and the longest single polygon (8 ms).
 - **The test levels** are as before, within noise (shiny_rooms 0.09 ms, cheese_1 0.18 ms, canyon_day 0.13 ms).
+
+## What a region misses stays whole
+
+Oct 13. A polygon is carved by a region (a shadow volume, a light's window, a beam's pyramid) plane by plane, and each plane cuts off the part outside it (`Pieces::split_region`).
+
+- **The waste it ends:** a region that misses the polygon is only found out at the plane all of what is left lies outside. The planes before it have cut it up by then, and every part was carved by every region after.
+- **Now** those cuts are undone, and the polygon (or the piece of one) goes on whole.
+- **The shadows are the same,** in fewer and larger pieces. Pixels differ only by rounding, where a shadow's edge is worked out through other cuts: over 18 views of 7 levels, at most 0.07% of pixels, by 1 to 5 levels (8 on 2 pixels of one view).
+- **First a setting** (Shadow misses: cut or whole), then made the only way once running around the stress level switching back and forth showed no difference (Oct 14).
+
+| View, from the spawn point (app bench) | Cut, 1 thread | Whole, 1 thread | Cut, 10 threads | Whole, 10 threads |
+| --- | --- | --- | --- | --- |
+| shadow_stress, flashlight off | 724 ms | 142 ms | 114 ms | 22 ms |
+| canyon_day | | | 0.75 ms | 0.59 ms |
+| script_rooms | | | 0.50 ms | 0.33 ms |
+| sunny_rooms | | | 0.22 ms | 0.17 ms |
+| shiny_rooms | | | 0.26 ms | 0.24 ms |
+| cheese_1 | | | 0.49 ms | 0.48 ms |
 
 ## Sky box and bloom (experiment, Oct 4; branch `sky-hdr`)
 

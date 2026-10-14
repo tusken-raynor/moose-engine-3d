@@ -1690,7 +1690,13 @@ impl Pieces {
 
     /// Splits `piece` by the region inside every plane of `planes` (in `carver.planes`):
     /// returns the part inside, if any, and appends the parts outside to `self.rest`.
+    ///
+    /// A piece the region misses is found out plane by plane: each plane before the one
+    /// all of what is left lies outside has cut a part off it. Those cuts are undone, and
+    /// it is appended whole: otherwise every region near a polygon would cut it up, and
+    /// each part would be carved by every region after.
     fn split_region(&mut self, carver: &Carver, piece: Piece, planes: Range<u32>, lined: usize) -> Option<Piece> {
+        let (records, edges, rest) = (self.records.len(), self.edges.len(), self.rest.len());
         let mut current = piece;
         for k in planes {
             let plane = carver.planes[k as usize];
@@ -1698,7 +1704,14 @@ impl Pieces {
             if let Some(back) = back {
                 self.rest.push(back);
             }
-            current = front?;
+            let Some(front) = front else {
+                self.records.truncate(records);
+                self.edges.truncate(edges);
+                self.rest.truncate(rest);
+                self.rest.push(piece);
+                return None;
+            };
+            current = front;
         }
         Some(current)
     }
@@ -2159,6 +2172,57 @@ mod tests {
         // The square itself (on its own cap) and the floor seen from below are lit.
         let n = c.carve(&records(&square), &edges, stride, 0, &at(Vec3::Y, square[0])).len();
         assert!((0..n).all(|i| c.piece(i).shadowed == 0));
+    }
+
+    #[test]
+    fn a_shadow_that_misses_the_floor_leaves_it_whole() {
+        // A square off to one side: its shadow lands past the floor, but the planes through
+        // the light and its two edges toward the floor cross it, and those are tried before
+        // the plane through its near edge, which all of the floor is outside.
+        let light = Vec3::new(0.0, 3.0, 0.0);
+        let square = [
+            Vec3::new(9.5, 1.0, 0.5),
+            Vec3::new(10.5, 1.0, 0.5),
+            Vec3::new(10.5, 1.0, -0.5),
+            Vec3::new(9.5, 1.0, -0.5),
+        ];
+        let floor = [
+            Vec3::new(-2.0, 0.0, -2.0),
+            Vec3::new(-2.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, 2.0),
+            Vec3::new(2.0, 0.0, -2.0),
+        ];
+        let stride = RECORD_FLOATS + 4;
+        let input = records(&floor);
+        let edges: Vec<Edge> = (0..4).map(Edge::Input).collect();
+        let mut c = carver(light, &[&[&square]]);
+        // Not cut along those planes: left as it was.
+        let n = c.carve(&input, &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
+        assert_eq!(n, 1);
+        let piece = c.piece(0);
+        assert_eq!(c.records(&piece), &input[..]);
+        assert_eq!(piece.shadowed, 0);
+        assert!(c.edges(&piece).iter().all(|e| matches!(e, PieceEdge::Clip(Edge::Input(_)))));
+
+        // With a shadow that does fall on it as well, that one alone is carved.
+        let over = [
+            Vec3::new(-0.5, 1.0, -0.5),
+            Vec3::new(-0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, -0.5),
+        ];
+        let alone = carver(light, &[&[&over]]).carve(&input, &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
+        let mut c = carver(light, &[&[&square], &[&over]]);
+        let n = c.carve(&input, &edges, stride, 0, &at(Vec3::Y, floor[0])).len();
+        assert_eq!(n, alone, "the square's shadow cuts nothing");
+        let (mut lit, mut dark) = (0.0, 0.0);
+        for i in 0..n {
+            let piece = c.piece(i);
+            let a = area(c.records(&piece), stride);
+            if piece.shadowed & 1 != 0 { dark += a } else { lit += a }
+        }
+        assert!((dark - 2.25).abs() < 1e-4, "shadow area {dark}");
+        assert!((lit + dark - 16.0).abs() < 1e-3, "pieces cover the floor: {}", lit + dark);
     }
 
     #[test]
