@@ -8,7 +8,7 @@ Sound is the `moose-audio` crate: our own software mixer, and the level's own ge
 
 **Who plays sounds is not the sound engine's business.** It has an API (below). Engine events (a footstep, taking damage) and scripts call it alike.
 
-**Built so far (Oct 12):** WAV sounds as assets; the mixer; sounds heard everywhere, at a place, or on an entity; hearing through portals; the 32 loudest mixed; the player's footsteps and a test sound in the app. **Planned** sections at the end are the agenda, not gaps.
+**Built so far (Oct 13):** WAV sounds as assets; the mixer; sounds heard everywhere, at a place, or on an entity; hearing through portals; the 32 loudest mixed; the player's footsteps and a test sound in the app; scripts playing, looping, stopping and awaiting sounds (see the Scripting Spec's Sound section). **Planned** sections at the end are the agenda, not gaps.
 
 ## Conventions
 
@@ -118,7 +118,6 @@ A sound heard everywhere keeps its two channels if it is stereo. One with a plac
 
 - **Floors:** which footstep a surface makes, from its material (a `$` meta value). Physics has to say which surface the player stands on first.
 - **Level format and editor:** sound entities placed in the level (a sound, its reach, looping), and a sector's ambience. Shown and moved in the editor like lights.
-- **Scripts:** sounds as a primitive, with `await` on one ending (`is_playing` is what that waits on).
 - **Music:** long files streamed from disk rather than held in memory, in a compressed format (OGG), with fades between tracks.
 - **Rooms:** a reverb per sector, from its size or a meta value.
 - **Doors:** a portal's opening as an amount, not just passable or not, so a door muffles less as it opens.

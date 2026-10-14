@@ -13,7 +13,13 @@ fn doc(out: &mut String, indent: &str, text: &str) {
 }
 
 fn signature(desc: &ApiDesc, m: &Method) -> String {
-    let mut params: Vec<String> = m.params.iter().map(|(n, t)| format!("{n}: {}", desc.type_name(t))).collect();
+    let required = m.params.len() - m.optional;
+    let mut params: Vec<String> = m
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| format!("{n}{}: {}", if i < required { "" } else { "?" }, desc.type_name(t)))
+        .collect();
     if m.rest {
         params.push("...values: any[]".to_string());
     }

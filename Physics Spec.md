@@ -4,7 +4,7 @@
 
 Physics is the `moose-physics` crate, a wrapper over **Rapier** (`rapier3d` 0.36). Rapier runs entirely on the CPU, builds with Cargo alone, and does its math in the same glam the engine uses, so vectors pass straight through. The rest of the engine never names a Rapier type: it talks to `Physics`, so the library underneath can be changed.
 
-**Built so far (Oct 12):** collision with the level, terrain and props; props with a mass, which fall, roll and are pushed; a walking player (gravity, jumping, crouching, stairs, slopes) who pushes them; ray casts. **Planned** sections at the end are the agenda, not gaps.
+**Built so far (Oct 13):** collision with the level, terrain and props; props with a mass, which fall, roll and are pushed; props that go where scripts put them, pushing bodies and carrying the player; a walking player (gravity, jumping, crouching, stairs, slopes) who pushes bodies; what began to touch what; ray casts. **Planned** sections at the end are the agenda, not gaps.
 
 ## Conventions
 
@@ -26,7 +26,8 @@ Built once from a `World` (`Physics::new`), and again whenever the level is rebu
 | The level's surfaces | One triangle mesh | Every surface of every sector, sky surfaces too (they bound the level) |
 | Portals | None | Except those not passable: solid, like a surface |
 | Terrain | A triangle mesh per terrain | Its carved pieces, which are already in world space |
-| Props | A triangle mesh each | The model as drawn, at the entity's position, rotation and scale |
+| Static props (`static`) | A triangle mesh each, fixed | The model as drawn, at the entity's position, rotation and scale |
+| Other props with no mass | A triangle mesh each, on a body that goes where it is put (below) | The same, until something puts the entity elsewhere |
 | Props with a mass | A body each (below) | A ball, a box or a convex hull |
 | Characters | A capsule each | Moved to where the character is each step, so bodies meet it |
 | Actors, blockers | None yet | Actors are planned (below); blockers only hide things |
@@ -59,6 +60,24 @@ A body's shape is scaled with its entity and turns with it. Triangle meshes are 
 Fast bodies are swept between steps (continuous collision detection), so they don't pass through walls.
 
 **In the world.** Each frame the game moves each body's entity to where its body is (`Physics::bodies`, blended between steps like a character; `World::move_entity`), so drawing, the sectors it is in and its shadows follow. `Physics::reset_bodies` puts them all back where the level has them, at rest.
+
+## Props that are put places
+
+A prop with no mass that isn't `static` has a body too, but physics never moves it of its own accord: it goes where it is **put** (`Physics::put`), which is what a script moving its entity does (see the Scripting Spec). The entity is the game's; the body follows it.
+
+- **It travels there.** Put somewhere, it moves there over the physics steps of the next frame, an even share each step, rather than jumping. So it has a speed while it moves, and what it meets is pushed by that speed and not passed through.
+- **It pushes bodies and isn't pushed.** A ball in its way is shoved along; the prop is not slowed, whatever the ball weighs. Nothing stops it.
+- **It carries characters.** One standing on it rises and sinks with the spot under its feet, and is taken along the ground with it. One it moves into is moved out of its way. Either stops at what else is in the way.
+- **A body with a mass can be held** (`Physics::hold`): it stops, and goes where it is put like these, until it is released at rest (`Physics::release`). A script's `moveTo` on a ball does this for the trip.
+- **Put while not held, a body with a mass is there at once** and goes on from there with the speed it had.
+
+`Physics::bodies` (what the game moves entities after) lists only the bodies physics is moving: those with a mass that nothing holds.
+
+**Two colliders.** Such a prop has its model in physics twice. One is on a body that goes where it is told (Rapier's *kinematic* kind): that is what gives it a speed as it moves, so bodies it meets are pushed properly. But Rapier's character controller holds a character to anything of that kind it touches, moving or not: one that leaned on a crate couldn't walk away from it. So characters (and what they look for under and around them) meet a second, plain copy on no body, which bodies never meet, moved along with the first; and carrying is done here (`Physics::carry`), not by the controller.
+
+## Touches
+
+`Physics::take_touches` gives what began to touch since it was last asked, each pair once, with how fast the two were closing: a body and the level, two bodies, a body or a put prop and a character, a character and a prop it walked into. A touch is told when it begins, not while it lasts; a character leaning on something touches it once. Two fixed things never touch. Scripts hear these as `onTouched` and `onBumped`.
 
 ## Characters
 
@@ -125,9 +144,22 @@ impl Physics {
     /// Runs the steps a frame of `dt` seconds brings due. Returns how many.
     pub fn advance(&mut self, dt: f32) -> u32;
 
-    /// The props with a body, each as (its entity, its position, its rotation) now.
+    /// The props physics is moving, each as (its entity, its position, its rotation) now.
     pub fn bodies(&self) -> impl Iterator<Item = (u32, Vec3, Quat)>;
     pub fn reset_bodies(&mut self);
+
+    /// Something other than physics put an entity here: its body follows (see above).
+    pub fn put(&mut self, entity: u32, position: Vec3, rotation: Quat) -> bool;
+    pub fn hold(&mut self, entity: u32);
+    pub fn release(&mut self, entity: u32);
+    pub fn release_all(&mut self);
+    pub fn mass(&self, entity: u32) -> Option<f32>;
+    pub fn velocity(&self, entity: u32) -> Option<Vec3>;
+    pub fn set_velocity(&mut self, entity: u32, velocity: Vec3) -> bool;
+    pub fn push(&mut self, entity: u32, impulse: Vec3) -> bool;      // kg m/s, through its middle
+
+    /// What began to touch since this was last asked: Touch { a, b, speed }.
+    pub fn take_touches(&mut self) -> Vec<Touch>;
 
     /// The first thing a ray meets within `max` meters, passing through character `skip`.
     pub fn ray(&self, from: Vec3, direction: Vec3, max: f32, skip: Option<CharacterId>) -> Option<RayHit>;  // distance, point, normal, solid
@@ -137,7 +169,9 @@ impl Physics {
 ## Planned
 
 - **More for bodies:** friction, bounce and drag per entity; bodies that push the player back (standing on a rolling ball carries nobody yet); joints between bodies.
-- **Level format:** per entity, bodies moved by scripts or animation (`kinematic`); per surface, an option to not collide. Editor fields for an entity's mass and shape (they are written in its options for now).
+- **Level format:** per surface, an option to not collide. Editor fields for an entity's mass and shape (they are written in its options for now).
+- **Props put places that turn:** a put prop's rotation is followed, but nothing turns one yet (scripts move, they don't turn).
+- **Riding bodies:** a character is carried by a prop that is put places, not by a body with a mass it stands on.
 - **Actors:** a capsule each, moved like the player.
 - **Seeing it:** an overlay of the colliders' wireframes, like the shadow mesh (F4).
 - **Ground feel:** acceleration and friction on the ground, ladders, water.

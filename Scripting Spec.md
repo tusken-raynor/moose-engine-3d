@@ -28,7 +28,7 @@ export async function onActivated(target: Entity, by: Player) {
 }
 ```
 
-**Built so far (Oct 12):** the language, compiler and VM; the API table and `moose.d.ts` written from it; level and entity/template placement; five events; hot reload that keeps state; `assets/levels/script_rooms.mmp` as a working example. **Planned** at the end is the agenda, not gaps.
+**Built so far (Oct 13):** the language, compiler and VM; the API table and `moose.d.ts` written from it; level and entity/template placement; seven events; physics and sound in the table, with scripts and physics each following what the other moves; hot reload that keeps state; `assets/levels/script_rooms.mmp` as a working example. **Planned** at the end is the agenda, not gaps.
 
 ## A script file
 
@@ -69,6 +69,7 @@ How an input's value is written depends on its type:
 | `string` | The text (quote the whole option if it has spaces) |
 | `Vec3`, `Color` | `1,2,3` |
 | `Entity`, `Sector`, `Light` | Its name in the level. Exactly one thing may have it |
+| `Sound` | Its file in `assets/sounds` (`land.wav`) |
 | `T \| null` | As `T`, or `none`, or left out |
 
 A placement with a problem (a script that doesn't compile, an input that names nothing, an input the script doesn't have, `self` in a level's script) is reported with the level's line and isn't run. The level and its other scripts still load.
@@ -84,6 +85,8 @@ A script hears an event by exporting a function with its name. It may take fewer
 | `onActivated(target: Entity, by: Player)` | A player used `target`: E (the Use key), looking at it within 3 m with nothing of the level between | Scripts attached to `target`, or with an input bound to it |
 | `onEntered(sector: Sector, by: Player)` | A player walked into `sector` | Scripts with an input bound to it |
 | `onExited(sector: Sector, by: Player)` | A player walked out of it | The same |
+| `onTouched(target: Entity, other: Entity \| null, speed: number)` | `target` began to touch something, closing at `speed` m/s: another entity, or the level or terrain (`other` is null). One of the two has a mass or was moved by a script. Both entities are told, each as `target` | Scripts attached to `target`, or with an input bound to it |
+| `onBumped(target: Entity, by: Player, speed: number)` | A player ran into `target` or landed on it. Once, however long they lean on it | The same |
 
 So a script hears about what it is attached to and what its inputs name. An entity with a template script and a level script watching it sends the event to both.
 
@@ -125,6 +128,8 @@ Where the engine is stricter than TypeScript's own check (VSCode accepts these; 
 | `level` | The level: `name`, `ambient`, and its `$KEY` values |
 | `sectors`, `entities`, `lights` | The managers: `count`, `find(name)`, `all()` (and `sectors.at(position)`) |
 | `players` | `players.local`, the player at this screen |
+| `physics` | `gravity`, `ray(from, direction, reach)` |
+| `sounds` | `find(name)` |
 | `time` | `now`, `delta` |
 | `random` | `range`, `int`, `chance`: the same run of numbers every time the level starts |
 | `console` | `log`, `warn`: to the terminal, and on screen for a moment |
@@ -135,9 +140,12 @@ Where the engine is stricter than TypeScript's own check (VSCode accepts these; 
 | --- | --- |
 | `Sector` | `name`, `center`, `surfaces()`, `entities()`, `lights()`, `$KEY` values |
 | `Surface` | `sector`, `$KEY` values |
-| `Entity` | `name`, `position`, `sector`, `isStatic`, `animation`, `moveTo`, `moveBy`, `$KEY` values |
+| `Entity` | `name`, `position`, `sector`, `isStatic`, `animation`, `moveTo`, `moveBy`, `mass`, `velocity`, `push`, `$KEY` values |
 | `Light` | `name`, `color`, `range`, `position`, `sector`, `fadeTo` |
-| `Player` | `position`, `sector` |
+| `Player` | `position`, `sector`, `feet`, `velocity`, `grounded`, `crouching`, `teleport` |
+| `Hit` | What a ray met: `point`, `normal`, `distance`, `entity` |
+| `Sound` | `seconds`, `play`, `loop`, `playAt`, `loopAt`, `playOn`, `loopOn` |
+| `Playing` | A sound that was played: `playing`, `volume`, `stop`, `moveTo`, `follow`, `ended` |
 | `Vec3`, `Color` | Values, not references: `add sub scale dot length distance normalized lerp`; `scale lerp` |
 
 **`$KEY` values** are the level's meta values (`$wet=200`), the ones materials read with `level:`, `sector:`, `face:` and `entity:` sources. On each thing that has them: `has(key)`, `get(key, fallback)`, `set(key, value)`, `getColor(key, fallback)`, `setColor(key, value)`. A script setting one is how it reaches a material.
@@ -147,6 +155,61 @@ Where the engine is stricter than TypeScript's own check (VSCode accepts these; 
 **Readonly** properties are what the engine can't change yet (a sector's shape, a light's position). VSCode flags a write, and so does the engine.
 
 **Static entities** (`static` in the level) can't be moved: their shadows are baked. A script that tries gets a warning and a promise that is already settled.
+
+**Arguments that can be left out** are marked `?` in `moose.d.ts` (`play(volume?: number, pitch?: number)`): only the engine's functions have them, not a script's own.
+
+## Physics
+
+Physics (the `moose-physics` crate; see the Physics Spec) keeps its own copy of everything solid: a **collider** for each thing, which is the shape it collides as. Sixty times a second it works out what touches what and moves what it is in charge of. Scripts and physics both move entities, so each entity has one of them in charge of where it is, and the other follows:
+
+| The entity | In the level | In charge of where it is | What follows |
+| --- | --- | --- | --- |
+| A static prop | `static` | Nobody: it never moves | Its collider is fixed, like the level's walls |
+| A prop a script can move | No `mass=`, not `static` | The scripts (the entity's `position`) | Its collider goes where the entity was put |
+| A prop with a mass | `mass=5` | Physics: it falls, rolls, bounces and is pushed | Its entity goes where its body is, every frame |
+
+So `entity.position` is always where the thing is, whoever moved it: a script reading a ball's position sees where physics has rolled it, and a player or a ball meets a crate where a script took it.
+
+**A script moving a prop** (`position`, `moveTo`, `moveBy`). The entity moves at once, as drawn. Its collider follows over the next frame's physics steps: it travels there rather than jumping, so what is in its way is pushed and not passed through.
+- A ball in its way is shoved along, by as much as the prop moves: the prop is not slowed, whatever the ball weighs.
+- A player standing on it is carried: up and down with it (a lift), and along with it. A player it moves into is moved out of its way.
+- Nothing stops it. If a wall is behind what it pushes, the thing is squeezed into the prop or the wall. Scripts decide where things go; physics only works out the consequences.
+
+**A script and a prop with a mass.** Physics is in charge of it, so a script steers it rather than places it:
+- `push(impulse)` shoves it. An impulse is a mass times a change of velocity (kg m/s): the same push moves a heavy thing less. `self.push(vec3(0, 4 * self.mass, 0))` sends it up at 4 m/s whatever it weighs.
+- `velocity` reads how fast it is going, and setting it replaces that.
+- Setting `position` puts it somewhere at once, and it goes on from there with the speed it had.
+- `moveTo` and `moveBy` take it out of physics' hands for the trip: it goes where the script says, pushing things like any prop a script moves and ignoring gravity, and is let go at rest when it arrives.
+- `mass` is what it weighs, and 0 for a prop physics doesn't move. Pushing or setting the velocity of one of those is a warning: it has no speed of its own.
+
+**Hearing about collisions.** `onTouched` fires when an entity begins to touch something, with how fast the two were closing: a ball landing, two balls meeting, a crate a script slid into a ball. `onBumped` fires when a player runs into an entity. Both fire once when the touch begins, not for as long as it lasts. Two things that never move (a static prop and the floor) never report.
+
+**Rays.** `physics.ray(from, direction, reach)` returns the first solid thing on a line, or null: for line of sight, what is under something, what a shot hits. The `Hit` says where, how far, which way the surface faces, and which entity (null for the level or terrain). A `Hit` stays good until 64 more rays have met something, so read it where you cast it.
+
+**The player** has `feet`, `velocity`, `grounded` and `crouching` from physics, and `teleport(feet)`.
+
+**Timing.** Each frame physics runs first, then the entities with a mass are moved to their bodies, then scripts run. A collider follows a script's move in the next frame's physics, so it is at most a frame behind what is drawn.
+
+## Sound
+
+Sounds are files in `assets/sounds` (see the Sound Spec). A script gets one as an input (`const thump = input<Sound>()`, set in the level to `land.wav`) or by name (`sounds.find("land.wav")`, null with a warning if it can't be loaded).
+
+| To play it | Heard |
+| --- | --- |
+| `sound.play(volume?, pitch?)` | The same everywhere: the interface, music, a voice in the player's head |
+| `sound.playAt(position, volume?, pitch?, reach?)` | From a place in the level: through its openings, never through walls |
+| `sound.playOn(entity, volume?, pitch?, reach?)` | From an entity, following it as it moves |
+| `loop`, `loopAt`, `loopOn` | The same, over and over until stopped |
+
+`volume` is its loudness (1 as recorded), `pitch` its speed (1 as recorded, 2 an octave up in half the time), and `reach` how far it carries in meters (50 if left out).
+
+Each returns a `Playing`: `stop()` it, change its `volume`, move it (`moveTo(position)`, `follow(entity)`), ask whether it is still `playing`, or wait for it:
+
+```ts
+await door.playOn(self).ended();   // goes on when the sound has finished (or was stopped)
+```
+
+Pitch and reach are set when it starts and can't be changed after (the sound engine's limit for now). A sound keeps playing when the handler that started it ends. Sounds scripts started are stopped when the scripts start over, not when a script file is reloaded.
 
 ## The table
 
@@ -175,9 +238,9 @@ Open the repo, or `assets/scripts`. `tsconfig.json` there points TypeScript at `
 
 ## Planned
 
-- **More of the world in the table:** portals (opening and closing), spawn points, materials, sounds (`moose-audio`), physics (rays, bodies), cameras; entity rotation and scale; spawning and destroying entities, with handles that know when their thing is gone (`alive`).
-- **More events:** touch and damage, timers by name, a player joining, a script's own messages to other scripts.
-- **Moved props and physics:** a prop a script moves keeps its collider where the level put it, until physics has moving bodies.
+- **More of the world in the table:** portals (opening and closing), spawn points, materials, cameras; entity rotation and scale (and with rotation, spin and off-center pushes for bodies); spawning and destroying entities, with handles that know when their thing is gone (`alive`).
+- **More of physics:** trigger volumes that tell scripts what enters and leaves them (sensors); friction and bounce per entity; a script changing an entity's mass or making it static; rays that report the surface they met.
+- **More events:** damage, timers by name, a player joining, a script's own messages to other scripts.
 - **The editor:** placing scripts and binding inputs in the level editor, with each input shown as a field of its type; exported state shown live.
 - **Results from `Promise.all`:** `const [a, b] = await Promise.all([...])`.
 - **Arrays and strings as values**, when a real script needs them.

@@ -61,14 +61,16 @@ pub(crate) fn parse(src: &str) -> Result<Module, Problem> {
     Ok(module)
 }
 
-/// A signature as an API table writes it: `name(a: T, b: U): R`, or with `...rest: any[]`
-/// last. Returns the name, parameters, return type, and whether it takes a rest.
-pub(crate) fn parse_signature(text: &str) -> Result<(String, Vec<(String, TypeExpr)>, Option<TypeExpr>, bool), String> {
+/// A signature as an API table writes it: `name(a: T, b?: U): R`, or with `...rest: any[]`
+/// last. Returns the name, parameters, return type, whether it takes a rest, and how many
+/// of its last parameters can be left out (`b?`).
+#[allow(clippy::type_complexity)]
+pub(crate) fn parse_signature(text: &str) -> Result<(String, Vec<(String, TypeExpr)>, Option<TypeExpr>, bool, usize), String> {
     let fail = |(_, m): Problem| format!("'{text}': {m}");
     let mut p = Parser { tokens: lex(text).map_err(fail)?, pos: 0 };
     let name = p.ident("a name").map_err(fail)?;
     p.expect("(").map_err(fail)?;
-    let (mut params, mut rest) = (Vec::new(), false);
+    let (mut params, mut rest, mut optional) = (Vec::new(), false, 0);
     while !p.eat(")") {
         if p.eat("...") {
             rest = true;
@@ -81,6 +83,11 @@ pub(crate) fn parse_signature(text: &str) -> Result<(String, Vec<(String, TypeEx
             break;
         }
         let param = p.ident("a parameter").map_err(fail)?;
+        if p.eat("?") {
+            optional += 1;
+        } else if optional > 0 {
+            return Err(format!("'{text}': after one that can be left out, every parameter can be ({param}?)"));
+        }
         p.expect(":").map_err(fail)?;
         params.push((param, p.type_expr().map_err(fail)?));
         if !p.eat(",") {
@@ -92,7 +99,7 @@ pub(crate) fn parse_signature(text: &str) -> Result<(String, Vec<(String, TypeEx
     if p.peek() != &Tok::Eof {
         return Err(format!("'{text}': {} after the signature", p.describe()));
     }
-    Ok((name, params, ret, rest))
+    Ok((name, params, ret, rest, optional))
 }
 
 /// A type as an API table writes it.
@@ -563,12 +570,15 @@ mod tests {
 
     #[test]
     fn api_signatures_read_like_typescript() {
-        let (name, params, ret, rest) = parse_signature("moveTo(position: Vec3, seconds: number): Promise<void>").unwrap();
+        let (name, params, ret, rest, _) = parse_signature("moveTo(position: Vec3, seconds: number): Promise<void>").unwrap();
         assert_eq!((name.as_str(), params.len(), rest), ("moveTo", 2, false));
         assert_eq!(ret, Some(TypeExpr::Generic("Promise".into(), Box::new(TypeExpr::Name("void".into())))));
-        let (_, params, ret, rest) = parse_signature("log(...values: any[])").unwrap();
+        let (_, params, ret, rest, _) = parse_signature("log(...values: any[])").unwrap();
         assert!(params.is_empty() && ret.is_none() && rest);
         assert!(parse_signature("f(a)").is_err());
+        let (_, params, _, _, optional) = parse_signature("play(at: Vec3, volume?: number, pitch?: number): Playing").unwrap();
+        assert_eq!((params.len(), optional), (3, 2));
+        assert!(parse_signature("play(volume?: number, at: Vec3)").is_err());
         assert_eq!(parse_type("Light | null").unwrap(), TypeExpr::Nullable(Box::new(TypeExpr::Name("Light".into()))));
     }
 }

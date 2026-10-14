@@ -86,6 +86,9 @@ pub struct Method {
     pub ret: Type,
     /// It takes any number of further values of any type.
     pub rest: bool,
+    /// How many of its last parameters a call can leave out (`volume?: number`): the
+    /// function is handed `null` for each.
+    pub optional: usize,
     pub func: u32,
     pub doc: String,
 }
@@ -211,11 +214,11 @@ impl<K: Host> Api<K> {
     }
 
     fn signature(&mut self, sig: &str, doc: &str, f: HostFn<K>) -> Method {
-        let (name, params, ret, rest) = parse_signature(sig).unwrap_or_else(|e| panic!("script API: {e}"));
+        let (name, params, ret, rest, optional) = parse_signature(sig).unwrap_or_else(|e| panic!("script API: {e}"));
         let resolve = |t: &TypeExpr| self.desc.resolve(t).unwrap_or_else(|e| panic!("script API: '{sig}': {e}"));
         let params = params.iter().map(|(n, t)| (n.clone(), resolve(t))).collect();
         let ret = ret.as_ref().map_or(Type::Void, resolve);
-        Method { name, params, ret, rest, func: self.add(f), doc: doc.to_string() }
+        Method { name, params, ret, rest, optional, func: self.add(f), doc: doc.to_string() }
     }
 
     /// Declares a class. Declare every class before the members that name it.
@@ -266,7 +269,7 @@ impl<K: Host> Api<K> {
 
     /// An event, by the signature its handlers have: `onActivated(target: Entity, by: Player)`.
     pub fn event(&mut self, sig: &str, doc: &str) {
-        let (name, params, _, _) = parse_signature(sig).unwrap_or_else(|e| panic!("script API: {e}"));
+        let (name, params, _, _, _) = parse_signature(sig).unwrap_or_else(|e| panic!("script API: {e}"));
         let params = params
             .iter()
             .map(|(n, t)| (n.clone(), self.desc.resolve(t).unwrap_or_else(|e| panic!("script API: '{sig}': {e}"))))

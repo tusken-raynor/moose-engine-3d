@@ -1114,10 +1114,16 @@ impl<'a, 'b> Fc<'a, 'b> {
         }
     }
 
-    /// Compiles arguments against parameters.
-    fn args(&mut self, name: &str, params: &[Type], rest: bool, args: &[Expr], line: usize) -> R<()> {
-        if args.len() < params.len() || (args.len() > params.len() && !rest) {
-            return Err(self.err(line, format!("{name} takes {} argument(s), not {}", params.len(), args.len())));
+    /// Compiles arguments against parameters, the last `optional` of which can be left
+    /// out (`null` is passed for each). Returns how many values that leaves on the stack.
+    fn args(&mut self, name: &str, params: &[Type], optional: usize, rest: bool, args: &[Expr], line: usize) -> R<u8> {
+        let required = params.len() - optional;
+        if args.len() < required || (args.len() > params.len() && !rest) {
+            let takes = match optional {
+                0 => params.len().to_string(),
+                _ => format!("{required} to {}", params.len()),
+            };
+            return Err(self.err(line, format!("{name} takes {takes} argument(s), not {}", args.len())));
         }
         if args.len() > 250 {
             return Err(self.err(line, "too many arguments"));
@@ -1126,7 +1132,10 @@ impl<'a, 'b> Fc<'a, 'b> {
             let ty = self.expr(arg)?;
             self.coerce(&ty, params.get(i).unwrap_or(&Type::Any), arg.line)?;
         }
-        Ok(())
+        for _ in args.len()..params.len() {
+            self.emit(Op::Push(Value::Null));
+        }
+        Ok(args.len().max(params.len()) as u8)
     }
 
     fn call(&mut self, callee: &Expr, args: &[Expr], line: usize) -> R<(Type, Vec<usize>)> {
@@ -1138,7 +1147,7 @@ impl<'a, 'b> Fc<'a, 'b> {
                     && !self.scopes.iter().flatten().any(|(n, _)| n == name)
                 {
                     let sig = self.c.sigs[index as usize].clone();
-                    self.args(name, &sig.params, false, args, line)?;
+                    self.args(name, &sig.params, 0, false, args, line)?;
                     let ty = if sig.is_async {
                         self.emit(Op::Spawn(index, args.len() as u8));
                         Type::Promise(Box::new(sig.ret))
@@ -1151,8 +1160,8 @@ impl<'a, 'b> Fc<'a, 'b> {
                 if self.is_free(name)
                     && let Some(func) = desc.funcs.iter().find(|f| f.name == *name)
                 {
-                    self.args(name, &types(func), func.rest, args, line)?;
-                    self.emit(Op::CallHost(func.func, args.len() as u8));
+                    let count = self.args(name, &types(func), func.optional, func.rest, args, line)?;
+                    self.emit(Op::CallHost(func.func, count));
                     return Ok((func.ret.clone(), Vec::new()));
                 }
                 Err(self.err(line, format!("'{name}' is not a function")))
@@ -1187,9 +1196,9 @@ impl<'a, 'b> Fc<'a, 'b> {
                 let Some(method) = class_def.methods.iter().find(|m| m.name == *name) else {
                     return Err(self.err(line, format!("{} has no method '{name}'", class_def.name)));
                 };
-                self.args(name, &types(method), method.rest, args, line)?;
+                let count = self.args(name, &types(method), method.optional, method.rest, args, line)?;
                 self.line = line as u32;
-                self.emit(Op::CallHost(method.func, args.len() as u8 + 1));
+                self.emit(Op::CallHost(method.func, count + 1));
                 Ok((method.ret.clone(), skips))
             }
             _ => Err(self.err(line, "this can't be called")),

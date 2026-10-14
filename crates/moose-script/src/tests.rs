@@ -68,6 +68,8 @@ fn api() -> Api<Kind> {
         Value::Null
     }));
     api.func("whole(value: int): int", "", h!(|w, cx, a| a[0]));
+    api.func("sum(a: number, b?: number, c?: number): number", "", h!(|w, cx, a| Value::Num(a.iter().map(|v| v.num()).sum())));
+    api.func("given(a?: number): boolean", "", h!(|w, cx, a| Value::Bool(a[0] != Value::Null)));
     api.event("onStart()", "The level has started.");
     api.event("onActivated(target: Lamp, by: Lamp | null)", "Something was used.");
     api.event("onTick(dt: number)", "");
@@ -146,6 +148,17 @@ fn numbers_are_numbers_unless_something_says_int() {
     assert!(error("let t = 0;\nconst a = whole(t);").message.contains("number, where int"));
     assert!(error("const s = \"a\" + \"b\";").message.contains("strings can't be joined"));
     assert!(error("function f() { if (1) {} }").message.contains("a condition is a boolean"));
+}
+
+#[test]
+fn a_call_can_leave_out_what_the_table_marks_optional() {
+    assert_eq!(
+        marks("export function onStart() {\n mark(sum(1));\n mark(sum(1, 2));\n mark(sum(1, 2, 4));\n mark(given() ? 1 : 0);\n mark(given(0) ? 1 : 0);\n}"),
+        [1.0, 3.0, 7.0, 0.0, 1.0]
+    );
+    assert!(error("const a = sum();").message.contains("sum takes 1 to 3 argument(s), not 0"));
+    assert!(error("const a = sum(1, 2, 3, 4);").message.contains("sum takes 1 to 3 argument(s), not 4"));
+    assert!(error("const a = sum(1, true);").message.contains("boolean, where number is wanted"));
 }
 
 #[test]
@@ -528,6 +541,7 @@ fn the_declarations_are_written_from_the_table() {
         "interface Lamps {\n  readonly count: int;\n  find(name: string): Lamp | null;\n  all(): Iterable<Lamp>;\n}\ndeclare const lamps: Lamps;",
         "declare function rgb(r: number, g: number, b: number): Color;",
         "declare function sleep(seconds: number): Promise<void>;",
+        "declare function sum(a: number, b?: number, c?: number): number;",
         "  log(...values: any[]): void;",
         "declare const console: Console;",
         "//   export function onActivated(target: Lamp, by: Lamp | null)\n//     Something was used.",
