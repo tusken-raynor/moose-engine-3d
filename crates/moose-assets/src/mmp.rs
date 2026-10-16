@@ -61,6 +61,7 @@ struct EntityRec {
     rotation: Quat,
     scale: f32,
     is_static: bool,
+    in_probes: bool,
     occluder: OccluderRec,
     shadow: ShadowKind,
     animation: Option<String>,
@@ -205,6 +206,22 @@ impl Cursor<'_> {
     }
 
     /// Reads a header line `keyword arg...`, returning its line number and arguments.
+    /// Reads a header line `keyword` with `args` arguments, then any options (`key=value`).
+    pub(crate) fn header_with_options(&mut self, keyword: &str, args: usize) -> Result<(usize, Vec<String>), LoadError> {
+        let Some(line) = self.lines.get(self.pos) else {
+            return Err(LoadError::new(self.path, None, format!("missing '{keyword}' section")));
+        };
+        if line.tokens[0] != keyword {
+            return Err(self.err(line.no, format!("expected '{keyword}', found '{}'", line.tokens[0])));
+        }
+        let fields = line.tokens[1..].iter().take_while(|t| !t.contains('=')).count();
+        if fields != args || line.tokens[1 + args..].iter().any(|t| !t.contains('=')) {
+            return Err(self.err(line.no, format!("'{keyword}' takes {args} argument(s), then options")));
+        }
+        self.pos += 1;
+        Ok((line.no, line.tokens[1..].to_vec()))
+    }
+
     pub(crate) fn header(&mut self, keyword: &str, args: usize) -> Result<(usize, Vec<String>), LoadError> {
         let Some(line) = self.lines.get(self.pos) else {
             return Err(LoadError::new(
@@ -653,6 +670,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         }
         // Options after the name.
         let (mut is_static, mut occluder) = (false, OccluderRec::Ready(Occluder::Mesh));
+        let mut in_probes = false;
         let (mut shadow, mut animation) = (ShadowKind::Soft, None);
         let mut exclude = Vec::new();
         let (mut script, mut inputs) = (None, Vec::new());
@@ -679,6 +697,9 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
                     if is_static && kind == EntityKind::Actor {
                         return Err(fail("only props can be static".to_string()));
                     }
+                }
+                None | Some(("probes", "on" | "off")) if option_key(option) == "probes" => {
+                    in_probes = option != "probes=off";
                 }
                 Some(("shadow", value)) => {
                     shadow = match value {
@@ -752,6 +773,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             rotation,
             scale,
             is_static,
+            in_probes,
             occluder,
             shadow,
             animation,
@@ -763,11 +785,12 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         });
     }
 
-    // Optional: ambient light (1 1 1 without it: surfaces show their full color), then
-    // point lights.
+    // Optional: ambient light (1 1 1 without it: surfaces show their full color), and how
+    // it differs by direction, then point lights.
     let mut ambient = Vec3::ONE;
+    let mut ambient_shape = [Vec3::ONE; 6];
     if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "ambient") {
-        let (line, args) = c.header("ambient", 3)?;
+        let (line, args) = c.header_with_options("ambient", 3)?;
         let row = Line {
             no: line,
             tokens: args,
@@ -776,6 +799,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         if ambient.min_element() < 0.0 {
             return Err(c.err(line, "ambient light cannot be negative".to_string()));
         }
+        ambient_shape = ambient_shape_of(&row.tokens[3..]).map_err(|e| c.err(line, e))?;
     }
     let (mut lights, mut light_names) = (Vec::new(), Vec::new());
     if c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == "lights") {
@@ -1342,6 +1366,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
             rotation: e.rotation,
             scale: e.scale,
             is_static: e.is_static,
+            in_probes: e.in_probes,
             occluder,
             shadow: e.shadow,
             animation: e.animation,
@@ -1414,6 +1439,7 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         terrain,
         bindings,
         ambient,
+        ambient_shape,
         lights: lights.into_iter().map(|(_, l)| l).collect(),
         light_names,
         directional,
@@ -1424,4 +1450,31 @@ pub(crate) fn parse_mmp(assets: &mut Assets, path: &Path, src: &str) -> Result<L
         face_excluded_lights,
         scripts,
     })
+}
+
+/// The ambient light's multipliers by direction (see `Level::ambient_shape`) from the
+/// `ambient` line's options: `+x=R:G:B`, and likewise `-x`, `+y`, `-y`, `+z` and `-z`; one
+/// for each direction not given.
+pub(crate) fn ambient_shape_of(options: &[String]) -> Result<[Vec3; 6], String> {
+    const KEYS: [&str; 6] = ["+x", "-x", "+y", "-y", "+z", "-z"];
+    let mut shape = [Vec3::ONE; 6];
+    let mut seen = [false; 6];
+    for option in options {
+        let (key, value) = option.split_once('=').unwrap_or((option, ""));
+        let k = KEYS
+            .iter()
+            .position(|&name| name == key)
+            .ok_or_else(|| format!("unknown ambient option '{key}' (the directions are +x, -x, +y, -y, +z and -z)"))?;
+        if std::mem::replace(&mut seen[k], true) {
+            return Err(format!("ambient direction {key} is given twice"));
+        }
+        let n: Vec<f32> = value
+            .split(':')
+            .map(|x| x.parse::<f32>().ok().filter(|x| x.is_finite() && *x >= 0.0))
+            .collect::<Option<_>>()
+            .filter(|n: &Vec<f32>| n.len() == 3)
+            .ok_or_else(|| format!("ambient {key} is R:G:B, three numbers 0 or more, not '{value}'"))?;
+        shape[k] = Vec3::new(n[0], n[1], n[2]);
+    }
+    Ok(shape)
 }

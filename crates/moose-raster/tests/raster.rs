@@ -1167,7 +1167,10 @@ fn exactly_lit(out: &ViewGeometry, assets: &Assets, w: &RefPixel) -> u32 {
     let mesh = assets.mesh(p.mesh);
     let normal = out.objects[p.object as usize].rotation
         * mesh.polygons[p.source_polygon() as usize].plane.normal;
-    let mut light = out.ambient;
+    let mut light = match &out.probes {
+        Some(probes) => probes.sample(w.pos, RasterConfig::default().probe_blend).at(normal) * out.probe_scale,
+        None => out.ambient.at(normal),
+    };
     for &i in out.polygon_lights(p) {
         let l = out.lights[i as usize];
         let d = l.position - w.pos;
@@ -1295,6 +1298,53 @@ fn small_lit_faces_hold_still_as_the_view_moves() {
     assert!(off * 100 < pixels * 7, "{off} of {pixels} pixels off by more than 2 levels");
     assert!(far_off * 200 < pixels * 3, "{far_off} of {pixels} pixels off by more than 8 levels");
     assert!(jumps * 5000 < pairs, "{jumps} of {pairs} pixels jump between frames");
+}
+
+#[test]
+fn surfaces_only_probes_light_are_checked_like_lit_ones() {
+    // No lights, and probes 2 m apart whose light changes sharply from one to the next and
+    // with the way a surface faces: the light still bends across a polygon no light
+    // reaches, so its lattice is checked and refined as a lit one's is (it once wasn't:
+    // a smooth ball's faces each kept their own 32 px points, and showed as facets).
+    let (mut world, assets) = world();
+    world.set_lights(Vec::new(), Vec3::splat(0.1));
+    let mut probes = moose_assets::AmbientProbes::covering(Vec3::new(-4.0, 0.0, -20.0), Vec3::new(4.0, 4.0, 8.0), 2.0);
+    for cell in probes.cells().collect::<Vec<_>>() {
+        let [i, j, k] = cell;
+        let index = probes.index(cell);
+        probes.probes[index].faces = std::array::from_fn(|d| {
+            let bright = (i * 7 + j * 3 + k * 5 + d) % 4 == 0;
+            Vec3::new(0.05, 0.06, 0.08) + Vec3::new(0.9, 0.8, 0.6) * bright as u32 as f32
+        });
+    }
+    probes.ambient = world.ambient;
+    world.probes = Some(std::sync::Arc::new(probes));
+    let mut out = ViewGeometry::new();
+    // How many pixels were compared, and how many are off by more than 2 levels.
+    let mut compare = |refine_threshold: f32| {
+        let mut r = renderer(RasterConfig { refine_threshold, ..RasterConfig::default() });
+        let (mut pixels, mut off) = (0usize, 0usize);
+        for cam in random_views(&world, 100, 73, VP) {
+            out.build(&world, &assets, &cam.view());
+            let got = render(&mut r, &out, &assets, VP, None);
+            let want = reference(&out, &assets, VP);
+            for (&g, w) in got.iter().zip(&want) {
+                if w.polygon != 0 {
+                    pixels += 1;
+                    off += (channel_diff(g, exactly_lit(&out, &assets, w)) > 2) as usize;
+                }
+            }
+        }
+        println!("refine threshold {refine_threshold}: {pixels} pixels, {off} off by more than 2 levels");
+        (pixels, off)
+    };
+    // About 10.9% of pixels off by more than 2 levels unchecked, 2.2% checked: the rest is
+    // light bending faster than the closest points (`min_step`) follow, between probes far
+    // more different than a level's.
+    let (_, unchecked) = compare(0.0);
+    let (pixels, checked) = compare(RasterConfig::default().refine_threshold);
+    assert!(checked * 4 < unchecked, "checking left {checked} pixels off, against {unchecked} unchecked");
+    assert!(checked * 100 < pixels * 3, "{checked} of {pixels} pixels off by more than 2 levels");
 }
 
 #[test]

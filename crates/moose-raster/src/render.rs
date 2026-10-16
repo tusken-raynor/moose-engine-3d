@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use glam::{Vec2, Vec3};
-use moose_assets::{Assets, MeshId, Light, Texture, TextureId};
+use moose_assets::{Ambient, AmbientProbes, Assets, MeshId, Light, ProbeBlend, Texture, TextureId};
 use moose_scene::Viewport;
 use moose_view::{
     EdgeLine, Object, PolygonKind, ScreenVertex, ViewGeometry, ViewPolygon, pixel_edge,
@@ -32,6 +32,10 @@ pub enum RasterPath {
     /// Edge-walked and z-tested per pixel into the visibility buffer.
     PerPixel,
 }
+
+/// How far a contact sphere darkens the ambient light, in its radii from its center: past
+/// it, none (see `shaders::contact`).
+pub(crate) const CONTACT_REACH: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RasterConfig {
@@ -87,6 +91,17 @@ pub struct RasterConfig {
     /// Beams' fades (see `Light::beam`) are drawn as a stipple, each pixel lit or not by a
     /// 4×4 ordered dither: a retro look, and cheap, as no pixel needs a partial light.
     pub beam_dither: bool,
+    /// The ambient light bumps normal-mapped surfaces like a light: from the way it is
+    /// brightest (see `moose_assets::Ambient`). Off, it lights a bumped surface the same
+    /// whichever way its bumps face, and pixels the ambient light alone reaches don't read
+    /// their bumps.
+    pub ambient_bumps: bool,
+    /// How the ambient light probes around a sample point are blended (see
+    /// `moose_assets::AmbientProbes::sample`).
+    pub probe_blend: ProbeBlend,
+    /// How much entities darken the ambient light on surfaces they are close to or touch
+    /// (see `moose_view::ContactSphere`): 0, none; 1, all of the sky their spheres hide.
+    pub contact_strength: f32,
     /// Pixels per cell of the grid blurred casters' shadows are blurred on (see
     /// [`BlurGrid`]), each way: its resolution.
     pub blur_scale: u32,
@@ -117,6 +132,9 @@ impl Default for RasterConfig {
             penumbra_padding: 16,
             show_samples: false,
             beam_dither: false,
+            ambient_bumps: true,
+            probe_blend: ProbeBlend::Trilinear,
+            contact_strength: 0.0,
             blur_scale: 8,
             blur_half_rate: false,
             smooth_edges: false,
@@ -297,6 +315,9 @@ struct PolygonSetup {
     /// The lights that reach it, in `ThreadBins::lights`.
     first_light: u32,
     light_count: u16,
+    /// The contact spheres close enough to darken it, in `ThreadBins::contacts`.
+    first_contact: u32,
+    contact_count: u16,
     /// The shadow slots of the lights it is in the full shadow of (see
     /// `ViewPolygon::shadowed`).
     shadowed: u32,
@@ -347,6 +368,9 @@ struct ThreadBins {
     /// index ([`NO_SPLIT`] for none; see `SampleContext::light_split`).
     lights: Vec<Light>,
     light_split: Vec<u8>,
+    /// Each polygon's contact spheres (see `PolygonSetup::first_contact`): center and
+    /// radius.
+    contacts: Vec<glam::Vec4>,
     /// Polygons' shadow pieces; their vertices, edge lines, how much of the light reaches
     /// each vertex, and each vertex's ray (in a beam's pieces; see `ShadowVertex::ray`).
     shadows: Vec<ShadowSetup>,
@@ -586,7 +610,12 @@ struct Textures<'a> {
     blank: &'a Texture,
     focal: f32,
     time: f32,
-    ambient: Vec3,
+    ambient: Ambient,
+    /// See `RasterConfig::ambient_bumps`.
+    ambient_bumps: bool,
+    probes: Option<(&'a AmbientProbes, Vec3)>,
+    probe_blend: ProbeBlend,
+    contact_strength: f32,
     blur: Option<&'a BlurGrid>,
     /// Lattices to build in (see `Renderer::lattice_pool`).
     lattices: &'a Mutex<Vec<Lattice>>,
@@ -664,6 +693,10 @@ impl Renderer {
             focal: geometry.focal,
             time: self.time,
             ambient: geometry.ambient,
+            ambient_bumps: self.config.ambient_bumps,
+            probes: geometry.probes.as_deref().map(|p| (p, geometry.probe_scale)),
+            probe_blend: self.config.probe_blend,
+            contact_strength: self.config.contact_strength,
             blur: None,
             lattices: &self.lattice_pool,
         };
@@ -691,6 +724,7 @@ impl Renderer {
             lattice_pool.lock().unwrap().extend(built);
             bins.lights.clear();
             bins.light_split.clear();
+            bins.contacts.clear();
             bins.shadows.clear();
             bins.shadow_vertices.clear();
             bins.shadow_lines.clear();
@@ -1127,6 +1161,19 @@ fn setup_polygon(
             (lo.min(q), hi.max(q))
         });
     let (center, radius) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
+    // The contact spheres close enough to darken it: not its own entity's.
+    let first_contact = bins.contacts.len() as u32;
+    if config.contact_strength > 0.0 {
+        let own = match p.source {
+            moose_view::PolygonSource::Entity { entity, .. } => Some(entity),
+            _ => None,
+        };
+        for c in &geometry.contacts {
+            if Some(c.entity) != own && c.center.distance(center) < radius + CONTACT_REACH * c.radius {
+                bins.contacts.push(c.center.extend(c.radius));
+            }
+        }
+    }
     // Lights up to the surface's back light angle behind its plane reach it too (its bumps).
     let back = s.back_light.clamp(0.0, 1.0);
     // A polygon lit by normals of its own (a smooth mesh's, not its plane's) is lit by a
@@ -1249,11 +1296,16 @@ fn setup_polygon(
     bins.lines
         .extend_from_slice(&geometry.edge_lines[p.vertices()]);
     let local = bins.polygons.len();
-    // A lit polygon whose material says which of its outputs is the light has its tiles
-    // checked and refined by it.
+    // A polygon whose material says which of its outputs is the light has its tiles checked
+    // and refined by it, where that light can bend: where lights reach it, or the ambient
+    // light changes over it (probes, an ambient cube that isn't one color every way, or
+    // contact spheres darkening it). Flat ambient alone is the same everywhere.
+    let ambient_bends = geometry.probes.is_some()
+        || !geometry.ambient.is_uniform()
+        || bins.contacts.len() as u32 > first_contact;
     let light_out = remap
         .light
-        .filter(|_| bins.lights.len() as u32 > first_light && config.refine_threshold > 0.0)
+        .filter(|_| (bins.lights.len() as u32 > first_light || ambient_bends) && config.refine_threshold > 0.0)
         .map(|at| at as u16);
     // A lattice per block of rows it is in, none built yet.
     let block = |row: i32| (row - viewport.y as i32).div_euclid(BLOCK_ROWS);
@@ -1289,6 +1341,8 @@ fn setup_polygon(
         half_rate: p.mirror.is_some(),
         first_light,
         light_count: (bins.lights.len() as u32 - first_light) as u16,
+        first_contact,
+        contact_count: (bins.contacts.len() as u32 - first_contact) as u16,
         shadowed: p.shadowed,
         position: remap.position.map(|p| p as u16),
         lod: lod_at,
@@ -2106,7 +2160,10 @@ fn sample_context<'a>(
     split: &'a [Cell<F32s>],
 ) -> SampleContext<'a> {
     let lights = p.first_light as usize..p.first_light as usize + p.light_count as usize;
+    let contacts = p.first_contact as usize..p.first_contact as usize + p.contact_count as usize;
     SampleContext {
+        contacts: &bins.contacts[contacts],
+        contact_strength: textures.contact_strength,
         eye: p.eye,
         object: &p.object,
         params: &p.params,
@@ -2114,6 +2171,9 @@ fn sample_context<'a>(
         light_split: &bins.light_split[lights],
         split,
         ambient: textures.ambient,
+        ambient_bumps: textures.ambient_bumps,
+        probes: textures.probes,
+        probe_blend: textures.probe_blend,
         focal: textures.focal,
         back: p.back,
     }

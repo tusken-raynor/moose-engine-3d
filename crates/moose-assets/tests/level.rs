@@ -375,6 +375,7 @@ fn loads_ambient_and_lights() {
     );
     let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
     assert_eq!(level.ambient, Vec3::new(0.1, 0.2, 0.3));
+    assert_eq!(level.ambient_shape, [Vec3::ONE; 6]);
     assert_eq!(level.lights.len(), 2);
     let l = level.lights[1];
     assert_eq!((l.sector, l.position, l.range), (2, Vec3::new(1.0, 1.0, -15.0), 3.5));
@@ -393,6 +394,22 @@ fn loads_ambient_and_lights() {
 }
 
 #[test]
+fn loads_the_ambient_light_by_direction() {
+    // Multipliers of its color, per axis direction; one for those not given.
+    let src = with_lights("ambient 0.1 0.2 0.3  +y=1.5:1.5:2 -y=0.5:0.4:0.3 -z=0:1:0", &[]);
+    let level = assets().parse_level("two_rooms.mmp", &src).unwrap();
+    let one = Vec3::ONE;
+    assert_eq!(
+        level.ambient_shape,
+        [one, one, Vec3::new(1.5, 1.5, 2.0), Vec3::new(0.5, 0.4, 0.3), one, Vec3::new(0.0, 1.0, 0.0)]
+    );
+    // And back, as written.
+    let doc = moose_assets::LevelDoc::parse(std::path::Path::new("two_rooms.mmp"), &src).unwrap();
+    assert_eq!(doc.ambient_options, ["+y=1.5:1.5:2", "-y=0.5:0.4:0.3", "-z=0:1:0"]);
+    assert!(doc.to_text().contains("ambient 0.10 0.20 0.30  +y=1.5:1.5:2 -y=0.5:0.4:0.3 -z=0:1:0\n"));
+}
+
+#[test]
 fn rejects_light_errors() {
     let reject = |ambient: &str, row: &str, expected: &str| {
         let src = with_lights(ambient, &[row]);
@@ -404,6 +421,11 @@ fn rejects_light_errors() {
     };
     let fine = "0  0.0 2.0 4.0  1 1 1  5";
     reject("ambient 1 -1 1", fine, "ambient light cannot be negative");
+    reject("ambient 1 1 1  up=1:1:1", fine, "unknown ambient option 'up'");
+    reject("ambient 1 1 1  +y=1:1", fine, "ambient +y is R:G:B");
+    reject("ambient 1 1 1  +y=1:-1:1", fine, "ambient +y is R:G:B");
+    reject("ambient 1 1 1  -x=1:1:1 -x=2:2:2", fine, "given twice");
+    reject("ambient 1 1 1 0.5", fine, "'ambient' takes 3 argument(s)");
     reject("ambient 1 1 1", "7  0.0 2.0 4.0  1 1 1  5", "sector 7 does not exist");
     reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 -1 1  5", "color cannot be negative");
     reject("ambient 1 1 1", "0  0.0 2.0 4.0  1 1 1  0", "range must be positive");
@@ -427,6 +449,8 @@ fn loads_entity_options() {
     };
     let e = with("static");
     assert_eq!((e.is_static, e.occluder), (true, Occluder::Mesh));
+    // Drawn in ambient light probes, though it moves.
+    assert!(!with("").in_probes && with("probes").in_probes && !with("probes=off").in_probes);
     assert_eq!(with("occluder=none").occluder, Occluder::None);
     assert_eq!(with("static occluder=lod:2").occluder, Occluder::Lod(2));
     assert_eq!(

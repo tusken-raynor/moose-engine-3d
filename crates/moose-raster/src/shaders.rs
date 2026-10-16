@@ -3,16 +3,47 @@
 use crate::shader::{F32s, Fill, I16s, I32s, SampleContext, U32s};
 
 /// The light reaching [`LANES`](crate::shader::LANES) sample points on a surface facing
-/// `normal` (unit length), in linear RGB (1 shows a surface's full color): the ambient light,
-/// plus each light that reaches the polygon, by Lambert's cosine law, a smooth falloff to
+/// `normal` (unit length), in linear RGB (1 shows a surface's full color): the ambient light
+/// from the way it faces (see [`ambient`]), plus each light that reaches the polygon, by Lambert's cosine law, a smooth falloff to
 /// nothing at its range, `(1 - d^2 / range^2)^2`, and a spot light's cone (smoothstep from
 /// its outer half-angle to its inner; a point light's cone is whole).
 ///
 /// Evaluated at sample points only, and interpolated to pixels in between.
 #[inline(always)]
 fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F32s; 3] {
-    let a = ctx.ambient;
-    let mut light = [F32s::fill(a.x), F32s::fill(a.y), F32s::fill(a.z)];
+    let ambient = Ambient { faces: ambient_faces(ctx, position), open: contact(ctx, position, normal) };
+    diffuse_in(ctx, &ambient, position, normal)
+}
+
+/// The ambient light at sample points: its colors (see [`ambient_faces`]), and how much of
+/// it the contact spheres leave (see [`contact`]).
+struct Ambient {
+    faces: Option<[[F32s; 3]; 6]>,
+    open: Option<F32s>,
+}
+
+/// [`diffuse`] and [`bumps`] at the same sample points, the ambient light found there once
+/// for both.
+#[inline(always)]
+fn diffuse_and_bumps(
+    ctx: &SampleContext,
+    position: &[F32s; 3],
+    frame: [&[F32s; 3]; 3],
+) -> ([F32s; 3], [Bumps; BUMP_CHANNELS]) {
+    let ambient = Ambient { faces: ambient_faces(ctx, position), open: contact(ctx, position, frame[2]) };
+    (diffuse_in(ctx, &ambient, position, frame[2]), bumps_in(ctx, &ambient, position, frame))
+}
+
+/// [`diffuse`] with the ambient light there (see [`Ambient`]).
+#[inline(always)]
+fn diffuse_in(ctx: &SampleContext, ambient: &Ambient, position: &[F32s; 3], normal: &[F32s; 3]) -> [F32s; 3] {
+    let mut light = match &ambient.faces {
+        Some(faces) => cube_light(faces, normal),
+        None => ctx.ambient.faces[0].to_array().map(F32s::fill),
+    };
+    if let Some(open) = ambient.open {
+        light = light.map(|c| c * open);
+    }
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
@@ -49,6 +80,170 @@ fn diffuse(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> [F3
         light[2] += F32s::fill(l.color.z) * k;
     }
     light
+}
+
+/// The ambient light's six colors (see `moose_assets::Ambient`) at
+/// [`LANES`](crate::shader::LANES) sample points at `position`: where there are probes,
+/// theirs there (blended as `SampleContext::probe_blend` says, see [`probe_faces`]), and
+/// elsewhere the frame's. `None` where it is the same everywhere and from every way.
+#[inline(always)]
+fn ambient_faces(ctx: &SampleContext, position: &[F32s; 3]) -> Option<[[F32s; 3]; 6]> {
+    let Some((probes, scale)) = ctx.probes else {
+        return (!ctx.ambient.is_uniform()).then(|| ctx.ambient.faces.map(|c| c.to_array().map(F32s::fill)));
+    };
+    let faces = probe_faces(probes, ctx.probe_blend, position);
+    Some(faces.map(|face| std::array::from_fn(|c| face[c] * F32s::fill(scale[c]))))
+}
+
+/// The probes' six colors at [`LANES`](crate::shader::LANES) points at `position`, as
+/// `AmbientProbes::sample` has them, blended for all the points at once: per grid cell
+/// any of them is in (sample points are close together: most often one, rarely more than
+/// two), its probes read once (the 8 corners of the cell, or for a smooth blend the 27
+/// around the nearest probe), and each weighed for the points in it.
+#[inline(always)]
+fn probe_faces(probes: &moose_assets::AmbientProbes, blend: moose_assets::ProbeBlend, position: &[F32s; 3]) -> [[F32s; 3]; 6] {
+    use crate::shader::LANES;
+    use moose_assets::ProbeBlend;
+    let (zero, one, half) = (F32s::fill(0.0), F32s::fill(1.0), F32s::fill(0.5));
+    let smooth = blend == ProbeBlend::Smooth;
+    let inv = F32s::fill(1.0 / probes.spacing);
+    let origin = probes.origin.to_array();
+    // Per axis: each point's cell (its lowest corner; for a smooth blend, its nearest
+    // probe), and how far from it; and for a smooth blend, the spline's weights for the
+    // probes before, at and after it.
+    let mut cells = [[0i64; LANES]; 3];
+    let mut f = [zero; 3];
+    let mut spline = [[one, zero, zero]; 3];
+    for a in 0..3 {
+        let last = probes.dims[a].saturating_sub(1) as f32;
+        let x = ((position[a] - F32s::fill(origin[a])) * inv).max(zero).min(F32s::fill(last));
+        let c = if smooth {
+            (x + half).floor().min(F32s::fill(last))
+        } else {
+            x.floor().min(F32s::fill((last - 1.0).max(0.0)))
+        };
+        cells[a] = c.to_array().map(|v| v as i64);
+        f[a] = x - c;
+        if smooth {
+            let t = f[a];
+            spline[a] = [half * (half - t) * (half - t), F32s::fill(0.75) - t * t, half * (half + t) * (half + t)];
+        }
+    }
+    // The probes read around each cell (offsets along each axis), and each one's weight at
+    // every point, as if every point were in its own cell.
+    let corners: &[[i64; 3]] = if smooth { &SMOOTH_CORNERS } else { &CELL_CORNERS };
+    let weights: Vec<F32s> = corners
+        .iter()
+        .map(|d| match blend {
+            ProbeBlend::Smooth => (0..3).fold(one, |w, a| w * spline[a][(d[a] + 1) as usize]),
+            ProbeBlend::Trilinear => (0..3).fold(one, |w, a| w * if d[a] == 1 { f[a] } else { one - f[a] }),
+        })
+        .collect();
+    let cell_of = |lane: usize| [cells[0][lane], cells[1][lane], cells[2][lane]];
+    let mut faces = [[zero; 3]; 6];
+    let mut done = [false; LANES];
+    for first in 0..LANES {
+        if done[first] {
+            continue;
+        }
+        // The points in this cell.
+        let cell = cell_of(first);
+        let mut mask = [0.0f32; LANES];
+        for lane in first..LANES {
+            if !done[lane] && cell_of(lane) == cell {
+                (mask[lane], done[lane]) = (1.0, true);
+            }
+        }
+        let mask = F32s::from(mask);
+        for (d, &weight) in corners.iter().zip(&weights) {
+            let at = std::array::from_fn(|a| (cell[a] + d[a]).clamp(0, probes.dims[a] as i64 - 1) as usize);
+            let weight = weight * mask;
+            for (sum, color) in faces.iter_mut().zip(probes.probes[probes.index(at)].faces) {
+                for (s, c) in sum.iter_mut().zip(color.to_array()) {
+                    *s += weight * F32s::fill(c);
+                }
+            }
+        }
+    }
+    faces
+}
+
+/// A grid cell's 8 corners, from its lowest.
+const CELL_CORNERS: [[i64; 3]; 8] = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
+
+/// The 27 probes around one, itself among them.
+const SMOOTH_CORNERS: [[i64; 3]; 27] = {
+    let mut c = [[0i64; 3]; 27];
+    let mut i = 0;
+    while i < 27 {
+        c[i] = [(i % 3) as i64 - 1, (i / 3 % 3) as i64 - 1, (i / 9) as i64 - 1];
+        i += 1;
+    }
+    c
+};
+
+/// How much of the ambient light the contact spheres near the polygon leave at
+/// [`LANES`](crate::shader::LANES) sample points at `position` on a surface facing
+/// `normal`: each takes the part of the sky a sphere hides from a point, `cos * (r / d)^2`
+/// for a sphere of radius `r` whose center is `d` away at an angle off the normal of cosine
+/// `cos` (all of it where a sphere sits on the surface, a quarter of it a radius beside),
+/// eased out to none by [`CONTACT_REACH`](crate::render::CONTACT_REACH) radii, times
+/// `SampleContext::contact_strength`; what each leaves multiplies. `None` without any.
+#[inline(always)]
+fn contact(ctx: &SampleContext, position: &[F32s; 3], normal: &[F32s; 3]) -> Option<F32s> {
+    if ctx.contacts.is_empty() {
+        return None;
+    }
+    let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
+    let strength = F32s::fill(ctx.contact_strength);
+    let mut open = one;
+    for c in ctx.contacts {
+        let d = [F32s::fill(c.x) - position[0], F32s::fill(c.y) - position[1], F32s::fill(c.z) - position[2]];
+        let d2 = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).max(F32s::fill(1e-8));
+        let r2 = F32s::fill(c.w * c.w);
+        let reach2 = r2 * F32s::fill(crate::render::CONTACT_REACH * crate::render::CONTACT_REACH);
+        if d2.simd_ge(reach2).all() {
+            continue;
+        }
+        let inv = d2.recip_sqrt();
+        let cos = ((normal[0] * d[0] + normal[1] * d[1] + normal[2] * d[2]) * inv).max(zero);
+        let hidden = (cos * r2 / d2).min(one);
+        // Eased out from all of it at the sphere's surface to none at its reach.
+        let t = ((reach2 - d2) / (reach2 - r2)).max(zero).min(one);
+        let fade = t * t * (F32s::fill(3.0) - t - t);
+        open *= one - strength * hidden * fade;
+    }
+    Some(open)
+}
+
+/// An ambient cube's light (its six colors, `faces`) on surfaces facing `normal`.
+#[inline(always)]
+fn cube_light(faces: &[[F32s; 3]; 6], normal: &[F32s; 3]) -> [F32s; 3] {
+    let zero = F32s::fill(0.0);
+    let mut light = [zero; 3];
+    for (k, n) in normal.iter().enumerate() {
+        let (w, back) = (*n * *n, n.simd_lt(zero));
+        for (c, sum) in light.iter_mut().enumerate() {
+            *sum += w * back.select(faces[2 * k + 1][c], faces[2 * k][c]);
+        }
+    }
+    light
+}
+
+/// Luminance of linear RGB.
+#[inline(always)]
+fn luma_lanes([r, g, b]: [F32s; 3]) -> F32s {
+    r * F32s::fill(0.2126) + g * F32s::fill(0.7152) + b * F32s::fill(0.0722)
+}
+
+/// An ambient cube's change along each axis, in luminance: half the difference between the
+/// axis's two directions. A surface facing `n` takes about its mean plus this dotted with
+/// `n`: what bumps take from it (see [`bumps`]).
+#[inline(always)]
+fn cube_slope(faces: &[[F32s; 3]; 6]) -> [F32s; 3] {
+    let f: [F32s; 6] = faces.map(luma_lanes);
+    let half = F32s::fill(0.5);
+    [(f[0] - f[1]) * half, (f[2] - f[3]) * half, (f[4] - f[5]) * half]
 }
 
 /// The display's gamma: textures, vertex colors and the framebuffer hold gamma-encoded
@@ -525,6 +720,44 @@ pub mod unlit_color {
 
 pub use unlit_color::UnlitColor;
 
+/// One color for the whole polygon, exactly as given (`params.values[0]`, a whole number
+/// below 2^24, as 0xRRGGBB): not a look, but a way to tell which polygon covers each pixel
+/// (an ambient light probe's views are drawn with each polygon's number).
+pub mod flat_id {
+    use crate::shader::{Fill, Material, PixelContext, SampleContext, U32s, VertexContext};
+
+    crate::material_io! {
+        vertex {}
+        sampled {}
+        fixed32 {}
+        fixed16 {}
+        float {}
+    }
+
+    pub struct FlatId;
+
+    impl Material for FlatId {
+        crate::material_types!();
+
+        #[inline(always)]
+        fn shade_vertex(_: &Vertex, _: &VertexContext) -> Sampled {
+            Sampled::default()
+        }
+
+        #[inline(always)]
+        fn shade_sample(_: &SampledLanes, _: &SampleContext) -> Interp {
+            Interp::default()
+        }
+
+        #[inline(always)]
+        fn shade_pixel(_: &Fixed32, _: &Fixed16, _: &Floats, ctx: &PixelContext) -> U32s {
+            U32s::fill(ctx.params.values[0] as u32 & 0xFF_FFFF)
+        }
+    }
+}
+
+pub use flat_id::FlatId;
+
 /// Per-vertex color (the mesh attribute `color`, three 0-255 values, lit as
 /// [`VertexColor`]) drawn translucent, with one opacity for the whole surface:
 /// `params.values[0]`, from 0 (invisible) to 1.
@@ -938,9 +1171,15 @@ pub use textured::Textured;
 /// texel's factor is exactly 1.
 #[derive(Clone, Copy)]
 struct Bumps {
-    /// The ambient light's share of the flat brightness (the lights that always reach
-    /// only: the split lights' channels have none).
+    /// The ambient light's share of the flat brightness, less what its slope (`slope`)
+    /// gives the flat surface (the lights that always reach only: the split lights'
+    /// channels have none).
     ambient: F32s,
+    /// The ambient light's slope (see [`ambient_slope`]) in tangent space, over the flat
+    /// brightness: a texel's normal takes its dot with it, unclamped, so a texel tilted
+    /// toward the way the ambient light is brightest gains and one tilted away loses. None
+    /// without `SampleContext::ambient_bumps`. The lights that always reach's channel only.
+    slope: [F32s; 3],
     /// The sum of the lights' directions (toward them, unit length) times their share of
     /// the flat brightness: lights in front of the surface only.
     toward: [F32s; 3],
@@ -961,9 +1200,9 @@ pub(crate) const BUMP_CHANNELS: usize = 3;
 
 /// Bump values to interpolate (`bump` outputs): the lights that always reach's ambient
 /// share and summed direction, the shadowed lamps' summed direction, the flashlight's
-/// direction, and the lights behind's summed direction (a share of the first channel's
-/// brightness).
-pub(crate) const BUMP_LANES: usize = 13;
+/// direction, the lights behind's summed direction (a share of the first channel's
+/// brightness), and the ambient light's slope (a share of it too).
+pub(crate) const BUMP_LANES: usize = 16;
 
 #[inline(always)]
 fn bump_lanes([rest, lamps, flash]: &[Bumps; BUMP_CHANNELS]) -> [F32s; BUMP_LANES] {
@@ -972,27 +1211,30 @@ fn bump_lanes([rest, lamps, flash]: &[Bumps; BUMP_CHANNELS]) -> [F32s; BUMP_LANE
         lamps.toward[0], lamps.toward[1], lamps.toward[2],
         flash.toward[0], flash.toward[1], flash.toward[2],
         rest.behind[0], rest.behind[1], rest.behind[2],
+        rest.slope[0], rest.slope[1], rest.slope[2],
     ]
 }
 
-/// Whether there is any light from one way in `bump` for the lights that always reach
-/// (not the ambient light only), in front of the surface or behind it.
+/// Whether there is any light from one way in `bump` for the lights that always reach, in
+/// front of the surface or behind it, or the ambient light is brighter one way than another
+/// (not an ambient light the same from every way only).
 #[inline(always)]
 fn bump_has_rest(bump: &[F32s; BUMP_LANES]) -> bool {
     let len2 = |k: usize| bump[k] * bump[k] + bump[k + 1] * bump[k + 1] + bump[k + 2] * bump[k + 2];
-    (len2(1) + len2(10)).simd_ge(F32s::fill(1e-4)).any()
+    (len2(1) + len2(10) + len2(13)).simd_ge(F32s::fill(1e-4)).any()
 }
 
 /// A texel's bumps' factor on channel `g`: 0, the lights that always reach (its ambient
-/// share, its normal's cosine with their summed direction, and with the lights behind the
-/// surface's, which only a normal tilted toward them catches); 1, the shadowed lamps (its
-/// normal's cosine with theirs); 2, the flashlight (with its).
+/// share from the way it faces, its normal's cosine with their summed direction, and with
+/// the lights behind the surface's, which only a normal tilted toward them catches); 1, the
+/// shadowed lamps (its normal's cosine with theirs); 2, the flashlight (with its).
 #[inline(always)]
 fn bump_factor(normal: &[F32s; 3], bump: &[F32s; BUMP_LANES], g: usize) -> F32s {
     let zero = F32s::fill(0.0);
-    let cos = |k: usize| (normal[0] * bump[k] + normal[1] * bump[k + 1] + normal[2] * bump[k + 2]).max(zero);
+    let dot = |k: usize| normal[0] * bump[k] + normal[1] * bump[k + 1] + normal[2] * bump[k + 2];
+    let cos = |k: usize| dot(k).max(zero);
     match g {
-        0 => bump[0] + cos(1) + cos(10),
+        0 => (bump[0] + dot(13)).max(zero) + cos(1) + cos(10),
         1 => cos(4),
         _ => cos(7),
     }
@@ -1006,18 +1248,46 @@ fn bump_factor(normal: &[F32s; 3], bump: &[F32s; BUMP_LANES], g: usize) -> F32s 
 /// light as much as it reaches (see `PixelContext::light_scaled`): a light that doesn't
 /// reach a pixel doesn't bump it, and the others still do. The flashlight, the light most
 /// unlike the others (low, close, often grazing), never steers their bumps, nor they its.
-#[inline(always)]
+#[cfg(test)]
 fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> [Bumps; BUMP_CHANNELS] {
+    let ambient = Ambient { faces: ambient_faces(ctx, position), open: contact(ctx, position, frame[2]) };
+    bumps_in(ctx, &ambient, position, frame)
+}
+
+/// [`bumps`] with the ambient light there (see [`Ambient`]).
+#[inline(always)]
+fn bumps_in(
+    ctx: &SampleContext,
+    ambient_there: &Ambient,
+    position: &[F32s; 3],
+    frame: [&[F32s; 3]; 3],
+) -> [Bumps; BUMP_CHANNELS] {
+    let faces = ambient_there.faces.as_ref();
+    let open = ambient_there.open.unwrap_or(F32s::fill(1.0));
     let (zero, one) = (F32s::fill(0.0), F32s::fill(1.0));
     let luma = |c: glam::Vec3| 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-    let ambient = F32s::fill(luma(ctx.ambient));
+    let dot = |a: &[F32s; 3], b: &[F32s; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    // The ambient light on the flat surface, and its slope in tangent space (see
+    // `cube_slope`): its share for a texel facing the flat surface's way is the flat light,
+    // whatever its slope.
+    let ambient = open
+        * match faces {
+            Some(faces) => luma_lanes(cube_light(faces, frame[2])),
+            None => F32s::fill(luma(ctx.ambient.faces[0])),
+        };
+    let slope = match faces {
+        Some(faces) if ctx.ambient_bumps => {
+            let s = cube_slope(faces);
+            frame.map(|axis| dot(axis, &s) * open)
+        }
+        _ => [zero; 3],
+    };
     // Per channel: the flat brightness, the summed directions, the color.
     let mut flat = [ambient, zero, zero];
     let mut toward = [[zero; 3]; BUMP_CHANNELS];
     let mut color = [[zero; 3]; BUMP_CHANNELS];
     let mut behind = [zero; 3];
     let back = F32s::fill(ctx.back.max(1e-6));
-    let dot = |a: &[F32s; 3], b: &[F32s; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     for (i, l) in ctx.lights.iter().enumerate() {
         let d = [
             F32s::fill(l.position.x) - position[0],
@@ -1063,7 +1333,8 @@ fn bumps(ctx: &SampleContext, position: &[F32s; 3], frame: [&[F32s; 3]; 3]) -> [
     std::array::from_fn(|g| {
         let over = flat[g].max(F32s::fill(1e-6)).recip();
         Bumps {
-            ambient: if g == 0 { ambient * over } else { zero },
+            ambient: if g == 0 { (ambient - slope[2]) * over } else { zero },
+            slope: if g == 0 { slope.map(|v| v * over) } else { [zero; 3] },
             toward: toward[g].map(|v| v * over),
             color: color[g],
             behind: if g == 0 { behind.map(|v| v * over) } else { [zero; 3] },
@@ -1124,7 +1395,7 @@ pub mod textured_lit {
         sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
         fixed16 { lod: 1, fade: 1 if !MIRRORED }
-        float { bump: 13 if !MIRRORED, spec: 6 if !MIRRORED }
+        float { bump: 16 if !MIRRORED, spec: 6 if !MIRRORED }
     }
 
     /// Textured, bumpy and shiny as `BUMP` and `SPECULAR` say (see the module); seen in a
@@ -1182,7 +1453,7 @@ pub mod textured_lit {
                 };
             }
             let frame = [&s.tangent, &s.bitangent, &s.normal];
-            let channels = super::bumps(ctx, &s.position, frame);
+            let (light, channels) = super::diffuse_and_bumps(ctx, &s.position, frame);
             let zero = F32s::fill(0.0);
             // The channels' directions: the bumps', and the highlights' (their half vectors
             // are made at the pixels).
@@ -1224,7 +1495,7 @@ pub mod textured_lit {
                 uv: s.uv,
                 lod: s.lod,
                 fade: [t * t * (F32s::fill(3.0) - t - t)],
-                light: super::light_output(super::diffuse(ctx, &s.position, &s.normal)),
+                light: super::light_output(light),
                 bump,
                 spec,
             }
@@ -1352,7 +1623,7 @@ pub mod basic_bumpy {
         sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
         fixed16 { lod: 1, fade: 1 if !MIRRORED }
-        float { bump: 13 if !MIRRORED }
+        float { bump: 16 if !MIRRORED }
     }
 
     pub struct BasicBumpy<const MIRRORED: bool = false>;
@@ -1377,11 +1648,11 @@ pub mod basic_bumpy {
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            let (light, channels) = super::diffuse_and_bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            let light = super::light_output(light);
             if MIRRORED {
                 return Interp { uv: s.uv, lod: s.lod, light, ..Default::default() };
             }
-            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
             Interp {
                 uv: s.uv,
                 lod: s.lod,
@@ -1473,7 +1744,7 @@ pub mod colored_bumpy {
         sampled { uv: 2, lod: 1, tint: 3, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
         fixed16 { lod: 1, fade: 1 if !MIRRORED }
-        float { tint: 3, bump: 13 if !MIRRORED }
+        float { tint: 3, bump: 16 if !MIRRORED }
     }
 
     pub struct ColoredBumpy<const MIRRORED: bool = false>;
@@ -1499,11 +1770,11 @@ pub mod colored_bumpy {
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            let (light, channels) = super::diffuse_and_bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            let light = super::light_output(light);
             if MIRRORED {
                 return Interp { uv: s.uv, lod: s.lod, tint: s.tint, light, ..Default::default() };
             }
-            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
             Interp {
                 uv: s.uv,
                 lod: s.lod,
@@ -1559,7 +1830,7 @@ pub mod random_sections {
         sampled { uv: 2, lod: 1, cell: 2, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { cell: 2, light: 3 }
         fixed16 { lod: 1, fade: 1 if !MIRRORED }
-        float { bump: 13 if !MIRRORED }
+        float { bump: 16 if !MIRRORED }
     }
 
     pub struct RandomSections<const MIRRORED: bool = false>;
@@ -1598,11 +1869,11 @@ pub mod random_sections {
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            let (light, channels) = super::diffuse_and_bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            let light = super::light_output(light);
             if MIRRORED {
                 return Interp { cell: s.cell, lod: s.lod, light, ..Default::default() };
             }
-            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
             Interp {
                 cell: s.cell,
                 lod: s.lod,
@@ -1978,7 +2249,7 @@ pub mod reflective_bumpy {
         sampled { uv: 2, lod: 1, normal: 3, tangent: 3 if !MIRRORED, bitangent: 3 if !MIRRORED, position: 3 }
         fixed32 { uv: 2, light: 3 }
         fixed16 { lod: 1, facing: 1, fade: 1 if !MIRRORED }
-        float { distance: 1, bump: 13 if !MIRRORED }
+        float { distance: 1, bump: 16 if !MIRRORED }
     }
 
     const SHORT: usize = 0;
@@ -2035,12 +2306,12 @@ pub mod reflective_bumpy {
 
         #[inline(always)]
         fn shade_sample(s: &SampledLanes, ctx: &SampleContext) -> Interp {
-            let light = super::light_output(super::diffuse(ctx, &s.position, &s.normal));
+            let (light, channels) = super::diffuse_and_bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
+            let light = super::light_output(light);
             let (facing, distance) = super::facing_and_distance(ctx.eye, &s.position, &s.normal);
             if MIRRORED {
                 return Interp { uv: s.uv, lod: s.lod, light, facing: [facing], distance: [distance], ..Default::default() };
             }
-            let channels = super::bumps(ctx, &s.position, [&s.tangent, &s.bitangent, &s.normal]);
             let p = &ctx.params.values;
             Interp {
                 uv: s.uv,
@@ -2402,6 +2673,137 @@ mod tests {
     };
 
     #[test]
+    fn a_sphere_darkens_the_ambient_light_only_close_to_it() {
+        use crate::shader::Fill;
+        let params = Params::default();
+        let f = |v: f32| F32s::fill(v);
+        // A ball of radius 0.3 resting on a floor facing up.
+        let contacts = [Vec3::new(0.0, 0.3, 0.0).extend(0.3)];
+        let ctx = SampleContext {
+            eye: Vec3::new(0.0, 2.0, 5.0),
+            focal: 360.0,
+            object: &Object::IDENTITY,
+            params: &params,
+            lights: &[],
+            ambient: moose_assets::Ambient::uniform(Vec3::splat(0.2)),
+            ambient_bumps: true,
+            probes: None,
+            probe_blend: moose_assets::ProbeBlend::Trilinear,
+            contacts: &contacts,
+            contact_strength: 1.0,
+            light_split: &[],
+            split: &[],
+            back: 0.0,
+        };
+        let open = |ctx: &SampleContext, x: f32, y: f32, normal: [f32; 3]| {
+            super::contact(ctx, &[f(x), f(y), f(0.0)], &normal.map(f)).unwrap().to_array()[0]
+        };
+        let up = [0.0, 1.0, 0.0];
+        // Under it: all of the sky hidden; a radius beside, part; past its reach, none.
+        let (under, beside, far) = (open(&ctx, 0.0, 0.0, up), open(&ctx, 0.3, 0.0, up), open(&ctx, 1.0, 0.0, up));
+        assert!(under < 1e-3, "{under}");
+        assert!(0.5 < beside && beside < 0.9, "{beside}");
+        assert_eq!(far, 1.0);
+        // On top of the ball, facing away from its center: nothing.
+        assert_eq!(open(&ctx, 0.0, 0.6, up), 1.0);
+        // The light there is the ambient light times what is left.
+        let light = super::diffuse(&ctx, &[f(0.3), f(0.0), f(0.0)], &up.map(f))[0].to_array()[0];
+        assert!((light - 0.2 * beside).abs() < 1e-6);
+        // Weaker, less.
+        let half = SampleContext { contact_strength: 0.5, ..ctx };
+        let under_half = open(&half, 0.0, 0.0, up);
+        assert!((under_half - 0.5).abs() < 1e-3, "{under_half}");
+    }
+
+    #[test]
+    fn probes_blended_at_once_are_as_blended_one_point_at_a_time() {
+        use crate::shader::Fill;
+        use moose_assets::{Ambient, AmbientProbes, ProbeBlend};
+        let mut g = AmbientProbes::covering(Vec3::new(-2.0, 0.0, -2.0), Vec3::new(2.0, 2.0, 2.0), 1.0);
+        for (n, a) in g.probes.iter_mut().enumerate() {
+            for (k, face) in a.faces.iter_mut().enumerate() {
+                *face = Vec3::new((n * 7 + k) as f32 % 5.0, (n * 3 + k * 2) as f32 % 7.0, (n + k * 5) as f32 % 3.0);
+            }
+        }
+        let check = |xs: [f32; 8], y: f32, z: f32| {
+            let position = [F32s::from(xs), F32s::fill(y), F32s::fill(z)];
+            for blend in [ProbeBlend::Trilinear, ProbeBlend::Smooth] {
+                let faces = super::probe_faces(&g, blend, &position);
+                for (lane, &x) in xs.iter().enumerate() {
+                    let want: Ambient = g.sample(Vec3::new(x, y, z), blend);
+                    for k in 0..6 {
+                        for c in 0..3 {
+                            let got = faces[k][c].to_array()[lane];
+                            assert!((got - want.faces[k][c]).abs() < 1e-4, "{blend:?} lane {lane} face {k}: {got} against {}", want.faces[k][c]);
+                        }
+                    }
+                }
+            }
+        };
+        // All in one cell: read once.
+        check([0.1, 0.2, 0.35, 0.5, 0.6, 0.75, 0.8, 0.95], 1.3, -0.4);
+        // Across cells, and past the grid's edge.
+        check([-3.0, -1.5, -0.2, 0.4, 1.1, 1.9, 2.5, 9.0], 0.7, 1.6);
+    }
+
+    #[test]
+    fn the_ambient_light_lights_and_bumps_from_the_way_it_is_brightest() {
+        use crate::shader::Fill;
+        use moose_assets::Ambient;
+        let params = Params::default();
+        let f = |v: f32| F32s::fill(v);
+        // A wall at the origin facing +x, its texture's u along -z and v along y; the ambient
+        // light bright from above, dim from below, the same from every way across.
+        let (position, frame) = ([f(0.0); 3], [[f(0.0), f(0.0), f(-1.0)], [f(0.0), f(1.0), f(0.0)], [f(1.0), f(0.0), f(0.0)]]);
+        let mut ambient = Ambient::uniform(Vec3::splat(0.2));
+        (ambient.faces[2], ambient.faces[3]) = (Vec3::splat(0.6), Vec3::splat(0.05));
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        // Texels in tangent space: flat, tilted up (toward +v), tilted down.
+        let (flat, up, down) = ([f(0.0), f(0.0), f(1.0)], [f(0.0), f(s), f(s)], [f(0.0), f(-s), f(s)]);
+        let run = |ambient_bumps: bool| {
+            let ctx = SampleContext {
+                eye: Vec3::new(5.0, 0.0, 0.0),
+                focal: 360.0,
+                object: &Object::IDENTITY,
+                params: &params,
+                lights: &[],
+                ambient,
+                ambient_bumps,
+                probes: None,
+                probe_blend: moose_assets::ProbeBlend::Trilinear,
+                contacts: &[],
+                contact_strength: 0.0,
+                light_split: &[],
+                split: &[],
+                back: 0.0,
+            };
+            // The light on surfaces facing each axis way is that way's color.
+            for (k, d) in Ambient::DIRECTIONS.iter().enumerate() {
+                let light = super::diffuse(&ctx, &position, &d.to_array().map(f)).map(|c| c.to_array()[0]);
+                assert!((Vec3::from(light) - ambient.faces[k]).length() < 1e-6, "{d}: {light:?}");
+            }
+            // Between them, as the ambient light has it.
+            let n = Vec3::new(1.0, 1.0, -1.0).normalize();
+            let light = super::diffuse(&ctx, &position, &n.to_array().map(f)).map(|c| c.to_array()[0]);
+            assert!((Vec3::from(light) - ambient.at(n)).length() < 1e-6);
+            let lanes = super::bump_lanes(&super::bumps(&ctx, &position, [&frame[0], &frame[1], &frame[2]]));
+            let at = |n: &[F32s; 3]| super::bump_factor(n, &lanes, 0).to_array()[0];
+            (at(&flat), at(&up), at(&down), super::bump_has_rest(&lanes))
+        };
+        // Directional: a flat texel takes the wall's own light, one tilted up more, one
+        // tilted down less; the bumps are read.
+        let (flat1, up1, down1, rest1) = run(true);
+        assert!(rest1 && (flat1 - 1.0).abs() < 1e-5, "{flat1}");
+        assert!(up1 > 1.5 && down1 < 0.6, "{up1} {down1}");
+        // Flat: every texel takes the wall's own light, and the bumps aren't read.
+        let (flat0, up0, down0, rest0) = run(false);
+        assert!(!rest0);
+        for v in [flat0, up0, down0] {
+            assert!((v - 1.0).abs() < 1e-5, "{v}");
+        }
+    }
+
+    #[test]
     fn a_light_just_behind_bumps_only_texels_tilted_toward_it_within_the_back_light_angle() {
         use crate::shader::Fill;
         use moose_assets::Light;
@@ -2420,7 +2822,12 @@ mod tests {
                 object: &Object::IDENTITY,
                 params: &params,
                 lights: &lights,
-                ambient: Vec3::splat(0.1),
+                ambient: moose_assets::Ambient::uniform(Vec3::splat(0.1)),
+                ambient_bumps: true,
+                probes: None,
+                probe_blend: moose_assets::ProbeBlend::Trilinear,
+                contacts: &[],
+                contact_strength: 0.0,
                 light_split: &[],
                 split: &[],
                 back: back_deg.to_radians().sin(),
@@ -2472,7 +2879,12 @@ mod tests {
             object: &Object::IDENTITY,
             params: &params,
             lights: &lights,
-            ambient: Vec3::splat(0.05),
+            ambient: moose_assets::Ambient::uniform(Vec3::splat(0.05)),
+            ambient_bumps: true,
+                probes: None,
+                probe_blend: moose_assets::ProbeBlend::Trilinear,
+                contacts: &[],
+                contact_strength: 0.0,
             light_split: &[0, 1],
             split: &split,
             back: 0.0,
@@ -2553,7 +2965,7 @@ mod tests {
         let (full, mirrored) = (TexturedNormalSpecular::IO, TexturedLitMirrored::IO);
         // uv, lod, light; no tangent frame, bump fade, bumps or highlight.
         assert_eq!(layout_len(mirrored.interp), 2 + 3 + 1);
-        assert_eq!(layout_len(full.interp), 2 + 3 + 1 + 1 + 13 + 6);
+        assert_eq!(layout_len(full.interp), 2 + 3 + 1 + 1 + super::BUMP_LANES + 6);
         assert_eq!(layout_len(mirrored.sampled), layout_len(full.sampled) - 6);
         assert_eq!(<TexturedLitMirrored as Material>::Interp::len(true), 6);
         // Its values round-trip through the engine's shorter layout.
@@ -2562,7 +2974,7 @@ mod tests {
         let mut back = vec![F32s::fill(-1.0); 6];
         interp.write_lanes(&mut back, true);
         assert_eq!(back, values);
-        assert_eq!(interp.bump, [F32s::fill(0.0); 13]);
+        assert_eq!(interp.bump, [F32s::fill(0.0); super::BUMP_LANES]);
     }
 
     /// A texture set with `given` in its first slots, the first again in the rest.
@@ -2818,7 +3230,12 @@ mod tests {
             object: &Object::IDENTITY,
             params: &params,
             lights: &[],
-            ambient: Vec3::ONE,
+            ambient: moose_assets::Ambient::uniform(Vec3::ONE),
+            ambient_bumps: true,
+                probes: None,
+                probe_blend: moose_assets::ProbeBlend::Trilinear,
+                contacts: &[],
+                contact_strength: 0.0,
             light_split: &[],
             split: &[],
             back: 0.0,

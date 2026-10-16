@@ -40,6 +40,13 @@ pub struct World {
     pub spawn_points: Vec<SpawnPoint>,
     /// Light that reaches everything (linear RGB; 1 is a surface's full color).
     pub ambient: Vec3,
+    /// How the ambient light differs by the way a surface faces (see
+    /// `moose_assets::Level::ambient_shape`): the ambient light by direction is
+    /// `Ambient::shaped(ambient, &ambient_shape)`.
+    pub ambient_shape: [Vec3; 6],
+    /// The ambient light by direction at points over the level, from what can be seen there
+    /// (see `moose_assets::AmbientProbes`): the ambient light where there are any.
+    pub probes: Option<std::sync::Arc<moose_assets::AmbientProbes>>,
     /// Lights from far away, entering through sky surfaces.
     pub directional: Vec<DirectionalLight>,
     /// The level's meta keys and values (see `moose_assets::meta`): its own, and per
@@ -97,6 +104,8 @@ pub struct Entity {
     pub occluder: Occluder,
     /// It never moves: static lights' shadows from it (and on it) can be worked out once.
     pub is_static: bool,
+    /// It moves and is drawn in ambient light probes (see `EntitySpawn::in_probes`).
+    pub in_probes: bool,
     /// How its shadows' edges are drawn.
     pub shadow: ShadowKind,
     /// The animation it plays (by name), if its model has a skeleton.
@@ -235,6 +244,7 @@ impl World {
                     sectors: Vec::new(),
                     occluder,
                     is_static,
+                    in_probes: spawn.in_probes,
                     shadow: spawn.shadow,
                     animation: spawn.animation,
                     binding: spawn.binding,
@@ -266,6 +276,8 @@ impl World {
             bindings: level.bindings,
             spawn_points,
             ambient: level.ambient,
+            ambient_shape: level.ambient_shape,
+            probes: None,
             directional: level.directional,
             meta_keys: level.meta_keys,
             meta: level.meta,

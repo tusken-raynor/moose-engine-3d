@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::ops::Range;
 
 use glam::Vec3;
-use moose_assets::{MipLevel, Light, Texture};
+use moose_assets::{Ambient, AmbientProbes, MipLevel, Light, ProbeBlend, Texture};
 use moose_view::Object;
 
 use wide::{f32x4, f32x8, i16x8, i32x4, i32x8, u16x8, u32x4, u32x8};
@@ -1250,9 +1250,21 @@ pub struct SampleContext<'a> {
     pub object: &'a Object,
     pub params: &'a Params,
     /// The lights that reach the polygon (those in range of it and in front of it), and
-    /// the light that reaches everything (linear RGB).
+    /// the light that reaches everything (linear RGB), by the way a surface faces.
     pub lights: &'a [Light],
-    pub ambient: Vec3,
+    pub ambient: Ambient,
+    /// The ambient light bumps normal-mapped surfaces from the way it is brightest (see
+    /// `RasterConfig::ambient_bumps`).
+    pub ambient_bumps: bool,
+    /// The ambient light by direction at points over the level, in place of `ambient`
+    /// where there are probes, times the second (see `ViewGeometry::probe_scale`); and how
+    /// the probes around a sample point are blended.
+    pub probes: Option<(&'a AmbientProbes, Vec3)>,
+    pub probe_blend: ProbeBlend,
+    /// The entities' spheres close enough to darken the polygon's ambient light (center
+    /// and radius; see `moose_view::ContactSphere`), and how much they do (0 to 1).
+    pub contacts: &'a [glam::Vec4],
+    pub contact_strength: f32,
     /// Per light, [`NO_SPLIT`], or for a light whose shadow covers part of the polygon,
     /// which of `split` gets its strength as well as the sum getting its light: the engine
     /// takes its light (its color times that) back out pixel by pixel, as much as the

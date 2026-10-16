@@ -63,6 +63,28 @@
 //!   --flashlight-fade D   how wide the flashlight's cone fades, in degrees, inside its 20
 //!                         degree edge (default 8; 0 is a hard edge)
 //!   --dither-beam         draw the flashlight beam's fade as a stipple (an ordered dither)
+//!   --probes M            bake ambient light probes M meters apart at load (0, the
+//!                         default: none): light bounced off what the lights reach, added
+//!                         to the ambient light
+//!   --probe-fade S        how long a probe drawn again fades to its new light, in seconds
+//!                         (default 0.1)
+//!   --all-far-probes      far from the eye, draw every probe again, not every other one
+//!   --drawn-probes        draw probes again whole each time, not relit from a buffer of
+//!                         what they see (to compare)
+//!   --smooth-probes       blend the 27 probes around a point by a quadratic B-spline: no
+//!                         bands where the cells meet
+//!   --probe-size N        each face of a probe's cube map N pixels each way (8, 16, the
+//!                         default, or 32)
+//!   --basic-ambient       the ambient light the level's one color, everywhere and from
+//!                         every way: none of the above, nor its shape by direction
+//!   --contact-shadows X   how much entities darken the ambient light where they touch or
+//!                         nearly touch surfaces, 0 (the default: none) to 1
+//!   --probe-rate N        draw the probes near the eye again N times a second (farther
+//!                         ones 8 times less often), blending them to their new light
+//!                         (0, the default: never)
+//!   --flat-ambient-bumps  the ambient light bumps normal-mapped surfaces the same whichever
+//!                         way they face, not from the way it is brightest (cheaper where
+//!                         the ambient light alone reaches)
 //!   --smooth-edges        smooth the edges between surfaces (anti-aliasing)
 //!   --fly                 start flying (no gravity; Space/C rise and sink) rather than
 //!                         walking (see the Physics Spec)
@@ -114,6 +136,7 @@ mod editor_panel;
 mod gui;
 mod material_edit;
 mod material_screen;
+mod probes;
 mod materials;
 mod mesh_edit;
 mod scripts;
@@ -135,6 +158,8 @@ use moose_scene::{Camera, Viewport, World};
 use moose_view::{MAX_SHADOW_SLOTS, PolygonSource, ViewGeometry};
 
 const EYE_HEIGHT: f32 = 1.7;
+/// Time kept back from drawing probes before a frame is due (see `App::idle_probes`).
+const IDLE_MARGIN: Duration = Duration::from_millis(1);
 const MOVE_SPEED: f32 = 3.0; // m/s
 const FAST: f32 = 3.0;
 /// Running (Shift, while walking) is this many times walking speed, and crouching this many.
@@ -203,6 +228,9 @@ const FLASHLIGHT_FADES: [f32; 6] = [0.0, 2.0, 4.0, 8.0, 14.0, 20.0];
 /// own size. Each light's size is its own: a level light's `radius=`, the sun's angle in
 /// the level, the flashlight's `FLASHLIGHT_RADIUS`.
 const SOFTNESS: [f32; 5] = [0.0, 1.0, 2.0, 4.0, 6.0];
+/// How much entities darken the ambient light where they touch surfaces, to choose from
+/// (see `RasterConfig::contact_strength`).
+const CONTACT_STRENGTHS: [f32; 4] = [0.0, 0.25, 0.5, 1.0];
 /// The radius of the flashlight's source, in meters.
 const FLASHLIGHT_RADIUS: f32 = 0.05;
 
@@ -285,6 +313,16 @@ struct Options {
     /// Draw the shadow pieces' outlines over the frame (F4).
     show_shadow_mesh: bool,
     dither_beam: bool,
+    flat_ambient_bumps: bool,
+    probes: f32,
+    smooth_probes: bool,
+    drawn_probes: bool,
+    probe_fade: f32,
+    all_far_probes: bool,
+    probe_rate: f32,
+    contact_shadows: f32,
+    probe_size: u32,
+    basic_ambient: bool,
     smooth_edges: bool,
     /// Start flying rather than walking.
     fly: bool,
@@ -376,6 +414,16 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
         show_samples: false,
         show_shadow_mesh: false,
         dither_beam: false,
+        flat_ambient_bumps: false,
+        probes: 0.0,
+        smooth_probes: false,
+        drawn_probes: false,
+        probe_fade: 0.1,
+        all_far_probes: false,
+        probe_rate: 0.0,
+        contact_shadows: 0.0,
+        probe_size: 16,
+        basic_ambient: false,
         smooth_edges: false,
         fly: false,
         no_sound: false,
@@ -502,6 +550,16 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<Options, Stri
             "--show-samples" => o.show_samples = true,
             "--show-shadow-mesh" => o.show_shadow_mesh = true,
             "--dither-beam" => o.dither_beam = true,
+            "--flat-ambient-bumps" => o.flat_ambient_bumps = true,
+            "--probes" => o.probes = value()?.parse().map_err(|_| "bad --probes")?,
+            "--smooth-probes" => o.smooth_probes = true,
+            "--drawn-probes" => o.drawn_probes = true,
+            "--probe-fade" => o.probe_fade = value()?.parse().map_err(|_| "bad --probe-fade")?,
+            "--all-far-probes" => o.all_far_probes = true,
+            "--probe-rate" => o.probe_rate = value()?.parse().map_err(|_| "bad --probe-rate")?,
+            "--contact-shadows" => o.contact_shadows = value()?.parse().map_err(|_| "bad --contact-shadows")?,
+            "--probe-size" => o.probe_size = value()?.parse().map_err(|_| "bad --probe-size")?,
+            "--basic-ambient" => o.basic_ambient = true,
             "--smooth-edges" => o.smooth_edges = true,
             "--fly" => o.fly = true,
             "--no-sound" => o.no_sound = true,
@@ -586,6 +644,23 @@ struct Settings {
     weather: usize,
     /// Every light's source size, as a multiple of its own (one of `SOFTNESS`).
     softness: f32,
+    /// How far apart the ambient light probes are, in meters (one of
+    /// `probes::PROBE_SPACINGS`; 0, none).
+    probe_spacing: f32,
+    /// How often the probes near the eye are drawn again, a second (one of
+    /// `probes::PROBE_RATES`; 0, never).
+    probe_rate: f32,
+    /// Each face of a probe's cube map, in pixels each way (one of `probes::PROBE_SIZES`).
+    probe_size: u32,
+    /// How long a probe drawn again fades to its new light, in seconds (one of
+    /// `probes::PROBE_FADES`).
+    probe_fade: f32,
+    /// Probes are relit from a buffer of what they see, filled once (see `probes::Seen`),
+    /// rather than drawn again whole.
+    probe_relight: bool,
+    /// Far from the eye, only every other probe along each axis is drawn again, and those
+    /// between are blended from them (see `probes::fill_between`).
+    sparse_far_probes: bool,
     /// The same for shadows carved every frame (dynamic lights' and moving occluders'), at
     /// most `softness`: hard wherever that is.
     dynamic_softness: f32,
@@ -741,10 +816,15 @@ struct App {
     /// The bloom pass, and how long it took last frame (ms).
     bloom: Bloom,
     post_ms: f64,
+    /// How long drawing ambient light probes again took last frame (ms; see
+    /// `probes::Updates`).
+    probe_ms: f64,
     /// Per entity, its cube map if it is a mirror ball.
     cube_maps: Vec<Option<CubeMap>>,
     /// Cube map textures no longer used (the level was rebuilt), to draw the next ones in.
     spare_cubes: Vec<TextureId>,
+    /// What keeps the ambient light probes up to date, if there are probes.
+    probe_updates: Option<probes::Updates>,
     /// The level editor (Tab), with the level's tables.
     editor: editor::Editor,
     /// The model files in assets/models, for the editor.
@@ -813,6 +893,13 @@ impl App {
         let mut renderer = Renderer::new(RasterConfig {
             show_samples: options.show_samples,
             beam_dither: options.dither_beam,
+            ambient_bumps: !options.flat_ambient_bumps,
+            contact_strength: options.contact_shadows.clamp(0.0, 1.0),
+            probe_blend: if options.smooth_probes {
+                moose_assets::ProbeBlend::Smooth
+            } else {
+                moose_assets::ProbeBlend::Trilinear
+            },
             smooth_edges: options.smooth_edges,
             blur_scale: options.blur_scale.unwrap_or(defaults.blur_scale),
             blur_half_rate: options.blur_half_rate,
@@ -864,6 +951,7 @@ impl App {
                 g.config.max_reflections = options.bounces;
                 g.config.cache_shadows = !options.no_shadow_cache;
                 g.config.dynamic_shadows = !options.no_dynamic_shadows;
+                g.config.basic_ambient = options.basic_ambient;
                 g
             },
             renderer,
@@ -876,8 +964,10 @@ impl App {
             toast: None,
             bloom: Bloom::default(),
             post_ms: 0.0,
+            probe_ms: 0.0,
             cube_maps,
             spare_cubes: Vec::new(),
+            probe_updates: None,
             editor: {
                 let mut editor = editor::Editor::new(doc, level_path);
                 editor.materials = materials_names.clone();
@@ -904,6 +994,12 @@ impl App {
                 shadows: !options.no_shadows,
                 sun: !options.no_sun,
                 softness: options.softness.max(0.0),
+                probe_spacing: options.probes.max(0.0),
+                probe_rate: options.probe_rate.max(0.0),
+                probe_size: options.probe_size.clamp(1, 64),
+                probe_fade: options.probe_fade.max(0.0),
+                sparse_far_probes: !options.all_far_probes,
+                probe_relight: !options.drawn_probes,
                 dynamic_softness: options.dynamic_softness.max(0.0),
                 flashlight_fade: options.flashlight_fade.clamp(0.0, FLASHLIGHT_OUTER),
                 cone: options.cone,
@@ -950,6 +1046,7 @@ impl App {
             started.elapsed().as_secs_f64() * 1000.0
         );
         app.bake_cube_maps()?;
+        app.bake_probes()?;
         app.settings.level_lights = options.level_lights;
         app.day = app.day_of(options.time_of_day);
         app.show_clouds();
@@ -1017,7 +1114,7 @@ impl App {
         self.apply_lights(false);
         self.geometry.clear_shadows();
         self.geometry.bake_shadows(&self.world, &self.assets);
-        let baked = self.bake_cube_maps();
+        let baked = self.bake_cube_maps().and_then(|()| self.bake_probes());
         self.settings.level_lights = level_lights;
         self.editor.learn_animations(&self.world, &self.assets);
         // Its scripts start over, with the level's things as they are now.
@@ -1718,6 +1815,13 @@ impl App {
         self.day.as_ref().map(|d| d.now(self.time, self.settings.cycle == CycleMode::Off))
     }
 
+    /// Starts baking the ambient light probes again (see `bake_probes`).
+    fn rebake_probes(&mut self) {
+        if let Err(e) = self.bake_probes() {
+            self.toast = Some((e, Instant::now()));
+        }
+    }
+
     /// Bakes a cube map for each mirror ball: the level rendered six times from the ball's
     /// center, a 90 degree square view down each axis. The ball itself is not in them: from
     /// inside, all of its faces face away.
@@ -2027,6 +2131,33 @@ impl App {
                 (_, fade) => format!("{fade}°"),
             },
             Setting::FlashlightDither => on(cfg.beam_dither),
+            Setting::AmbientBumps => if cfg.ambient_bumps { "directional" } else { "flat" }.into(),
+            Setting::AmbientProbes => match s.probe_spacing {
+                0.0 => "off".into(),
+                m => format!("{m} m apart"),
+            },
+            Setting::AmbientLight => if self.geometry.config.basic_ambient { "basic" } else { "full" }.into(),
+            Setting::ProbeSize => format!("{0}x{0} a face", s.probe_size),
+            Setting::DistantProbes => if s.sparse_far_probes { "every other" } else { "all" }.into(),
+            Setting::ProbeDrawing => if s.probe_relight { "relit" } else { "drawn whole" }.into(),
+
+            Setting::ProbeFade => match s.probe_fade {
+                0.0 => "at once".into(),
+                f => format!("{f} s"),
+            },
+            Setting::ContactShadows => match cfg.contact_strength {
+                0.0 => "off".into(),
+                k => format!("{:.0}%", k * 100.0),
+            },
+            Setting::ProbeRate => match s.probe_rate {
+                0.0 => "never".into(),
+                r => format!("{r} a second near"),
+            },
+            Setting::ProbeBlend => match cfg.probe_blend {
+                moose_assets::ProbeBlend::Trilinear => "8 probes",
+                moose_assets::ProbeBlend::Smooth => "27 probes, smooth",
+            }
+            .into(),
             Setting::FlashlightBeam => self.cone_name().into(),
             Setting::Bump => s.bump.name().into(),
             Setting::Sky => s.sky.name().into(),
@@ -2125,6 +2256,36 @@ impl App {
                 s.cone = CONES[wrap(i, CONES.len())];
             }
             Setting::FlashlightDither => cfg.beam_dither = !cfg.beam_dither,
+            Setting::AmbientBumps => cfg.ambient_bumps = !cfg.ambient_bumps,
+            Setting::AmbientProbes => {
+                s.probe_spacing = cycle(&probes::PROBE_SPACINGS, s.probe_spacing, dir);
+                self.rebake_probes();
+            }
+            Setting::ProbeRate => s.probe_rate = cycle(&probes::PROBE_RATES, s.probe_rate, dir),
+            Setting::ContactShadows => cfg.contact_strength = cycle(&CONTACT_STRENGTHS, cfg.contact_strength, dir),
+            Setting::AmbientLight => {
+                let basic = &mut self.geometry.config.basic_ambient;
+                *basic = !*basic;
+            }
+            Setting::ProbeFade => s.probe_fade = cycle(&probes::PROBE_FADES, s.probe_fade, dir),
+            Setting::DistantProbes => s.sparse_far_probes = !s.sparse_far_probes,
+            Setting::ProbeDrawing => {
+                s.probe_relight = !s.probe_relight;
+                self.rebake_probes();
+            }
+
+            Setting::ProbeSize => {
+                s.probe_size = cycle(&probes::PROBE_SIZES, s.probe_size as f32, dir) as u32;
+                self.rebake_probes();
+            }
+            Setting::ProbeBlend => {
+                const BLENDS: [moose_assets::ProbeBlend; 2] = [
+                    moose_assets::ProbeBlend::Trilinear,
+                    moose_assets::ProbeBlend::Smooth,
+                ];
+                let i = BLENDS.iter().position(|&b| b == cfg.probe_blend).unwrap_or(0);
+                cfg.probe_blend = BLENDS[wrap(i, BLENDS.len())];
+            }
             Setting::Sky => {
                 let i = SkyStyle::ALL.iter().position(|&v| v == s.sky).unwrap_or(0);
                 s.sky = SkyStyle::ALL[wrap(i, SkyStyle::ALL.len())];
@@ -2207,9 +2368,10 @@ impl App {
         let on = |b: bool, name: &str| if b { name.to_string() } else { format!("{name} off") };
         vec![
             format!(
-                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms   post {:.2} ms   present {present_ms:.2} ms",
+                "{fps:.0} fps{}   view {view_ms:.2} ms   raster {raster_ms:.2} ms   post {:.2} ms   present {present_ms:.2} ms{}",
                 if s.capped { format!(" (cap {})", s.cap) } else { String::new() },
                 self.post_ms,
+                if self.probe_updates.is_some() { format!("   probes {:.2} ms", self.probe_ms) } else { String::new() },
             ),
             format!(
                 "{}  ({:.1}, {:.1}, {:.1})  yaw {:.0}  pitch {:.0}",
@@ -2306,6 +2468,18 @@ impl App {
             cfg.refine_threshold,
         ));
         add(format!("--cone {}", self.cone_name()));
+        if s.probe_spacing > 0.0 {
+            add(format!(
+                "--probes {} --probe-size {} --probe-rate {} --probe-fade {}",
+                s.probe_spacing, s.probe_size, s.probe_rate, s.probe_fade
+            ));
+            if !s.sparse_far_probes {
+                add("--all-far-probes".into());
+            }
+        }
+        if cfg.contact_strength > 0.0 {
+            add(format!("--contact-shadows {}", cfg.contact_strength));
+        }
         add(format!("--time {time}"));
         if let Some(day) = &self.day {
             // The day's start that makes it this time of day at `time`, and the cover now
@@ -2331,6 +2505,10 @@ impl App {
             (cfg.show_samples, "--show-samples"),
             (s.shadow_mesh, "--show-shadow-mesh"),
             (cfg.beam_dither, "--dither-beam"),
+            (!cfg.ambient_bumps, "--flat-ambient-bumps"),
+            (cfg.probe_blend == moose_assets::ProbeBlend::Smooth, "--smooth-probes"),
+            (!s.probe_relight, "--drawn-probes"),
+            (self.geometry.config.basic_ambient, "--basic-ambient"),
             (cfg.smooth_edges, "--smooth-edges"),
             (s.fly, "--fly"),
         ] {
@@ -2397,6 +2575,9 @@ impl App {
     /// first, so the flashlight follows the camera.
     fn render(&mut self) -> Result<(f64, f64), String> {
         self.apply_lights(true);
+        let probes = Instant::now();
+        self.update_probes()?;
+        self.probe_ms = probes.elapsed().as_secs_f64() * 1000.0;
         let mut pixels = std::mem::take(&mut self.pixels);
         let camera = self.camera.clone();
         let times = self.draw(&camera, &mut pixels, self.width, self.height);
@@ -2499,97 +2680,25 @@ impl App {
         height: u32,
     ) -> Result<(f64, f64), String> {
         let t0 = Instant::now();
-        let view = camera.view();
-        self.geometry.build(&self.world, &self.assets, &view);
-        let t1 = Instant::now();
-        let s = &self.settings;
         // Each material's surface this frame, under the player's settings.
         let table = self.materials.table(&self.shaders, &self.frame_settings(), &self.world);
-        let (world, assets, shaders) = (&self.world, &self.assets, &self.shaders);
-        let (level, cube_maps) = (assets.mesh(world.geometry), &self.cube_maps);
-        let (level_filters, entity_filters) = (&self.level_filters, &self.entity_filters);
-        let per_pixel = s.per_pixel_crates;
-        let mut target = Target {
-            pixels,
-            width,
-            height,
+        let scene = Scene {
+            world: &self.world,
+            assets: &self.assets,
+            shaders: &self.shaders,
+            table: &table,
+            cube_maps: &self.cube_maps,
+            level_filters: &self.level_filters,
+            entity_filters: &self.entity_filters,
+            per_pixel: self.settings.per_pixel_crates,
+            time: self.time,
+            plain_copies: false,
+            draw: SceneDraw::Lit,
         };
-        // What each polygon is drawn with: its binding's material in its scenario (its
-        // reflection drawn under it, or seen in a mirror), or its vertex colors.
-        let surface_of = |p: &moose_view::ViewPolygon| -> Surface {
-            // Its binding, and where it is (for the inputs read there).
-            let (binding, filters, entity, place) = match p.source {
-                PolygonSource::World { polygon, sector } => {
-                    let b = level.polygons[polygon as usize].material;
-                    let place = materials::Place { face: Some(polygon), sector: Some(sector), entity: None };
-                    (world.bindings.get(b as usize), level_filters.get(b as usize), None, place)
-                }
-                PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => {
-                    let sector = match p.source {
-                        PolygonSource::Terrain { sector, .. } => sector,
-                        _ => world.entities[entity as usize].sector,
-                    };
-                    let place = materials::Place { face: None, sector: Some(sector), entity: Some(entity) };
-                    (
-                        world.entities[entity as usize].binding.as_ref(),
-                        entity_filters.get(entity as usize),
-                        Some(entity as usize),
-                        place,
-                    )
-                }
-            };
-            let mut surface = match binding {
-                Some(b) => {
-                    let r = table.get(b.material, p.reflection.is_some(), p.mirror.is_some());
-                    let mesh = assets.mesh(p.mesh);
-                    let mut surface = table.surface(r, place, world);
-                    if r.attribs.iter().any(|&a| mesh.attrib(a).is_none()) {
-                        // A mesh without what its shader reads is drawn plain.
-                        shaders.plain()
-                    } else if r.entity_cube {
-                        // Its own cube map, once baked.
-                        match entity.and_then(|e| cube_maps[e]) {
-                            Some(cube) => {
-                                surface.textures[0] = Some(cube.texture);
-                                surface.params = Params::new(&[cube.radius, CUBE_SIZE as f32]);
-                                surface
-                            }
-                            None => shaders.plain(),
-                        }
-                    } else {
-                        surface
-                    }
-                }
-                None => shaders.plain(),
-            };
-            if let Some(filters) = filters {
-                for (slot, f) in filters.iter().enumerate() {
-                    if let Some(f) = f {
-                        surface.filters[slot] = *f;
-                    }
-                }
-            }
-            // The lights it isn't lit by: its face's (with its sector's), or its entity's.
-            surface.excluded_lights = match (place.face, entity) {
-                (Some(f), _) => world.face_excluded_lights.get(f as usize).copied().unwrap_or(0),
-                (None, Some(e)) => world.entities[e].excluded_lights,
-                (None, None) => 0,
-            };
-            if per_pixel && entity.is_some() && !matches!(p.source, PolygonSource::Terrain { .. }) {
-                surface.path_override = Some(RasterPath::PerPixel);
-            }
-            surface
-        };
-        self.renderer.time = self.time;
-        self.renderer
-            .render(&mut target, camera.viewport, &self.geometry, &self.assets, surface_of)
-            .map_err(|e| e.to_string())?;
-        let t2 = Instant::now();
-        Ok((
-            (t1 - t0).as_secs_f64() * 1000.0,
-            (t2 - t1).as_secs_f64() * 1000.0,
-        ))
+        let (view, raster) = draw_scene(&scene, &mut self.renderer, &mut self.geometry, camera, pixels, width, height)?;
+        Ok((view, raster + t0.elapsed().as_secs_f64() * 1000.0 - view - raster))
     }
+
 
     /// Moves the camera by `delta` (world space), one axis at a time so it slides along
     /// walls, then keeps it clear of them.
@@ -2967,6 +3076,16 @@ enum Setting {
     FlashlightBeam,
     FlashlightFade,
     FlashlightDither,
+    AmbientBumps,
+    AmbientLight,
+    AmbientProbes,
+    ProbeSize,
+    ProbeFade,
+    DistantProbes,
+    ProbeDrawing,
+    ContactShadows,
+    ProbeRate,
+    ProbeBlend,
     Bump,
     Sky,
     Bloom,
@@ -3065,6 +3184,15 @@ impl Page {
                 Set(Lit),
                 Set(Shadows),
                 Set(DynamicShadows),
+                Set(AmbientLight),
+                Set(AmbientProbes),
+                Set(ProbeSize),
+                Set(ProbeRate),
+                Set(ProbeFade),
+                Set(DistantProbes),
+                Set(ProbeDrawing),
+                Set(ContactShadows),
+                Set(ProbeBlend),
                 Set(Softness),
                 Set(DynamicSoftness),
                 Set(LevelLights),
@@ -3084,6 +3212,7 @@ impl Page {
                 Set(Resolution),
                 Set(SmoothEdges),
                 Set(Bump),
+                Set(AmbientBumps),
                 Set(Specular),
                 Set(Sky),
                 Set(Bloom),
@@ -3188,6 +3317,16 @@ impl Item {
                 Setting::FlashlightBeam => "Cone",
                 Setting::FlashlightFade => "Fade",
                 Setting::FlashlightDither => "Dither",
+                Setting::AmbientBumps => "Ambient bumps",
+                Setting::AmbientProbes => "Ambient probes",
+                Setting::ProbeRate => "Probe updates",
+                Setting::ContactShadows => "Contact shadows",
+                Setting::AmbientLight => "Ambient light",
+                Setting::ProbeSize => "Probe resolution",
+                Setting::ProbeFade => "Probe fade",
+                Setting::DistantProbes => "Distant probes",
+                Setting::ProbeDrawing => "Probe drawing",
+                Setting::ProbeBlend => "Probe blend",
                 Setting::Bump => "Bump mapping",
                 Setting::Sky => "Sky",
                 Setting::Bloom => "Bloom",
@@ -3409,6 +3548,162 @@ fn draw_ui(
     }
     layout
 }
+
+/// What views are drawn with at one moment: the world, its assets, and what makes each
+/// polygon's surface. Shared by the threads drawing ambient light probes, each with its own
+/// renderer and view (see [`draw_scene`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Scene<'a> {
+    world: &'a World,
+    assets: &'a Assets,
+    shaders: &'a ShaderIds,
+    table: &'a materials::Table,
+    cube_maps: &'a [Option<CubeMap>],
+    level_filters: &'a [[Option<u8>; MATERIAL_SLOTS]],
+    entity_filters: &'a [[Option<u8>; MATERIAL_SLOTS]],
+    per_pixel: bool,
+    time: f32,
+    /// Every material drawn as its copy for what is seen in a mirror (no bumps or
+    /// highlights): for ambient light probes, too small to show them.
+    plain_copies: bool,
+    /// How it is drawn: lit, or for an ambient light probe's buffer of what it sees, each
+    /// polygon's number or its colors unlit (see [`SceneDraw`]).
+    draw: SceneDraw,
+}
+
+/// How a [`Scene`] is drawn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SceneDraw {
+    Lit,
+    /// Each polygon in one color, its number in the view's polygons plus one (see
+    /// `FlatId`): 0 where none is.
+    Ids,
+    /// Each surface's colors as they are, as if in an ambient light of 1 and no other:
+    /// what it gives back of the light that falls on it (a sky, what it gives).
+    Colors,
+}
+
+/// Renders what `camera` sees in `scene` into `pixels` (`width` x `height`, holding the
+/// camera's viewport) with `renderer`, its view built in `geometry`; returns (view ms,
+/// raster ms).
+pub(crate) fn draw_scene(
+    scene: &Scene,
+    renderer: &mut Renderer,
+    geometry: &mut ViewGeometry,
+    camera: &Camera,
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+) -> Result<(f64, f64), String> {
+    let t0 = Instant::now();
+    let view = camera.view();
+    geometry.build(scene.world, scene.assets, &view);
+    if scene.draw == SceneDraw::Colors {
+        for light in &mut geometry.lights {
+            light.color = Vec3::ZERO;
+        }
+        geometry.ambient = moose_assets::Ambient::uniform(Vec3::ONE);
+        geometry.probes = None;
+        geometry.contacts.clear();
+    }
+    let t1 = Instant::now();
+    let (world, assets, shaders, table) = (scene.world, scene.assets, scene.shaders, scene.table);
+    let (level, cube_maps) = (assets.mesh(world.geometry), scene.cube_maps);
+    let (level_filters, entity_filters) = (scene.level_filters, scene.entity_filters);
+    let per_pixel = scene.per_pixel;
+    let mut target = Target {
+        pixels,
+        width,
+        height,
+    };
+    // What each polygon is drawn with: its binding's material in its scenario (its
+    // reflection drawn under it, or seen in a mirror), or its vertex colors.
+    let lit_surface = |p: &moose_view::ViewPolygon| -> Surface {
+        // Its binding, and where it is (for the inputs read there).
+        let (binding, filters, entity, place) = match p.source {
+            PolygonSource::World { polygon, sector } => {
+                let b = level.polygons[polygon as usize].material;
+                let place = materials::Place { face: Some(polygon), sector: Some(sector), entity: None };
+                (world.bindings.get(b as usize), level_filters.get(b as usize), None, place)
+            }
+            PolygonSource::Entity { entity, .. } | PolygonSource::Terrain { entity, .. } => {
+                let sector = match p.source {
+                    PolygonSource::Terrain { sector, .. } => sector,
+                    _ => world.entities[entity as usize].sector,
+                };
+                let place = materials::Place { face: None, sector: Some(sector), entity: Some(entity) };
+                (
+                    world.entities[entity as usize].binding.as_ref(),
+                    entity_filters.get(entity as usize),
+                    Some(entity as usize),
+                    place,
+                )
+            }
+        };
+        let mut surface = match binding {
+            Some(b) => {
+                let r = table.get(b.material, p.reflection.is_some(), p.mirror.is_some() || scene.plain_copies);
+                let mesh = assets.mesh(p.mesh);
+                let mut surface = table.surface(r, place, world);
+                if r.attribs.iter().any(|&a| mesh.attrib(a).is_none()) {
+                    // A mesh without what its shader reads is drawn plain.
+                    shaders.plain()
+                } else if r.entity_cube {
+                    // Its own cube map, once baked.
+                    match entity.and_then(|e| cube_maps[e]) {
+                        Some(cube) => {
+                            surface.textures[0] = Some(cube.texture);
+                            surface.params = Params::new(&[cube.radius, CUBE_SIZE as f32]);
+                            surface
+                        }
+                        None => shaders.plain(),
+                    }
+                } else {
+                    surface
+                }
+            }
+            None => shaders.plain(),
+        };
+        if let Some(filters) = filters {
+            for (slot, f) in filters.iter().enumerate() {
+                if let Some(f) = f {
+                    surface.filters[slot] = *f;
+                }
+            }
+        }
+        // The lights it isn't lit by: its face's (with its sector's), or its entity's.
+        surface.excluded_lights = match (place.face, entity) {
+            (Some(f), _) => world.face_excluded_lights.get(f as usize).copied().unwrap_or(0),
+            (None, Some(e)) => world.entities[e].excluded_lights,
+            (None, None) => 0,
+        };
+        if per_pixel && entity.is_some() && !matches!(p.source, PolygonSource::Terrain { .. }) {
+            surface.path_override = Some(RasterPath::PerPixel);
+        }
+        surface
+    };
+    let first: *const moose_view::ViewPolygon = geometry.polygons.as_ptr();
+    let surface_of = |p: &moose_view::ViewPolygon| -> Surface {
+        let surface = lit_surface(p);
+        if scene.draw != SceneDraw::Ids {
+            return surface;
+        }
+        // Its place in the view's polygons (the renderer asks of them in place), and
+        // whether it gives light, unlit (a sky): bit 23.
+        let index = (std::ptr::from_ref(p) as usize - first as usize) / std::mem::size_of::<moose_view::ViewPolygon>();
+        shaders.flat_id((index as u32 + 1) | u32::from(shaders.unlit(surface.material)) << 23)
+    };
+    renderer.time = scene.time;
+    renderer
+        .render(&mut target, camera.viewport, geometry, assets, surface_of)
+        .map_err(|e| e.to_string())?;
+    let t2 = Instant::now();
+    Ok((
+        (t1 - t0).as_secs_f64() * 1000.0,
+        (t2 - t1).as_secs_f64() * 1000.0,
+    ))
+}
+
 
 /// Draws the last frame's shadow pieces (see `ViewGeometry::shadow_pieces`) over it, for
 /// seeing how shadows are carved: each piece's outline, colored by what it is, and a dot
@@ -4501,20 +4796,22 @@ fn run() -> Result<(), String> {
         }
         app.editor.ortho_center = app.camera.position;
         app.set_time(options.time);
+        app.finish_probes()?;
         let (view_ms, raster_ms) = app.frame()?;
         if options.bench > 0 {
-            let (mut view, mut raster, mut post) = (0.0, 0.0, 0.0);
+            let (mut view, mut raster, mut post, mut probes) = (0.0, 0.0, 0.0, 0.0);
             for _ in 0..options.bench {
                 let (v, r) = app.frame()?;
-                (view, raster, post) = (view + v, raster + r, post + app.post_ms);
+                (view, raster, post, probes) = (view + v, raster + r, post + app.post_ms, probes + app.probe_ms);
             }
             let n = options.bench as f64;
             println!(
-                "{} frames: view {:.3} ms, raster {:.3} ms, post {:.3} ms on average",
+                "{} frames: view {:.3} ms, raster {:.3} ms, post {:.3} ms, probes {:.3} ms on average",
                 options.bench,
                 view / n,
                 raster / n,
-                post / n
+                post / n,
+                probes / n
             );
         }
         let hud = app.settings.hud.then(|| app.hud(0.0, view_ms, raster_ms, 0.0));
@@ -5053,6 +5350,15 @@ fn run() -> Result<(), String> {
         let cursor = display.cursor_position();
         menu.layout = draw_ui(&mut app, menu.open.then_some((menu.page, menu.selected)), menu.binding, typing, hud, !menu.back.is_empty(), cursor);
         display.set_size(app.width, app.height);
+        // What time is left before the frame is due goes to drawing ambient light probes,
+        // less what showing it takes (as last time), and a little.
+        if let Some(next) = display.next_frame() {
+            let t = display.present_times();
+            let showing = Duration::from_secs_f64((t.copy + t.show) / 1000.0) + IDLE_MARGIN;
+            if let Err(e) = app.idle_probes(next.checked_sub(showing).unwrap_or(next)) {
+                app.toast = Some((e, Instant::now()));
+            }
+        }
         display.present(&app.pixels)?;
         let t = display.present_times();
         present_sum += t.copy + t.show + t.events;

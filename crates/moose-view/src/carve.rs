@@ -845,6 +845,64 @@ impl Carver {
         !self.casters.is_empty()
     }
 
+    /// How much of the light in shadow slot `slot` reaches world point `p` (in `sector`, on
+    /// `entity` if one's, which doesn't shadow itself), as carving would have it there: 0 in
+    /// full shadow, 1 where nothing covers it, between in soft edges (see
+    /// [`crate::frame::soft_reach`]). Outside the light's own sector, a point no window into
+    /// its sector lets the light through to is dark. 1 for a light that casts no shadows.
+    pub fn reaching(&self, slot: u8, p: Vec3, sector: u32, entity: Option<u32>) -> f32 {
+        let Some(caster) = self.casters.iter().find(|c| c.bit == 1 << slot) else {
+            return 1.0;
+        };
+        if !caster.shadows {
+            return 1.0;
+        }
+        let inside = |planes: &Range<u32>| self.planes[planes.start as usize..planes.end as usize].iter().all(|h| h.distance(p) >= -ON_PLANE);
+        let (mut softs, mut wedges) = (Vec::new(), Vec::new());
+        let soft = |volume: &Volume, softs: &mut Vec<ShadowSoft>, wedges: &mut Vec<ShadowWedge>| {
+            let start = wedges.len() as u32;
+            wedges.extend(self.wedges[volume.wedges.start as usize..volume.wedges.end as usize].iter().map(Wedge::shadow));
+            softs.push(ShadowSoft { wedges: start..wedges.len() as u32, window: volume.window });
+        };
+        // Through the windows into its sector, unless it lights that one whole: all of it
+        // through one whose core it is in; none outside every one.
+        if caster.whole != Some(sector) {
+            let (mut whole, mut any) = (false, false);
+            for w in caster.windows.clone() {
+                let (s, v) = self.windows[w as usize];
+                let volume = &self.volumes[v as usize];
+                if s != sector || !inside(&volume.planes) {
+                    continue;
+                }
+                any = true;
+                if volume.core.is_empty() || inside(&volume.core) {
+                    whole = true;
+                    break;
+                }
+                soft(volume, &mut softs, &mut wedges);
+            }
+            if !any {
+                return 0.0;
+            }
+            if whole {
+                softs.clear();
+                wedges.clear();
+            }
+        }
+        // The occluders: in one's core, none of it.
+        for v in caster.volumes.clone() {
+            let volume = &self.volumes[v as usize];
+            if (volume.owner.is_some() && volume.owner == entity) || !inside(&volume.planes) {
+                continue;
+            }
+            if volume.core.is_empty() || inside(&volume.core) {
+                return 0.0;
+            }
+            soft(volume, &mut softs, &mut wedges);
+        }
+        if softs.is_empty() { 1.0 } else { crate::frame::soft_reach(&softs, &wedges, p) }
+    }
+
     /// Whether any light this frame is a beam (see [`Light::beam`]).
     pub fn has_beams(&self) -> bool {
         self.casters.iter().any(|c| c.beam.is_some())
@@ -1985,7 +2043,7 @@ fn is_convex(mesh: &Mesh, polygons: &[usize]) -> bool {
 /// The polygons a model casts shadows with, in parts (each convex, or cast face by face):
 /// its shadow proxies, one part per bone (by their first corner's bone), if it has any;
 /// otherwise all its polygons as one.
-fn occluder_parts(mesh: &Mesh) -> Vec<Vec<usize>> {
+pub(crate) fn occluder_parts(mesh: &Mesh) -> Vec<Vec<usize>> {
     let proxies: Vec<usize> = (0..mesh.polygons.len()).filter(|&k| mesh.polygons[k].flags.proxy()).collect();
     if proxies.is_empty() {
         return vec![(0..mesh.polygons.len()).collect()];
@@ -2223,6 +2281,27 @@ mod tests {
         }
         assert!((dark - 2.25).abs() < 1e-4, "shadow area {dark}");
         assert!((lit + dark - 16.0).abs() < 1e-3, "pieces cover the floor: {}", lit + dark);
+    }
+
+    #[test]
+    fn a_point_is_as_lit_as_carving_would_have_it() {
+        // A light 3 m above the floor, a 1 m square 2 m below it: its shadow on the floor is
+        // 1.5 m square.
+        let light = Vec3::new(0.0, 3.0, 0.0);
+        let square = [
+            Vec3::new(-0.5, 1.0, -0.5),
+            Vec3::new(-0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, 0.5),
+            Vec3::new(0.5, 1.0, -0.5),
+        ];
+        let c = carver(light, &[&[&square]]);
+        let at = |x: f32, z: f32| c.reaching(0, Vec3::new(x, 0.0, z), 0, None);
+        assert_eq!(at(0.0, 0.0), 0.0);
+        assert_eq!(at(0.7, -0.7), 0.0);
+        assert_eq!(at(0.8, 0.0), 1.0);
+        assert_eq!(at(2.0, 2.0), 1.0);
+        // Its own entity's surface isn't shadowed by it; another light's slot, none at all.
+        assert_eq!(c.reaching(5, Vec3::ZERO, 0, None), 1.0);
     }
 
     #[test]

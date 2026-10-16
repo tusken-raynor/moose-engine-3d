@@ -945,6 +945,7 @@ dependencies = [
  "moose-script",
  "moose-view",
  "png",
+ "rayon",
 ]
 
 [[package]]

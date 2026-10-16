@@ -26,6 +26,8 @@ mod mmp_doc;
 mod mmp_edit;
 pub use mmp_edit::fit_affine;
 mod mmdl;
+mod probes;
+pub use probes::{AmbientProbes, ProbeBlend};
 mod mmdl_doc;
 mod obj;
 mod clouds;
@@ -40,7 +42,7 @@ mod texture;
 pub use error::LoadError;
 pub use geom::{Aabb, Plane};
 pub use level::{
-    Body, BodyShape, DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
+    Ambient, Body, BodyShape, DirectionalLight, EntityKind, EntitySpawn, FLASHLIGHT_ID, Level, Light, LightMask, NO_LIGHT_ID, NO_SECTOR, Occluder, Oscillation, ShadowKind,
     Portal, PortalFlags, ScriptPlacement, Sector, Sky, Terrain,
 };
 pub use mmp_doc::{

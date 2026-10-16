@@ -5,6 +5,41 @@ use glam::{Quat, Vec3};
 use crate::geom::{Aabb, Plane};
 use crate::store::MeshId;
 
+/// The ambient light by the way a surface faces (an ambient cube): a color for each
+/// direction along each axis, in the order +x, -x, +y, -y, +z, -z. A surface facing unit
+/// normal `n` takes each axis's color on the side `n` points to, weighted by that component
+/// of `n` squared (the weights add up to 1). Six equal colors light every surface alike.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Ambient {
+    pub faces: [Vec3; 6],
+}
+
+impl Ambient {
+    /// The axis directions, in [`Ambient::faces`]' order.
+    pub const DIRECTIONS: [Vec3; 6] = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+
+    /// The same light from every way.
+    pub const fn uniform(color: Vec3) -> Ambient {
+        Ambient { faces: [color; 6] }
+    }
+
+    /// `color` times each direction's multiplier in `shape` (see `Level::ambient_shape`).
+    pub fn shaped(color: Vec3, shape: &[Vec3; 6]) -> Ambient {
+        Ambient { faces: shape.map(|s| color * s) }
+    }
+
+    /// The light on a surface facing unit normal `n`.
+    pub fn at(&self, n: Vec3) -> Vec3 {
+        let side = |k: usize, v: f32| self.faces[2 * k + usize::from(v < 0.0)] * (v * v);
+        side(0, n.x) + side(1, n.y) + side(2, n.z)
+    }
+
+    /// Whether every direction's color is the same.
+    pub fn is_uniform(&self) -> bool {
+        self.faces.iter().all(|&f| f == self.faces[0])
+    }
+}
+
 /// A loaded `.mmp` level: world geometry split into convex sectors joined by portals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Level {
@@ -22,6 +57,9 @@ pub struct Level {
     pub bindings: Vec<crate::material::Binding>,
     /// Light that reaches everything, in linear RGB (1 is a surface's full color).
     pub ambient: Vec3,
+    /// How the ambient light differs by the way a surface faces: per axis direction (in
+    /// [`Ambient`]'s order), what its color is multiplied by. All ones without it.
+    pub ambient_shape: [Vec3; 6],
     pub lights: Vec<Light>,
     /// Per light (its `lights`, then its `directional` lights), its name (`name=`), which
     /// materials read it by (`light:NAME`) and exclusions name it by.
@@ -446,6 +484,9 @@ pub struct EntitySpawn {
     pub scale: f32,
     /// A prop that never moves: lighting from static lights can be worked out for it once.
     pub is_static: bool,
+    /// It moves and is drawn in ambient light probes (`probes`): a door, a lift; static
+    /// props always are.
+    pub in_probes: bool,
     /// What it casts shadows with.
     pub occluder: Occluder,
     /// How its shadows' edges are drawn.
@@ -518,4 +559,25 @@ pub enum Occluder {
     /// light, of a ball of `radius` around `center` (in model space). A round shape's
     /// shadow with no silhouette to find.
     Facing { sides: u8, radius: f32, center: Vec3 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ambient_light_by_direction() {
+        let shape = [Vec3::X, Vec3::Y, Vec3::Z, Vec3::ONE, Vec3::splat(2.0), Vec3::ZERO];
+        let a = Ambient::shaped(Vec3::splat(0.5), &shape);
+        // Facing each axis way, that way's color.
+        for (k, d) in Ambient::DIRECTIONS.iter().enumerate() {
+            assert_eq!(a.at(*d), shape[k] * 0.5, "{d}");
+        }
+        // Between, each axis's by its share: half and half.
+        let n = Vec3::new(1.0, -1.0, 0.0).normalize();
+        assert!((a.at(n) - (shape[0] + shape[3]) * 0.25).length() < 1e-6);
+        assert!(!a.is_uniform());
+        let u = Ambient::uniform(Vec3::splat(0.3));
+        assert!(u.is_uniform() && (u.at(Vec3::new(0.3, -0.5, 0.81).normalize()) - Vec3::splat(0.3)).length() < 1e-6);
+    }
 }

@@ -170,6 +170,7 @@ Options, after `name` (props and actors; terrains take only `material=` and `fil
 | `material=NAME` | The material the whole model is drawn with (see the Material Format Spec). Without one, its vertex colors. |
 | `filterN=SAMPLER` | How texture slot N of its material is read, over the material's own (as for surfaces). |
 | `static` | Props only. The prop never moves, so static lights' shadows from it and on it can be worked out once. `static=on` is the same, `static=off` turns off a template's. |
+| `probes` | It moves and is drawn in ambient light probes: something big enough to change the light around it by hiding or showing what is behind it (a door, a lift). Static props always are; other moving things aren't (a ball would light itself with its own color), though their shadows count. `probes=on` is the same, `probes=off` turns off a template's. |
 | `occluder=...` | What the entity casts shadows with. Without it, `mesh`. |
 | `shadow=soft\|blurred\|hard` | How its shadows' edges are drawn, from a light with a size. `soft` (the default) carves their soft edges: exact, and cached for static props. `blurred` carves them hard and blurs them on screen, as wide as their soft edge would be: for figures casting shadows with simple proxies, whose blur hides how simple they are; worked out every frame. `hard` carves them from the light's center: the cheapest. |
 | `anim=NAME` | It plays its model's animation `NAME` over and over (or holds its last frame, for one that doesn't loop), from when the level starts. Not with `static`. `anim=none` turns off a template's. |
@@ -201,6 +202,12 @@ entities 3
 ```
 
 **`ambient r g b`** (optional): light that reaches every surface, in linear RGB, where 1 shows a surface's full color. Without it, ambient light is 1 1 1, so a level with no lights looks as it always did.
+
+Options on the same line say how the ambient light differs by the way a surface faces: `+x=R:G:B`, `-x=R:G:B`, `+y=…`, `-y=…`, `+z=…` and `-z=…`, each multiplying the color for surfaces facing that way along that axis (1:1:1 for each not given). A surface facing between them takes each axis's by the square of its normal's part along it (see the Lighting Spec's Ambient light by direction). For example, a dim sky above and a darker floor below:
+
+```
+ambient 0.10 0.10 0.10  +y=1.6:1.7:2.0 -y=0.4:0.36:0.32
+```
 
 **`lights`** (optional): static lights. A row with 8 fields is a point light, which shines every way. A row with 13 fields is a spot light, which adds a direction and a cone.
 

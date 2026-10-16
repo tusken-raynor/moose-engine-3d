@@ -18,4 +18,5 @@ moose-audio = { path = "../moose-audio" }
 moose-raster = { path = "../moose-raster" }
 moose-present = { path = "../moose-present" }
 glam.workspace = true
+rayon.workspace = true
 png.workspace = true

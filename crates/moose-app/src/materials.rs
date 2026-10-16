@@ -14,6 +14,7 @@ use moose_assets::{
     TextureSource,
 };
 use moose_raster::shaders::{
+    FlatId,
     BasicBumpy, BasicBumpyMirrored, ColoredBumpy, ColoredBumpyMirrored, CubeReflection, RandomSections, RandomSectionsMirrored, ReflectiveBumpy,
     ReflectiveBumpyMirrored, ReflectiveBumpyReflected, SkyBox, Textured, TexturedFresnel, TexturedLitMirrored, TexturedNormal, TexturedNormalSpecular,
     TexturedSpecular, TexturedTranslucent, UnlitColor, VertexColor, VertexColorDetail, VertexColorFresnel,
@@ -285,6 +286,8 @@ pub struct ShaderIds {
     terrain_detail: MaterialId,
     terrain_noise: MaterialId,
     sky_box: MaterialId,
+    /// `FlatId`: which polygon covers each pixel of an ambient light probe's views.
+    flat_id: MaterialId,
 }
 
 impl ShaderIds {
@@ -317,12 +320,24 @@ impl ShaderIds {
             terrain_detail: r.register_material::<VertexColorDetail>(),
             terrain_noise: r.register_material::<VertexColorNoise>(),
             sky_box: r.register_material::<SkyBox>(),
+            flat_id: r.register_material::<FlatId>(),
         }
     }
 
     /// Vertex colors, lit: what polygons that name no material are drawn with.
     pub fn plain(&self) -> Surface {
         Surface::new(self.vertex_color)
+    }
+
+    /// Whether a surface drawn with `material` gives light rather than taking it: a sky, drawn
+    /// unlit.
+    pub fn unlit(&self, material: MaterialId) -> bool {
+        material == self.sky || material == self.sky_box
+    }
+
+    /// A surface drawn all in color `id` (below 2^24) exactly: see `FlatId`.
+    pub fn flat_id(&self, id: u32) -> Surface {
+        Surface { params: Params::new(&[id as f32]), ..Surface::new(self.flat_id) }
     }
 }
 

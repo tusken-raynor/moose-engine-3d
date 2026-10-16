@@ -3002,6 +3002,7 @@ pub fn new_level_doc(title: &str) -> Result<LevelDoc, String> {
         templates: Vec::new(),
         entities: Vec::new(),
         ambient: Some(Vec3::splat(0.1)),
+        ambient_options: Vec::new(),
         lights: Vec::new(),
         directional: Vec::new(),
         scripts: Vec::new(),

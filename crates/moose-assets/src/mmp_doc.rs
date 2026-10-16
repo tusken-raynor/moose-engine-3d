@@ -30,6 +30,8 @@ pub struct LevelDoc {
     pub templates: Vec<TemplateDoc>,
     pub entities: Vec<EntityDoc>,
     pub ambient: Option<Vec3>,
+    /// The `ambient` line's options: how it differs by direction (`+x=R:G:B` and so on).
+    pub ambient_options: Vec<String>,
     pub lights: Vec<LightDoc>,
     pub directional: Vec<DirectionalDoc>,
     pub scripts: Vec<ScriptDoc>,
@@ -293,9 +295,11 @@ impl LevelDoc {
             });
         }
         let at = |c: &Cursor, keyword: &str| c.lines.get(c.pos).is_some_and(|l| l.tokens[0] == keyword);
-        let mut ambient = None;
+        let (mut ambient, mut ambient_options) = (None, Vec::new());
         if at(&c, "ambient") {
-            let (line, args) = c.header("ambient", 3)?;
+            let (line, args) = c.header_with_options("ambient", 3)?;
+            ambient_options = args[3..].to_vec();
+            crate::mmp::ambient_shape_of(&ambient_options).map_err(|e| c.err(line, e))?;
             ambient = Some(vec3(&c, &Line { no: line, tokens: args }, 0)?);
         }
         let mut lights = Vec::new();
@@ -361,6 +365,7 @@ impl LevelDoc {
             templates,
             entities,
             ambient,
+            ambient_options,
             lights,
             directional,
             scripts,
@@ -468,7 +473,8 @@ impl LevelDoc {
         }
         if let Some(a) = self.ambient {
             line(String::new());
-            line(format!("ambient {} {} {}", number(a.x), number(a.y), number(a.z)));
+            let options = if self.ambient_options.is_empty() { String::new() } else { format!("  {}", words(&self.ambient_options)) };
+            line(format!("ambient {} {} {}{options}", number(a.x), number(a.y), number(a.z)));
         }
         if !self.lights.is_empty() {
             line(String::new());

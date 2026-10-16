@@ -219,6 +219,12 @@ impl Display {
         Ok(())
     }
 
+    /// When the next frame is due to be shown, with a frame rate cap: until then, after the
+    /// frame is drawn, there is time to spare.
+    pub fn next_frame(&self) -> Option<Instant> {
+        self.state.interval.map(|interval| self.state.last_frame + interval)
+    }
+
     /// Where the last `present` spent its time.
     pub fn present_times(&self) -> PresentTimes {
         self.state.times

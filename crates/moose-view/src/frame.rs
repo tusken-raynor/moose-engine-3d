@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use glam::{Affine3A, Mat3A, Quat, Vec3, Vec3A, Vec4};
 use moose_assets::{
-    Assets, EntityKind, Mesh, MeshId, Plane, Light, PolyFlags, Polygon, Portal,
+    Ambient, Assets, EntityKind, Mesh, MeshId, Plane, Light, PolyFlags, Polygon, Portal,
 };
-use moose_scene::{View, World};
+use moose_scene::{Occluder, View, World};
 use rayon::prelude::*;
 
 use crate::carve::{Cached, CachedEdge, Carver, Parts, PieceEdge, Pieces, Receiver};
@@ -266,6 +266,19 @@ pub struct ViewConfig {
     /// light's size as given (0: hard): all of a dynamic light's, and moving occluders' of
     /// static lights. Cached (baked) shadows keep the light's size.
     pub dynamic_softness: f32,
+    /// Which of the entities that move (all but static props) are drawn. Views that are
+    /// kept, ambient light probes', draw only those flagged to be (`Entity::in_probes`): a
+    /// small thing that moves (a ball) would light itself with its own color; a big one (a
+    /// door) hides what is behind it, and is flagged. A probe's static view draws none.
+    pub moving_entities: MovingEntities,
+    /// The world is as it was for the last view built (its lights, and where everything
+    /// is): what blocks each light is kept from then, not gathered again. For several views
+    /// of one moment, like a cube map's faces.
+    pub same_world: bool,
+    /// The ambient light is the world's one color, the same everywhere and from every way,
+    /// as it first was: no shape by direction, no probes, no contact spheres. The lowest
+    /// setting.
+    pub basic_ambient: bool,
     /// How long one thread works out the shadows on the polygons in view before the rest
     /// are shared across threads: waking the pool costs tens of microseconds, more than
     /// all of them take where few shadows fall. Zero shares them from the start, and
@@ -280,9 +293,21 @@ impl Default for ViewConfig {
             cache_shadows: true,
             dynamic_shadows: true,
             dynamic_softness: 1.0,
+            moving_entities: MovingEntities::All,
+            same_world: false,
+            basic_ambient: false,
             parallel_shadows: Duration::from_micros(250),
         }
     }
+}
+
+/// Which of the entities that move a view draws (see `ViewConfig::moving_entities`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MovingEntities {
+    All,
+    /// Those flagged to be drawn in probes (`Entity::in_probes`).
+    Flagged,
+    None,
 }
 
 /// Reflects a point across a plane. Points on the plane (within `ON_MIRROR`) stay exactly
@@ -342,9 +367,18 @@ pub struct ViewGeometry {
     /// length in pixels.
     pub eye: Vec3,
     pub focal: f32,
-    /// The world's lights and ambient light; see [`ViewGeometry::polygon_lights`].
+    /// The world's lights and ambient light (by direction); see
+    /// [`ViewGeometry::polygon_lights`].
     pub lights: Vec<Light>,
-    pub ambient: Vec3,
+    pub ambient: Ambient,
+    /// The world's ambient light probes, if it has them: where they are, their light is the
+    /// ambient light, in place of `ambient` (see `World::probes`).
+    pub probes: Option<std::sync::Arc<moose_assets::AmbientProbes>>,
+    /// What the probes' light is multiplied by: the world's ambient light over theirs.
+    pub probe_scale: Vec3,
+    /// Spheres standing for the entities' shapes, which darken the ambient light on what
+    /// they are close to (see [`ContactSphere`]).
+    pub contacts: Vec<ContactSphere>,
     /// The lights that can reach each polygon, as ranges of `light_lists` (indices into
     /// `lights`): per sector for level polygons, and per object (parallel to `objects`) for
     /// an entity's, the lights of every sector it touches.
@@ -545,7 +579,7 @@ impl ViewGeometry {
     /// built.
     pub fn new() -> Self {
         Self {
-            ambient: Vec3::ONE,
+            ambient: Ambient::uniform(Vec3::ONE),
             ..Self::default()
         }
     }
@@ -595,6 +629,20 @@ impl ViewGeometry {
             next = m.parent;
         }
         p
+    }
+
+    /// Gathers what blocks each of `world`'s lights now, for [`ViewGeometry::light_reaching`]
+    /// (as building a view does, with its config).
+    pub fn prepare_lights(&mut self, world: &World, assets: &Assets) {
+        self.scratch
+            .carver
+            .prepare(world, assets, world.lights(), (self.config.dynamic_shadows, self.config.dynamic_softness));
+    }
+
+    /// How much of the light in shadow slot `slot` reaches world point `p` (in `sector`, on
+    /// `entity` if one's), as carving would have it there (see `prepare_lights`).
+    pub fn light_reaching(&self, slot: u8, p: Vec3, sector: u32, entity: Option<u32>) -> f32 {
+        self.scratch.carver.reaching(slot, p, sector, entity)
     }
 
     /// Forgets every baked and cached shadow, for after the world changes (an editor moved
@@ -767,7 +815,24 @@ impl ViewGeometry {
         (self.eye, self.focal) = (view.position, view.focal);
         self.lights.clear();
         self.lights.extend_from_slice(world.lights());
-        self.ambient = world.ambient;
+        self.ambient = if self.config.basic_ambient {
+            Ambient::uniform(world.ambient)
+        } else {
+            Ambient::shaped(world.ambient, &world.ambient_shape)
+        };
+        self.probes = world.probes.clone().filter(|_| !self.config.basic_ambient);
+        // The probes hold the ambient light as it was when they were baked: as bright as it
+        // is now.
+        self.probe_scale = match &self.probes {
+            Some(p) => Vec3::select(p.ambient.cmpgt(Vec3::ZERO), world.ambient / p.ambient, Vec3::ONE),
+            None => Vec3::ONE,
+        };
+        self.contacts.clear();
+        for (ei, entity) in world.entities.iter().enumerate() {
+            if entity.kind.is_drawn() && !self.config.basic_ambient {
+                contact_spheres(entity, ei as u32, assets, &mut self.contacts);
+            }
+        }
         self.light_lists.clear();
         self.sector_lights.clear();
         for sector in 0..world.sectors.len() as u32 {
@@ -777,14 +842,16 @@ impl ViewGeometry {
         }
         self.object_lights.clear();
         self.object_lights.push(0..0); // the level: per sector instead
-        self.scratch
-            .carver
-            .prepare(
-                world,
-                assets,
-                &self.lights,
-                (self.config.dynamic_shadows, self.config.dynamic_softness),
-            );
+        if !self.config.same_world {
+            self.scratch
+                .carver
+                .prepare(
+                    world,
+                    assets,
+                    &self.lights,
+                    (self.config.dynamic_shadows, self.config.dynamic_softness),
+                );
+        }
         self.visits.clear();
         self.mirrors.clear();
         self.window_planes.clear();
@@ -1136,7 +1203,13 @@ impl ViewGeometry {
             let space = Space::of(direct, &self.mirrors, group);
             s.blockers.build(&world.blockers, space.eye);
             for (ei, entity) in world.entities.iter().enumerate() {
-                if !entity.kind.is_drawn() {
+                let drawn = entity.is_static
+                    || match self.config.moving_entities {
+                        MovingEntities::All => true,
+                        MovingEntities::Flagged => entity.in_probes,
+                        MovingEntities::None => false,
+                    };
+                if !entity.kind.is_drawn() || !drawn {
                     continue;
                 }
                 let box_world = box_corners(entity.bounds.min, entity.bounds.max);
@@ -1276,6 +1349,58 @@ impl ViewGeometry {
             }
         }
         self.cast_shadows(view);
+    }
+}
+
+/// A sphere standing for part of an entity's shape (its occluder's: see `Occluder`), which
+/// darkens the ambient light on surfaces close to it, as the sky it hides from them: a
+/// ball's own sphere, or the sphere inside each part of its shadow proxies, about each
+/// part's middle and as wide as reaches its nearest face. So a figure's feet darken the
+/// floor they stand on, and its body, well above it, doesn't.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContactSphere {
+    pub center: Vec3,
+    pub radius: f32,
+    /// The entity it is part of: it doesn't darken that entity.
+    pub entity: u32,
+}
+
+/// Appends `entity`'s contact spheres (see [`ContactSphere`]) to `out`.
+fn contact_spheres(entity: &moose_scene::Entity, index: u32, assets: &Assets, out: &mut Vec<ContactSphere>) {
+    let transform = entity.transform();
+    let mesh_id = match entity.occluder {
+        Occluder::None => return,
+        Occluder::Facing { radius, center, .. } => {
+            out.push(ContactSphere { center: transform.transform_point3(center), radius: radius * entity.scale, entity: index });
+            return;
+        }
+        Occluder::Mesh | Occluder::Lod(_) => entity.mesh,
+        Occluder::Model(mesh) => mesh,
+    };
+    let mesh = assets.mesh(mesh_id);
+    for part in crate::carve::occluder_parts(mesh) {
+        let points: Vec<Vec3> = part
+            .iter()
+            .flat_map(|&k| mesh.polygon_points(&mesh.polygons[k]))
+            .map(|p| transform.transform_point3(p))
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+        let center = points.iter().copied().sum::<Vec3>() / points.len() as f32;
+        // As wide as reaches its nearest face (the faces' planes, in world space).
+        let radius = part
+            .iter()
+            .map(|&k| {
+                let p = &mesh.polygons[k];
+                let normal = (entity.rotation * p.plane.normal).normalize_or_zero();
+                let on = transform.transform_point3(mesh.polygon_points(p).next().unwrap_or(Vec3::ZERO));
+                normal.dot(on - center).abs()
+            })
+            .fold(f32::INFINITY, f32::min);
+        if radius.is_finite() && radius > 1e-3 {
+            out.push(ContactSphere { center, radius, entity: index });
+        }
     }
 }
 
